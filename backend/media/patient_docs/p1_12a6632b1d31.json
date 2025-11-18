@@ -1,0 +1,158 @@
+{
+  "resourceType": "Bundle",
+  "type": "collection",
+  "timestamp": "2025-11-03T12:39:32.078963",
+  "entry": [
+    {
+      "resource": {
+        "resourceType": "Patient",
+        "id": "patient-1",
+        "identifier": [
+          {
+            "system": "urn:uhid",
+            "value": "NH-000001"
+          },
+          {
+            "system": "https://healthid.ndhm.gov.in",
+            "value": "ABHA-168940531879"
+          }
+        ],
+        "name": [
+          {
+            "use": "official",
+            "text": "nirmal kumar"
+          }
+        ],
+        "gender": "male",
+        "birthDate": "2000-01-01",
+        "telecom": [
+          {
+            "system": "phone",
+            "value": "8865546309"
+          }
+        ]
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "MedicationDispense",
+        "status": "completed",
+        "subject": {
+          "reference": "Patient/patient-1"
+        },
+        "whenHandedOver": "2025-11-03T06:56:00",
+        "note": [
+          {
+            "text": "Dispense • Amount ₹600.00"
+          }
+        ]
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "Invoice",
+        "status": "issued",
+        "subject": {
+          "reference": "Patient/patient-1"
+        },
+        "date": "2025-11-03T06:56:00",
+        "note": [
+          {
+            "text": "Invoice • draft • Net ₹600.00"
+          }
+        ]
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "Invoice",
+        "status": "issued",
+        "subject": {
+          "reference": "Patient/patient-1"
+        },
+        "date": "2025-11-03T06:55:01",
+        "note": [
+          {
+            "text": "Invoice • finalized • Net ₹300.00"
+          }
+        ]
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "Encounter",
+        "status": "finished",
+        "class": {
+          "code": "AMB"
+        },
+        "subject": {
+          "reference": "Patient/patient-1"
+        },
+        "period": {
+          "start": "2025-11-03T06:54:45"
+        }
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "Observation",
+        "status": "final",
+        "code": {
+          "text": "Vital signs"
+        },
+        "subject": {
+          "reference": "Patient/patient-1"
+        },
+        "effectiveDateTime": "2025-11-03T06:54:25",
+        "note": [
+          {
+            "text": "BP 123/123 mmHg  ·  T 123.0°C  ·  Pulse 123/min  ·  SpO₂ 123%"
+          }
+        ]
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "Invoice",
+        "status": "issued",
+        "subject": {
+          "reference": "Patient/patient-1"
+        },
+        "date": "2025-11-03T05:40:11",
+        "note": [
+          {
+            "text": "Invoice • finalized • Net ₹1112100.00"
+          }
+        ]
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "DiagnosticReport",
+        "status": "final",
+        "code": {
+          "text": "Radiology"
+        },
+        "subject": {
+          "reference": "Patient/patient-1"
+        },
+        "effectiveDateTime": "2025-11-03T05:35:48",
+        "conclusion": "testing (testing)"
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "DiagnosticReport",
+        "status": "final",
+        "code": {
+          "text": "Lab Test"
+        },
+        "subject": {
+          "reference": "Patient/patient-1"
+        },
+        "effectiveDateTime": "2025-11-03T05:32:42",
+        "conclusion": "testing (lab-test) • Result: testing"
+      }
+    }
+  ]
+}

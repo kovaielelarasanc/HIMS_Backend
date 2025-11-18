@@ -1,0 +1,75 @@
+# backend/app/core/config.py
+import os
+from typing import List
+from pydantic import BaseModel
+from dotenv import load_dotenv
+from urllib.parse import quote_plus
+from pathlib import Path
+load_dotenv()
+
+
+def _split_csv(value: str) -> List[str]:
+    return [v.strip() for v in (value or "").split(",") if v.strip()]
+
+
+class Settings(BaseModel):
+    PROJECT_NAME: str = os.getenv("PROJECT_NAME", "NABH HIMS & EMR")
+    API_V1_STR: str = os.getenv("API_V1_STR", "/api")
+    SITE_URL: str = "http://127.0.0.1:8000"
+    # CORS (env takes priority)
+    BACKEND_CORS_ORIGINS: List[str] = _split_csv(
+        os.getenv("CORS_ORIGINS",
+                  "http://localhost:5173,http://127.0.0.1:5173"))
+
+    # MySQL
+    MYSQL_HOST: str = os.getenv("MYSQL_HOST", "localhost")
+    MYSQL_PORT: int = int(os.getenv("MYSQL_PORT", "3306"))
+    MYSQL_USER: str = os.getenv("MYSQL_USER", "root")
+    MYSQL_PASSWORD: str = os.getenv("MYSQL_PASSWORD", "")
+    MYSQL_DB: str = os.getenv("MYSQL_DB", "nabh_hims_emr")
+    DB_DRIVER: str = os.getenv("DB_DRIVER", "pymysql")
+
+    SQLALCHEMY_DATABASE_URI: str = (
+        f"mysql+{DB_DRIVER}://{quote_plus(MYSQL_USER)}:{quote_plus(MYSQL_PASSWORD)}"
+        f"@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DB}")
+
+    # Security
+  # The code block you provided is defining several settings related to authentication and security in
+  # the application using environment variables. Let's break it down:
+    JWT_SECRET: str = os.getenv("JWT_SECRET", "change-this")
+    JWT_ALG: str = os.getenv("JWT_ALG", "HS256")
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = int(
+        os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))
+    REFRESH_TOKEN_EXPIRE_MINUTES: int = int(
+        os.getenv("REFRESH_TOKEN_EXPIRE_MINUTES", str(7 * 24 * 60)))
+    # new add jwt
+    
+    BCRYPT_ROUNDS: int = int(os.getenv("BCRYPT_ROUNDS", "12"))
+
+    # Email (Office 365 defaults)
+    SMTP_HOST: str = os.getenv("SMTP_HOST", "smtp.office365.com")
+    SMTP_PORT: int = int(os.getenv("SMTP_PORT", "587"))
+    SMTP_USER: str = os.getenv("SMTP_USER", "")
+    SMTP_PASSWORD: str = os.getenv("SMTP_PASSWORD", "")
+    SMTP_FROM: str = os.getenv("SMTP_FROM", "no-reply@nutryah.com")
+
+    # Admin
+    ADMIN_ALL_ACCESS: bool = os.getenv(
+        "ADMIN_ALL_ACCESS", "false").lower() in {"1", "true", "yes"}
+
+    # File storage
+    STORAGE_DIR: str = os.getenv("STORAGE_DIR", "./media")
+    MEDIA_URL: str = os.getenv("MEDIA_URL", "/media")   # ✅ ADD THIS
+
+    # Billing flags (used by auto-billing service)
+    BILLING_AUTOCREATE: bool = os.getenv(
+        "BILLING_AUTOCREATE", "false").lower() in {"1", "true", "yes"}
+    BILLING_AUTOFINALIZE_OPD: bool = os.getenv(
+        "BILLING_AUTOFINALIZE_OPD", "false").lower() in {"1", "true", "yes"}
+    BILLING_DEFAULT_TAX: float = float(
+        os.getenv("BILLING_DEFAULT_TAX", "0") or 0.0)
+
+
+settings = Settings()
+
+Path(settings.STORAGE_DIR).resolve().mkdir(parents=True, exist_ok=True)
