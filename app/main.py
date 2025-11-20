@@ -22,7 +22,38 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Routers
+from fastapi.responses import JSONResponse
+from fastapi import Request
+
+
+# 🔥 Global OPTIONS handler – CORS + Cloudflare safe
+@app.options("/{rest_of_path:path}")
+async def cors_preflight_handler(rest_of_path: str, request: Request):
+    origin = request.headers.get("origin")
+    allowed_origins = settings.BACKEND_CORS_ORIGINS
+
+    headers = {
+        "Access-Control-Allow-Methods":
+        "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+        "Access-Control-Allow-Headers":
+        request.headers.get("access-control-request-headers", "*"),
+        "Access-Control-Allow-Credentials":
+        "true",
+        "Vary":
+        "Origin",
+    }
+
+    # Only echo origin if it is in the allowed list
+    if origin in allowed_origins:
+        headers["Access-Control-Allow-Origin"] = origin
+
+    return JSONResponse(
+        status_code=200,
+        content={"message": "preflight ok"},
+        headers=headers,
+    )
+
+
 app.include_router(api_router, prefix=settings.API_V1_STR)
 
 # Media mount
@@ -30,10 +61,11 @@ app.include_router(api_router, prefix=settings.API_V1_STR)
 # MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
 # app.mount("/media", StaticFiles(directory=str(MEDIA_ROOT)), name="media")
 
-
 MEDIA_ROOT = Path(settings.STORAGE_DIR).resolve()
 MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
-app.mount(settings.MEDIA_URL, StaticFiles(directory=str(MEDIA_ROOT)), name="media")
+app.mount(settings.MEDIA_URL,
+          StaticFiles(directory=str(MEDIA_ROOT)),
+          name="media")
 
 
 # Health
