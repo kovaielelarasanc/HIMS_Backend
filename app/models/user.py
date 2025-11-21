@@ -1,7 +1,7 @@
-# backend/app/models/user.py (make sure this matches exactly)
 from sqlalchemy import Column, Integer, String, Boolean, ForeignKey
 from sqlalchemy.orm import relationship
 from app.db.base import Base
+
 
 class User(Base):
     __tablename__ = "users"
@@ -13,15 +13,25 @@ class User(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(120), nullable=False)
-    email = Column(String(191), unique=True, nullable=False)  # <= 191, no index=True
+    email = Column(String(191), unique=True,
+                   nullable=False)  # <= 191, no index=True
     password_hash = Column(String(255), nullable=False)
+
     is_active = Column(Boolean, default=True)
     is_admin = Column(Boolean, default=False)
 
-    department_id = Column(Integer, ForeignKey("departments.id"), nullable=True)
+    # NEW FIELD
+    is_doctor = Column(Boolean, default=False, nullable=False)
+
+    department_id = Column(Integer,
+                           ForeignKey("departments.id"),
+                           nullable=True)
     department = relationship("Department", back_populates="users")
 
-    roles = relationship("Role", secondary="user_roles", back_populates="users")
+    roles = relationship("Role",
+                         secondary="user_roles",
+                         back_populates="users")
+
 
 class UserRole(Base):
     __tablename__ = "user_roles"

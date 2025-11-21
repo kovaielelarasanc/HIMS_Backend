@@ -22,7 +22,8 @@ from app.api import (
     routes_lis, routes_ris, routes_ot, routes_billing, routes_ot_masters,
 
     # Files & History
-    routes_files, routes_lis_history, routes_ot_history, routes_ris_history, routes_emr, routes_templates, routes_patient_search
+    routes_files, routes_lis_history, routes_ot_history, routes_ris_history, routes_emr, routes_templates, routes_patient_search,
+    routes_dashboard, routes_mis, routes_patient_masters, routes_masters_credit
 )
 
 api_router = APIRouter()
@@ -37,6 +38,8 @@ api_router.include_router(routes_permissions.router, prefix="/permissions", tags
 
 # ---- Patients / ABHA
 api_router.include_router(routes_patients.router,    prefix="/patients",    tags=["patients"])
+api_router.include_router(routes_patient_masters.router,     prefix="/patient-masters", tags=["patient-masters"])
+api_router.include_router(routes_masters_credit.router,     prefix="/masters", tags=["masters"])
 api_router.include_router(routes_abha.router,        prefix="/abha",        tags=["abha"])
 
 # ---- OPD (Avoid path collisions: see notes in each module)
@@ -64,7 +67,7 @@ api_router.include_router(routes_masters.router,       prefix="/masters", tags=[
 api_router.include_router(routes_lis.router)
 api_router.include_router(routes_ris.router)
 api_router.include_router(routes_ot.router)
-api_router.include_router(routes_billing.router)
+api_router.include_router(routes_billing.router, prefix="/billing", tags=["billing"])
 api_router.include_router(routes_ot_masters.router)
 
 # ---- Files & History
@@ -77,3 +80,6 @@ api_router.include_router(routes_emr.router, prefix="/emr", tags=["EMR"])
 
 api_router.include_router(routes_templates.router, prefix="/templates", tags=["Templates & Consents"])
 api_router.include_router(routes_patient_search.router, prefix="/opd", tags=["OPD common"] )
+
+api_router.include_router(routes_dashboard.router, prefix="/dashboard", tags=["Dashboard"] )
+api_router.include_router(routes_mis.router, prefix="/mis", tags=["MIS"] )

@@ -1,23 +1,28 @@
+# FILE: app/services/pdf_emr.py
 from __future__ import annotations
+
 from io import BytesIO
 from typing import Iterable, Optional, Dict, Any, List
 from datetime import datetime
 
-# pip install reportlab
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
 from reportlab.lib import colors
+from reportlab.lib.utils import ImageReader
 
 
-def _wrap_text(c: canvas.Canvas,
-               text: str,
-               x: float,
-               y: float,
-               max_width: float,
-               line_height: float = 13) -> float:
-    if not text: return y
+def _wrap_text(
+    c: canvas.Canvas,
+    text: str,
+    x: float,
+    y: float,
+    max_width: float,
+    line_height: float = 13,
+) -> float:
+    """Simple left-aligned word wrapping."""
+    if not text:
+        return y
     words = (text or "").split()
     line = ""
     for w in words:
@@ -34,25 +39,25 @@ def _wrap_text(c: canvas.Canvas,
     return y
 
 
-def _kv(c: canvas.Canvas, x: float, y: float, label: str, value: Any,
-        max_width: float) -> float:
-    if value is None or value == "": return y
+def _kv(
+    c: canvas.Canvas,
+    x: float,
+    y: float,
+    label: str,
+    value: Any,
+    max_width: float,
+) -> float:
+    """Label: value helper (kept for compatibility, even if not used much)."""
+    if value is None or value == "":
+        return y
     return _wrap_text(c, f"{label}: {value}", x, y, max_width)
 
 
 def _section_rule(c: canvas.Canvas, y: float, W: float) -> float:
+    """Thin separator line (kept for compatibility)."""
     c.setStrokeColor(colors.HexColor("#E2E8F0"))
     c.line(20 * mm, y, W - 20 * mm, y)
     return y - 6 * mm
-
-
-def _page_break_if_needed(c: canvas.Canvas, y: float, H: float) -> float:
-    if y < 25 * mm:
-        c.showPage()
-        c.setFont("Helvetica-Bold", 11)
-        c.setFillColor(colors.HexColor("#0F172A"))
-        return H - 20 * mm
-    return y
 
 
 def generate_emr_pdf(
@@ -61,331 +66,868 @@ def generate_emr_pdf(
     sections_selected: Optional[set[str]] = None,
     letterhead_bytes: Optional[bytes] = None,
 ) -> bytes:
+    """
+    Generate a professional EMR summary PDF.
+
+    Layout:
+    - Optional hospital letterhead at the top (first page only)
+    - Patient banner (Name, UHID, Gender, DOB, Phone, Email, Generated date)
+    - Sections grouped by clinical area:
+      OPD, Vitals, Prescriptions, Lab, Radiology, Pharmacy, IPD, OT,
+      Billing, Attachments, Consents, Other
+    - Each event shows:
+      Date/time, title, status, doctor/department/location,
+      followed by structured details.
+    """
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     W, H = A4
 
-    # Letterhead (optional)
-    y = H - 20 * mm
-    if letterhead_bytes:
-        try:
-            img = ImageReader(BytesIO(letterhead_bytes))
-            iw, ih = img.getSize()
-            scale = (W - 20 * mm) / iw
-            draw_w = (W - 20 * mm)
-            draw_h = ih * scale
-            c.drawImage(img,
-                        10 * mm,
-                        H - draw_h - 10 * mm,
-                        width=draw_w,
-                        height=draw_h,
-                        preserveAspectRatio=True,
-                        mask='auto')
-            y = H - draw_h - 16 * mm
-        except Exception:
-            pass
+    # Margins / layout
+    LEFT = 20 * mm
+    RIGHT = W - 20 * mm
+    TOP = H - 20 * mm
+    BOTTOM = 18 * mm
+    CONTENT_W = RIGHT - LEFT
 
-    # Header
-    c.setFont("Helvetica-Bold", 14)
-    c.setFillColor(colors.HexColor("#0F172A"))
-    c.drawString(20 * mm, y, "Patient EMR Summary")
-    y -= 8 * mm
-
-    c.setFont("Helvetica", 10)
-    c.setFillColor(colors.black)
-    head = [
-        f"Name: {patient.get('name') or '—'}",
-        f"UHID: {patient.get('uhid') or '—'}",
-        f"Gender: {patient.get('gender') or '—'}",
-        f"DOB: {patient.get('dob') or '—'}",
-        f"Phone: {patient.get('phone') or '—'}  Email: {patient.get('email') or '—'}",
-        f"Generated at: {datetime.utcnow().isoformat()} (UTC)",
-    ]
-    for line in head:
-        c.drawString(20 * mm, y, line)
-        y -= 6 * mm
-    y = _section_rule(c, y, W)
-    y -= 2 * mm
-
-    # helper for section filtering
+    # ---- section mapping (aligned with EmrExport sections) ----
     def section_of(t: str) -> str:
-        if t == "opd_visit": return "opd"
-        if t == "opd_vitals": return "vitals"
-        if t == "rx": return "prescriptions"
-        if t == "lab": return "lab"
-        if t == "radiology": return "radiology"
-        if t == "pharmacy": return "pharmacy"
-        if t.startswith("ipd_"): return "ipd"
-        if t == "ot": return "ot"
-        if t == "billing": return "billing"
-        if t == "attachment": return "attachments"
-        if t == "consent": return "consents"
+        if t == "opd_visit":
+            return "opd"
+        if t == "opd_vitals":
+            return "vitals"
+        if t == "rx":
+            return "prescriptions"
+        if t == "lab":
+            return "lab"
+        if t == "radiology":
+            return "radiology"
+        if t == "pharmacy":
+            return "pharmacy"
+        if t.startswith("ipd_"):
+            return "ipd"
+        if t == "ot":
+            return "ot"
+        if t == "billing":
+            return "billing"
+        if t == "attachment":
+            return "attachments"
+        if t == "consent":
+            return "consents"
         return "other"
 
-    # Body
-    c.setFont("Helvetica-Bold", 11)
-    c.setFillColor(colors.HexColor("#0F172A"))
+    SECTION_ORDER = [
+        ("opd", "Outpatient (OPD) Encounters"),
+        ("vitals", "Vitals"),
+        ("prescriptions", "Prescriptions"),
+        ("lab", "Laboratory Investigations"),
+        ("radiology", "Radiology"),
+        ("pharmacy", "Pharmacy Dispense"),
+        ("ipd", "Inpatient (IPD)"),
+        ("ot", "Operation Theatre"),
+        ("billing", "Billing & Payments"),
+        ("attachments", "Attachments"),
+        ("consents", "Patient Consents"),
+        ("other", "Other"),
+    ]
 
+    # ---- page helpers ----
+    # Cache letterhead image once
+    letterhead_img = None
+    if letterhead_bytes:
+        try:
+            letterhead_img = ImageReader(BytesIO(letterhead_bytes))
+        except Exception:
+            letterhead_img = None
+
+    def draw_page_header(first: bool = False) -> float:
+        """Top-of-page: optional letterhead, then patient banner and rule."""
+        y = TOP
+
+        # Optional letterhead only on first page
+        if first and letterhead_img is not None:
+            iw, ih = letterhead_img.getSize()
+            avail_w = RIGHT - LEFT
+            scale = avail_w / float(iw)
+            draw_w = avail_w
+            draw_h = ih * scale
+            c.drawImage(
+                letterhead_img,
+                LEFT,
+                H - draw_h - 10 * mm,
+                width=draw_w,
+                height=draw_h,
+                preserveAspectRatio=True,
+                mask="auto",
+            )
+            y = H - draw_h - 16 * mm
+
+        # Title
+        c.setFont("Helvetica-Bold", 13)
+        c.setFillColor(colors.HexColor("#0F172A"))
+        c.drawString(LEFT, y, "Patient EMR Summary")
+        y -= 6 * mm
+
+        # Patient banner
+        c.setFont("Helvetica", 9)
+        c.setFillColor(colors.HexColor("#111827"))
+        name = patient.get("name") or "—"
+        uhid = patient.get("uhid") or "—"
+        gender = patient.get("gender") or "—"
+        dob = patient.get("dob") or "—"
+        phone = patient.get("phone") or "—"
+        email = patient.get("email") or "—"
+
+        c.drawString(LEFT, y, f"Name: {name}        UHID: {uhid}")
+        y -= 4.5 * mm
+        c.drawString(LEFT, y, f"Gender: {gender}        DOB: {dob}")
+        y -= 4.5 * mm
+        c.drawString(LEFT, y, f"Phone: {phone}")
+        y -= 4.5 * mm
+        c.setFillColor(colors.HexColor("#4B5563"))
+        c.drawString(
+            LEFT,
+            y,
+            f"Email: {email}        Generated at: "
+            f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M')} (UTC)",
+        )
+        y -= 5 * mm
+
+        # Separator
+        c.setStrokeColor(colors.HexColor("#CBD5E1"))
+        c.line(LEFT, y, RIGHT, y)
+        y -= 8 * mm
+        return y
+
+    def draw_footer():
+        """Footer with divider, brand and page number."""
+        c.setStrokeColor(colors.HexColor("#E2E8F0"))
+        c.line(LEFT, BOTTOM + 4 * mm, RIGHT, BOTTOM + 4 * mm)
+        c.setFont("Helvetica", 8)
+        c.setFillColor(colors.HexColor("#94A3B8"))
+        c.drawString(LEFT, BOTTOM, "Generated by Nutryah HIMS/EMR")
+        c.drawRightString(RIGHT, BOTTOM, f"Page {c.getPageNumber()}")
+
+    def page_break_if_needed(y: float) -> float:
+        """Ensure we keep enough space before starting a new block."""
+        if y < BOTTOM + 30 * mm:
+            draw_footer()
+            c.showPage()
+            return draw_page_header(first=False)
+        return y
+
+    # ---- Prepare data: sort + group by section ----
     sorted_items = sorted(items or [],
                           key=lambda x: x.get("ts", ""),
                           reverse=True)
+
+    section_map: Dict[str, List[Dict[str, Any]]] = {
+        k: []
+        for k, _ in SECTION_ORDER
+    }
     for it in sorted_items:
-        sec = section_of(it.get("type", ""))
+        sec = section_of(it.get("type", "") or "")
         if sections_selected and sec not in sections_selected:
             continue
+        if sec not in section_map:
+            sec = "other"
+        section_map.setdefault(sec, []).append(it)
 
-        y = _page_break_if_needed(c, y, H)
+    # ---- Render ----
+    y = draw_page_header(first=True)
 
-        # Row header
-        title = it.get("title") or "Event"
-        when = it.get("ts")
-        if isinstance(when, str): when = when.replace("T", " ")[:16]
-        header = f"{title}  •  {when or ''}"
-        status = it.get("status")
-        if status: header += f"  •  {status}"
-        c.drawString(20 * mm, y, header)
-        y -= 6 * mm
+    for sec_key, sec_label in SECTION_ORDER:
+        rows = section_map.get(sec_key) or []
+        if not rows:
+            continue
 
-        # Meta line
-        c.setFont("Helvetica", 10)
-        meta_bits: List[str] = []
-        if it.get("doctor_name"):
-            meta_bits.append(f"Doctor: {it['doctor_name']}")
-        if it.get("department_name"):
-            meta_bits.append(f"Dept: {it['department_name']}")
-        if it.get("location_name"):
-            meta_bits.append(f"Loc: {it['location_name']}")
-        if meta_bits:
-            y = _wrap_text(c, "  •  ".join(meta_bits), 20 * mm, y, W - 40 * mm)
-
-        # Module-specific details
-        data = it.get("data") or {}
-        typ = it.get("type")
-
-        if typ == "opd_visit":
-            y = _kv(c, 20 * mm, y, "Chief Complaint",
-                    data.get("chief_complaint"), W - 40 * mm)
-            y = _kv(c, 20 * mm, y, "Symptoms", data.get("symptoms"),
-                    W - 40 * mm)
-            y = _kv(c, 20 * mm, y, "Subjective", data.get("subjective"),
-                    W - 40 * mm)
-            y = _kv(c, 20 * mm, y, "Objective", data.get("objective"),
-                    W - 40 * mm)
-            y = _kv(c, 20 * mm, y, "Assessment", data.get("assessment"),
-                    W - 40 * mm)
-            y = _kv(c, 20 * mm, y, "Plan", data.get("plan"), W - 40 * mm)
-            y = _kv(c, 20 * mm, y, "Episode", data.get("episode_id"),
-                    W - 40 * mm)
-            ap = data.get("appointment") or {}
-            if ap:
-                y = _kv(c, 20 * mm, y, "Appointment Date", ap.get("date"),
-                        W - 40 * mm)
-                y = _kv(c, 20 * mm, y, "Slot",
-                        f"{ap.get('slot_start')} – {ap.get('slot_end')}",
-                        W - 40 * mm)
-
-        elif typ == "opd_vitals":
-            y = _kv(c, 20 * mm, y, "Recorded at", data.get("recorded_at"),
-                    W - 40 * mm)
-            y = _kv(c, 20 * mm, y, "Height (cm)", data.get("height_cm"),
-                    W - 40 * mm)
-            y = _kv(c, 20 * mm, y, "Weight (kg)", data.get("weight_kg"),
-                    W - 40 * mm)
-            y = _kv(c, 20 * mm, y, "BMI", data.get("bmi"), W - 40 * mm)
-            y = _kv(
-                c, 20 * mm, y, "BP",
-                f"{data.get('bp_systolic')}/{data.get('bp_diastolic')} mmHg",
-                W - 40 * mm)
-            y = _kv(c, 20 * mm, y, "Pulse", data.get("pulse"), W - 40 * mm)
-            y = _kv(c, 20 * mm, y, "RR", data.get("rr"), W - 40 * mm)
-            y = _kv(c, 20 * mm, y, "Temp (°C)", data.get("temp_c"),
-                    W - 40 * mm)
-            y = _kv(c, 20 * mm, y, "SpO₂ (%)", data.get("spo2"), W - 40 * mm)
-            y = _kv(c, 20 * mm, y, "Notes", data.get("notes"), W - 40 * mm)
-
-        elif typ == "rx":
-            y = _kv(c, 20 * mm, y, "Notes", data.get("notes"), W - 40 * mm)
-            y = _kv(c, 20 * mm, y, "Signed at", data.get("signed_at"),
-                    W - 40 * mm)
-            y = _kv(c, 20 * mm, y, "Signed by", data.get("signed_by"),
-                    W - 40 * mm)
-            items = data.get("items") or []
-            if items:
-                c.setFont("Helvetica-Bold", 10)
-                c.drawString(20 * mm, y, "Items:")
-                y -= 6 * mm
-                c.setFont("Helvetica", 10)
-                for di in items:
-                    y = _page_break_if_needed(c, y, H)
-                    line = f"- {di.get('drug_name')} {di.get('strength') or ''} • {di.get('frequency') or ''} • {di.get('duration_days')}d • Qty {di.get('quantity')} • ₹{di.get('line_total') or 0:.2f}"
-                    y = _wrap_text(c, line, 25 * mm, y, W - 45 * mm)
-
-        elif typ == "lab":
-            item = (data.get("item") or {})
-            y = _kv(c, 20 * mm, y, "Order ID", data.get("order_id"),
-                    W - 40 * mm)
-            y = _kv(c, 20 * mm, y, "Priority", data.get("priority"),
-                    W - 40 * mm)
-            y = _kv(c, 20 * mm, y, "Collected at", data.get("collected_at"),
-                    W - 40 * mm)
-            y = _kv(c, 20 * mm, y, "Reported at", data.get("reported_at"),
-                    W - 40 * mm)
-            for k, label in [
-                ("test_name", "Test"),
-                ("test_code", "Code"),
-                ("unit", "Unit"),
-                ("normal_range", "Normal Range"),
-                ("specimen_type", "Specimen"),
-                ("status", "Status"),
-                ("result_value", "Result"),
-                ("is_critical", "Critical"),
-                ("result_at", "Result at"),
-            ]:
-                y = _kv(c, 20 * mm, y, label, item.get(k), W - 40 * mm)
-
-        elif typ == "radiology":
-            for k, label in [
-                ("test_name", "Test"),
-                ("test_code", "Code"),
-                ("modality", "Modality"),
-                ("status", "Status"),
-                ("scheduled_at", "Scheduled"),
-                ("scanned_at", "Scanned"),
-                ("reported_at", "Reported"),
-                ("approved_at", "Approved"),
-            ]:
-                y = _kv(c, 20 * mm, y, label, data.get(k), W - 40 * mm)
-            y = _kv(c, 20 * mm, y, "Report Text", data.get("report_text"),
-                    W - 40 * mm)
-
-        elif typ == "pharmacy":
-            y = _kv(c, 20 * mm, y, "Sale ID", data.get("sale_id"), W - 40 * mm)
-            y = _kv(c, 20 * mm, y, "Context", data.get("context_type"),
-                    W - 40 * mm)
-            y = _kv(c, 20 * mm, y, "Payment", data.get("payment_mode"),
-                    W - 40 * mm)
-            y = _kv(c, 20 * mm, y, "Total", data.get("total_amount"),
-                    W - 40 * mm)
-            items = data.get("items") or []
-            if items:
-                c.setFont("Helvetica-Bold", 10)
-                c.drawString(20 * mm, y, "Items:")
-                y -= 6 * mm
-                c.setFont("Helvetica", 10)
-                for di in items:
-                    y = _page_break_if_needed(c, y, H)
-                    line = f"- {di.get('medicine_name') or di.get('medicine_id')} • Qty {di.get('qty')} • ₹{di.get('amount') or 0:.2f}"
-                    y = _wrap_text(c, line, 25 * mm, y, W - 45 * mm)
-
-        elif typ == "ipd_admission":
-            for k, label in [
-                ("admission_code", "Admission Code"),
-                ("admission_type", "Type"),
-                ("admitted_at", "Admitted at"),
-                ("expected_discharge_at", "Expected Discharge"),
-                ("preliminary_diagnosis", "Preliminary Diagnosis"),
-                ("history", "History"),
-                ("care_plan", "Care Plan"),
-                ("current_bed_code", "Current Bed"),
-                ("payor_type", "Payor"),
-                ("insurer_name", "Insurer"),
-                ("policy_number", "Policy"),
-                ("status", "Status"),
-            ]:
-                y = _kv(c, 20 * mm, y, label, data.get(k), W - 40 * mm)
-
-        elif typ == "ipd_transfer":
-            for k, label in [
-                ("admission_id", "Admission"),
-                ("from_bed_id", "From Bed"),
-                ("to_bed_id", "To Bed"),
-                ("reason", "Reason"),
-                ("transferred_at", "When"),
-            ]:
-                y = _kv(c, 20 * mm, y, label, data.get(k), W - 40 * mm)
-
-        elif typ == "ipd_discharge":
-            for k, label in [
-                ("finalized", "Finalized"),
-                ("finalized_at", "Finalized at"),
-                ("demographics", "Demographics"),
-                ("medical_history", "Medical History"),
-                ("treatment_summary", "Treatment Summary"),
-                ("medications", "Medications"),
-                ("follow_up", "Follow Up"),
-                ("icd10_codes", "ICD-10 Codes"),
-            ]:
-                y = _kv(c, 20 * mm, y, label, data.get(k), W - 40 * mm)
-
-        elif typ == "ot":
-            for k, label in [
-                ("surgery_name", "Surgery"),
-                ("surgery_code", "Code"),
-                ("estimated_cost", "Est. Cost"),
-                ("scheduled_start", "Scheduled Start"),
-                ("scheduled_end", "Scheduled End"),
-                ("actual_start", "Actual Start"),
-                ("actual_end", "Actual End"),
-                ("status", "Status"),
-                ("preop_notes", "Pre-op Notes"),
-                ("postop_notes", "Post-op Notes"),
-            ]:
-                y = _kv(c, 20 * mm, y, label, data.get(k), W - 40 * mm)
-
-        elif typ == "billing":
-            y = _kv(c, 20 * mm, y, "Invoice ID", data.get("invoice_id"),
-                    W - 40 * mm)
-            y = _kv(c, 20 * mm, y, "Status", data.get("status"), W - 40 * mm)
-            y = _kv(c, 20 * mm, y, "Net Total", data.get("net_total"),
-                    W - 40 * mm)
-            y = _kv(c, 20 * mm, y, "Paid", data.get("amount_paid"),
-                    W - 40 * mm)
-            y = _kv(c, 20 * mm, y, "Balance", data.get("balance_due"),
-                    W - 40 * mm)
-            items = data.get("items") or []
-            if items:
-                c.setFont("Helvetica-Bold", 10)
-                c.drawString(20 * mm, y, "Items:")
-                y -= 6 * mm
-                c.setFont("Helvetica", 10)
-                for li in items:
-                    y = _page_break_if_needed(c, y, H)
-                    line = f"- {li.get('service_type')}: {li.get('description')} • Qty {li.get('quantity')} • ₹{li.get('line_total') or 0:.2f}"
-                    y = _wrap_text(c, line, 25 * mm, y, W - 45 * mm)
-            pays = data.get("payments") or []
-            if pays:
-                c.setFont("Helvetica-Bold", 10)
-                c.drawString(20 * mm, y, "Payments:")
-                y -= 6 * mm
-                c.setFont("Helvetica", 10)
-                for p in pays:
-                    y = _page_break_if_needed(c, y, H)
-                    line = f"- {p.get('mode')} • ₹{p.get('amount') or 0:.2f} • {p.get('paid_at')}"
-                    y = _wrap_text(c, line, 25 * mm, y, W - 45 * mm)
-
-        elif typ == "attachment":
-            pass  # already lists under attachments
-
-        elif typ == "consent":
-            y = _kv(c, 20 * mm, y, "Type", data.get("type"), W - 40 * mm)
-            y = _kv(c, 20 * mm, y, "Captured at", data.get("captured_at"),
-                    W - 40 * mm)
-            y = _kv(c, 20 * mm, y, "Text", data.get("text"), W - 40 * mm)
-
-        # attachments list (if any)
-        atts = it.get("attachments") or []
-        for a in atts:
-            y = _wrap_text(
-                c,
-                f"Attachment: {(a.get('label') or 'file')} — {a.get('url') or ''}",
-                20 * mm, y, W - 40 * mm)
-
-        # row divider
-        y -= 3 * mm
-        y = _section_rule(c, y, W)
+        # Section heading
+        y = page_break_if_needed(y)
         c.setFont("Helvetica-Bold", 11)
         c.setFillColor(colors.HexColor("#0F172A"))
+        c.drawString(LEFT, y, sec_label)
+        c.setFont("Helvetica", 8)
+        c.setFillColor(colors.HexColor("#6B7280"))
+        c.drawRightString(RIGHT, y, f"{len(rows)} record(s)")
+        y -= 3 * mm
+        c.setStrokeColor(colors.HexColor("#E5E7EB"))
+        c.line(LEFT, y, RIGHT, y)
+        y -= 6 * mm
 
+        # Each entry inside section
+        for it in rows:
+            y = page_break_if_needed(y)
+
+            # Header line for this event
+            raw_ts = it.get("ts")
+            when_str = ""
+            if isinstance(raw_ts, datetime):
+                when_str = raw_ts.strftime("%Y-%m-%d %H:%M")
+            elif isinstance(raw_ts, str):
+                when_str = raw_ts.replace("T", " ")[:16]
+            title = it.get("title") or "Event"
+
+            c.setFont("Helvetica-Bold", 10)
+            c.setFillColor(colors.HexColor("#111827"))
+            header_line = f"{when_str}  |  {title}" if when_str else title
+            c.drawString(LEFT, y, header_line)
+
+            status = it.get("status")
+            if status:
+                c.setFont("Helvetica", 8)
+                c.setFillColor(colors.HexColor("#6B7280"))
+                c.drawRightString(RIGHT, y, status)
+            y -= 5 * mm
+
+            # Meta: doctor / department / location
+            meta_bits: List[str] = []
+            if it.get("doctor_name"):
+                meta_bits.append(f"Doctor: {it['doctor_name']}")
+            if it.get("department_name"):
+                meta_bits.append(f"Dept: {it['department_name']}")
+            if it.get("location_name"):
+                meta_bits.append(f"Location: {it['location_name']}")
+            if meta_bits:
+                c.setFont("Helvetica", 9)
+                c.setFillColor(colors.HexColor("#4B5563"))
+                y = _wrap_text(c, "  •  ".join(meta_bits), LEFT, y, CONTENT_W)
+                y -= 1 * mm
+
+            # Module specific block
+            data = it.get("data") or {}
+            typ = it.get("type")
+
+            c.setFont("Helvetica", 9)
+            c.setFillColor(colors.black)
+
+            # ---------- OPD Visit ----------
+            if typ == "opd_visit":
+                y = _wrap_text(
+                    c,
+                    f"Chief Complaint: {data.get('chief_complaint') or '—'}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"Symptoms: {data.get('symptoms') or '—'}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"Subjective: {data.get('subjective') or '—'}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"Objective: {data.get('objective') or '—'}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"Assessment: {data.get('assessment') or '—'}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"Plan: {data.get('plan') or '—'}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                if data.get("episode_id"):
+                    y = _wrap_text(
+                        c,
+                        f"Episode: {data.get('episode_id')}",
+                        LEFT,
+                        y,
+                        CONTENT_W,
+                    )
+                ap = data.get("appointment") or {}
+                if ap:
+                    if ap.get("date"):
+                        y = _wrap_text(
+                            c,
+                            f"Appointment Date: {ap.get('date')}",
+                            LEFT,
+                            y,
+                            CONTENT_W,
+                        )
+                    slot = ""
+                    if ap.get("slot_start") or ap.get("slot_end"):
+                        slot = (f"{ap.get('slot_start') or ''} – "
+                                f"{ap.get('slot_end') or ''}")
+                    if slot:
+                        y = _wrap_text(
+                            c,
+                            f"Slot: {slot}",
+                            LEFT,
+                            y,
+                            CONTENT_W,
+                        )
+
+            # ---------- Vitals ----------
+            elif typ == "opd_vitals":
+                y = _wrap_text(
+                    c,
+                    f"Recorded at: {data.get('recorded_at')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"Height (cm): {data.get('height_cm')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"Weight (kg): {data.get('weight_kg')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"BMI: {data.get('bmi')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                bp = None
+                if data.get("bp_systolic") and data.get("bp_diastolic"):
+                    bp = (f"{data.get('bp_systolic')}/"
+                          f"{data.get('bp_diastolic')} mmHg")
+                y = _wrap_text(
+                    c,
+                    f"BP: {bp or '—'}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"Pulse: {data.get('pulse')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"RR: {data.get('rr')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"Temp (°C): {data.get('temp_c')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                # Avoid SpO₂ subscript – use SpO2
+                y = _wrap_text(
+                    c,
+                    f"SpO2 (%): {data.get('spo2')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                if data.get("notes"):
+                    y = _wrap_text(
+                        c,
+                        f"Notes: {data.get('notes')}",
+                        LEFT,
+                        y,
+                        CONTENT_W,
+                    )
+
+            # ---------- Prescription ----------
+            elif typ == "rx":
+                if data.get("notes"):
+                    y = _wrap_text(
+                        c,
+                        f"Notes: {data.get('notes')}",
+                        LEFT,
+                        y,
+                        CONTENT_W,
+                    )
+                if data.get("signed_at"):
+                    y = _wrap_text(
+                        c,
+                        f"Signed at: {data.get('signed_at')}",
+                        LEFT,
+                        y,
+                        CONTENT_W,
+                    )
+                if data.get("signed_by"):
+                    y = _wrap_text(
+                        c,
+                        f"Signed by: {data.get('signed_by')}",
+                        LEFT,
+                        y,
+                        CONTENT_W,
+                    )
+                items_block = data.get("items") or []
+                if items_block:
+                    c.setFont("Helvetica-Bold", 9)
+                    c.drawString(LEFT, y, "Items:")
+                    y -= 4 * mm
+                    c.setFont("Helvetica", 9)
+                    for di in items_block:
+                        y = page_break_if_needed(y)
+                        line = (
+                            f"- {di.get('drug_name') or ''} "
+                            f"{di.get('strength') or ''}"
+                            f" • {di.get('frequency') or ''}"
+                            f" • {di.get('duration_days') or ''}d"
+                            f" • Qty {di.get('quantity') or ''}"
+                            f" • Rs {float(di.get('line_total') or 0):.2f}")
+                        y = _wrap_text(
+                            c,
+                            line,
+                            LEFT + 5 * mm,
+                            y,
+                            CONTENT_W - 5 * mm,
+                        )
+
+            # ---------- Lab ----------
+            elif typ == "lab":
+                item = data.get("item") or {}
+                y = _wrap_text(
+                    c,
+                    f"Order ID: {data.get('order_id')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"Priority: {data.get('priority')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"Collected at: {data.get('collected_at')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"Reported at: {data.get('reported_at')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"Test: {item.get('test_name')} "
+                    f"({item.get('test_code')})",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"Unit: {item.get('unit')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"Normal range: {item.get('normal_range')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"Specimen: {item.get('specimen_type')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"Status: {item.get('status')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"Result: {item.get('result_value')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                if item.get("is_critical") is not None:
+                    crit_text = "Yes" if item.get("is_critical") else "No"
+                    y = _wrap_text(
+                        c,
+                        f"Critical: {crit_text}",
+                        LEFT,
+                        y,
+                        CONTENT_W,
+                    )
+                y = _wrap_text(
+                    c,
+                    f"Result at: {item.get('result_at')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+
+            # ---------- Radiology ----------
+            elif typ == "radiology":
+                y = _wrap_text(
+                    c,
+                    f"Test: {data.get('test_name')} "
+                    f"({data.get('test_code')})",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"Modality: {data.get('modality')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"Status: {data.get('status')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"Scheduled at: {data.get('scheduled_at')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"Scanned at: {data.get('scanned_at')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"Reported at: {data.get('reported_at')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"Approved at: {data.get('approved_at')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                if data.get("report_text"):
+                    y = _wrap_text(
+                        c,
+                        f"Report: {data.get('report_text')}",
+                        LEFT,
+                        y,
+                        CONTENT_W,
+                    )
+
+            # ---------- Pharmacy ----------
+            elif typ == "pharmacy":
+                y = _wrap_text(
+                    c,
+                    f"Sale ID: {data.get('sale_id')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"Context: {data.get('context_type')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"Payment: {data.get('payment_mode')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"Total: Rs {data.get('total_amount')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                items_block = data.get("items") or []
+                if items_block:
+                    c.setFont("Helvetica-Bold", 9)
+                    c.drawString(LEFT, y, "Items:")
+                    y -= 4 * mm
+                    c.setFont("Helvetica", 9)
+                    for di in items_block:
+                        y = page_break_if_needed(y)
+                        line = (f"- {di.get('medicine_name')}"
+                                "or di.get('medicine_id')}"
+                                f" • Qty {di.get('qty') or ''}"
+                                f" • Rs {float(di.get('amount') or 0):.2f}")
+                        y = _wrap_text(
+                            c,
+                            line,
+                            LEFT + 5 * mm,
+                            y,
+                            CONTENT_W - 5 * mm,
+                        )
+
+            # ---------- IPD Admission ----------
+            elif typ == "ipd_admission":
+                for label, key in [
+                    ("Admission Code", "admission_code"),
+                    ("Type", "admission_type"),
+                    ("Admitted at", "admitted_at"),
+                    ("Expected Discharge", "expected_discharge_at"),
+                    ("Preliminary Diagnosis", "preliminary_diagnosis"),
+                    ("History", "history"),
+                    ("Care Plan", "care_plan"),
+                    ("Current Bed", "current_bed_code"),
+                    ("Payor", "payor_type"),
+                    ("Insurer", "insurer_name"),
+                    ("Policy", "policy_number"),
+                    ("Status", "status"),
+                ]:
+                    val = data.get(key)
+                    if val not in (None, ""):
+                        y = _wrap_text(
+                            c,
+                            f"{label}: {val}",
+                            LEFT,
+                            y,
+                            CONTENT_W,
+                        )
+
+            # ---------- IPD Transfer ----------
+            elif typ == "ipd_transfer":
+                for label, key in [
+                    ("Admission", "admission_id"),
+                    ("From Bed", "from_bed_id"),
+                    ("To Bed", "to_bed_id"),
+                    ("Reason", "reason"),
+                    ("Transferred at", "transferred_at"),
+                ]:
+                    val = data.get(key)
+                    if val not in (None, ""):
+                        y = _wrap_text(
+                            c,
+                            f"{label}: {val}",
+                            LEFT,
+                            y,
+                            CONTENT_W,
+                        )
+
+            # ---------- IPD Discharge ----------
+            elif typ == "ipd_discharge":
+                for label, key in [
+                    ("Finalized", "finalized"),
+                    ("Finalized at", "finalized_at"),
+                    ("Demographics", "demographics"),
+                    ("Medical History", "medical_history"),
+                    ("Treatment Summary", "treatment_summary"),
+                    ("Medications", "medications"),
+                    ("Follow Up", "follow_up"),
+                    ("ICD-10 Codes", "icd10_codes"),
+                ]:
+                    val = data.get(key)
+                    if val not in (None, ""):
+                        y = _wrap_text(
+                            c,
+                            f"{label}: {val}",
+                            LEFT,
+                            y,
+                            CONTENT_W,
+                        )
+
+            # ---------- OT ----------
+            elif typ == "ot":
+                for label, key in [
+                    ("Surgery", "surgery_name"),
+                    ("Code", "surgery_code"),
+                    ("Est. Cost", "estimated_cost"),
+                    ("Scheduled Start", "scheduled_start"),
+                    ("Scheduled End", "scheduled_end"),
+                    ("Actual Start", "actual_start"),
+                    ("Actual End", "actual_end"),
+                    ("Status", "status"),
+                    ("Pre-op Notes", "preop_notes"),
+                    ("Post-op Notes", "postop_notes"),
+                ]:
+                    val = data.get(key)
+                    if val not in (None, ""):
+                        y = _wrap_text(
+                            c,
+                            f"{label}: {val}",
+                            LEFT,
+                            y,
+                            CONTENT_W,
+                        )
+
+            # ---------- Billing ----------
+            elif typ == "billing":
+                y = _wrap_text(
+                    c,
+                    f"Invoice ID: {data.get('invoice_id')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"Status: {data.get('status')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"Net Total: Rs {data.get('net_total')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"Paid: Rs {data.get('amount_paid')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+                y = _wrap_text(
+                    c,
+                    f"Balance: Rs {data.get('balance_due')}",
+                    LEFT,
+                    y,
+                    CONTENT_W,
+                )
+
+                items_block = data.get("items") or []
+                if items_block:
+                    c.setFont("Helvetica-Bold", 9)
+                    c.drawString(LEFT, y, "Items:")
+                    y -= 4 * mm
+                    c.setFont("Helvetica", 9)
+                    for li in items_block:
+                        y = page_break_if_needed(y)
+                        line = (
+                            f"- {li.get('service_type')}: "
+                            f"{li.get('description') or ''}"
+                            f" • Qty {li.get('quantity') or ''}"
+                            f" • Rs {float(li.get('line_total') or 0):.2f}")
+                        y = _wrap_text(
+                            c,
+                            line,
+                            LEFT + 5 * mm,
+                            y,
+                            CONTENT_W - 5 * mm,
+                        )
+
+                pays = data.get("payments") or []
+                if pays:
+                    c.setFont("Helvetica-Bold", 9)
+                    c.drawString(LEFT, y, "Payments:")
+                    y -= 4 * mm
+                    c.setFont("Helvetica", 9)
+                    for pmt in pays:
+                        y = page_break_if_needed(y)
+                        line = (f"- {pmt.get('mode') or ''}"
+                                f" • Rs {float(pmt.get('amount') or 0):.2f}"
+                                f" • {pmt.get('paid_at') or ''}")
+                        y = _wrap_text(
+                            c,
+                            line,
+                            LEFT + 5 * mm,
+                            y,
+                            CONTENT_W - 5 * mm,
+                        )
+
+            # ---------- Consent ----------
+            elif typ == "consent":
+                if data.get("type"):
+                    y = _wrap_text(
+                        c,
+                        f"Type: {data.get('type')}",
+                        LEFT,
+                        y,
+                        CONTENT_W,
+                    )
+                if data.get("captured_at"):
+                    y = _wrap_text(
+                        c,
+                        f"Captured at: {data.get('captured_at')}",
+                        LEFT,
+                        y,
+                        CONTENT_W,
+                    )
+                if data.get("text"):
+                    y = _wrap_text(
+                        c,
+                        f"Text: {data.get('text')}",
+                        LEFT,
+                        y,
+                        CONTENT_W,
+                    )
+
+            # ---------- default / attachments-only ----------
+            # Attachments (just list names; actual files are in EMR UI)
+            atts = it.get("attachments") or []
+            if atts:
+                c.setFont("Helvetica-Bold", 9)
+                c.drawString(LEFT, y, "Attachments:")
+                y -= 4 * mm
+                c.setFont("Helvetica", 9)
+                for a in atts:
+                    y = page_break_if_needed(y)
+                    label = a.get("label") or "file"
+                    y = _wrap_text(
+                        c,
+                        f"- {label}",
+                        LEFT + 5 * mm,
+                        y,
+                        CONTENT_W - 5 * mm,
+                    )
+
+            # spacing between events
+            y -= 3 * mm
+            c.setStrokeColor(colors.HexColor("#E5E7EB"))
+            c.line(LEFT, y, RIGHT, y)
+            y -= 4 * mm
+
+    # Final footer + save
+    draw_footer()
     c.showPage()
     c.save()
     return buf.getvalue()

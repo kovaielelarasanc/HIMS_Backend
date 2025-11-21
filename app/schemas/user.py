@@ -6,6 +6,8 @@ class UserBase(BaseModel):
     name: str
     email: EmailStr
     is_active: bool = True
+    # NEW FIELD (read/write)
+    is_doctor: bool = False
 
 
 class UserCreate(UserBase):
@@ -29,6 +31,7 @@ class UserLite(BaseModel):
     name: str
     email: Optional[str] = None
     roles: List[str] = []
+    is_doctor: bool = False
 
     class Config:
-        orm_mode = True
+        from_attributes = True
