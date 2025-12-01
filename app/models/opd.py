@@ -1,6 +1,19 @@
 # app/models/opd.py
-from sqlalchemy import (Column, Integer, String, Date, Time, DateTime, Boolean,
-                        ForeignKey, Numeric, UniqueConstraint, Text, Index, CheckConstraint)
+from sqlalchemy import (
+    Column,
+    Integer,
+    String,
+    Date,
+    Time,
+    DateTime,
+    Boolean,
+    ForeignKey,
+    Numeric,
+    UniqueConstraint,
+    Text,
+    Index,
+    CheckConstraint,
+)
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from app.db.base import Base
@@ -10,8 +23,12 @@ class OpdSchedule(Base):
     __tablename__ = "opd_schedules"
     __table_args__ = (
         CheckConstraint("weekday BETWEEN 0 AND 6", name="ck_opd_sch_weekday"),
-        CheckConstraint("end_time > start_time",   name="ck_opd_sch_time"),
-        {"mysql_engine": "InnoDB", "mysql_charset": "utf8mb4", "mysql_collate": "utf8mb4_unicode_ci"},
+        CheckConstraint("end_time > start_time", name="ck_opd_sch_time"),
+        {
+            "mysql_engine": "InnoDB",
+            "mysql_charset": "utf8mb4",
+            "mysql_collate": "utf8mb4_unicode_ci",
+        },
     )
 
     id = Column(Integer, primary_key=True)
@@ -27,14 +44,16 @@ class OpdSchedule(Base):
     location = Column(String(120), default="")
     is_active = Column(Boolean, default=True)
 
-    # 👇 disambiguate
     doctor = relationship("User", foreign_keys=[doctor_user_id])
 
 
 class Appointment(Base):
     __tablename__ = "opd_appointments"
     __table_args__ = (
-        UniqueConstraint("doctor_user_id","date","slot_start", name="uq_doctor_date_slot"),
+        UniqueConstraint("doctor_user_id",
+                         "date",
+                         "slot_start",
+                         name="uq_doctor_date_slot"),
         CheckConstraint("slot_end > slot_start", name="ck_appt_slot_time"),
         Index("ix_opd_appt_patient_date", "patient_id", "date"),
     )
@@ -56,21 +75,24 @@ class Appointment(Base):
     slot_start = Column(Time, nullable=False)
     slot_end = Column(Time, nullable=False)
     purpose = Column(String(200), default="Consultation")
-    status = Column(String(30), default="booked")
+    status = Column(String(30), default="booked")  # booked / checked_in / ...
     created_at = Column(DateTime, default=datetime.utcnow)
 
-    # 👇 disambiguate all three
     patient = relationship("Patient", foreign_keys=[patient_id])
     doctor = relationship("User", foreign_keys=[doctor_user_id])
     department = relationship("Department", foreign_keys=[department_id])
+
+    # backref from FollowUp via appointment relationship string
 
 
 class Visit(Base):
     __tablename__ = "opd_visits"
     __table_args__ = (
-        UniqueConstraint("episode_id",   name="uq_opd_visits_episode"),
-        UniqueConstraint("appointment_id", name="uq_opd_visits_appt"),  # allows multiple NULLs
+        UniqueConstraint("episode_id", name="uq_opd_visits_episode"),
+        UniqueConstraint("appointment_id",
+                         name="uq_opd_visits_appt"),  # allows multiple NULLs
     )
+
     id = Column(Integer, primary_key=True, index=True)
     appointment_id = Column(Integer,
                             ForeignKey("opd_appointments.id"),
@@ -100,9 +122,10 @@ class Visit(Base):
     plan = Column(Text, nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at = Column(DateTime,
+                        default=datetime.utcnow,
+                        onupdate=datetime.utcnow)
 
-    # 👇 disambiguate all four
     appointment = relationship("Appointment", foreign_keys=[appointment_id])
     patient = relationship("Patient", foreign_keys=[patient_id])
     doctor = relationship("User", foreign_keys=[doctor_user_id])
@@ -128,13 +151,17 @@ class Vitals(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     patient = relationship("Patient", foreign_keys=[patient_id])
-    appointment_id = Column(Integer, ForeignKey("opd_appointments.id"), nullable=True, index=True)
+    appointment_id = Column(Integer,
+                            ForeignKey("opd_appointments.id"),
+                            nullable=True,
+                            index=True)
     appointment = relationship("Appointment", foreign_keys=[appointment_id])
 
 
 class Prescription(Base):
     __tablename__ = "opd_prescriptions"
     __table_args__ = (UniqueConstraint("visit_id", name="uq_rx_visit"), )
+
     id = Column(Integer, primary_key=True, index=True)
     visit_id = Column(Integer,
                       ForeignKey("opd_visits.id"),
@@ -146,7 +173,6 @@ class Prescription(Base):
 
     visit = relationship("Visit", foreign_keys=[visit_id])
     items = relationship("PrescriptionItem", cascade="all, delete-orphan")
-    # already disambiguated:
     signer = relationship("User", foreign_keys=[signed_by])
 
 
@@ -178,7 +204,7 @@ class RadiologyTest(Base):
     id = Column(Integer, primary_key=True)
     code = Column(String(32), unique=True, nullable=False, index=True)
     name = Column(String(255), nullable=False)
-    modality = Column(String(16))  # <--- add
+    modality = Column(String(16))
     price = Column(Numeric(10, 2), default=0)
     is_active = Column(Boolean, default=True)
 
@@ -186,9 +212,11 @@ class RadiologyTest(Base):
 class LabOrder(Base):
     __tablename__ = "opd_lab_orders"
     __table_args__ = (
-        UniqueConstraint("visit_id", "test_id", name="uq_lab_order_visit_test"),
+        UniqueConstraint("visit_id", "test_id",
+                         name="uq_lab_order_visit_test"),
         Index("ix_lab_order_status", "status"),
     )
+
     id = Column(Integer, primary_key=True, index=True)
     visit_id = Column(Integer,
                       ForeignKey("opd_visits.id"),
@@ -205,9 +233,11 @@ class LabOrder(Base):
 class RadiologyOrder(Base):
     __tablename__ = "opd_radiology_orders"
     __table_args__ = (
-        UniqueConstraint("visit_id", "test_id", name="uq_ris_order_visit_test"),
+        UniqueConstraint("visit_id", "test_id",
+                         name="uq_ris_order_visit_test"),
         Index("ix_ris_order_status", "status"),
     )
+
     id = Column(Integer, primary_key=True, index=True)
     visit_id = Column(Integer,
                       ForeignKey("opd_visits.id"),
@@ -228,3 +258,64 @@ class Medicine(Base):
     form = Column(String(60), nullable=True)  # tablet/syrup/injection etc.
     unit = Column(String(40), nullable=True)  # per tab / per 100ml etc.
     price_per_unit = Column(Numeric(10, 2), default=0)
+
+
+# ---------- NEW: Follow-up tracking ----------
+class FollowUp(Base):
+    """
+    Follow-up request created from a Visit.
+
+    - Initially status = 'waiting' (no slot yet).
+    - Waiting-time screen will confirm & assign a real Appointment.
+    """
+
+    __tablename__ = "opd_followups"
+    __table_args__ = (
+        UniqueConstraint("appointment_id", name="uq_followup_appointment"
+                         ),  # at most one follow-up record -> appointment link
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    patient_id = Column(Integer,
+                        ForeignKey("patients.id"),
+                        nullable=False,
+                        index=True)
+    department_id = Column(Integer,
+                           ForeignKey("departments.id"),
+                           nullable=False,
+                           index=True)
+    doctor_user_id = Column(Integer,
+                            ForeignKey("users.id"),
+                            nullable=False,
+                            index=True)
+
+    source_visit_id = Column(Integer,
+                             ForeignKey("opd_visits.id"),
+                             nullable=False,
+                             index=True)
+
+    # When doctor wants patient to come again (initial target)
+    due_date = Column(Date, nullable=False)
+
+    # waiting | scheduled | completed | cancelled
+    status = Column(String(30), default="waiting")
+
+    # Once waiting is confirmed -> real appointment
+    appointment_id = Column(Integer,
+                            ForeignKey("opd_appointments.id"),
+                            nullable=True,
+                            index=True)
+
+    note = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime,
+                        default=datetime.utcnow,
+                        onupdate=datetime.utcnow)
+
+    patient = relationship("Patient", foreign_keys=[patient_id])
+    doctor = relationship("User", foreign_keys=[doctor_user_id])
+    department = relationship("Department", foreign_keys=[department_id])
+    source_visit = relationship("Visit", foreign_keys=[source_visit_id])
+    appointment = relationship("Appointment", foreign_keys=[appointment_id])

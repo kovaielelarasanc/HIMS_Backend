@@ -31,6 +31,9 @@ class User(Base):
     roles = relationship("Role",
                          secondary="user_roles",
                          back_populates="users")
+    @property
+    def full_name(self) -> str:
+        return self.name
 
 
 class UserRole(Base):

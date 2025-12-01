@@ -12,7 +12,8 @@ from app.models.user import User
 from app.models.patient import Patient
 from app.models.opd import Appointment, Visit  # noqa: F401
 from app.models.ipd import IpdAdmission
-from app.models.pharmacy import PharmacySale, PharmacySaleItem, PharmacyMedicine
+# ✅ use NEW pharmacy models
+from app.models.pharmacy_prescription import PharmacySale, PharmacySaleItem
 from app.models.lis import LisOrder
 from app.models.ris import RisOrder
 from app.models.ot import OtOrder  # noqa: F401
@@ -95,14 +96,14 @@ def _report_patient_registration_summary(
         db: Session, user: User, filters: MISFilter) -> MISRawReportResult:
     start_dt, end_dt = _date_range(filters)
 
-    q = (db.query(
+    q = db.query(
         func.count(Patient.id).label("total"),
         func.coalesce(func.min(Patient.created_at), None).label("first_at"),
         func.coalesce(func.max(Patient.created_at), None).label("last_at"),
     ).filter(
         Patient.created_at >= start_dt,
         Patient.created_at < end_dt,
-    ))
+    )
 
     # If you store department on Patient, you can filter here.
     if filters.department_id:
@@ -128,10 +129,12 @@ def _report_patient_registration_summary(
 
     columns = [
         MISColumn(key="day", label="Date", type="date", align="left"),
-        MISColumn(key="count",
-                  label="New Patients",
-                  type="number",
-                  align="right"),
+        MISColumn(
+            key="count",
+            label="New Patients",
+            type="number",
+            align="right",
+        ),
     ]
 
     chart = MISChartConfig(
@@ -346,8 +349,9 @@ def _report_billing_revenue_summary(db: Session, user: User,
         code="billing.revenue_summary",
         name="Revenue Summary (OPD/IPD)",
         group="Billing / Finance",
-        description=
-        "Revenue by stream (OPD/IPD) and overall totals in the selected period.",
+        description=(
+            "Revenue by stream (OPD/IPD) and overall totals in the selected "
+            "period."),
         filters_applied=filters,
         summary={
             "invoice_count": int(total_row.count or 0),
@@ -440,29 +444,36 @@ def _report_billing_collection_summary(
 
 def _report_pharmacy_sales_summary(db: Session, user: User,
                                    filters: MISFilter) -> MISRawReportResult:
+    """
+    Pharmacy Sales Summary based on NEW PharmacySale / PharmacySaleItem models.
+    - Totals from PharmacySale (net_amount)
+    - Top 10 items from PharmacySaleItem grouped by item_name
+    """
     start_dt, end_dt = _date_range(filters)
 
+    # ✅ Use net_amount (amount + tax) and ignore cancelled bills
     total_row = (db.query(
-        func.coalesce(func.sum(PharmacySale.total_amount),
+        func.coalesce(func.sum(PharmacySale.net_amount),
                       0).label("total_amount"),
         func.count(PharmacySale.id).label("sale_count"),
     ).filter(
         PharmacySale.created_at >= start_dt,
         PharmacySale.created_at < end_dt,
+        PharmacySale.status != "CANCELLED",
     ).one())
 
+    # ✅ Top items from NEW PharmacySaleItem
     top_rows = (db.query(
-        PharmacyMedicine.name.label("medicine"),
-        func.coalesce(func.sum(PharmacySaleItem.qty), 0).label("qty"),
-        func.coalesce(func.sum(PharmacySaleItem.amount), 0).label("amount"),
-    ).join(PharmacySale, PharmacySaleItem.sale_id == PharmacySale.id).join(
-        PharmacyMedicine,
-        PharmacySaleItem.medicine_id == PharmacyMedicine.id,
-    ).filter(
+        PharmacySaleItem.item_name.label("medicine"),
+        func.coalesce(func.sum(PharmacySaleItem.quantity), 0).label("qty"),
+        func.coalesce(func.sum(PharmacySaleItem.total_amount),
+                      0).label("amount"),
+    ).join(PharmacySale, PharmacySaleItem.sale_id == PharmacySale.id).filter(
         PharmacySale.created_at >= start_dt,
         PharmacySale.created_at < end_dt,
-    ).group_by(PharmacyMedicine.id, PharmacyMedicine.name).order_by(
-        func.sum(PharmacySaleItem.qty).desc()).limit(10).all())
+        PharmacySale.status != "CANCELLED",
+    ).group_by(PharmacySaleItem.item_name).order_by(
+        func.sum(PharmacySaleItem.quantity).desc()).limit(10).all())
 
     data_rows = [{
         "medicine": r.medicine,
@@ -471,15 +482,19 @@ def _report_pharmacy_sales_summary(db: Session, user: User,
     } for r in top_rows]
 
     columns = [
-        MISColumn(key="medicine",
-                  label="Medicine",
-                  type="string",
-                  align="left"),
+        MISColumn(
+            key="medicine",
+            label="Medicine",
+            type="string",
+            align="left",
+        ),
         MISColumn(key="qty", label="Quantity", type="number", align="right"),
-        MISColumn(key="amount",
-                  label="Amount (INR)",
-                  type="number",
-                  align="right"),
+        MISColumn(
+            key="amount",
+            label="Amount (INR)",
+            type="number",
+            align="right",
+        ),
     ]
 
     chart = MISChartConfig(

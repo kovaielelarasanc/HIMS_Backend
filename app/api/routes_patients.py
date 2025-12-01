@@ -19,6 +19,7 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
+# type: ignore
 from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import get_db, current_user as auth_current_user
@@ -436,7 +437,7 @@ def delete_address(
     return {"message": "Deleted"}
 
 
-# -------- documents (upload) --------
+# -------- documents (upload + list + file) --------
 
 
 @router.post("/{patient_id}/documents", response_model=DocumentOut)
@@ -485,6 +486,37 @@ def list_documents(
     return (db.query(PatientDocument).filter(
         PatientDocument.patient_id == patient_id).order_by(
             PatientDocument.id.desc()).all())
+
+
+@router.get("/documents/{doc_id}/file")
+def get_document_file(
+        doc_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(auth_current_user),
+):
+    """
+    Stream patient document file for preview / download.
+    URL: GET /api/patients/documents/{doc_id}/file
+    """
+    if not has_perm(user, "patients.view"):
+        raise HTTPException(status_code=403, detail="Not permitted")
+
+    doc = db.query(PatientDocument).get(doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    path = Path(doc.storage_path)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="File not found on server")
+
+    media_type = doc.mime or "application/octet-stream"
+    headers = {
+        "Content-Disposition": f'inline; filename="{doc.filename}"',
+    }
+
+    return StreamingResponse(path.open("rb"),
+                             media_type=media_type,
+                             headers=headers)
 
 
 # -------- consents --------
@@ -648,6 +680,7 @@ def print_patient_info(
     # Lazy + safe import of WeasyPrint
     try:
         from weasyprint import HTML as _HTML  # type: ignore
+
         HTML = _HTML
     except Exception:
         HTML = None

@@ -165,6 +165,11 @@ class Invoice(Base):
         back_populates="invoice",
         cascade="all, delete-orphan",
     )
+    pharmacy_sales = relationship(
+        "PharmacySale",
+        back_populates="billing_invoice",
+        lazy="selectin",
+    )
 
 
 class InvoiceItem(Base):

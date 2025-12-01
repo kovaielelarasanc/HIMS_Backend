@@ -17,3 +17,7 @@ python-multipart
 reportlab>=4.1.0 
 tzdata>=2024.1
 weasyprint>=60
+python-barcode
+pillow
+jinja2
+qrcode

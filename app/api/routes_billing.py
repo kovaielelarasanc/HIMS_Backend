@@ -35,18 +35,21 @@ import logging
 import io
 from app.models.ipd import IpdPackage
 from app.models.payer import Payer, Tpa, CreditPlan
-from app.models.payer import CreditProvider  # if you want to use this as well
+from app.models.payer import CreditProvider  # optional / legacy
 
 router = APIRouter()
 
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Permissions helper
+# ---------------------------------------------------------------------------
 def has_perm(user: User, code: str) -> bool:
-    if user.is_admin:
+    if getattr(user, "is_admin", False):
         return True
-    for r in user.roles:
-        for p in r.permissions:
+    for r in getattr(user, "roles", []):
+        for p in getattr(r, "permissions", []):
             if p.code == code:
                 return True
     return False
@@ -55,8 +58,6 @@ def has_perm(user: User, code: str) -> bool:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
 def recalc_totals(inv: Invoice) -> None:
     """Recalculate invoice totals based on non-voided items & payments."""
     gross = 0.0
@@ -66,7 +67,7 @@ def recalc_totals(inv: Invoice) -> None:
     for it in inv.items:
         if it.is_voided:
             continue
-        # line_total is already after discount + tax
+        # line_total is after discount + tax
         gross += float(it.line_total or 0)
         tax_total += float(it.tax_amount or 0)
         discount_total += float(it.discount_amount or 0)
@@ -75,8 +76,7 @@ def recalc_totals(inv: Invoice) -> None:
     inv.tax_total = tax_total
     inv.discount_total = discount_total
 
-    # If you later want header-level discount logic,
-    # adjust net_total here accordingly. For now, use line-level net.
+    # header net_total = sum of item net
     inv.net_total = gross
 
     paid = 0.0
@@ -111,7 +111,7 @@ def _apply_unbilled_services(
 ) -> InvoiceOut:
     """
     Shared logic for adding unbilled services to an invoice.
-    Currently just a safe placeholder so FE doesn't break.
+    Currently placeholder so FE doesn't break.
     """
     if not has_perm(user, "billing.items.add"):
         raise HTTPException(status_code=403, detail="Not permitted")
@@ -150,18 +150,34 @@ def _manual_ref_for_invoice(invoice_id: int, seq: int) -> int:
     Generate a synthetic unique service_ref_id for manual items.
 
     This ensures (service_type='manual', service_ref_id, is_voided=0)
-    is always unique globally, so it will NOT hit the constraint:
-
-      uq_billing_service_unique (service_type, service_ref_id, is_voided)
+    is always unique globally.
     """
     return invoice_id * 1_000_000 + seq
+
+
+def _generate_invoice_number(db: Session) -> str:
+    """
+    Optional helper: generate invoice_number if Invoice model has that column.
+
+    Format: INV-YYYYMMDD-XXXX
+    """
+    today_str = datetime.utcnow().strftime("%Y%m%d")
+    prefix = f"INV-{today_str}"
+    last = (db.query(Invoice.invoice_number).filter(
+        Invoice.invoice_number.like(f"{prefix}-%")).order_by(
+            Invoice.invoice_number.desc()).first())
+    seq = 1
+    if last and last[0]:
+        try:
+            seq = int(last[0].split("-")[-1]) + 1
+        except Exception:
+            seq = 1
+    return f"{prefix}-{seq:04d}"
 
 
 # ---------------------------------------------------------------------------
 # Core Invoices
 # ---------------------------------------------------------------------------
-
-
 @router.post("/invoices", response_model=InvoiceOut)
 def create_invoice(
         payload: InvoiceCreate,
@@ -183,12 +199,17 @@ def create_invoice(
     payload_data = payload.model_dump(exclude_unset=True)
 
     # Direct fields present on Invoice model
-    for key in ("billing_type", "consultant_id", "remarks", "provider_id",
-                "visit_no"):
+    for key in (
+            "billing_type",
+            "consultant_id",
+            "remarks",
+            "provider_id",
+            "visit_no",
+    ):
         if hasattr(inv, key) and key in payload_data:
             setattr(inv, key, payload_data[key])
 
-    # Optional mapping: visit_id -> visit_no (string)
+    # Optional mapping: visit_id -> visit_no (string) if FE sends visit_id
     if "visit_id" in payload_data and hasattr(inv, "visit_no"):
         inv.visit_no = str(payload_data["visit_id"])
 
@@ -200,6 +221,15 @@ def create_invoice(
     inv.amount_paid = 0
     inv.balance_due = 0
     inv.created_by = user.id
+
+    # Optional invoice_number auto-generate if model has that column
+    if hasattr(inv,
+               "invoice_number") and not getattr(inv, "invoice_number", None):
+        try:
+            inv.invoice_number = _generate_invoice_number(db)
+        except Exception:
+            # if anything fails, keep it None / default
+            pass
 
     db.add(inv)
     db.commit()
@@ -333,8 +363,6 @@ def cancel_invoice(
 # ---------------------------------------------------------------------------
 # Items
 # ---------------------------------------------------------------------------
-
-
 @router.post("/invoices/{invoice_id}/items/manual", response_model=InvoiceOut)
 def add_manual_item(
         invoice_id: int,
@@ -349,15 +377,13 @@ def add_manual_item(
     if not inv:
         raise HTTPException(status_code=404, detail="Invoice not found")
 
-    # ---- IMPORTANT PART: make service_ref_id unique for manual lines ----
-    # If caller sends some custom ref, respect it (non-zero). Otherwise, auto-generate.
+    # ---- IMPORTANT: make service_ref_id unique for manual lines ----
     service_type = (payload.service_type or "manual").strip() or "manual"
 
     if payload.service_ref_id and payload.service_ref_id > 0:
         service_ref_id = payload.service_ref_id
     else:
         # For manual items, generate a unique synthetic ref id
-        # so that (service_type, service_ref_id, is_voided) stays unique.
         max_ref = (db.query(func.max(InvoiceItem.service_ref_id)).filter(
             InvoiceItem.service_type == "manual").scalar()) or 0
         service_ref_id = int(max_ref) + 1
@@ -386,7 +412,7 @@ def add_manual_item(
     it.line_total = base + tax_amt
 
     db.add(it)
-    db.flush()  # will NOT hit duplicate now
+    db.flush()  # service_ref_id uniqueness prevents duplicate constraint
 
     db.refresh(inv)
     recalc_totals(inv)
@@ -467,8 +493,10 @@ def add_service_item(
     return serialize_invoice(inv)
 
 
-@router.put("/invoices/{invoice_id}/items/{item_id}",
-            response_model=InvoiceOut)
+@router.put(
+    "/invoices/{invoice_id}/items/{item_id}",
+    response_model=InvoiceOut,
+)
 def update_item(
         invoice_id: int,
         item_id: int,
@@ -558,8 +586,6 @@ def void_item(
 
 
 # ---- UNBILLED SERVICES ----
-
-
 @router.post(
     "/invoices/{invoice_id}/items/bulk-from-unbilled",
     response_model=InvoiceOut,
@@ -612,8 +638,6 @@ def bulk_add_from_unbilled_alias(
 # ---------------------------------------------------------------------------
 # Payments & Advances
 # ---------------------------------------------------------------------------
-
-
 @router.post("/invoices/{invoice_id}/payments/bulk", response_model=InvoiceOut)
 def add_payments_bulk(
         invoice_id: int,
@@ -673,9 +697,6 @@ def add_payments_bulk(
     db.commit()
     db.refresh(inv)
     return serialize_invoice(inv)
-
-
-# still in app/api/routes_billing.py
 
 
 @router.post("/invoices/{invoice_id}/payments", response_model=InvoiceOut)
@@ -916,10 +937,8 @@ def apply_advances_to_invoice(
 
 
 # ---------------------------------------------------------------------------
-# Billing masters: doctors + credit/TPA providers
+# Billing masters: doctors + credit/TPA providers + packages
 # ---------------------------------------------------------------------------
-
-
 @router.get("/masters")
 def billing_masters(
         db: Session = Depends(get_db),
@@ -1004,8 +1023,6 @@ def billing_masters(
 # ---------------------------------------------------------------------------
 # Patient Billing Summary (JSON API for FE)
 # ---------------------------------------------------------------------------
-
-
 @router.get("/patients/{patient_id}/summary", response_model=dict)
 def patient_billing_summary(
         patient_id: int,
@@ -1154,8 +1171,6 @@ def patient_billing_summary_alias(
 # ---------------------------------------------------------------------------
 # Printing: Single Invoice & Patient Billing Summary (PDF/HTML)
 # ---------------------------------------------------------------------------
-
-
 @router.get("/invoices/{invoice_id}/print")
 def print_invoice(
         invoice_id: int,
@@ -1646,9 +1661,6 @@ def print_patient_billing_summary(
 </html>
     """.strip()
 
-    # ... keep everything above as you already have (html building) ...
-
-    import io
     try:
         from weasyprint import HTML as _HTML  # type: ignore
         HTML = _HTML

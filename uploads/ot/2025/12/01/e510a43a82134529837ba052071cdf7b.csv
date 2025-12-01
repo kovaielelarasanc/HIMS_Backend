@@ -1,0 +1,2 @@
+code,Bar Code Number,name,generic_name,form,strength,unit,pack_size,manufacturer,class_name,atc_code,hsn_code,lasa_flag,is_consumable,default_tax_percent,default_price,default_mrp,reorder_level,max_level,is_active
+AMOX500,,Amoxicillin 500,Amoxicillin,tablet,500 mg,tablet,10,ACME Pharma,Antibiotic,J01CA04,3004,FALSE,FALSE,12,3.50,5.00,50,500,TRUE

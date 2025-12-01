@@ -1,7 +1,9 @@
-# app/schemas/opd.py
-from typing import List, Optional
+# backend/app/schemas/opd.py
+
 from datetime import date, time, datetime
-from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Any
+
+from pydantic import BaseModel, Field, ConfigDict
 
 
 # ---------- Schedules ----------
@@ -13,6 +15,8 @@ class OpdScheduleBase(BaseModel):
     slot_minutes: int = 15
     location: Optional[str] = ""
     is_active: bool = True
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class OpdScheduleCreate(OpdScheduleBase):
@@ -31,9 +35,6 @@ class OpdScheduleUpdate(BaseModel):
 class OpdScheduleOut(OpdScheduleBase):
     id: int
 
-    class Config:
-        orm_mode = True
-
 
 # ---------- Slots ----------
 class SlotOut(BaseModel):
@@ -47,10 +48,11 @@ class AppointmentCreate(BaseModel):
     department_id: int
     doctor_user_id: int
     date: date
-    # routes_opd.py expects strings like "HH:MM"
+    # required start time
     slot_start: str = Field(..., description="HH:MM (24h)")
-    # optional; some backends compute from schedule
-    slot_end: Optional[str] = Field(None, description="HH:MM (24h)")
+    # optional end time (some clinics only store start)
+    # IMPORTANT: no Field(description=...) on Optional -> avoids recursion bug
+    slot_end: Optional[str] = None
     purpose: Optional[str] = "Consultation"
 
 
@@ -58,15 +60,15 @@ class AppointmentOut(BaseModel):
     id: int
     date: date
     slot_start: time
-    slot_end: time
+    slot_end: Optional[time] = None
     status: str
-    purpose: Optional[str]
-    patient: dict = Field(default_factory=dict)
-    doctor: dict = Field(default_factory=dict)
-    department: dict = Field(default_factory=dict)
+    purpose: Optional[str] = None
 
-    class Config:
-        orm_mode = True
+    patient: Dict[str, Any] = Field(default_factory=dict)
+    doctor: Dict[str, Any] = Field(default_factory=dict)
+    department: Dict[str, Any] = Field(default_factory=dict)
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class AppointmentStatusUpdate(BaseModel):
@@ -78,9 +80,14 @@ class DoctorWeekdaysOut(BaseModel):
     doctor_user_id: int
     weekdays: List[int]  # e.g. [0,2,4]
 
+    model_config = ConfigDict(from_attributes=True)
 
-# ⬇️ **This is the piece you were missing**
+
 class AppointmentRow(BaseModel):
+    """
+    Flattened row for listing appointments / queue per day.
+    """
+
     id: int
     uhid: str
     patient_name: str
@@ -92,10 +99,22 @@ class AppointmentRow(BaseModel):
     status: str
     visit_id: Optional[int] = None
     vitals_registered: bool
-    purpose: Optional[str] = None  # NEW
+    purpose: Optional[str] = None
 
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ---------- Reschedule ----------
+class AppointmentRescheduleIn(BaseModel):
+    """
+    Used for waiting-time management & no-show rebooking.
+    If create_new = True and current status is no_show, a new appointment
+    will be created (old remains as history).
+    """
+
+    date: date
+    slot_start: str = Field(..., description="HH:MM (24h)")
+    create_new: bool = False
 
 
 # ---------- Visits ----------
@@ -114,7 +133,6 @@ class VitalsIn(BaseModel):
     temp_c: Optional[float] = None
     spo2: Optional[int] = None
     notes: Optional[str] = None
-    # created_at: datetime
 
 
 class VisitOut(BaseModel):
@@ -124,16 +142,15 @@ class VisitOut(BaseModel):
     department_name: str
     doctor_name: str
     episode_id: str
-    visit_at: str
+    visit_at: str  # ISO string
 
-    # NEW fields so FE can show controls safely
     patient_id: int
     doctor_id: int
     appointment_id: Optional[int] = None
     appointment_status: Optional[str] = None
 
-    # If you're already returning vitals to FE:
-    current_vitals: Optional[dict] = None
+    # last recorded vitals for this visit
+    current_vitals: Optional[Dict[str, Any]] = None
 
     chief_complaint: Optional[str] = None
     symptoms: Optional[str] = None
@@ -142,8 +159,7 @@ class VisitOut(BaseModel):
     soap_assessment: Optional[str] = None
     plan: Optional[str] = None
 
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class VisitUpdate(BaseModel):
@@ -155,10 +171,7 @@ class VisitUpdate(BaseModel):
     plan: Optional[str] = None
 
 
-# ---------- Vitals ----------
-
-
-# ---------- Prescription ----------
+# ---------- Rx ----------
 class RxItemIn(BaseModel):
     drug_name: str
     strength: Optional[str] = ""
@@ -169,7 +182,7 @@ class RxItemIn(BaseModel):
 
 
 class PrescriptionIn(BaseModel):
-    items: List[RxItemIn] = []
+    items: List[RxItemIn] = Field(default_factory=list)
     notes: Optional[str] = None
 
 
@@ -182,12 +195,11 @@ class OrderIdsIn(BaseModel):
 class MedicineOut(BaseModel):
     id: int
     name: str
-    form: Optional[str]
-    unit: Optional[str]
+    form: Optional[str] = None
+    unit: Optional[str] = None
     price_per_unit: float
 
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class TestOut(BaseModel):
@@ -196,5 +208,66 @@ class TestOut(BaseModel):
     name: str
     price: float
 
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ---------- Follow-up ----------
+class FollowUpCreate(BaseModel):
+    """
+    Called from clinical screen after doctor finishes Visit.
+    """
+
+    due_date: date
+    note: Optional[str] = None
+
+
+class FollowUpUpdate(BaseModel):
+    due_date: date
+    note: Optional[str] = None
+
+
+class FollowUpScheduleIn(BaseModel):
+    """
+    Used on waiting-time management screen to confirm a waiting follow-up
+    into a real Appointment.
+
+    - `date` is optional: if not sent, backend uses follow-up.due_date
+    - `slot_start` should be "HH:MM" but we keep it Optional
+      so that Pydantic never throws 422 before our route logic.
+    """
+
+    # Allow extra fields safely (in case FE sends slot_id etc.)
+    model_config = ConfigDict(extra="ignore")
+
+    # If omitted, backend should use the follow-up's own due_date.
+    date: Optional[date] = None
+
+    # Let route validate it via _parse_slot(); avoid hard 422 from Pydantic
+    slot_start: Optional[str] = None
+
+
+class FollowUpRow(BaseModel):
+    """
+    Flattened row for FE grids (waiting list, follow-up MIS, etc.)
+    """
+
+    id: int
+    visit_id: int
+    appointment_id: Optional[int]
+
+    due_date: date
+    status: str
+
+    patient_id: int
+    patient_uhid: str
+    patient_name: str
+
+    doctor_id: int
+    doctor_name: str
+
+    department_id: int
+    department_name: str
+
+    note: Optional[str] = None
+
+    model_config = ConfigDict(from_attributes=True)

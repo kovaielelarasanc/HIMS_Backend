@@ -1,7 +1,7 @@
-# app/services/pdf.py
+# FILE: app/services/pdf.py
 from __future__ import annotations
 import io, re, os
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Any, Dict
 from urllib.parse import urlparse
 from app.core.config import settings
 
@@ -72,7 +72,7 @@ def _sanitize_for_xhtml2pdf_css(css: str) -> str:
     prev = None
     while prev != css:
         prev = css
-        css = re.sub(r"@[^{}]+{[^{}]*}", "", css)
+        css = re.sub(r"@[^{}]+{[^{}]*}", "", css, flags=re.S)
 
     # remove unsupported props
     css = re.sub(r"position\s*:\s*running\([^)]*\)\s*;?", "", css, flags=re.I)
@@ -94,17 +94,21 @@ def _strip_unsupported_css_in_html_for_xhtml2pdf(html: str) -> str:
     html = re.sub(r"<style[^>]*>.*?</style>", "", html, flags=re.I | re.S)
     safe_tag = f"<style>{safe}</style>"
     if re.search(r"<head[^>]*>", html, flags=re.I):
-        html = re.sub(r"(<head[^>]*>)",
-                      r"\1" + safe_tag,
-                      html,
-                      count=1,
-                      flags=re.I)
+        html = re.sub(
+            r"(<head[^>]*>)",
+            r"\1" + safe_tag,
+            html,
+            count=1,
+            flags=re.I,
+        )
     else:
-        html = re.sub(r"(<body[^>]*>)",
-                      r"<head>" + safe_tag + "</head>\1",
-                      html,
-                      count=1,
-                      flags=re.I)
+        html = re.sub(
+            r"(<body[^>]*>)",
+            r"<head>" + safe_tag + "</head>\1",
+            html,
+            count=1,
+            flags=re.I,
+        )
     return html
 
 
@@ -116,15 +120,15 @@ def _compat_html_for_xhtml2pdf(html: str) -> str:
 
     def _wrap_img(m):
         tag = m.group(0)
-        cls = (m.group('cls') or '').lower()
+        cls = (m.group("cls") or "").lower()
         # strip class to avoid double effects
         clean = re.sub(r'\sclass="[^"]*"', "", tag, flags=re.I)
-        if 'float-right' in cls:
-            return f'<div style="text-align:right">{clean}</div>'
-        if 'img-center' in cls:
-            return f'<div style="text-align:center">{clean}</div>'
-        if 'float-left' in cls:
-            return f'<div style="text-align:left">{clean}</div>'
+        if "float-right" in cls:
+            return f"<div style=\"text-align:right\">{clean}</div>"
+        if "img-center" in cls:
+            return f"<div style=\"text-align:center\">{clean}</div>"
+        if "float-left" in cls:
+            return f"<div style=\"text-align:left\">{clean}</div>"
         return tag
 
     html = re.sub(
@@ -141,23 +145,87 @@ def _inject_base_href(html: str, base_url: Optional[str]) -> str:
         return html
     base = f"<base href='{base_url.rstrip('/')}/'>"
     if "<head" in html:
-        return re.sub(r"(<head[^>]*>)",
-                      r"\1" + base,
-                      html,
-                      count=1,
-                      flags=re.I)
+        return re.sub(
+            r"(<head[^>]*>)",
+            r"\1" + base,
+            html,
+            count=1,
+            flags=re.I,
+        )
     return f"<!doctype html><head>{base}</head><body>{html}</body>"
 
 
-def render_html(body_html: str,
-                css_text: Optional[str],
-                context: dict,
-                base_url: Optional[str] = None) -> str:
+def _wrap_body_with_branding(body_html: str,
+                             context: Dict[str, Any] | None) -> str:
+    """
+    If UiBranding is passed in context as `branding`, automatically wrap the body
+    with a running header/footer so every PDF uses the configured letterhead.
+
+    Expected shape (from UiBrandingOut):
+      branding = {
+        "pdf_header_url": "/media/branding/pdf_header_xxx.png",
+        "pdf_footer_url": "/media/branding/pdf_footer_xxx.png",
+        "logo_url": "...", "org_name": "...", "org_tagline": "..."
+      }
+    """
+    if not context:
+        return body_html
+
+    branding = context.get("branding")
+    if not branding:
+        return body_html
+
+    # support both dict and pydantic model / object
+    def _get(obj, name, default=None):
+        if isinstance(obj, dict):
+            return obj.get(name, default)
+        return getattr(obj, name, default)
+
+    header_url = _get(branding, "pdf_header_url") or _get(branding, "logo_url")
+    footer_url = _get(branding, "pdf_footer_url")
+
+    if not header_url and not footer_url:
+        return body_html
+
+    parts = []
+
+    if header_url:
+        parts.append(f"""
+<header class="tpl-header">
+  <img src="{header_url}" style="width:100%;max-height:120px;object-fit:contain;" />
+</header>
+""")
+
+    parts.append(body_html)
+
+    if footer_url:
+        parts.append(f"""
+<footer class="tpl-footer">
+  <img src="{footer_url}" style="width:100%;max-height:80px;object-fit:contain;" />
+</footer>
+""")
+
+    return "".join(parts)
+
+
+def render_html(
+    body_html: str,
+    css_text: Optional[str],
+    context: dict,
+    base_url: Optional[str] = None,
+) -> str:
     """
     Build full HTML: base href + CSS + body.
+
+    If `context["branding"]` is provided (UiBrandingOut or dict),
+    the body will be wrapped with <header class="tpl-header"> and
+    <footer class="tpl-footer"> using pdf_header_url/pdf_footer_url.
     """
     css = (css_text or "") + "\n" + DEFAULT_PRINT_CSS
-    html = f"<!doctype html><html><head><meta charset='utf-8'><style>{css}</style></head><body>{body_html}</body></html>"
+    body_with_branding = _wrap_body_with_branding(body_html, context or {})
+    html = (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        f"<style>{css}</style></head><body>{body_with_branding}</body></html>")
     return _inject_base_href(html, base_url or settings.SITE_URL)
 
 
@@ -172,19 +240,25 @@ def _xhtml2pdf_link_callback(uri: str, rel: str) -> str:
     media_prefix = settings.MEDIA_URL.rstrip("/")
     if uri.startswith(media_prefix + "/"):
         rel_path = uri[len(media_prefix) + 1:]
-        return os.path.join(os.path.abspath(settings.STORAGE_DIR),
-                            rel_path.replace("/", os.sep))
+        return os.path.join(
+            os.path.abspath(settings.STORAGE_DIR),
+            rel_path.replace("/", os.sep),
+        )
     if uri.startswith("/media/"):
         rel_path = uri[7:]
-        return os.path.join(os.path.abspath(settings.STORAGE_DIR),
-                            rel_path.replace("/", os.sep))
+        return os.path.join(
+            os.path.abspath(settings.STORAGE_DIR),
+            rel_path.replace("/", os.sep),
+        )
     return uri
 
 
 # ---------- Main PDF generator ----------
-def generate_pdf(full_html: str,
-                 base_url: Optional[str] = None,
-                 prefer: Optional[str] = None) -> Tuple[bytes, str]:
+def generate_pdf(
+    full_html: str,
+    base_url: Optional[str] = None,
+    prefer: Optional[str] = None,
+) -> Tuple[bytes, str]:
     """
     Try WeasyPrint (best). Fallback to xhtml2pdf (sanitized + compat).
     'prefer' can force a path: "weasyprint" or "xhtml2pdf".
@@ -192,32 +266,45 @@ def generate_pdf(full_html: str,
     # force weasy
     if prefer == "weasyprint":
         from weasyprint import HTML
-        html_for_weasy = _inject_base_href(full_html, base_url
-                                           or settings.SITE_URL)
-        pdf = HTML(string=html_for_weasy,
-                   base_url=base_url or settings.SITE_URL).write_pdf()
+
+        html_for_weasy = _inject_base_href(
+            full_html,
+            base_url or settings.SITE_URL,
+        )
+        pdf = HTML(
+            string=html_for_weasy,
+            base_url=base_url or settings.SITE_URL,
+        ).write_pdf()
         return pdf, "weasyprint"
 
     # default: try weasy, then fallback
     if prefer != "xhtml2pdf":
         try:
             from weasyprint import HTML
-            html_for_weasy = _inject_base_href(full_html, base_url
-                                               or settings.SITE_URL)
-            pdf = HTML(string=html_for_weasy,
-                       base_url=base_url or settings.SITE_URL).write_pdf()
+
+            html_for_weasy = _inject_base_href(
+                full_html,
+                base_url or settings.SITE_URL,
+            )
+            pdf = HTML(
+                string=html_for_weasy,
+                base_url=base_url or settings.SITE_URL,
+            ).write_pdf()
             return pdf, "weasyprint"
         except Exception:
             pass
 
     # fallback: xhtml2pdf
     from xhtml2pdf import pisa
+
     out = io.BytesIO()
     html_for_pisa = _strip_unsupported_css_in_html_for_xhtml2pdf(full_html)
     html_for_pisa = _compat_html_for_xhtml2pdf(html_for_pisa)
-    status = pisa.CreatePDF(html_for_pisa,
-                            dest=out,
-                            link_callback=_xhtml2pdf_link_callback)
+    status = pisa.CreatePDF(
+        html_for_pisa,
+        dest=out,
+        link_callback=_xhtml2pdf_link_callback,
+    )
     if status.err:
         raise RuntimeError("PDF rendering failed (xhtml2pdf)")
     return out.getvalue(), "xhtml2pdf"

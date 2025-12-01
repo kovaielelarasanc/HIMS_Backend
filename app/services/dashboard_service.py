@@ -1,3 +1,4 @@
+# FILE: app/services/dashboard.py
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
@@ -10,15 +11,16 @@ from app.models.user import User
 from app.models.patient import Patient
 from app.models.opd import Appointment, Visit
 from app.models.ipd import IpdAdmission, IpdBed
-from app.models.pharmacy import (
+# ✅ use NEW pharmacy models (pharmacy_prescription.py)
+from app.models.pharmacy_prescription import (
     PharmacySale,
     PharmacySaleItem,
-    PharmacyMedicine,
 )
 from app.models.lis import LisOrder, LisOrderItem
 from app.models.ris import RisOrder
 from app.models.ot import OtOrder
-from app.models.billing import Invoice, InvoiceItem
+# ✅ include Payment for payment-mode widget
+from app.models.billing import Invoice, InvoiceItem, Payment
 from app.schemas.dashboard import DashboardDataResponse, DashboardWidget
 
 # ---------- Helpers: time range ----------
@@ -127,7 +129,8 @@ def _build_capabilities(user: User) -> Dict[str, bool]:
     can_billing = has("billing.") or has("invoices.")
 
     # Patients: if you can see OPD, IPD, or have anything clinical, you likely can see patient counts.
-    can_patients = can_opd or can_ipd or can_lab or can_radiology or can_pharmacy or can_billing
+    can_patients = (can_opd or can_ipd or can_lab or can_radiology
+                    or can_pharmacy or can_billing)
 
     return {
         "can_patients": can_patients,
@@ -305,8 +308,9 @@ def _build_patient_and_visit_metrics(
         Visit.visit_at >= start_dt, Visit.visit_at < end_dt).scalar() or 0)
 
     ipd_admissions = (db.query(func.count(IpdAdmission.id)).filter(
-        IpdAdmission.admitted_at >= start_dt, IpdAdmission.admitted_at
-        < end_dt).scalar() or 0)
+        IpdAdmission.admitted_at >= start_dt,
+        IpdAdmission.admitted_at < end_dt,
+    ).scalar() or 0)
 
     return [
         DashboardWidget(
@@ -357,9 +361,9 @@ def _build_revenue_metrics(
         func.sum(base_invoices.c.net_total),
         0)).filter(base_invoices.c.context_type == "ipd").scalar() or 0)
 
-    # Pharmacy revenue via PharmacySale
+    # Pharmacy revenue via PharmacySale (using net_amount for full value)
     pharmacy_rev = (db.query(
-        func.coalesce(func.sum(PharmacySale.total_amount), 0)).filter(
+        func.coalesce(func.sum(PharmacySale.net_amount), 0)).filter(
             PharmacySale.created_at >= start_dt,
             PharmacySale.created_at < end_dt,
         ).scalar() or 0)
@@ -503,17 +507,21 @@ def _build_top_medicines_widget(
     start_dt: datetime,
     end_dt: datetime,
 ) -> DashboardWidget:
+    """
+    Top 10 dispensed medicines based on NEW PharmacySale / PharmacySaleItem models.
+    Groups by PharmacySaleItem.item_name and sums quantity.
+    """
     rows = (db.query(
-        PharmacyMedicine.name.label("medicine"),
-        func.coalesce(func.sum(PharmacySaleItem.qty), 0).label("qty"),
-        func.coalesce(func.sum(PharmacySaleItem.amount), 0).label("amount"),
-    ).join(PharmacySale, PharmacySaleItem.sale_id == PharmacySale.id).join(
-        PharmacyMedicine,
-        PharmacySaleItem.medicine_id == PharmacyMedicine.id).filter(
-            PharmacySale.created_at >= start_dt,
-            PharmacySale.created_at < end_dt,
-        ).group_by(PharmacyMedicine.id, PharmacyMedicine.name).order_by(
-            func.sum(PharmacySaleItem.qty).desc()).limit(10).all())
+        PharmacySaleItem.item_name.label("medicine"),
+        func.coalesce(func.sum(PharmacySaleItem.quantity), 0).label("qty"),
+        func.coalesce(func.sum(PharmacySaleItem.total_amount),
+                      0).label("amount"),
+    ).join(PharmacySale, PharmacySaleItem.sale_id == PharmacySale.id).filter(
+        PharmacySale.created_at >= start_dt,
+        PharmacySale.created_at < end_dt,
+        PharmacySale.status != "CANCELLED",
+    ).group_by(PharmacySaleItem.item_name).order_by(
+        func.sum(PharmacySaleItem.quantity).desc()).limit(10).all())
 
     data = [{
         "medicine": r.medicine,
@@ -758,24 +766,56 @@ def _build_payment_mode_widget(
 ) -> DashboardWidget:
     """
     Income type chart: which payment mode is used more (cash / UPI / card / on-account).
-    Uses PharmacySale.payment_mode for now.
+
+    Uses Billing Payment records. It tries to auto-detect:
+      - mode column: Payment.mode OR Payment.payment_mode
+      - amount column: Payment.amount OR Payment.paid_amount
+      - date column: Payment.created_at / Payment.paid_at / Payment.payment_date
+
+    So even if your Payment model uses slightly different names, this should not crash;
+    worst case it returns an empty dataset.
     """
-    rows = (db.query(
-        PharmacySale.payment_mode,
-        func.coalesce(func.sum(PharmacySale.total_amount), 0).label("amount"),
-    ).filter(
-        PharmacySale.created_at >= start_dt,
-        PharmacySale.created_at < end_dt,
-    ).group_by(PharmacySale.payment_mode).all())
+    # Detect columns safely
+    payment_mode_col = getattr(Payment, "mode", None) or getattr(
+        Payment, "payment_mode", None)
+    amount_col = (getattr(Payment, "amount", None)
+                  or getattr(Payment, "paid_amount", None)
+                  or getattr(Payment, "value", None))
+    date_col = (getattr(Payment, "created_at", None)
+                or getattr(Payment, "paid_at", None)
+                or getattr(Payment, "payment_date", None))
+
+    # If we can't find basic columns, return an empty chart gracefully
+    if payment_mode_col is None or amount_col is None:
+        return DashboardWidget(
+            code="payment_modes",
+            title="Payment Modes",
+            widget_type="chart",
+            description="Cash vs UPI vs card vs on-account usage",
+            data=[],
+            config={"chart_type": "pie"},
+        )
+
+    q = db.query(
+        payment_mode_col.label("payment_mode"),
+        func.coalesce(func.sum(amount_col), 0).label("amount"),
+    )
+
+    if date_col is not None:
+        q = q.filter(date_col >= start_dt, date_col < end_dt)
+
+    rows = q.group_by(payment_mode_col).all()
 
     data = [{
-        "label": (r.payment_mode or "unknown").replace("_", " ").title(),
-        "value": float(r.amount or 0),
+        "label": (getattr(r, "payment_mode", None)
+                  or "unknown").replace("_", " ").title(),
+        "value":
+        float(getattr(r, "amount", 0) or 0),
     } for r in rows]
 
     return DashboardWidget(
         code="payment_modes",
-        title="Payment Modes (Pharmacy)",
+        title="Payment Modes (All Billing)",
         widget_type="chart",
         description="Cash vs UPI vs card vs on-account usage",
         data=data,
@@ -865,11 +905,11 @@ def _build_billing_summary_widget(
     data = [
         {
             "label": "Billed (finalized)",
-            "value": _safe_scalar(billed_amount)
+            "value": _safe_scalar(billed_amount),
         },
         {
             "label": "Pending (open)",
-            "value": _safe_scalar(pending_amount)
+            "value": _safe_scalar(pending_amount),
         },
     ]
 

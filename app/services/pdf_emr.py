@@ -4,12 +4,15 @@ from __future__ import annotations
 from io import BytesIO
 from typing import Iterable, Optional, Dict, Any, List
 from datetime import datetime
+from pathlib import Path
 
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
 from reportlab.lib import colors
 from reportlab.lib.utils import ImageReader
+
+from app.core.config import settings
 
 
 def _wrap_text(
@@ -60,17 +63,54 @@ def _section_rule(c: canvas.Canvas, y: float, W: float) -> float:
     return y - 6 * mm
 
 
+def _load_branding_images(
+        branding: Any | None) -> tuple[ImageReader | None, ImageReader | None]:
+    """
+    Given a UiBranding-like object (with pdf_header_path/pdf_footer_path),
+    load header/footer images from STORAGE_DIR, if any.
+    """
+    header_img = footer_img = None
+    if not branding:
+        return None, None
+
+    try:
+        header_path = getattr(branding, "pdf_header_path", None)
+        if header_path:
+            hp = Path(settings.STORAGE_DIR).joinpath(header_path)
+            if hp.exists():
+                header_img = ImageReader(str(hp))
+    except Exception:
+        header_img = None
+
+    try:
+        footer_path = getattr(branding, "pdf_footer_path", None)
+        if footer_path:
+            fp = Path(settings.STORAGE_DIR).joinpath(footer_path)
+            if fp.exists():
+                footer_img = ImageReader(str(fp))
+    except Exception:
+        footer_img = None
+
+    return header_img, footer_img
+
+
 def generate_emr_pdf(
     patient: Dict[str, Any],
     items: Iterable[Dict[str, Any]],
     sections_selected: Optional[set[str]] = None,
     letterhead_bytes: Optional[bytes] = None,
+    branding: Any | None = None,
 ) -> bytes:
     """
     Generate a professional EMR summary PDF.
 
+    Now integrates with UiBranding:
+    - If branding.pdf_header_path / pdf_footer_path exist, they are used
+      as header/footer artwork on every page.
+    - Falls back to legacy `letterhead_bytes` header if branding is not provided.
+
     Layout:
-    - Optional hospital letterhead at the top (first page only)
+    - Hospital header (branding image + org name/tagline)
     - Patient banner (Name, UHID, Gender, DOB, Phone, Email, Generated date)
     - Sections grouped by clinical area:
       OPD, Vitals, Prescriptions, Lab, Radiology, Pharmacy, IPD, OT,
@@ -89,6 +129,16 @@ def generate_emr_pdf(
     TOP = H - 20 * mm
     BOTTOM = 18 * mm
     CONTENT_W = RIGHT - LEFT
+
+    # --- header/footer images from customization ---
+    header_img, footer_img = _load_branding_images(branding)
+
+    # Backward compatibility: if no branding header but letterhead_bytes provided
+    if header_img is None and letterhead_bytes:
+        try:
+            header_img = ImageReader(BytesIO(letterhead_bytes))
+        except Exception:
+            header_img = None
 
     # ---- section mapping (aligned with EmrExport sections) ----
     def section_of(t: str) -> str:
@@ -132,35 +182,49 @@ def generate_emr_pdf(
     ]
 
     # ---- page helpers ----
-    # Cache letterhead image once
-    letterhead_img = None
-    if letterhead_bytes:
-        try:
-            letterhead_img = ImageReader(BytesIO(letterhead_bytes))
-        except Exception:
-            letterhead_img = None
 
     def draw_page_header(first: bool = False) -> float:
-        """Top-of-page: optional letterhead, then patient banner and rule."""
+        """
+        Top-of-page: branding header (if configured),
+        then EMR title + patient banner and a separator.
+        """
         y = TOP
 
-        # Optional letterhead only on first page
-        if first and letterhead_img is not None:
-            iw, ih = letterhead_img.getSize()
-            avail_w = RIGHT - LEFT
-            scale = avail_w / float(iw)
-            draw_w = avail_w
-            draw_h = ih * scale
-            c.drawImage(
-                letterhead_img,
-                LEFT,
-                H - draw_h - 10 * mm,
-                width=draw_w,
-                height=draw_h,
-                preserveAspectRatio=True,
-                mask="auto",
-            )
-            y = H - draw_h - 16 * mm
+        # Branding header image (all pages, if available)
+        if header_img is not None:
+            try:
+                iw, ih = header_img.getSize()
+                avail_w = RIGHT - LEFT
+                scale = avail_w / float(iw)
+                draw_w = avail_w
+                draw_h = ih * scale
+                c.drawImage(
+                    header_img,
+                    LEFT,
+                    H - draw_h - 10 * mm,
+                    width=draw_w,
+                    height=draw_h,
+                    preserveAspectRatio=True,
+                    mask="auto",
+                )
+                y = H - draw_h - 14 * mm
+            except Exception:
+                # if header image fails, fall back gracefully
+                y = TOP
+
+        # Organisation text (top-right, if available)
+        org_name = getattr(branding, "org_name", None) if branding else None
+        org_tagline = getattr(branding, "org_tagline",
+                              None) if branding else None
+        if org_name:
+            c.setFont("Helvetica-Bold", 10)
+            c.setFillColor(colors.HexColor("#0F172A"))
+            c.drawRightString(RIGHT, y + 2 * mm, org_name)
+            if org_tagline:
+                c.setFont("Helvetica", 8)
+                c.setFillColor(colors.HexColor("#6B7280"))
+                c.drawRightString(RIGHT, y - 2 * mm, org_tagline)
+        y -= 8 * mm
 
         # Title
         c.setFont("Helvetica-Bold", 13)
@@ -200,12 +264,47 @@ def generate_emr_pdf(
         return y
 
     def draw_footer():
-        """Footer with divider, brand and page number."""
+        """
+        Footer with branding footer (if configured), divider,
+        brand text and page number.
+        """
+        y_line = BOTTOM + 4 * mm
+
+        # Branding footer image
+        if footer_img is not None:
+            try:
+                iw, ih = footer_img.getSize()
+                avail_w = RIGHT - LEFT
+                scale = avail_w / float(iw)
+                draw_w = avail_w
+                draw_h = ih * scale
+                c.drawImage(
+                    footer_img,
+                    LEFT,
+                    BOTTOM,  # align with bottom margin
+                    width=draw_w,
+                    height=draw_h,
+                    preserveAspectRatio=True,
+                    mask="auto",
+                )
+                y_line = BOTTOM + draw_h + 2 * mm
+            except Exception:
+                y_line = BOTTOM + 4 * mm
+
+        # Divider line above footer
         c.setStrokeColor(colors.HexColor("#E2E8F0"))
-        c.line(LEFT, BOTTOM + 4 * mm, RIGHT, BOTTOM + 4 * mm)
+        c.line(LEFT, y_line, RIGHT, y_line)
+
+        # Brand text + page number
         c.setFont("Helvetica", 8)
         c.setFillColor(colors.HexColor("#94A3B8"))
-        c.drawString(LEFT, BOTTOM, "Generated by Nutryah HIMS/EMR")
+
+        org_name = getattr(branding, "org_name", None) if branding else None
+        brand_text = "Generated by Nutryah HIMS/EMR"
+        if org_name:
+            brand_text = f"Generated by {org_name} via Nutryah HIMS/EMR"
+
+        c.drawString(LEFT, BOTTOM, brand_text)
         c.drawRightString(RIGHT, BOTTOM, f"Page {c.getPageNumber()}")
 
     def page_break_if_needed(y: float) -> float:
@@ -217,9 +316,11 @@ def generate_emr_pdf(
         return y
 
     # ---- Prepare data: sort + group by section ----
-    sorted_items = sorted(items or [],
-                          key=lambda x: x.get("ts", ""),
-                          reverse=True)
+    sorted_items = sorted(
+        items or [],
+        key=lambda x: x.get("ts", ""),
+        reverse=True,
+    )
 
     section_map: Dict[str, List[Dict[str, Any]]] = {
         k: []
@@ -364,8 +465,7 @@ def generate_emr_pdf(
                         )
                     slot = ""
                     if ap.get("slot_start") or ap.get("slot_end"):
-                        slot = (f"{ap.get('slot_start') or ''} – "
-                                f"{ap.get('slot_end') or ''}")
+                        slot = f"{ap.get('slot_start') or ''} – {ap.get('slot_end') or ''}"
                     if slot:
                         y = _wrap_text(
                             c,
@@ -407,8 +507,7 @@ def generate_emr_pdf(
                 )
                 bp = None
                 if data.get("bp_systolic") and data.get("bp_diastolic"):
-                    bp = (f"{data.get('bp_systolic')}/"
-                          f"{data.get('bp_diastolic')} mmHg")
+                    bp = f"{data.get('bp_systolic')}/{data.get('bp_diastolic')} mmHg"
                 y = _wrap_text(
                     c,
                     f"BP: {bp or '—'}",
@@ -437,7 +536,6 @@ def generate_emr_pdf(
                     y,
                     CONTENT_W,
                 )
-                # Avoid SpO₂ subscript – use SpO2
                 y = _wrap_text(
                     c,
                     f"SpO2 (%): {data.get('spo2')}",
@@ -489,8 +587,7 @@ def generate_emr_pdf(
                     for di in items_block:
                         y = page_break_if_needed(y)
                         line = (
-                            f"- {di.get('drug_name') or ''} "
-                            f"{di.get('strength') or ''}"
+                            f"- {di.get('drug_name') or ''} {di.get('strength') or ''}"
                             f" • {di.get('frequency') or ''}"
                             f" • {di.get('duration_days') or ''}d"
                             f" • Qty {di.get('quantity') or ''}"
@@ -536,8 +633,7 @@ def generate_emr_pdf(
                 )
                 y = _wrap_text(
                     c,
-                    f"Test: {item.get('test_name')} "
-                    f"({item.get('test_code')})",
+                    f"Test: {item.get('test_name')} ({item.get('test_code')})",
                     LEFT,
                     y,
                     CONTENT_W,
@@ -598,8 +694,7 @@ def generate_emr_pdf(
             elif typ == "radiology":
                 y = _wrap_text(
                     c,
-                    f"Test: {data.get('test_name')} "
-                    f"({data.get('test_code')})",
+                    f"Test: {data.get('test_name')} ({data.get('test_code')})",
                     LEFT,
                     y,
                     CONTENT_W,
@@ -693,8 +788,9 @@ def generate_emr_pdf(
                     c.setFont("Helvetica", 9)
                     for di in items_block:
                         y = page_break_if_needed(y)
-                        line = (f"- {di.get('medicine_name')}"
-                                "or di.get('medicine_id')}"
+                        med_name = di.get("medicine_name") or di.get(
+                            "medicine_id") or ""
+                        line = (f"- {med_name}"
                                 f" • Qty {di.get('qty') or ''}"
                                 f" • Rs {float(di.get('amount') or 0):.2f}")
                         y = _wrap_text(
@@ -843,8 +939,7 @@ def generate_emr_pdf(
                     for li in items_block:
                         y = page_break_if_needed(y)
                         line = (
-                            f"- {li.get('service_type')}: "
-                            f"{li.get('description') or ''}"
+                            f"- {li.get('service_type')}: {li.get('description') or ''}"
                             f" • Qty {li.get('quantity') or ''}"
                             f" • Rs {float(li.get('line_total') or 0):.2f}")
                         y = _wrap_text(

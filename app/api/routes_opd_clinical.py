@@ -59,7 +59,10 @@ def record_vitals(
     if not has_perm(user, "vitals.create"):
         raise HTTPException(status_code=403, detail="Not permitted")
 
+    # Resolve patient_id (keep your existing logic)
     patient_id = payload.patient_id
+    appt = None
+
     if not patient_id and payload.appointment_id:
         appt = db.query(Appointment).get(payload.appointment_id)
         if not appt:
@@ -68,10 +71,13 @@ def record_vitals(
         patient_id = appt.patient_id
 
     if not patient_id:
-        raise HTTPException(status_code=400,
-                            detail="patient_id could not be resolved")
+        raise HTTPException(
+            status_code=400,
+            detail="patient_id could not be resolved",
+        )
 
-    vit = Vitals(
+    # Build kwargs so we can add appointment_id only if present on the model
+    vit_kwargs = dict(
         patient_id=patient_id,
         height_cm=payload.height_cm,
         weight_kg=payload.weight_kg,
@@ -84,13 +90,21 @@ def record_vitals(
         notes=payload.notes or "",
         created_at=datetime.utcnow(),
     )
+
+    # If your Vitals model actually has appointment_id, set it.
+    if hasattr(Vitals, "appointment_id") and payload.appointment_id:
+        vit_kwargs["appointment_id"] = payload.appointment_id
+
+    vit = Vitals(**vit_kwargs)
     db.add(vit)
     db.commit()
     db.refresh(vit)
+
     return {
         "message": "Vitals recorded",
         "id": vit.id,
         "patient_id": vit.patient_id,
+        "appointment_id": getattr(vit, "appointment_id", None),
         "created_at": vit.created_at,
     }
 

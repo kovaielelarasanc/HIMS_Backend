@@ -1,3 +1,4 @@
+# FILE: app/api/routes_emr.py
 from __future__ import annotations
 
 from datetime import datetime, date, timedelta
@@ -5,7 +6,16 @@ from decimal import Decimal
 from io import BytesIO
 from typing import List, Optional, Set, Dict
 
-from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form, Body
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Query,
+    UploadFile,
+    File,
+    Form,
+    Body,
+)
 from fastapi.responses import StreamingResponse, JSONResponse
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import or_, func
@@ -15,28 +25,47 @@ from app.models.user import User
 from app.models.patient import Patient, PatientConsent
 from app.models.common import FileAttachment
 from app.models.department import Department
-from app.models.opd import (Visit, Vitals as OpdVitals, Prescription as OpdRx,
-                            PrescriptionItem as OpdRxItem, Appointment,
-                             LabOrder, RadiologyOrder)
+from app.models.opd import (
+    Visit,
+    Vitals as OpdVitals,
+    Prescription as OpdRx,
+    PrescriptionItem as OpdRxItem,
+    Appointment,
+    LabOrder,
+    RadiologyOrder,
+)
 from app.models.lis import LisOrder, LisOrderItem, LisAttachment
 from app.models.ris import RisOrder, RisAttachment
-from app.models.ipd import (IpdAdmission, IpdTransfer, IpdDischargeSummary,
-                            IpdBed, IpdBedAssignment)
+from app.models.ipd import (
+    IpdAdmission,
+    IpdTransfer,
+    IpdDischargeSummary,
+    IpdBed,
+    IpdBedAssignment,
+)
 from app.models.ot import OtOrder, OtAttachment
 from app.models.billing import Invoice, InvoiceItem, Payment
 
-# Pharmacy (optional)
+# Pharmacy (optional, NEW models)
 HAS_PHARMACY = False
 try:
-    from app.models.pharmacy import (PharmacySale, PharmacySaleItem,
-                                     PharmacyMedicine)
+    # ✅ use new pharmacy_prescription models
+    from app.models.pharmacy_prescription import PharmacySale, PharmacySaleItem
+
     HAS_PHARMACY = True
 except Exception:
     HAS_PHARMACY = False
 
-from app.schemas.emr import (TimelineItemOut, AttachmentOut, PatientMiniOut,
-                             PatientLookupOut, EmrExportRequest, FhirBundleOut)
+from app.schemas.emr import (
+    TimelineItemOut,
+    AttachmentOut,
+    PatientMiniOut,
+    PatientLookupOut,
+    EmrExportRequest,
+    FhirBundleOut,
+)
 from app.services.pdf_emr import generate_emr_pdf
+from app.services.ui_branding import get_ui_branding  # branding helper
 
 router = APIRouter()
 
@@ -72,12 +101,14 @@ _UI_STATUS = {
 
 
 def _map_ui_status(raw: Optional[str]) -> Optional[str]:
-    if not raw: return None
+    if not raw:
+        return None
     return _UI_STATUS.get(raw, raw)
 
 
 def _safe_dt(value) -> datetime:
-    if isinstance(value, datetime): return value
+    if isinstance(value, datetime):
+        return value
     if isinstance(value, date):
         return datetime(value.year, value.month, value.day)
     try:
@@ -87,8 +118,10 @@ def _safe_dt(value) -> datetime:
 
 
 def _as_float(x):
-    if x is None: return None
-    if isinstance(x, Decimal): return float(x)
+    if x is None:
+        return None
+    if isinstance(x, Decimal):
+        return float(x)
     try:
         return float(x)
     except Exception:
@@ -98,17 +131,20 @@ def _as_float(x):
 def _bmi(height_cm, weight_kg):
     h = _as_float(height_cm)
     w = _as_float(weight_kg)
-    if not h or not w: return None
+    if not h or not w:
+        return None
     try:
         m = h / 100.0
-        if m <= 0: return None
+        if m <= 0:
+            return None
         return round(w / (m * m), 1)
     except Exception:
         return None
 
 
 def _patient_by_uhid(db: Session, uhid: str) -> Optional[Patient]:
-    if not uhid: return None
+    if not uhid:
+        return None
     return db.query(Patient).filter(Patient.uhid == uhid).first()
 
 
@@ -131,15 +167,19 @@ def _date_window(
         df: Optional[str],
         dt: Optional[str]) -> tuple[Optional[datetime], Optional[datetime]]:
     dfrom = dto = None
-    if df: dfrom = datetime.fromisoformat(df + "T00:00:00")
-    if dt: dto = datetime.fromisoformat(dt + "T23:59:59")
+    if df:
+        dfrom = datetime.fromisoformat(df + "T00:00:00")
+    if dt:
+        dto = datetime.fromisoformat(dt + "T23:59:59")
     return dfrom, dto
 
 
 def _in_window(ts: datetime, dfrom: Optional[datetime],
                dto: Optional[datetime]) -> bool:
-    if dfrom and ts < dfrom: return False
-    if dto and ts > dto: return False
+    if dfrom and ts < dfrom:
+        return False
+    if dto and ts > dto:
+        return False
     return True
 
 
@@ -237,8 +277,10 @@ def _build_timeline(
                 chips.append(f"BP {vt.bp_systolic}/{vt.bp_diastolic} mmHg")
             if vt.temp_c is not None:
                 chips.append(f"T {_as_float(vt.temp_c)}°C")
-            if vt.pulse: chips.append(f"Pulse {vt.pulse}/min")
-            if vt.spo2: chips.append(f"SpO₂ {vt.spo2}%")
+            if vt.pulse:
+                chips.append(f"Pulse {vt.pulse}/min")
+            if vt.spo2:
+                chips.append(f"SpO₂ {vt.spo2}%")
             appt = vt.appointment
             appt_data = None
             if appt:
@@ -277,10 +319,11 @@ def _build_timeline(
     if _want("rx", allow):
         rxs = (db.query(OpdRx).options(
             joinedload(OpdRx.visit).joinedload(Visit.doctor),
-            joinedload(OpdRx.items), joinedload(OpdRx.signer)).join(
-                Visit, OpdRx.visit_id == Visit.id).filter(
-                    Visit.patient_id == patient_id).order_by(
-                        OpdRx.id.desc()).limit(500).all())
+            joinedload(OpdRx.items),
+            joinedload(OpdRx.signer),
+        ).join(Visit, OpdRx.visit_id == Visit.id).filter(
+            Visit.patient_id == patient_id).order_by(
+                OpdRx.id.desc()).limit(500).all())
         for rx in rxs:
             ts = rx.signed_at or (rx.visit.visit_at
                                   if rx.visit else None) or rx.visit.created_at
@@ -311,8 +354,8 @@ def _build_timeline(
                     ts=ts,
                     title=_title_for("rx"),
                     subtitle=(rx.notes or "Prescription"),
-                    doctor_name=(rx.visit.doctor.name
-                                 if rx.visit and rx.visit.doctor else None),
+                    doctor_name=rx.visit.doctor.name
+                    if rx.visit and rx.visit.doctor else None,
                     status=_map_ui_status(
                         "signed" if rx.signed_at else "draft"),
                     ref_kind="opd_visit",
@@ -424,59 +467,89 @@ def _build_timeline(
                     },
                 ))
 
-    # --- Pharmacy sale (items list with qty & amounts) ---
+    # --- Pharmacy sale (NEW models: items list with qty & amounts) ---
     if HAS_PHARMACY and _want("pharmacy", allow):
-        sales = (db.query(PharmacySale).filter(
-            PharmacySale.patient_id == patient_id).order_by(
-                PharmacySale.id.desc()).limit(250).all())
-        # collect item names via one shot lookup
+        sales = (
+            db.query(PharmacySale).filter(
+                PharmacySale.patient_id == patient_id,
+                PharmacySale.status != "CANCELLED",  # skip cancelled bills
+            ).order_by(PharmacySale.id.desc()).limit(250).all())
+
         sale_ids = [s.id for s in sales]
         items_by_sale: Dict[int, List[PharmacySaleItem]] = {}
-        med_name: Dict[int, str] = {}
         if sale_ids:
-            items = db.query(PharmacySaleItem).filter(
-                PharmacySaleItem.sale_id.in_(sale_ids)).all()
+            items = (db.query(PharmacySaleItem).filter(
+                PharmacySaleItem.sale_id.in_(sale_ids)).all())
             for it in items:
                 items_by_sale.setdefault(it.sale_id, []).append(it)
-            med_ids = list({it.medicine_id for it in items})
-            if med_ids:
-                meds = db.query(PharmacyMedicine).filter(
-                    PharmacyMedicine.id.in_(med_ids)).all()
-                med_name = {m.id: m.name for m in meds}
 
         for s in sales:
             ts = _safe_dt(s.created_at)
             if not _in_window(ts, dfrom, dto):
                 continue
+
             line_items = []
             for it in items_by_sale.get(s.id, []):
                 line_items.append({
-                    "medicine_id": it.medicine_id,
-                    "medicine_name": med_name.get(it.medicine_id),
-                    "qty": it.qty,
-                    "unit_price": _as_float(it.unit_price),
-                    "tax_percent": _as_float(it.tax_percent),
-                    "amount": _as_float(it.amount),
+                    # snapshot name/code from sale item itself
+                    "item_name":
+                    getattr(it, "item_name", None),
+                    "item_code":
+                    getattr(it, "item_code", None),
+                    "quantity":
+                    getattr(it, "quantity", None),
+                    "unit_price":
+                    _as_float(getattr(it, "unit_price", None)),
+                    "discount_percent":
+                    _as_float(getattr(it, "discount_percent", None)),
+                    "tax_percent":
+                    _as_float(getattr(it, "tax_percent", None)),
+                    "total_amount":
+                    _as_float(getattr(it, "total_amount", None)),
                 })
+
+            total_amount = _as_float(
+                getattr(s, "net_amount", None)
+                or getattr(s, "total_amount", None) or 0) or 0.0
+
+            status_raw = (getattr(s, "status", "") or "").lower()
+            status_ui = _map_ui_status(status_raw)
+
             out.append(
                 TimelineItemOut(
                     type="pharmacy",
                     ts=ts,
                     title=_title_for("pharmacy"),
-                    subtitle=
-                    f"Dispense • Amount ₹{float(s.total_amount or 0):.2f}",
-                    status="completed",
+                    subtitle=f"Dispense • Net ₹{float(total_amount):.2f}",
+                    status=status_ui or "completed",
                     ref_kind="pharmacy_sale",
                     ref_display="Pharmacy dispense",
                     data={
-                        "sale_id": s.id,
-                        "context_type": s.context_type,
-                        "visit_id": s.visit_id,
-                        "admission_id": s.admission_id,
-                        "location_id": s.location_id,
-                        "payment_mode": s.payment_mode,
-                        "total_amount": _as_float(s.total_amount),
-                        "items": line_items,
+                        "sale_id":
+                        s.id,
+                        "status":
+                        getattr(s, "status", None),
+                        "context_type":
+                        getattr(s, "context_type", None),
+                        "visit_id":
+                        getattr(s, "visit_id", None),
+                        "admission_id":
+                        getattr(s, "admission_id", None),
+                        "location_id":
+                        getattr(s, "location_id", None),
+                        "payment_mode":
+                        getattr(s, "payment_mode", None),
+                        "gross_amount":
+                        _as_float(getattr(s, "gross_amount", None)),
+                        "discount_amount":
+                        _as_float(getattr(s, "discount_amount", None)),
+                        "tax_amount":
+                        _as_float(getattr(s, "tax_amount", None)),
+                        "net_amount":
+                        _as_float(getattr(s, "net_amount", None))
+                        or total_amount,
+                        "items":
+                        line_items,
                     },
                 ))
 
@@ -801,7 +874,10 @@ def emr_timeline(
     Optional[str] = Query(
         None,
         description=
-        "comma-separated: opd_visit,opd_vitals,rx,lab,radiology,pharmacy,ipd_admission,ipd_transfer,ipd_discharge,ot,billing,attachment,consent",
+        ("comma-separated: "
+         "opd_visit,opd_vitals,rx,lab,radiology,pharmacy,"
+         "ipd_admission,ipd_transfer,ipd_discharge,ot,billing,attachment,consent"
+         ),
     ),
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
@@ -855,7 +931,8 @@ async def export_emr_pdf(
         if not has_consent:
             raise HTTPException(
                 status_code=412,
-                detail="Active consent is required to export EMR.")
+                detail="Active consent is required to export EMR.",
+            )
 
     dfrom, dto = _date_window(date_from, date_to)
     items = [
@@ -871,11 +948,16 @@ async def export_emr_pdf(
 
     letter_bytes = await letterhead.read() if letterhead is not None else None
 
+    # load UiBranding and pass into PDF generator
+    branding = get_ui_branding(db)  # may be None
+
     pdf_bytes = generate_emr_pdf(
         patient=_patient_brief(p),
         items=items,
         sections_selected=sections_selected,
-        letterhead_bytes=letter_bytes,
+        letterhead_bytes=
+        letter_bytes,  # still supported (fallback/header override)
+        branding=branding,  # branding-based header/footer
     )
     filename = f"EMR_{p.uhid or p.id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.pdf"
     return StreamingResponse(
@@ -908,7 +990,8 @@ def export_emr_pdf_json(
         if not has_consent:
             raise HTTPException(
                 status_code=412,
-                detail="Active consent is required to export EMR.")
+                detail="Active consent is required to export EMR.",
+            )
 
     dfrom = payload.date_from and datetime(
         payload.date_from.year, payload.date_from.month, payload.date_from.day)
@@ -937,11 +1020,15 @@ def export_emr_pdf_json(
         }.items() if v
     }
 
+    # load UiBranding for JSON-based export as well
+    branding = get_ui_branding(db)  # may be None
+
     pdf_bytes = generate_emr_pdf(
         patient=_patient_brief(p),
         items=items,
         sections_selected=allow_sections,
-        letterhead_bytes=None,
+        letterhead_bytes=None,  # JSON export doesn't upload letterhead
+        branding=branding,  # branding-based header/footer
     )
 
     filename = f"EMR_{p.uhid or p.id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.pdf"
@@ -982,13 +1069,13 @@ def emr_fhir_bundle(
     # Patient resource
     name = [{
         "use": "official",
-        "text": " ".join([x for x in [p.first_name, p.last_name] if x])
+        "text": " ".join([x for x in [p.first_name, p.last_name] if x]),
     }]
     identifiers = [{"system": "urn:uhid", "value": p.uhid}]
     if p.abha_number:
         identifiers.append({
             "system": "https://healthid.ndhm.gov.in",
-            "value": p.abha_number
+            "value": p.abha_number,
         })
     patient_res = {
         "resourceType": "Patient",

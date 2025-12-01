@@ -11,9 +11,8 @@ from app.db.base import Base
 # Import all models so metadata is complete
 from app.models import (  # noqa: F401
     Department, User, UserRole, Role, RolePermission, Permission, OtpToken,
-    patient, opd, ipd, pharmacy, common, lis, ris, ot_master, ot, billing,
-    template,payer
-)
+    patient, opd, ipd, common, lis, ris, ot_master, ot, billing, template,
+    payer, ui_branding, pharmacy_inventory, pharmacy_prescription)
 
 
 def print_tables(conn):
@@ -28,6 +27,7 @@ def seed_permissions(db: Session) -> None:
     Seed ONLY missing permission codes; safe to run multiple times.
     """
     MODULES = [
+        # -------- CORE / ADMIN ----------
         ("departments", ["view", "create", "update", "delete"]),
         ("roles", ["view", "create", "update", "delete"]),
         ("permissions", ["view", "create", "update", "delete"]),
@@ -47,13 +47,15 @@ def seed_permissions(db: Session) -> None:
             "consents.create",
             "attachments.manage",
         ]),
-        # NEW: Patient masters (payer / TPA / credit plan / doctor list access)
+
+        # Patient masters (payer / TPA / credit plan / doctor list access)
         (
             "patients.masters",
             [
                 "view",  # can list doctors, payers, tpas, credit plans, ref sources
                 "manage",  # can create / update / deactivate payers, tpas, plans
-            ]),
+            ],
+        ),
 
         # -------- OPD ----------
         ("schedules", ["manage"]),
@@ -64,6 +66,22 @@ def seed_permissions(db: Session) -> None:
         ("orders.lab", ["create", "view"]),
         ("orders.ris", ["create", "view"]),
 
+        # NEW: OPD Queue & Follow-ups
+        (
+            "opd.queue",
+            [
+                "view",  # can see OPD queue screen
+                "manage",  # can change statuses, start/continue visits from queue
+            ],
+        ),
+        (
+            "opd.followups",
+            [
+                "view",  # can see follow-up list (for doctor / front office)
+                "manage",  # can confirm slots, reschedule, mark done/cancelled
+            ],
+        ),
+
         # -------- IPD ----------
         ("ipd", ["view", "manage", "nursing", "doctor"]),
         ("ipd.masters", ["manage"]),
@@ -72,13 +90,16 @@ def seed_permissions(db: Session) -> None:
         ("ipd.my", ["view"]),
         ("ipd.discharged", ["view"]),
         ("ipd.bedboard", ["view"]),
-
-        # -------- Pharmacy ----------
-        ("pharmacy", ["view"]),
-        ("pharmacy.masters", ["manage"]),
-        ("pharmacy.procure", ["manage"]),
-        ("pharmacy.inventory", ["view", "manage"]),
-        ("pharmacy.dispense", ["create"]),
+        ("pharmacy.inventory.locations", ["view", "manage"]),
+        ("pharmacy.inventory.suppliers", ["view", "manage"]),
+        ("pharmacy.inventory.items", ["view", "manage"]),
+        ("pharmacy.inventory.stock", ["view"]),
+        ("pharmacy.inventory.alerts", ["view"]),
+        ("pharmacy.inventory.po", ["view", "manage"]),
+        ("pharmacy.inventory.grn", ["view", "manage"]),
+        ("pharmacy.inventory.returns", ["view", "manage"]),
+        ("pharmacy.inventory", ["dispense"]),
+        ("pharmacy.inventory.txns", ["view"]),
 
         # -------- LIS ----------
         ("lab.masters", ["view", "manage"]),
@@ -103,34 +124,67 @@ def seed_permissions(db: Session) -> None:
         ("billing", ["view", "create", "finalize"]),
         ("billing.items", ["add"]),
         ("billing.payments", ["add"]),
+
+        # -------- EMR / Templates / Consents ----------
         ("emr", ["view", "download"]),
         ("templates", ["view", "manage"]),
         ("consents", ["view", "manage"]),
 
         # -------- MIS / Analytics ----------
-        # General MIS screen access
-        ("mis", ["view"]),
-
-        # Collections / Accounts
-        ("mis.collection", ["view"]
-         ),  # daily summary, date-wise collection, etc.
+        ("mis", ["view"]),  # overall MIS access
+        ("mis.collection", ["view"
+                            ]),  # daily summary, date-wise collection, etc.
         ("mis.accounts", ["view"]),  # income by dept / consultant / service
-
-        # OPD / IPD / Visits
         ("mis.opd", ["view"]),  # OPD MIS
         ("mis.ipd", ["view"]),  # IPD MIS
         ("mis.visits", ["view"]),  # Combined
-
-        # Pharmacy / Stock
         ("mis.pharmacy", ["view"]),  # pharmacy sales, top drugs
         ("mis.stock", ["view"]),  # stock analytics
-
-        # Lab / Radiology
         ("mis.lab", ["view"]),  # test orders, TAT
         ("mis.radiology", ["view"]),  # radiology orders, TAT
+        (
+            "pharmacy.rx",
+            [
+                "view",  # can see Rx queue & patient Rx history
+                "dispense",  # convert Rx -> PharmacySale (issue medicines)
+                "override",  # allow brand substitution / qty override
+                "cancel",  # cancel pending dispense (before finalize)
+            ]),
+
+        # Direct counter sales (OTC) and general pharmacy sales
+        (
+            "pharmacy.sales",
+            [
+                "view",  # search / list all pharmacy sales
+                "create",  # direct sale (no Rx – OTC)
+                "return",  # create sale returns / credit note
+            ]),
+
+        # Pharmacy billing wrapper (for detailed bill view/print/refund)
+        (
+            "pharmacy.billing",
+            [
+                "view",  # see pharmacy bills, print, reprint
+                "create",  # finalize / post bill
+                "refund",  # refund / adjust pharmacy bill
+            ]),
+
+        # Sale-level returns workflow (separate from GRN / purchase returns)
+        (
+            "pharmacy.returns",
+            [
+                "view",  # see list of returns
+                "manage",  # approve / finalize returns
+            ]),
+
+        # -------- Settings / Customization ----------
+
+        # UI branding, themes, PDF headers/footers, etc.
+        ("settings.customization", ["view", "manage"]),
     ]
 
     from app.models.permission import Permission
+
     seen = set()
     for module, actions in MODULES:
         for action in actions:
@@ -138,8 +192,9 @@ def seed_permissions(db: Session) -> None:
             if code in seen:
                 continue
             seen.add(code)
-            if not db.query(Permission).filter(
-                    Permission.code == code).first():
+            exists = (db.query(Permission).filter(
+                Permission.code == code).first())
+            if not exists:
                 label = f"{module.replace('.', ' ').title()} — {action.title()}"
                 db.add(Permission(code=code, label=label, module=module))
 
