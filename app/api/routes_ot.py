@@ -16,31 +16,62 @@ from app.utils.files import save_upload
 router = APIRouter(prefix="/ot", tags=["OT"])
 
 
-# ---- serializer to match OtOrderOut (string datetimes) ----
 def _to_out(o: OtOrder) -> dict:
     iso = lambda dt: dt.isoformat() if dt else None
     return {
-        "id": o.id,
-        "patient_id": o.patient_id,
-        "context_type": o.context_type,
-        "context_id": o.context_id,
-        "surgery_master_id": o.surgery_master_id,
-        "surgery_code": o.surgery_code,
-        "surgery_name": o.surgery_name,
-        "estimated_cost": float(o.estimated_cost or 0),
-        "surgeon_id": o.surgeon_id,
-        "anaesthetist_id": o.anaesthetist_id,
-        "preop_notes": o.preop_notes,
-        "status": o.status,
-        "scheduled_start": iso(o.scheduled_start),
-        "scheduled_end": iso(o.scheduled_end),
-        "actual_start": iso(o.actual_start),
-        "actual_end": iso(o.actual_end),
-        "created_at": iso(o.created_at),
-        "updated_at": iso(o.updated_at),
-        "approved_at": iso(getattr(o, "approved_at", None)),
-        "reported_at": iso(getattr(o, "reported_at", None)),
-        "scanned_at": iso(getattr(o, "scanned_at", None)),
+        "id":
+        o.id,
+        "patient_id":
+        o.patient_id,
+        "context_type":
+        o.context_type,
+        "context_id":
+        o.context_id,
+        "surgery_master_id":
+        o.surgery_master_id,
+        "surgery_code":
+        o.surgery_code,
+        "surgery_name":
+        o.surgery_name,
+        "estimated_cost":
+        float(o.estimated_cost or 0),
+        "surgeon_id":
+        o.surgeon_id,
+        "anaesthetist_id":
+        o.anaesthetist_id,
+        "preop_notes":
+        o.preop_notes,
+        "status":
+        o.status,
+        "scheduled_start":
+        iso(o.scheduled_start),
+        "scheduled_end":
+        iso(o.scheduled_end),
+        "actual_start":
+        iso(o.actual_start),
+        "actual_end":
+        iso(o.actual_end),
+        "created_at":
+        iso(o.created_at),
+        "updated_at":
+        iso(o.updated_at),
+        "approved_at":
+        iso(getattr(o, "approved_at", None)),
+        "reported_at":
+        iso(getattr(o, "reported_at", None)),
+        "scanned_at":
+        iso(getattr(o, "scanned_at", None)),
+
+        # NEW: attachments (for anaesthesia records / reports)
+        "attachments": [
+            {
+                "id": a.id,
+                "url": a.file_url,  # keep 'url' for history compatibility
+                "file_url": a.file_url,  # explicit
+                "note": a.note,
+                "created_at": iso(a.created_at),
+            } for a in (o.attachments or [])
+        ],
     }
 
 

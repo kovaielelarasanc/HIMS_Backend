@@ -186,6 +186,7 @@ def create_invoice(
 ):
     """
     Create a billing invoice (OP/IP/Pharmacy/Lab/Radiology/General).
+    Always starts in 'draft' status.
     """
     if not has_perm(user, "billing.create"):
         raise HTTPException(status_code=403, detail="Not permitted")
@@ -213,6 +214,7 @@ def create_invoice(
     if "visit_id" in payload_data and hasattr(inv, "visit_no"):
         inv.visit_no = str(payload_data["visit_id"])
 
+    # Always draft by default – finalized only via explicit API
     inv.status = "draft"
     inv.gross_total = 0
     inv.tax_total = 0
@@ -255,6 +257,7 @@ def get_invoice(
 @router.get("/invoices", response_model=List[InvoiceOut])
 def list_invoices(
         patient_id: Optional[int] = None,
+        patient_uhid: Optional[str] = None,
         billing_type: Optional[str] = None,
         status: Optional[str] = None,
         from_date: Optional[date] = None,
@@ -264,14 +267,27 @@ def list_invoices(
 ):
     """
     List invoices with optional filters.
-    Supports: patient_id, billing_type, status, date range.
+    Supports: patient_id, patient_uhid, billing_type, status, date range.
+
+    NOTE:
+      - If patient_uhid is passed, it takes precedence over patient_id.
+      - This allows FE to avoid exposing raw numeric patient IDs.
     """
     if not has_perm(user, "billing.view"):
         raise HTTPException(status_code=403, detail="Not permitted")
 
     q = db.query(Invoice)
-    if patient_id:
+
+    # Prefer UHID if provided
+    if patient_uhid:
+        patient = db.query(Patient).filter(
+            Patient.uhid == patient_uhid).first()
+        if not patient:
+            raise HTTPException(status_code=404, detail="Patient not found")
+        q = q.filter(Invoice.patient_id == patient.id)
+    elif patient_id:
         q = q.filter(Invoice.patient_id == patient_id)
+
     if billing_type and hasattr(Invoice, "billing_type"):
         q = q.filter(Invoice.billing_type == billing_type)
     if status:
@@ -324,13 +340,14 @@ def finalize_invoice(
 ):
     """
     Lock invoice; no structural edits allowed after this (only payments).
+    Explicit action: auto-billing logic keeps invoice in 'draft' by default.
     """
     if not has_perm(user, "billing.finalize"):
         raise HTTPException(status_code=403, detail="Not permitted")
 
     inv = db.query(Invoice).get(invoice_id)
     if not inv:
-        raise HTTPException(status_code=404, detail="Not found")
+        raise HTTPException(status_code=404, detail="Invoice not found")
 
     recalc_totals(inv)
     inv.status = "finalized"
@@ -829,15 +846,28 @@ def create_advance(
 @router.get("/advances", response_model=List[dict])
 def list_advances(
         patient_id: Optional[int] = None,
+        patient_uhid: Optional[str] = None,
         only_with_balance: bool = False,
         db: Session = Depends(get_db),
         user: User = Depends(auth_current_user),
 ):
+    """
+    List patient advances.
+
+    - If patient_uhid is provided, it is used to resolve the patient internally.
+    - Otherwise, patient_id can be used.
+    """
     if not has_perm(user, "billing.view"):
         raise HTTPException(status_code=403, detail="Not permitted")
 
     q = db.query(Advance)
-    if patient_id:
+    if patient_uhid:
+        patient = db.query(Patient).filter(
+            Patient.uhid == patient_uhid).first()
+        if not patient:
+            raise HTTPException(status_code=404, detail="Patient not found")
+        q = q.filter(Advance.patient_id == patient.id)
+    elif patient_id:
         q = q.filter(Advance.patient_id == patient_id)
     if only_with_balance:
         q = q.filter(Advance.balance_remaining > 0)
@@ -1168,6 +1198,25 @@ def patient_billing_summary_alias(
     return patient_billing_summary(patient_id=patient_id, db=db, user=user)
 
 
+# UHID-based summary (no raw numeric ID needed in FE)
+@router.get("/patients/by-uhid/{uhid}/summary", response_model=dict)
+def patient_billing_summary_by_uhid(
+        uhid: str,
+        db: Session = Depends(get_db),
+        user: User = Depends(auth_current_user),
+):
+    """
+    Same as /billing/patients/{id}/summary but resolved via UHID.
+    """
+    if not has_perm(user, "billing.view"):
+        raise HTTPException(status_code=403, detail="Not permitted")
+
+    patient = db.query(Patient).filter(Patient.uhid == uhid).first()
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+    return patient_billing_summary(patient_id=patient.id, db=db, user=user)
+
+
 # ---------------------------------------------------------------------------
 # Printing: Single Invoice & Patient Billing Summary (PDF/HTML)
 # ---------------------------------------------------------------------------
@@ -1324,7 +1373,6 @@ def print_invoice(
       <div class="section-title">Patient</div>
       <div class="muted">UHID: {getattr(patient, 'uhid', '')}</div>
       <div>{(patient.first_name or "")} {(patient.last_name or "")}</div>
-      <div class="muted">ID: {patient.id}</div>
       <div class="muted">Phone: {patient.phone or "—"}</div>
     </div>
   </div>
@@ -1573,7 +1621,6 @@ def print_patient_billing_summary(
   <div class="title">Patient Billing Summary</div>
   <div class="muted">
     UHID: {summary['patient']['uhid'] or '—'} &nbsp;|
-    Patient ID: {summary['patient']['id']} &nbsp;|
     Name: {summary['patient']['name']} &nbsp;|
     Phone: {summary['patient']['phone'] or '—'}
   </div>
@@ -1699,5 +1746,26 @@ def print_patient_billing_summary_alias(
         user: User = Depends(auth_current_user),
 ):
     return print_patient_billing_summary(patient_id=patient_id,
+                                         db=db,
+                                         user=user)
+
+
+# UHID-based printable summary
+@router.get("/patients/by-uhid/{uhid}/print-summary")
+def print_patient_billing_summary_by_uhid(
+        uhid: str,
+        db: Session = Depends(get_db),
+        user: User = Depends(auth_current_user),
+):
+    """
+    Printable patient billing summary resolved via UHID instead of numeric ID.
+    """
+    if not has_perm(user, "billing.view"):
+        raise HTTPException(status_code=403, detail="Not permitted")
+
+    patient = db.query(Patient).filter(Patient.uhid == uhid).first()
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+    return print_patient_billing_summary(patient_id=patient.id,
                                          db=db,
                                          user=user)

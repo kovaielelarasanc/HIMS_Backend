@@ -22,7 +22,7 @@ from app.schemas.patient_masters import (
     DoctorRefOut,
     ReferenceSourceOut,
 )
-
+from app.models.patient import PatientType
 router = APIRouter()
 
 
@@ -363,7 +363,8 @@ def all_patient_masters(
         "doctors": [...],
         "payers": [...],
         "tpas": [...],
-        "credit_plans": [...]
+        "credit_plans": [...],
+        "patient_types": [...]
       }
     """
     if not has_perm(user, "patients.masters.view"):
@@ -375,10 +376,15 @@ def all_patient_masters(
     tpas = list_tpas(db=db, user=user)
     credit_plans = list_credit_plans(db=db, user=user)
 
+    patient_types = (db.query(PatientType).filter(
+        PatientType.is_active.is_(True)).order_by(
+            PatientType.sort_order.asc(), PatientType.name.asc()).all())
+
     return {
         "reference_sources": reference_sources,
         "doctors": doctors,
         "payers": payers,
         "tpas": tpas,
         "credit_plans": credit_plans,
+        "patient_types": patient_types,
     }

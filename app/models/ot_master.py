@@ -1,6 +1,16 @@
 from __future__ import annotations
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, Numeric, Boolean, DateTime, UniqueConstraint, Index, ForeignKey
+from sqlalchemy import (
+    Column,
+    Integer,
+    String,
+    Numeric,
+    Boolean,
+    DateTime,
+    UniqueConstraint,
+    Index,
+    ForeignKey,
+)
 from app.db.base import Base
 
 
@@ -18,7 +28,13 @@ class OtSurgeryMaster(Base):
     id = Column(Integer, primary_key=True, index=True)
     code = Column(String(40), nullable=False)
     name = Column(String(200), nullable=False)
+
+    # Existing package / base cost
     default_cost = Column(Numeric(12, 2), nullable=False, default=0)
+
+    # NEW: OT hourly cost (₹ / hour) – for billing purpose
+    hourly_cost = Column(Numeric(12, 2), nullable=False, default=0)
+
     description = Column(String(500), default="")
     active = Column(Boolean, default=True)
 

@@ -519,7 +519,7 @@ def _build_top_medicines_widget(
     ).join(PharmacySale, PharmacySaleItem.sale_id == PharmacySale.id).filter(
         PharmacySale.created_at >= start_dt,
         PharmacySale.created_at < end_dt,
-        PharmacySale.status != "CANCELLED",
+        PharmacySale.invoice_status != "CANCELLED",
     ).group_by(PharmacySaleItem.item_name).order_by(
         func.sum(PharmacySaleItem.quantity).desc()).limit(10).all())
 

@@ -472,7 +472,7 @@ def _build_timeline(
         sales = (
             db.query(PharmacySale).filter(
                 PharmacySale.patient_id == patient_id,
-                PharmacySale.status != "CANCELLED",  # skip cancelled bills
+                PharmacySale.invoice_status != "CANCELLED",  # skip cancelled bills
             ).order_by(PharmacySale.id.desc()).limit(250).all())
 
         sale_ids = [s.id for s in sales]

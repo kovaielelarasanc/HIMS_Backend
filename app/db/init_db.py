@@ -1,18 +1,16 @@
-# backend/app/db/init_db.py
+# app/db/init_db.py
 from __future__ import annotations
 
 import argparse
+
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 
-from app.db.session import engine
+from app.db.base_master import MasterBase
 from app.db.base import Base
-
-# Import all models so metadata is complete
-from app.models import (  # noqa: F401
-    Department, User, UserRole, Role, RolePermission, Permission, OtpToken,
-    patient, opd, ipd, common, lis, ris, ot_master, ot, billing, template,
-    payer, ui_branding, pharmacy_inventory, pharmacy_prescription)
+from app.db.session import master_engine, get_or_create_tenant_engine
+from app.models import tenant as Tenant
 
 
 def print_tables(conn):
@@ -24,7 +22,7 @@ def print_tables(conn):
 
 def seed_permissions(db: Session) -> None:
     """
-    Seed ONLY missing permission codes; safe to run multiple times.
+    Seed ONLY missing permission codes into a TENANT DB; safe to run multiple times.
     """
     MODULES = [
         # -------- CORE / ADMIN ----------
@@ -47,15 +45,7 @@ def seed_permissions(db: Session) -> None:
             "consents.create",
             "attachments.manage",
         ]),
-
-        # Patient masters (payer / TPA / credit plan / doctor list access)
-        (
-            "patients.masters",
-            [
-                "view",  # can list doctors, payers, tpas, credit plans, ref sources
-                "manage",  # can create / update / deactivate payers, tpas, plans
-            ],
-        ),
+        ("patients.masters", ["view", "manage"]),
 
         # -------- OPD ----------
         ("schedules", ["manage"]),
@@ -65,22 +55,8 @@ def seed_permissions(db: Session) -> None:
         ("prescriptions", ["create", "esign"]),
         ("orders.lab", ["create", "view"]),
         ("orders.ris", ["create", "view"]),
-
-        # NEW: OPD Queue & Follow-ups
-        (
-            "opd.queue",
-            [
-                "view",  # can see OPD queue screen
-                "manage",  # can change statuses, start/continue visits from queue
-            ],
-        ),
-        (
-            "opd.followups",
-            [
-                "view",  # can see follow-up list (for doctor / front office)
-                "manage",  # can confirm slots, reschedule, mark done/cancelled
-            ],
-        ),
+        ("opd.queue", ["view", "manage"]),
+        ("opd.followups", ["view", "manage"]),
 
         # -------- IPD ----------
         ("ipd", ["view", "manage", "nursing", "doctor"]),
@@ -90,6 +66,8 @@ def seed_permissions(db: Session) -> None:
         ("ipd.my", ["view"]),
         ("ipd.discharged", ["view"]),
         ("ipd.bedboard", ["view"]),
+
+        # -------- Pharmacy Inventory ----------
         ("pharmacy.inventory.locations", ["view", "manage"]),
         ("pharmacy.inventory.suppliers", ["view", "manage"]),
         ("pharmacy.inventory.items", ["view", "manage"]),
@@ -131,59 +109,28 @@ def seed_permissions(db: Session) -> None:
         ("consents", ["view", "manage"]),
 
         # -------- MIS / Analytics ----------
-        ("mis", ["view"]),  # overall MIS access
-        ("mis.collection", ["view"
-                            ]),  # daily summary, date-wise collection, etc.
-        ("mis.accounts", ["view"]),  # income by dept / consultant / service
-        ("mis.opd", ["view"]),  # OPD MIS
-        ("mis.ipd", ["view"]),  # IPD MIS
-        ("mis.visits", ["view"]),  # Combined
-        ("mis.pharmacy", ["view"]),  # pharmacy sales, top drugs
-        ("mis.stock", ["view"]),  # stock analytics
-        ("mis.lab", ["view"]),  # test orders, TAT
-        ("mis.radiology", ["view"]),  # radiology orders, TAT
-        (
-            "pharmacy.rx",
-            [
-                "view",  # can see Rx queue & patient Rx history
-                "dispense",  # convert Rx -> PharmacySale (issue medicines)
-                "override",  # allow brand substitution / qty override
-                "cancel",  # cancel pending dispense (before finalize)
-            ]),
+        ("mis", ["view"]),
+        ("mis.collection", ["view"]),
+        ("mis.accounts", ["view"]),
+        ("mis.opd", ["view"]),
+        ("mis.ipd", ["view"]),
+        ("mis.visits", ["view"]),
+        ("mis.pharmacy", ["view"]),
+        ("mis.stock", ["view"]),
+        ("mis.lab", ["view"]),
+        ("mis.radiology", ["view"]),
 
-        # Direct counter sales (OTC) and general pharmacy sales
-        (
-            "pharmacy.sales",
-            [
-                "view",  # search / list all pharmacy sales
-                "create",  # direct sale (no Rx – OTC)
-                "return",  # create sale returns / credit note
-            ]),
-
-        # Pharmacy billing wrapper (for detailed bill view/print/refund)
-        (
-            "pharmacy.billing",
-            [
-                "view",  # see pharmacy bills, print, reprint
-                "create",  # finalize / post bill
-                "refund",  # refund / adjust pharmacy bill
-            ]),
-
-        # Sale-level returns workflow (separate from GRN / purchase returns)
-        (
-            "pharmacy.returns",
-            [
-                "view",  # see list of returns
-                "manage",  # approve / finalize returns
-            ]),
+        # -------- Pharmacy Rx & Billing ----------
+        ("pharmacy.rx", ["view", "dispense", "override", "cancel"]),
+        ("pharmacy.sales", ["view", "create", "return"]),
+        ("pharmacy.billing", ["view", "create", "refund"]),
+        ("pharmacy.returns", ["view", "manage"]),
 
         # -------- Settings / Customization ----------
-
-        # UI branding, themes, PDF headers/footers, etc.
         ("settings.customization", ["view", "manage"]),
     ]
 
-    from app.models.permission import Permission
+    from app.models.permission import Permission  # tenant-level
 
     seen = set()
     for module, actions in MODULES:
@@ -192,19 +139,47 @@ def seed_permissions(db: Session) -> None:
             if code in seen:
                 continue
             seen.add(code)
-            exists = (db.query(Permission).filter(
-                Permission.code == code).first())
+            exists = db.query(Permission).filter(
+                Permission.code == code).first()
             if not exists:
                 label = f"{module.replace('.', ' ').title()} — {action.title()}"
                 db.add(Permission(code=code, label=label, module=module))
 
 
-def run(fresh: bool = False) -> None:
+# ---------- MASTER DB INIT ----------
+
+
+def init_master_db(fresh: bool = False) -> None:
+    """
+    Initialize / migrate the central Tenant Management DB.
+    """
     if fresh:
-        print("WARNING: Dropping ALL tables (dev only) …")
+        print("WARNING: Dropping ALL MASTER tables (dev only) …")
+        MasterBase.metadata.drop_all(bind=master_engine)
+
+    print("Creating master tables …")
+    MasterBase.metadata.create_all(bind=master_engine)
+
+    with master_engine.connect() as conn:
+        print_tables(conn)
+
+    print("Master DB ready.")
+
+
+# ---------- TENANT DB INIT (used during provisioning) ----------
+
+
+def init_tenant_db(db_uri: str, fresh: bool = False) -> None:
+    """
+    Create / migrate all tenant tables in a specific tenant DB and seed permissions.
+    """
+    engine = get_or_create_tenant_engine(db_uri)
+
+    if fresh:
+        print(f"WARNING: Dropping ALL TENANT tables for {db_uri} (dev only) …")
         Base.metadata.drop_all(bind=engine)
 
-    print("Creating all missing tables …")
+    print(f"Creating tenant tables for {db_uri} …")
     Base.metadata.create_all(bind=engine)
 
     with engine.connect() as conn:
@@ -214,19 +189,26 @@ def run(fresh: bool = False) -> None:
         with Session(engine) as db:
             seed_permissions(db)
             db.commit()
-            print("Permissions seeded (missing codes inserted).")
+            print("Tenant permissions seeded (missing codes inserted).")
     except SQLAlchemyError as e:
-        print("Seeding failed:", e)
+        print("Tenant seeding failed:", e)
         raise
+
+
+def run(fresh: bool = False) -> None:
+    """
+    Backward-compatible entry point — now only initializes MASTER DB.
+    """
+    init_master_db(fresh=fresh)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Initialize DB (create tables, seed permissions).")
+        description="Initialize MASTER DB (create tables).")
     parser.add_argument(
         "--fresh",
         action="store_true",
-        help="Drop & recreate all tables (DEV ONLY).",
+        help="Drop & recreate all MASTER tables (DEV ONLY).",
     )
     args = parser.parse_args()
     run(fresh=args.fresh)

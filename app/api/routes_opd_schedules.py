@@ -1,4 +1,6 @@
+# app/api/routes_opd_schedule.py
 from __future__ import annotations
+
 from datetime import date, datetime, timedelta
 from typing import List, Optional
 
@@ -85,6 +87,18 @@ def create_schedule(
     if payload.end_time <= payload.start_time:
         raise HTTPException(status_code=400,
                             detail="End time must be after start time")
+
+    # One schedule per doctor per weekday (extra safety in addition to DB constraint)
+    exists = (db.query(OpdSchedule).filter(
+        OpdSchedule.doctor_user_id == payload.doctor_user_id,
+        OpdSchedule.weekday == payload.weekday,
+    ).first())
+    if exists:
+        raise HTTPException(
+            status_code=400,
+            detail="Schedule already exists for this doctor on this weekday",
+        )
+
     sch = OpdSchedule(
         doctor_user_id=payload.doctor_user_id,
         weekday=payload.weekday,
@@ -118,8 +132,26 @@ def update_schedule(
         start = data.get("start_time", sch.start_time)
         end = data.get("end_time", sch.end_time)
         if end <= start:
-            raise HTTPException(status_code=400,
-                                detail="End time must be after start time")
+            raise HTTPException(
+                status_code=400,
+                detail="End time must be after start time",
+            )
+
+    # prevent moving to an already-occupied weekday for that doctor
+    if "weekday" in data:
+        new_weekday = data["weekday"]
+        if new_weekday != sch.weekday:
+            dup = (db.query(OpdSchedule).filter(
+                OpdSchedule.doctor_user_id == sch.doctor_user_id,
+                OpdSchedule.weekday == new_weekday,
+                OpdSchedule.id != sch.id,
+            ).first())
+            if dup:
+                raise HTTPException(
+                    status_code=400,
+                    detail=
+                    "Schedule already exists for this doctor on the target weekday",
+                )
 
     for k, v in data.items():
         setattr(sch, k, v)
@@ -156,11 +188,11 @@ def get_free_slots(
         raise HTTPException(status_code=403, detail="Not permitted")
 
     weekday = date.weekday()
-    schedules = db.query(OpdSchedule).filter(
+    schedules = (db.query(OpdSchedule).filter(
         OpdSchedule.doctor_user_id == doctor_user_id,
         OpdSchedule.weekday == weekday,
         OpdSchedule.is_active.is_(True),
-    ).all()
+    ).all())
     if not schedules:
         return []
 

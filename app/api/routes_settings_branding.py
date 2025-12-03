@@ -1,10 +1,11 @@
+# FILE: backend/app/api/routes_settings_branding.py
 from __future__ import annotations
 
 import logging
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy.orm import Session
@@ -12,8 +13,13 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_db, current_user as auth_current_user
 from app.core.config import settings
 from app.models.user import User
-from app.models.settings import UiBranding
-from app.schemas.settings import UiBrandingOut, UiBrandingUpdate
+from app.models.ui_branding import UiBranding
+from app.schemas.ui_branding import (
+    UiBrandingOut,
+    UiBrandingUpdate,
+    UiBrandingPublicOut,
+)
+from app.services.ui_branding import get_or_create_default_ui_branding
 
 logger = logging.getLogger(__name__)
 
@@ -36,22 +42,13 @@ def has_perm(user: User, code: str) -> bool:
 
 def _ensure_branding(db: Session,
                      current_user: Optional[User] = None) -> UiBranding:
-    """Always return one row; create default if not exists."""
-    branding = db.query(UiBranding).first()
-    if not branding:
-        branding = UiBranding(
-            primary_color="#0f172a",  # slate-900
-            sidebar_bg_color="#0f172a",
-            content_bg_color="#f8fafc",  # slate-50
-            text_color="#0f172a",
-            icon_color="#0f172a",
-            icon_bg_color="#e2e8f0",  # slate-200
-        )
-        if current_user:
-            branding.updated_by_id = current_user.id
-        db.add(branding)
-        db.commit()
-        db.refresh(branding)
+    """
+    Always return one row; create default if not exists.
+    Scoped per-tenant via get_db.
+    """
+    updated_by_id = current_user.id if current_user else None
+    branding = get_or_create_default_ui_branding(db,
+                                                 updated_by_id=updated_by_id)
     return branding
 
 
@@ -59,22 +56,89 @@ def _to_url(rel_path: Optional[str]) -> Optional[str]:
     """Convert stored relative path to public /media URL."""
     if not rel_path:
         return None
-    rel_path = rel_path.lstrip("/").replace("\\", "/")
+    rel_path = str(rel_path).lstrip("/").replace("\\", "/")
     return f"/media/{rel_path}"
 
 
+def _branding_common_payload(branding: UiBranding) -> Dict[str, Any]:
+    """
+    Common org + color payload with SAFE DEFAULTS.
+    This is the key part that fixes 'null' color values.
+    """
+    # ---- COLORS WITH FALLBACKS ----
+    primary = branding.primary_color or "#2563eb"
+    primary_dark = branding.primary_color_dark or None
+
+    sidebar_bg_color = branding.sidebar_bg_color or "#ffffff"
+    content_bg_color = branding.content_bg_color or "#f9fafb"
+    card_bg_color = branding.card_bg_color or "#ffffff"
+    border_color = branding.border_color or "#e5e7eb"
+
+    text_color = branding.text_color or "#111827"
+    text_muted_color = branding.text_muted_color or "#9ca3af"
+
+    icon_color = branding.icon_color or text_color
+    icon_bg_color = branding.icon_bg_color or "rgba(37,99,235,0.08)"
+
+    return {
+        # org
+        "org_name": branding.org_name,
+        "org_tagline": branding.org_tagline,
+        "org_address": branding.org_address,
+        "org_phone": branding.org_phone,
+        "org_email": branding.org_email,
+        "org_website": branding.org_website,
+        "org_gstin": branding.org_gstin,
+        # colors (with defaults)
+        "primary_color": primary,
+        "primary_color_dark": primary_dark,
+        "sidebar_bg_color": sidebar_bg_color,
+        "content_bg_color": content_bg_color,
+        "card_bg_color": card_bg_color,
+        "border_color": border_color,
+        "text_color": text_color,
+        "text_muted_color": text_muted_color,
+        "icon_color": icon_color,
+        "icon_bg_color": icon_bg_color,
+    }
+
+
 def _branding_to_out(branding: UiBranding) -> UiBrandingOut:
+    """
+    Full admin view (used by settings page).
+    Explicit mapping so we never lose fields.
+    """
+    base = _branding_common_payload(branding)
+
     return UiBrandingOut(
         id=branding.id,
-        primary_color=branding.primary_color,
-        sidebar_bg_color=branding.sidebar_bg_color,
-        content_bg_color=branding.content_bg_color,
-        text_color=branding.text_color,
-        icon_color=branding.icon_color,
-        icon_bg_color=branding.icon_bg_color,
+        **base,
+        # URLs
         logo_url=_to_url(branding.logo_path),
+        login_logo_url=_to_url(branding.login_logo_path),
+        favicon_url=_to_url(branding.favicon_path),
         pdf_header_url=_to_url(branding.pdf_header_path),
         pdf_footer_url=_to_url(branding.pdf_footer_path),
+        # audit
+        updated_at=branding.updated_at.isoformat() if isinstance(
+            branding.updated_at, datetime) else None,
+        updated_by_name=branding.updated_by.name
+        if branding.updated_by else None,
+    )
+
+
+def _branding_to_public(branding: UiBranding) -> UiBrandingPublicOut:
+    """
+    Lightweight version for login page / normal screens.
+    Uses SAME color defaults as _branding_to_out.
+    """
+    base = _branding_common_payload(branding)
+
+    return UiBrandingPublicOut(
+        **base,
+        logo_url=_to_url(branding.logo_path),
+        login_logo_url=_to_url(branding.login_logo_path),
+        favicon_url=_to_url(branding.favicon_path),
     )
 
 
@@ -103,11 +167,40 @@ def _save_branding_file(upload: UploadFile, prefix: str) -> str:
     return rel_path
 
 
+# ============================
+#  PUBLIC: used by all users
+# ============================
+
+
+@router.get("/ui-branding/public", response_model=UiBrandingPublicOut)
+def get_ui_branding_public(db: Session = Depends(get_db), ):
+    """
+    Public / tenant-wide branding, no special permission required.
+
+    Used by:
+      - Login page
+      - Main app layout / sidebar / topbar for ALL users.
+
+    Still tenant-scoped via get_db middleware.
+    """
+    branding = _ensure_branding(db)
+    return _branding_to_public(branding)
+
+
+# ============================
+#  ADMIN: manage customization
+# ============================
+
+
 @router.get("/ui-branding", response_model=UiBrandingOut)
 def get_ui_branding(
         db: Session = Depends(get_db),
         current_user: User = Depends(auth_current_user),
 ):
+    """
+    Full branding detail for admin settings screen.
+    Requires customization.view permission.
+    """
     if not has_perm(current_user, "settings.customization.view"):
         raise HTTPException(status_code=403, detail="Not enough permissions")
 
@@ -148,6 +241,7 @@ def upload_ui_branding_assets(
         logo: UploadFile | None = File(None),
         pdf_header: UploadFile | None = File(None),
         pdf_footer: UploadFile | None = File(None),
+        # NOTE: if later you want login_logo + favicon, add them here.
         db: Session = Depends(get_db),
         current_user: User = Depends(auth_current_user),
 ):

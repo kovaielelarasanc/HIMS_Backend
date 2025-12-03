@@ -459,7 +459,7 @@ def _report_pharmacy_sales_summary(db: Session, user: User,
     ).filter(
         PharmacySale.created_at >= start_dt,
         PharmacySale.created_at < end_dt,
-        PharmacySale.status != "CANCELLED",
+        PharmacySale.invoice_status != "CANCELLED",
     ).one())
 
     # ✅ Top items from NEW PharmacySaleItem
@@ -471,7 +471,7 @@ def _report_pharmacy_sales_summary(db: Session, user: User,
     ).join(PharmacySale, PharmacySaleItem.sale_id == PharmacySale.id).filter(
         PharmacySale.created_at >= start_dt,
         PharmacySale.created_at < end_dt,
-        PharmacySale.status != "CANCELLED",
+        PharmacySale.invoice_status != "CANCELLED",
     ).group_by(PharmacySaleItem.item_name).order_by(
         func.sum(PharmacySaleItem.quantity).desc()).limit(10).all())
 

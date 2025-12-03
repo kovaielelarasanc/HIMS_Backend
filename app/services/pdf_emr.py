@@ -201,7 +201,7 @@ def generate_emr_pdf(
                 c.drawImage(
                     header_img,
                     LEFT,
-                    H - draw_h - 10 * mm,
+                    H - draw_h - 1 * mm,
                     width=draw_w,
                     height=draw_h,
                     preserveAspectRatio=True,

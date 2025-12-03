@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Optional, List
 
-from pydantic import BaseModel, ConfigDict, EmailStr
+from pydantic import BaseModel, ConfigDict, EmailStr, field_validator
 
 
 class AddressBase(BaseModel):
@@ -56,17 +56,52 @@ class ConsentOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+# ---------- Patient Type master ----------
+
+
+class PatientTypeBase(BaseModel):
+    code: str
+    name: str
+    description: Optional[str] = None
+    is_active: bool = True
+    sort_order: int = 0
+
+
+class PatientTypeCreate(PatientTypeBase):
+    pass
+
+
+class PatientTypeUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    is_active: Optional[bool] = None
+    sort_order: Optional[int] = None
+
+
+class PatientTypeOut(PatientTypeBase):
+    id: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ---------- Patient core ----------
+
+
 class PatientCreate(BaseModel):
+    # mandatory core fields
+    prefix: str
     first_name: str
     last_name: Optional[str] = None
     gender: str
-    dob: Optional[date] = None
-    phone: Optional[str] = None
-    email: Optional[EmailStr] = None
+    dob: date
+    marital_status: str
+    phone: str
+    email: EmailStr
+    patient_type: str  # value should come from Patient Type master
+
+    # optional
     aadhar_last4: Optional[str] = None
     blood_group: Optional[str] = None
-
-    marital_status: Optional[str] = None
 
     ref_source: Optional[str] = None
     ref_doctor_id: Optional[int] = None
@@ -79,7 +114,6 @@ class PatientCreate(BaseModel):
     guardian_phone: Optional[str] = None
     guardian_relation: Optional[str] = None
 
-    patient_type: Optional[str] = "none"
     tag: Optional[str] = None
     religion: Optional[str] = None
     occupation: Optional[str] = None
@@ -103,8 +137,61 @@ class PatientCreate(BaseModel):
     # only for create
     address: Optional[AddressIn] = None
 
+    # --------- validators for mandatory & formats ----------
+
+    @field_validator("prefix")
+    @classmethod
+    def validate_prefix(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("Prefix is required")
+        return v
+
+    @field_validator("first_name")
+    @classmethod
+    def validate_first_name(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("Patient name is required")
+        return v
+
+    @field_validator("marital_status")
+    @classmethod
+    def validate_marital_status(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("Marital status is required")
+        return v
+
+    @field_validator("patient_type")
+    @classmethod
+    def validate_patient_type(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("Patient type is required")
+        return v
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, v: str) -> str:
+        digits = "".join(ch for ch in v if ch.isdigit())
+        if len(digits) != 10:
+            raise ValueError("Mobile number must be exactly 10 digits")
+        return digits
+
+    @field_validator("dob")
+    @classmethod
+    def validate_dob(cls, v: date) -> date:
+        today = date.today()
+        if v > today:
+            raise ValueError("DOB cannot be in the future")
+        if today.year - v.year > 120:
+            raise ValueError("DOB is too far in the past")
+        return v
+
 
 class PatientUpdate(BaseModel):
+    prefix: Optional[str] = None
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     gender: Optional[str] = None
@@ -148,12 +235,35 @@ class PatientUpdate(BaseModel):
 
     family_id: Optional[int] = None
 
+    @field_validator("phone")
+    @classmethod
+    def validate_phone_update(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        digits = "".join(ch for ch in v if ch.isdigit())
+        if len(digits) != 10:
+            raise ValueError("Mobile number must be exactly 10 digits")
+        return digits
+
+    @field_validator("dob")
+    @classmethod
+    def validate_dob_update(cls, v: Optional[date]) -> Optional[date]:
+        if v is None:
+            return v
+        today = date.today()
+        if v > today:
+            raise ValueError("DOB cannot be in the future")
+        if today.year - v.year > 120:
+            raise ValueError("DOB is too far in the past")
+        return v
+
 
 class PatientOut(BaseModel):
     id: int
     uhid: str
     abha_number: Optional[str] = None
 
+    prefix: Optional[str] = None
     first_name: str
     last_name: Optional[str] = None
     gender: str
@@ -162,7 +272,7 @@ class PatientOut(BaseModel):
 
     phone: Optional[str] = None
     email: Optional[EmailStr] = None
-    aadhar_last4: Optional[str] = None
+    # aadhar_last4: Optional[str] = None
 
     marital_status: Optional[str] = None
 

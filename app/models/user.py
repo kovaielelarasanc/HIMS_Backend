@@ -1,3 +1,4 @@
+# app/models/user.py
 from sqlalchemy import Column, Integer, String, Boolean, ForeignKey
 from sqlalchemy.orm import relationship
 from app.db.base import Base
@@ -13,8 +14,7 @@ class User(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(120), nullable=False)
-    email = Column(String(191), unique=True,
-                   nullable=False)  # <= 191, no index=True
+    email = Column(String(191), unique=True, nullable=False)
     password_hash = Column(String(255), nullable=False)
 
     is_active = Column(Boolean, default=True)
@@ -28,9 +28,12 @@ class User(Base):
                            nullable=True)
     department = relationship("Department", back_populates="users")
 
-    roles = relationship("Role",
-                         secondary="user_roles",
-                         back_populates="users")
+    roles = relationship(
+        "Role",
+        secondary="user_roles",
+        back_populates="users",
+    )
+
     @property
     def full_name(self) -> str:
         return self.name
@@ -43,5 +46,6 @@ class UserRole(Base):
         "mysql_charset": "utf8mb4",
         "mysql_collate": "utf8mb4_unicode_ci",
     }
+
     user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
     role_id = Column(Integer, ForeignKey("roles.id"), primary_key=True)

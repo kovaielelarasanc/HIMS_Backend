@@ -13,6 +13,7 @@ from app.api import (
     # Patients / ABHA
     routes_patients,
     routes_abha,
+    routes_patient_types,
 
     # OPD
     routes_opd_common,
@@ -35,7 +36,7 @@ from app.api import (
     routes_ot,
     routes_billing,
     routes_ot_masters,
-
+    routes_system,
     # Files & History
     routes_files,
     routes_lis_history,
@@ -49,7 +50,8 @@ from app.api import (
     routes_patient_masters,
     routes_masters_credit,
     routes_ui_branding,
-    routes_inventory)
+    routes_inventory,
+    routes_audit_logs)
 
 api_router = APIRouter()
 
@@ -72,6 +74,14 @@ api_router.include_router(routes_patients.router,
 api_router.include_router(routes_patient_masters.router,
                           prefix="/patient-masters",
                           tags=["patient-masters"])
+api_router.include_router(
+    routes_patient_types.router,
+    prefix="/patient-types",
+    tags=["Patient Types"],
+)
+api_router.include_router(routes_audit_logs.router,
+                          prefix="/audit-logs",
+                          tags=["audit-logs"])  # 👈 this gives /api/audit-logs
 api_router.include_router(routes_masters_credit.router,
                           prefix="/masters",
                           tags=["masters"])
@@ -150,3 +160,5 @@ api_router.include_router(
 # api_router.include_router(routes_pharmacy_billing.router,
 #                           prefix="/pharmacy/billing",
 #                           tags=["pharmacy-billing"])
+
+api_router.include_router(routes_system.router, tags=["system"])

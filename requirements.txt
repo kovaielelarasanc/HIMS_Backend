@@ -21,3 +21,4 @@ python-barcode
 pillow
 jinja2
 qrcode
+openpyxl

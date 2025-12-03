@@ -1,4 +1,4 @@
-# app/schemas/ui_branding.py
+# FILE: backend/app/schemas/ui_branding.py
 from typing import Optional
 
 from pydantic import BaseModel, ConfigDict
@@ -65,11 +65,28 @@ class UiBrandingPublicOut(BaseModel):
 
     org_name: Optional[str] = None
     org_tagline: Optional[str] = None
+    org_address: Optional[str] = None
+    org_phone: Optional[str] = None
+    org_email: Optional[str] = None
+    org_website: Optional[str] = None
+    org_gstin: Optional[str] = None
+
+    # colors
     primary_color: Optional[str] = None
+    primary_color_dark: Optional[str] = None
+
     sidebar_bg_color: Optional[str] = None
     content_bg_color: Optional[str] = None
-    text_color: Optional[str] = None
+    card_bg_color: Optional[str] = None
+    border_color: Optional[str] = None
 
+    text_color: Optional[str] = None
+    text_muted_color: Optional[str] = None
+
+    icon_color: Optional[str] = None
+    icon_bg_color: Optional[str] = None
+
+    # URLs (resolved)
     logo_url: Optional[str] = None
     login_logo_url: Optional[str] = None
     favicon_url: Optional[str] = None

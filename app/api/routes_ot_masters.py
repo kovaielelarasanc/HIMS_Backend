@@ -50,13 +50,16 @@ def list_surgeries(
         page,
         "page_size":
         page_size,
-        "items": [{
-            "id": r.id,
-            "code": r.code,
-            "name": r.name,
-            "default_cost": float(r.default_cost or 0),
-            "active": bool(r.active),
-        } for r in rows],
+        "items": [
+            {
+                "id": r.id,
+                "code": r.code,
+                "name": r.name,
+                "default_cost": float(r.default_cost or 0),
+                "hourly_cost": float(r.hourly_cost or 0),  # NEW
+                "active": bool(r.active),
+            } for r in rows
+        ],
     }
 
 
@@ -71,16 +74,19 @@ def create_surgery(
         code=payload.code.strip(),
         name=payload.name.strip(),
         default_cost=payload.default_cost or 0,
+        hourly_cost=payload.hourly_cost or 0,  # NEW
         active=True if payload.active is None else bool(payload.active),
         created_by=user.id,
     )
     db.add(m)
     db.commit()
+    db.refresh(m)
     return OtSurgeryMasterOut(
         id=m.id,
         code=m.code,
         name=m.name,
         default_cost=float(m.default_cost or 0),
+        hourly_cost=float(m.hourly_cost or 0),  # NEW
         active=bool(m.active),
     )
 
@@ -99,14 +105,17 @@ def update_surgery(
     m.code = payload.code.strip()
     m.name = payload.name.strip()
     m.default_cost = payload.default_cost or 0
+    m.hourly_cost = payload.hourly_cost or 0  # NEW
     if payload.active is not None:
         m.active = bool(payload.active)
     db.commit()
+    db.refresh(m)
     return OtSurgeryMasterOut(
         id=m.id,
         code=m.code,
         name=m.name,
         default_cost=float(m.default_cost or 0),
+        hourly_cost=float(m.hourly_cost or 0),  # NEW
         active=bool(m.active),
     )
 

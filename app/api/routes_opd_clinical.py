@@ -1,7 +1,7 @@
-# backend/app/api/routes_opd_clinical.py
+# app/api/routes_opd_clinical.py
 from __future__ import annotations
 from datetime import datetime, date, timedelta
-from typing import Optional, List
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session, joinedload
@@ -29,7 +29,6 @@ from pydantic import BaseModel, Field, validator
 
 
 class VitalsCreate(BaseModel):
-    # FE may send appointment_id; we use it only to resolve patient if patient_id omitted
     appointment_id: Optional[int] = Field(None)
     patient_id: Optional[int] = Field(None)
 
@@ -59,7 +58,6 @@ def record_vitals(
     if not has_perm(user, "vitals.create"):
         raise HTTPException(status_code=403, detail="Not permitted")
 
-    # Resolve patient_id (keep your existing logic)
     patient_id = payload.patient_id
     appt = None
 
@@ -76,22 +74,20 @@ def record_vitals(
             detail="patient_id could not be resolved",
         )
 
-    # Build kwargs so we can add appointment_id only if present on the model
     vit_kwargs = dict(
         patient_id=patient_id,
         height_cm=payload.height_cm,
         weight_kg=payload.weight_kg,
         temp_c=payload.temp_c,
         pulse=payload.pulse,
-        rr=payload.resp_rate,  # map
+        rr=payload.resp_rate,
         spo2=int(payload.spo2) if payload.spo2 is not None else None,
-        bp_systolic=payload.bp_sys,  # map
-        bp_diastolic=payload.bp_dia,  # map
+        bp_systolic=payload.bp_sys,
+        bp_diastolic=payload.bp_dia,
         notes=payload.notes or "",
         created_at=datetime.utcnow(),
     )
 
-    # If your Vitals model actually has appointment_id, set it.
     if hasattr(Vitals, "appointment_id") and payload.appointment_id:
         vit_kwargs["appointment_id"] = payload.appointment_id
 
@@ -112,25 +108,46 @@ def record_vitals(
 # ----- QUEUE -----
 @router.get("/queue")
 def get_queue(
-        doctor_user_id: int = Query(...),
+        doctor_user_id: Optional[int] = Query(
+            None,
+            description=
+            "If omitted and current user is a doctor, uses current user's id",
+        ),
         for_date: date = Query(default_factory=date.today),
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
 ):
-    if not (has_perm(user, "appointments.view")
-            or has_perm(user, "visits.view") or user.is_admin):
+    if not (has_perm(user, "appointments.view") or has_perm(
+            user, "visits.view") or user.is_admin or user.is_doctor):
         raise HTTPException(status_code=403, detail="Not permitted")
+
+    target_doctor_id = doctor_user_id
+    if target_doctor_id is None:
+        if user.is_doctor:
+            target_doctor_id = user.id
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="doctor_user_id is required for non-doctor users",
+            )
+    else:
+        if (user.is_doctor and target_doctor_id != user.id
+                and not has_perm(user, "appointments.view")):
+            raise HTTPException(
+                status_code=403,
+                detail="Not permitted to view other doctor's queue",
+            )
 
     appts = (db.query(Appointment).options(joinedload(
         Appointment.patient)).filter(
-            Appointment.doctor_user_id == doctor_user_id,
-            Appointment.date == for_date).order_by(
-                Appointment.slot_start.asc()).all())
+            Appointment.doctor_user_id == target_doctor_id,
+            Appointment.date == for_date,
+        ).order_by(Appointment.slot_start.asc()).all())
 
     vis_map = {
         v.appointment_id: v.id
         for v in db.query(Visit).filter(
-            Visit.appointment_id.in_([a.id for a in appts])).all()
+            Visit.appointment_id.in_([a.id for a in appts]))
     }
 
     vitals_map = {}
@@ -161,6 +178,8 @@ def get_queue(
             "status": a.status,
             "visit_id": vis_map.get(a.id),
             "doctor_user_id": a.doctor_user_id,
+            "department_id":
+            a.department_id,  # NEW: for default department in UI
             "booked_by": getattr(a, "booked_by", None),
             "patient": {
                 "id": p.id,

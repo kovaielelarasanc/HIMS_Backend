@@ -1,10 +1,10 @@
 # app/api/routes_opd.py
 from __future__ import annotations
+
 from datetime import datetime, date as dt_date, time as dt_time, timedelta, date
-from typing import Optional, List, Set
+from typing import Optional, List, Set, Dict, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Body
-
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import func, case
@@ -23,6 +23,10 @@ from app.models.opd import (
     RadiologyOrder,
     OpdSchedule,
     FollowUp,
+    Medicine,
+    LabTest,
+    RadiologyTest,
+    DoctorFee,
 )
 from app.schemas.opd import (
     AppointmentCreate,
@@ -39,6 +43,11 @@ from app.schemas.opd import (
     FollowUpScheduleIn,
     FollowUpRow,
     AppointmentRescheduleIn,
+    MedicineOut,
+    TestOut,
+    DoctorFeeCreate,
+    DoctorFeeUpdate,
+    DoctorFeeOut,
 )
 from app.models.role import Role
 from app.services.billing_auto import (
@@ -91,7 +100,7 @@ ALLOWED_STATUS = {
     "no_show",
     "cancelled",
 }
-TRANSITIONS = {
+TRANSITIONS: Dict[str, Set[str]] = {
     "booked": {"checked_in", "cancelled", "no_show"},
     "checked_in": {"in_progress", "cancelled"},
     "in_progress": {"completed"},
@@ -124,14 +133,12 @@ def _format_visit_time(v: Visit) -> str:
     if dt is None:
         return ""
 
-    # Treat stored datetime as local naive and format
     return dt.strftime("%d %b %Y, %I:%M %p")
 
 
 def vitals_done_on(db: Session, patient_id: int, d: dt_date) -> bool:
     """
     Legacy helper: 'Did this patient have any vitals on this calendar date?'
-
     Uses DATE(created_at) so it's robust against UTC/local differences.
     """
     row = (db.query(Vitals.id).filter(
@@ -143,14 +150,11 @@ def vitals_done_on(db: Session, patient_id: int, d: dt_date) -> bool:
 
 def episode_id_for_month(db: Session) -> str:
     ym = datetime.utcnow().strftime("%Y%m")
-    count = (db.query(Visit).filter(
-        Visit.episode_id.like(f"OP-{ym}-%")).count())
+    count = db.query(Visit).filter(Visit.episode_id.like(f"OP-{ym}-%")).count()
     return f"OP-{ym}-{count + 1:04d}"
 
 
 # --------------- internal helpers for booking/reschedule ---------------
-
-
 def _parse_slot(slot_str: str) -> dt_time:
     try:
         return datetime.strptime(slot_str, "%H:%M").time()
@@ -159,8 +163,11 @@ def _parse_slot(slot_str: str) -> dt_time:
                             detail="Invalid slot_start (HH:MM)")
 
 
-def _get_active_schedule_for_doctor_and_date(db: Session, doctor_user_id: int,
-                                             d: dt_date) -> OpdSchedule:
+def _get_active_schedule_for_doctor_and_date(
+    db: Session,
+    doctor_user_id: int,
+    d: dt_date,
+) -> OpdSchedule:
     weekday = d.weekday()
     sch = (db.query(OpdSchedule).filter(
         OpdSchedule.doctor_user_id == doctor_user_id,
@@ -182,8 +189,12 @@ def _compute_slot_end(d: dt_date, slot_start: dt_time,
     return end.time()
 
 
-def _check_slot_in_schedule(sch: OpdSchedule, d: dt_date, slot_start: dt_time,
-                            slot_end: dt_time) -> None:
+def _check_slot_in_schedule(
+    sch: OpdSchedule,
+    d: dt_date,
+    slot_start: dt_time,
+    slot_end: dt_time,
+) -> None:
     if not (sch.start_time <= slot_start < sch.end_time):
         raise HTTPException(
             status_code=400,
@@ -199,8 +210,10 @@ def _check_slot_in_schedule(sch: OpdSchedule, d: dt_date, slot_start: dt_time,
 def _ensure_not_past(d: dt_date, slot_start: dt_time) -> None:
     req_dt_local = datetime.combine(d, slot_start, LOCAL_TZ)
     if req_dt_local < now_local():
-        raise HTTPException(status_code=400,
-                            detail="Cannot book or reschedule to a past slot")
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot book or reschedule to a past slot",
+        )
 
 
 def _ensure_no_patient_duplicate(
@@ -360,7 +373,7 @@ def doctor_weekdays(
     return {
         "doctor_user_id": doctor_user_id,
         "weekdays": sorted({w
-                            for (w, ) in qs})
+                            for (w, ) in qs}),
     }
 
 
@@ -372,7 +385,9 @@ def get_slots(
         date_param: Optional[date] = Query(None, alias="date"),
         slot_minutes: int = 15,
         detailed: bool = Query(
-            False, description="If true, return status for each slot"),
+            False,
+            description="If true, return status for each slot",
+        ),
         db: Session = Depends(get_db),
 ):
     if date_param:
@@ -405,7 +420,7 @@ def get_slots(
     }
 
     now = now_local()
-    out = []
+    out: List[Dict[str, Any]] = []
     for sch in schedules:
         step = timedelta(minutes=sch.slot_minutes or slot_minutes)
         cur = datetime.combine(d, sch.start_time, LOCAL_TZ)
@@ -456,8 +471,11 @@ def create_appointment(
         raise HTTPException(404, "Patient not found")
 
     slot_start = _parse_slot(payload.slot_start)
-    sch = _get_active_schedule_for_doctor_and_date(db, payload.doctor_user_id,
-                                                   payload.date)
+    sch = _get_active_schedule_for_doctor_and_date(
+        db,
+        payload.doctor_user_id,
+        payload.date,
+    )
     slot_end = _compute_slot_end(payload.date, slot_start, sch.slot_minutes)
     _check_slot_in_schedule(sch, payload.date, slot_start, slot_end)
     _ensure_not_past(payload.date, slot_start)
@@ -483,7 +501,6 @@ def create_appointment(
 def vitals_done_for_appointment(db: Session, ap: Appointment) -> bool:
     """
     Preferred helper now that Vitals can be linked to an Appointment.
-
     1. If Vitals.appointment_id exists, check that first.
     2. Fallback to legacy patient+date logic.
     """
@@ -492,8 +509,6 @@ def vitals_done_for_appointment(db: Session, ap: Appointment) -> bool:
             Vitals.id).filter(Vitals.appointment_id == ap.id).first()
         if exists:
             return True
-
-    # Fallback: any vitals for this patient on that date
     return vitals_done_on(db, ap.patient_id, ap.date)
 
 
@@ -534,7 +549,6 @@ def list_appointments(
     out: List[AppointmentRow] = []
     for r in rows:
         vitals_flag = vitals_done_for_appointment(db, r)
-
         out.append(
             AppointmentRow(
                 id=r.id,
@@ -555,14 +569,14 @@ def list_appointments(
     return out
 
 
-class AppointmentStatusUpdate(BaseModel):
+class AppointmentStatusUpdateLocal(BaseModel):
     status: str  # booked | checked_in | in_progress | completed | no_show | cancelled
 
 
 @router.patch("/appointments/{appointment_id}/status")
 def update_appointment_status(
         appointment_id: int,
-        payload: AppointmentStatusUpdate,
+        payload: AppointmentStatusUpdateLocal,
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
 ):
@@ -596,7 +610,6 @@ def update_appointment_status(
                 department_id=ap.department_id,
                 doctor_user_id=ap.doctor_user_id,
                 episode_id=epi,
-                # local check-in time
                 visit_at=now_local().replace(tzinfo=None),
             )
             db.add(visit)
@@ -619,7 +632,6 @@ def update_appointment_status(
             db.add(visit)
             db.flush()
         elif visit.visit_at is None:
-            # backfill visit_at if missing
             visit.visit_at = now_local().replace(tzinfo=None)
 
         auto_add_item_for_event(
@@ -681,7 +693,6 @@ def reschedule_appointment(
     _ensure_not_past(new_date, new_slot_start)
 
     if payload.create_new or ap.status == "no_show":
-        # keep old as history, create new one
         _ensure_no_patient_duplicate(db, ap.patient_id, new_date)
         _ensure_slot_free_for_doctor(db, ap.doctor_user_id, new_date,
                                      new_slot_start)
@@ -704,7 +715,6 @@ def reschedule_appointment(
             "appointment_id": new_ap.id,
         }
 
-    # normal reschedule on same row
     _ensure_no_patient_duplicate(db, ap.patient_id, new_date, ap.id)
     _ensure_slot_free_for_doctor(
         db,
@@ -734,7 +744,9 @@ def reschedule_appointment(
 @router.get("/appointments/noshow", response_model=List[AppointmentRow])
 def list_no_show_appointments(
         for_date: Optional[dt_date] = Query(
-            None, description="If omitted, today's date will be used"),
+            None,
+            description="If omitted, today's date will be used",
+        ),
         doctor_id: Optional[int] = Query(None),
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
@@ -821,8 +833,6 @@ def create_visit(
         raise HTTPException(status_code=404, detail="Appointment not found")
 
     epi = episode_id_for_month(db)
-
-    # actual check-in timestamp (local time, stored as naive)
     visit_at_local = now_local().replace(tzinfo=None)
 
     v = Visit(
@@ -1077,8 +1087,6 @@ def add_rad_orders(
 
 
 # ------------------- FOLLOW-UP MODULE -------------------
-
-
 def _build_followup_row(fu: FollowUp) -> FollowUpRow:
     p = fu.patient
     d = fu.doctor
@@ -1216,15 +1224,14 @@ def schedule_followup(
     """
     Confirm a waiting follow-up into a real Appointment.
 
-    This endpoint is intentionally lenient with payload shape to avoid 422
-    validation errors. Expected JSON body:
+    This endpoint is intentionally lenient with payload shape to avoid 422.
+    Expected JSON body:
 
     {
       "date": "YYYY-MM-DD",   # optional; if missing uses followup.due_date
       "slot_start": "HH:MM"   # required
     }
     """
-    # Load follow-up with relations
     fu = (db.query(FollowUp).options(
         joinedload(FollowUp.patient),
         joinedload(FollowUp.doctor),
@@ -1243,7 +1250,6 @@ def schedule_followup(
             or has_perm(user, "appointments.create")):
         raise HTTPException(status_code=403, detail="Not permitted")
 
-    # ---- Extract and normalize input fields from raw JSON ----
     raw_date = body.get("date")
     raw_slot = body.get("slot_start") or body.get("slot")
 
@@ -1257,7 +1263,6 @@ def schedule_followup(
         elif isinstance(raw_date, datetime):
             d = raw_date.date()
         elif isinstance(raw_date, str):
-            # Accept "YYYY-MM-DD" or an ISO string like "YYYY-MM-DDTHH:MM:SS"
             try:
                 d = datetime.strptime(raw_date[:10], "%Y-%m-%d").date()
             except Exception:
@@ -1271,13 +1276,10 @@ def schedule_followup(
                 detail="Invalid date format, expected YYYY-MM-DD",
             )
     else:
-        # Fallback: use existing follow-up due date
         d = fu.due_date
 
-    # Parse time string into dt_time
     slot_start = _parse_slot(raw_slot)
 
-    # ---- Apply normal booking rules ----
     sch = _get_active_schedule_for_doctor_and_date(db, fu.doctor_user_id, d)
     slot_end = _compute_slot_end(d, slot_start, sch.slot_minutes)
     _check_slot_in_schedule(sch, d, slot_start, slot_end)
@@ -1285,7 +1287,6 @@ def schedule_followup(
     _ensure_no_patient_duplicate(db, fu.patient_id, d)
     _ensure_slot_free_for_doctor(db, fu.doctor_user_id, d, slot_start)
 
-    # ---- Create appointment ----
     ap = Appointment(
         patient_id=fu.patient_id,
         department_id=fu.department_id,
@@ -1299,7 +1300,6 @@ def schedule_followup(
     db.add(ap)
     db.flush()
 
-    # Link & update follow-up
     fu.appointment_id = ap.id
     fu.due_date = d
     fu.status = "scheduled"
@@ -1315,15 +1315,158 @@ def schedule_followup(
     }
 
 
+# ------------------- DOCTOR FEES MASTER -------------------
+def _doctor_fee_to_out(row: DoctorFee,
+                       doctor_name: Optional[str] = None) -> DoctorFeeOut:
+    dto = DoctorFeeOut.model_validate(row, from_attributes=True)
+    if doctor_name:
+        dto.doctor_name = doctor_name
+    return dto
+
+
+@router.get("/doctor-fees", response_model=List[DoctorFeeOut])
+def list_doctor_fees(
+        doctor_user_id: Optional[int] = Query(None),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    """
+    Doctor Consultation Fee master (for billing auto-pricing).
+    """
+    if not _has_any_perm(
+            user,
+        {"schedules.manage", "billing.view", "appointments.view"},
+    ):
+        raise HTTPException(status_code=403, detail="Not permitted")
+
+    q = (db.query(DoctorFee, User.name).join(
+        User, User.id == DoctorFee.doctor_user_id).order_by(User.name.asc()))
+    if doctor_user_id:
+        q = q.filter(DoctorFee.doctor_user_id == doctor_user_id)
+
+    rows = q.all()
+    out: List[DoctorFeeOut] = []
+    for fee, doc_name in rows:
+        out.append(_doctor_fee_to_out(fee, doc_name))
+    return out
+
+
+@router.post("/doctor-fees", response_model=DoctorFeeOut)
+def create_doctor_fee(
+        payload: DoctorFeeCreate,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    if not has_perm(user, "schedules.manage"):
+        raise HTTPException(status_code=403, detail="Not permitted")
+
+    doc = db.get(User, payload.doctor_user_id)
+    if not doc or not doc.is_active:
+        raise HTTPException(status_code=404, detail="Doctor user not found")
+
+    existing = (db.query(DoctorFee).filter(
+        DoctorFee.doctor_user_id == payload.doctor_user_id).first())
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail="Fee already exists for this doctor. Use update instead.",
+        )
+
+    fee = DoctorFee(
+        doctor_user_id=payload.doctor_user_id,
+        base_fee=payload.base_fee,
+        followup_fee=payload.followup_fee,
+        currency=payload.currency or "INR",
+        is_active=payload.is_active,
+        notes=payload.notes or None,
+    )
+    db.add(fee)
+    db.commit()
+    db.refresh(fee)
+    return _doctor_fee_to_out(fee, doctor_name=doc.name)
+
+
+@router.get("/doctor-fees/{fee_id}", response_model=DoctorFeeOut)
+def get_doctor_fee(
+        fee_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    if not _has_any_perm(
+            user,
+        {"schedules.manage", "billing.view", "appointments.view"},
+    ):
+        raise HTTPException(status_code=403, detail="Not permitted")
+
+    fee = db.get(DoctorFee, fee_id)
+    if not fee:
+        raise HTTPException(status_code=404, detail="Not found")
+    doc = db.get(User, fee.doctor_user_id)
+    return _doctor_fee_to_out(fee, doctor_name=doc.name if doc else None)
+
+
+@router.put("/doctor-fees/{fee_id}", response_model=DoctorFeeOut)
+def update_doctor_fee(
+        fee_id: int,
+        payload: DoctorFeeUpdate,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    if not has_perm(user, "schedules.manage"):
+        raise HTTPException(status_code=403, detail="Not permitted")
+
+    fee = db.get(DoctorFee, fee_id)
+    if not fee:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    data = payload.model_dump(exclude_unset=True)
+    for k, v in data.items():
+        setattr(fee, k, v)
+
+    fee.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(fee)
+    doc = db.get(User, fee.doctor_user_id)
+    return _doctor_fee_to_out(fee, doctor_name=doc.name if doc else None)
+
+
+@router.delete("/doctor-fees/{fee_id}")
+def delete_doctor_fee(
+        fee_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    """
+    Hard delete doctor fee row.
+    You can disable instead by setting is_active=false from UI.
+    """
+    if not has_perm(user, "schedules.manage"):
+        raise HTTPException(status_code=403, detail="Not permitted")
+
+    fee = db.get(DoctorFee, fee_id)
+    if not fee:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    db.delete(fee)
+    db.commit()
+    return {"message": "Deleted"}
+
+
 # ------------------- OPD DASHBOARD (Summary) -------------------
 @router.get("/dashboard")
 def opd_dashboard_summary(
         date_from: Optional[dt_date] = Query(
-            None, description="From date (YYYY-MM-DD), default = last 7 days"),
+            None,
+            description="From date (YYYY-MM-DD), default = last 7 days",
+        ),
         date_to: Optional[dt_date] = Query(
-            None, description="To date (YYYY-MM-DD), default = today"),
+            None,
+            description="To date (YYYY-MM-DD), default = today",
+        ),
         doctor_id: Optional[int] = Query(
-            None, description="Optional filter for a single doctor_user_id"),
+            None,
+            description="Optional filter for a single doctor_user_id",
+        ),
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
 ):
@@ -1335,18 +1478,15 @@ def opd_dashboard_summary(
     - Doctor-wise appointment stats
     """
 
-    # Permissions: either appointments.view OR mis.opd.view
     if not (has_perm(user, "appointments.view")
             or has_perm(user, "mis.opd.view")):
         raise HTTPException(status_code=403, detail="Not permitted")
 
-    # Defaults: last 7 days
     if date_to is None:
         date_to = dt_date.today()
     if date_from is None:
         date_from = date_to - timedelta(days=6)
 
-    # Common filters
     base_filters = [
         Appointment.date >= date_from,
         Appointment.date <= date_to,
@@ -1354,7 +1494,6 @@ def opd_dashboard_summary(
     if doctor_id:
         base_filters.append(Appointment.doctor_user_id == doctor_id)
 
-    # ---- Appointment-level aggregates ----
     ap_base = db.query(Appointment).filter(*base_filters)
 
     total_appointments = ap_base.count()
@@ -1370,7 +1509,6 @@ def opd_dashboard_summary(
         func.count(func.distinct(
             Appointment.patient_id))).filter(*base_filters).scalar() or 0)
 
-    # ---- Follow-up aggregates ----
     fu_filters = [
         FollowUp.due_date >= date_from,
         FollowUp.due_date <= date_to,
@@ -1389,15 +1527,12 @@ def opd_dashboard_summary(
     followups_cancelled = fu_base.filter(
         FollowUp.status == "cancelled").count()
 
-    # Follow-ups per doctor (for mapping into doctor_stats)
     fu_per_doc_rows = (db.query(
         FollowUp.doctor_user_id.label("doctor_id"),
         func.count(FollowUp.id).label("total"),
     ).filter(*fu_filters).group_by(FollowUp.doctor_user_id).all())
     fu_per_doc = {row.doctor_id: row.total for row in fu_per_doc_rows}
 
-    # ---- Doctor-wise appointment stats ----
-    # Group by doctor & department
     doc_rows = (db.query(
         Appointment.doctor_user_id.label("doctor_id"),
         User.name.label("doctor_name"),
@@ -1417,7 +1552,7 @@ def opd_dashboard_summary(
                 Department.name,
             ).order_by(func.count(Appointment.id).desc()).all())
 
-    doctor_stats = []
+    doctor_stats: List[Dict[str, Any]] = []
     for row in doc_rows:
         doc_id = row.doctor_id
         doctor_stats.append({
@@ -1439,7 +1574,6 @@ def opd_dashboard_summary(
             int(fu_per_doc.get(doc_id, 0)),
         })
 
-    # Top doctors
     top_by_appointments = (max(doctor_stats,
                                key=lambda d: d["total_appointments"])
                            if doctor_stats else None)
