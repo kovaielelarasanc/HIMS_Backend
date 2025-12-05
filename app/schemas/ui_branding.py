@@ -51,6 +51,8 @@ class UiBrandingOut(UiBrandingBase):
     favicon_url: Optional[str] = None
     pdf_header_url: Optional[str] = None
     pdf_footer_url: Optional[str] = None
+    letterhead_url: Optional[str] = None
+    letterhead_position: Optional[str] = None
 
     updated_at: Optional[str] = None
     updated_by_name: Optional[str] = None

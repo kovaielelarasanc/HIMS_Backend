@@ -37,6 +37,14 @@ router = APIRouter(prefix="/pharmacy", tags=["pharmacy"])
 # INTERNAL HELPERS – for display fields (patient / doctor / items)
 # ------------------------------------------------------------------
 
+def has_perm(user: User, code: str) -> bool:
+    if user.is_admin:
+        return True
+    for r in user.roles:
+        for p in r.permissions:
+            if p.code == code:
+                return True
+    return False
 
 def _attach_display_fields(rx: PharmacyPrescription) -> PharmacyPrescription:
     """

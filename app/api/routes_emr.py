@@ -43,7 +43,7 @@ from app.models.ipd import (
     IpdBed,
     IpdBedAssignment,
 )
-from app.models.ot import OtOrder, OtAttachment
+from app.models.ot import OtSchedule
 from app.models.billing import Invoice, InvoiceItem, Payment
 
 # Pharmacy (optional, NEW models)
@@ -663,10 +663,9 @@ def _build_timeline(
 
     # --- OT Case ---
     if _want("ot", allow):
-        ot = (db.query(OtOrder).options(joinedload(
-            OtOrder.attachments)).filter(
-                OtOrder.patient_id == patient_id).order_by(
-                    OtOrder.id.desc()).limit(200).all())
+        ot = (db.query(OtSchedule)(
+                OtSchedule.patient_id == patient_id).order_by(
+                    OtSchedule.id.desc()).limit(200).all())
         for oc in ot:
             ts = oc.actual_end or oc.actual_start or oc.scheduled_start or oc.created_at
             ts = _safe_dt(ts)

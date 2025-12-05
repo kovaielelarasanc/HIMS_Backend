@@ -44,8 +44,9 @@ def seed_permissions(db: Session) -> None:
             "consents.view",
             "consents.create",
             "attachments.manage",
+            "masters.view",
+            "masters.manage",
         ]),
-        ("patients.masters", ["view", "manage"]),
 
         # -------- OPD ----------
         ("schedules", ["manage"]),
@@ -85,6 +86,8 @@ def seed_permissions(db: Session) -> None:
         ("lab.samples", ["collect"]),
         ("lab.results", ["enter", "validate", "report"]),
         ("lab.attachments", ["add"]),
+        ("lis.masters.departments", ["view", "create", "update", "delete"]),
+        ("lis.masters.services", ["view", "create", "update", "delete"]),
 
         # -------- RIS ----------
         ("radiology.masters", ["view", "manage"]),
@@ -95,8 +98,28 @@ def seed_permissions(db: Session) -> None:
         ("radiology.attachments", ["add"]),
 
         # -------- OT ----------
-        ("ot.masters", ["view", "manage"]),
-        ("ot.cases", ["view", "update", "create"]),
+        ("ot.masters", ["view", "create", "update", "delete"]),
+        ("ot.specialities", ["view", "create", "update", "delete"]),
+        ("ot.theatres", ["view", "create", "update", "delete"]),
+        ("ot.equipment", ["view", "create", "update", "delete"]),
+        ("ot.environment", ["view", "create", "update", "delete"]),
+        ("ot.schedule", ["view", "create", "update", "delete", "cancel"]),
+        ("ot.cases", ["view", "create", "update", "delete", "close"]),
+        ("ot.pre_anaesthesia", ["view", "create", "update"]),
+        ("ot.preop_checklist", ["view", "create", "update"]),
+        ("ot.surgical_safety", ["view", "create", "update"]),
+        ("ot.anaesthesia_record", ["view", "create", "update"]),
+        ("ot.anaesthesia_vitals", ["view", "create", "update", "delete"]),
+        ("ot.anaesthesia_drugs", ["view", "create", "update", "delete"]),
+        ("ot.nursing_record", ["view", "create", "update"]),
+        ("ot.counts", ["view", "create", "update"]),
+        ("ot.implants", ["view", "create", "update", "delete"]),
+        ("ot.operation_notes", ["view", "create", "update"]),
+        ("ot.blood_transfusion", ["view", "create", "update", "delete"]),
+        ("ot.pacu", ["view", "create", "update"]),
+        ("ot.equipment_checklist", ["view", "create", "update", "delete"]),
+        ("ot.cleaning_log", ["view", "create", "update", "delete"]),
+        ("ot.environment_log", ["view", "create", "update", "delete"]),
 
         # -------- Billing ----------
         ("billing", ["view", "create", "finalize"]),
@@ -172,19 +195,30 @@ def init_master_db(fresh: bool = False) -> None:
 def init_tenant_db(db_uri: str, fresh: bool = False) -> None:
     """
     Create / migrate all tenant tables in a specific tenant DB and seed permissions.
+    For brand new tenants we temporarily disable FOREIGN_KEY_CHECKS so
+    MySQL doesn't complain about table creation order (FKs like lis_result_lines → lis_orders).
     """
     engine = get_or_create_tenant_engine(db_uri)
 
     if fresh:
         print(f"WARNING: Dropping ALL TENANT tables for {db_uri} (dev only) …")
-        Base.metadata.drop_all(bind=engine)
+        with engine.begin() as conn:
+            # Disable FK checks so drop_all doesn't choke on references
+            conn.execute(text("SET FOREIGN_KEY_CHECKS = 0"))
+            Base.metadata.drop_all(bind=conn)
+            conn.execute(text("SET FOREIGN_KEY_CHECKS = 1"))
 
     print(f"Creating tenant tables for {db_uri} …")
-    Base.metadata.create_all(bind=engine)
+    with engine.begin() as conn:
+        # ✅ Disable FK checks so create_all can create tables in any order
+        conn.execute(text("SET FOREIGN_KEY_CHECKS = 0"))
+        Base.metadata.create_all(bind=conn)
+        conn.execute(text("SET FOREIGN_KEY_CHECKS = 1"))
 
-    with engine.connect() as conn:
+        # Optional: see what got created
         print_tables(conn)
 
+    # Seed permissions AFTER tables are created
     try:
         with Session(engine) as db:
             seed_permissions(db)

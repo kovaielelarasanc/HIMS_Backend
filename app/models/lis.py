@@ -47,6 +47,86 @@ class LisOrder(Base):
                          cascade="all, delete-orphan")
 
 
+class LisResultLine(Base):
+    """
+    Per-order result row linked to LabService (department + sub-department analyte).
+
+    This is what you use for the “panel” style report like Haematology / CBC etc.
+    """
+    __tablename__ = "lis_result_lines"
+    __table_args__ = (
+        Index("ix_lis_res_order", "order_id"),
+        Index("ix_lis_res_service", "service_id"),
+        UniqueConstraint(
+            "order_id",
+            "service_id",
+            name="uq_lis_result_order_service",
+        ),
+        {
+            "mysql_engine": "InnoDB",
+            "mysql_charset": "utf8mb4",
+            "mysql_collate": "utf8mb4_unicode_ci",
+        },
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    order_id = Column(Integer, nullable=False, index=True)
+    service_id = Column(
+        Integer,
+        ForeignKey("lab_services.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+
+    # Snapshot fields (so old reports remain same even if master changes)
+    department_id = Column(Integer,
+                           ForeignKey("lab_departments.id"),
+                           nullable=True)
+    sub_department_id = Column(Integer,
+                               ForeignKey("lab_departments.id"),
+                               nullable=True)
+
+    service_name = Column(String(255), nullable=False)
+    unit = Column(String(64), nullable=True)
+    normal_range = Column(String(255), nullable=True)
+
+    result_value = Column(String(255), nullable=True)
+    flag = Column(String(4), nullable=True)  # H / L / N / CRIT / etc.
+    comments = Column(Text, nullable=True)
+
+    entered_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    validated_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    reported_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(
+        DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+
+    order = relationship(
+        "LisOrder",
+        backref="result_lines",
+        primaryjoin="LisResultLine.order_id == LisOrder.id",
+        foreign_keys=[order_id],
+    )
+    service = relationship("LabService", backref="result_lines")
+
+    department = relationship(
+        "LabDepartment",
+        foreign_keys=[department_id],
+        backref="result_lines_main",
+    )
+    sub_department = relationship(
+        "LabDepartment",
+        foreign_keys=[sub_department_id],
+        backref="result_lines_sub",
+    )
+
+
 class LisOrderItem(Base):
     """
     Individual test line item.
@@ -112,3 +192,100 @@ class LisAttachment(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     item = relationship("LisOrderItem", back_populates="attachments")
+
+
+class LabDepartment(Base):
+    """
+    Lab Department / Sub-department master.
+
+    Examples:
+      - Biochemistry (parent)
+      - Haematology (parent)
+      - Clinical Pathology (parent)
+      - Cardiac Markers (child of Biochemistry)
+    """
+    __tablename__ = "lab_departments"
+    __table_args__ = (
+        UniqueConstraint("name",
+                         "parent_id",
+                         name="uq_lab_dept_name_per_parent"),
+        {
+            "mysql_engine": "InnoDB",
+            "mysql_charset": "utf8mb4",
+            "mysql_collate": "utf8mb4_unicode_ci",
+        },
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(255), nullable=False)
+    code = Column(String(50), nullable=True, index=True)
+    description = Column(Text, nullable=True)
+
+    # NULL = top level (department)
+    # non-NULL = sub department
+    parent_id = Column(Integer,
+                       ForeignKey("lab_departments.id"),
+                       nullable=True)
+
+    is_active = Column(Boolean, nullable=False, default=True)
+    display_order = Column(Integer, nullable=True)
+
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime,
+                        nullable=False,
+                        default=datetime.utcnow,
+                        onupdate=datetime.utcnow)
+
+    parent = relationship("LabDepartment",
+                          remote_side=[id],
+                          backref="children")
+    services = relationship("LabService", back_populates="department")
+
+
+class LabService(Base):
+    """
+    Department-wise service (test) master.
+
+    - Unit, Normal Range are optional:
+      if blank, we store "-" at DB level.
+    """
+    __tablename__ = "lab_services"
+    __table_args__ = (
+        UniqueConstraint("department_id",
+                         "name",
+                         name="uq_lab_service_name_per_dept"),
+        {
+            "mysql_engine": "InnoDB",
+            "mysql_charset": "utf8mb4",
+            "mysql_collate": "utf8mb4_unicode_ci",
+        },
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    department_id = Column(Integer,
+                           ForeignKey("lab_departments.id"),
+                           nullable=False,
+                           index=True)
+
+    name = Column(String(255), nullable=False)
+    code = Column(String(50), nullable=True, index=True)
+
+    unit = Column(String(64), nullable=True)  # UI sends "" -> "-"
+    normal_range = Column(String(255), nullable=True)  # UI sends "" -> "-"
+
+    # Advanced fields (can be empty now, useful later)
+    sample_type = Column(String(128), nullable=True)  # Serum / Plasma / Urine
+    method = Column(String(128), nullable=True)  # Immunoassay / Colorimetric
+    comments_template = Column(Text, nullable=True)  # auto comments on report
+
+    is_active = Column(Boolean, nullable=False, default=True)
+    display_order = Column(Integer, nullable=True)
+
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime,
+                        nullable=False,
+                        default=datetime.utcnow,
+                        onupdate=datetime.utcnow)
+
+    department = relationship("LabDepartment", back_populates="services")

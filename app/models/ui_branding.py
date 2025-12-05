@@ -60,6 +60,10 @@ class UiBranding(Base):
     # --- PDF: header/footer artwork + behaviour ---
     pdf_header_path = Column(String(255), nullable=True)
     pdf_footer_path = Column(String(255), nullable=True)
+    
+    letterhead_path = Column(String(255), nullable=True)          # PDF or image
+    letterhead_type = Column(String(50), nullable=True)           # pdf / image
+    letterhead_position = Column(String(50), default="background")  
 
     # space reserved for header/footer (millimetres).
     # frontends never need this, only PDF code.

@@ -25,22 +25,25 @@ from app.api import (
     routes_ipd_masters,
     routes_ipd,
     routes_pharmacy,
-    # Pharmacy
-    # routes_pharmacy_dispense, routes_pharmacy_inventory, routes_pharmacy_procurement,
-    # routes_pharmacy_masters, routes_pharmacy_reports, routes_pharmacy_rx,
+ 
     routes_pharmacy_rx_list,
-    # routes_pharmacy_billing,
-    # LIS / RIS / OT / Billing
+  
     routes_lis,
     routes_ris,
-    routes_ot,
+    
     routes_billing,
+    
     routes_ot_masters,
+    routes_ot_schedule_cases,
+    routes_ot_clinical,
+    routes_ot_admin_logs,
+    
+    
     routes_system,
-    # Files & History
+   
     routes_files,
     routes_lis_history,
-    routes_ot_history,
+
     routes_ris_history,
     routes_emr,
     routes_templates,
@@ -51,7 +54,9 @@ from app.api import (
     routes_masters_credit,
     routes_ui_branding,
     routes_inventory,
-    routes_audit_logs)
+    routes_audit_logs,
+    routes_lis_masters
+    )
 
 api_router = APIRouter()
 
@@ -105,13 +110,6 @@ api_router.include_router(routes_ipd_masters.router,
                           tags=["ipd"])
 api_router.include_router(routes_ipd.router, prefix="/ipd", tags=["ipd"])
 
-# ---- Pharmacy
-# api_router.include_router(routes_pharmacy_masters.router,     prefix="/pharmacy", tags=["Pharmacy Masters"])
-# api_router.include_router(routes_pharmacy_procurement.router, prefix="/pharmacy", tags=["Pharmacy Procurement"])
-# api_router.include_router(routes_pharmacy_inventory.router,   prefix="/pharmacy", tags=["Pharmacy Inventory"])
-# api_router.include_router(routes_pharmacy_dispense.router,    prefix="/pharmacy", tags=["Pharmacy Dispense"])
-# api_router.include_router(routes_pharmacy_reports.router,     prefix="/pharmacy", tags=["Pharmacy Alerts/Reports"])
-# api_router.include_router(routes_pharmacy_rx.router,          prefix="/pharmacy", tags=["Pharmacy Prescriptions"])
 
 # ---- Masters
 api_router.include_router(routes_masters.router,
@@ -119,19 +117,29 @@ api_router.include_router(routes_masters.router,
                           tags=["masters"])
 
 # ---- LIS / RIS / OT / Billing
-api_router.include_router(routes_lis.router)
+api_router.include_router(routes_lis.router,  prefix="/lab", tags=["LIS Orders"])
+api_router.include_router(routes_lis_masters.router)
+
+
 api_router.include_router(routes_ris.router)
-api_router.include_router(routes_ot.router)
+
 api_router.include_router(routes_billing.router,
                           prefix="/billing",
                           tags=["billing"])
+
+
+
 api_router.include_router(routes_ot_masters.router)
+api_router.include_router(routes_ot_schedule_cases.router)
+api_router.include_router(routes_ot_clinical.router)
+api_router.include_router(routes_ot_admin_logs.router)
+
 
 # ---- Files & History
 api_router.include_router(routes_files.router, prefix="/files", tags=["Files"])
 api_router.include_router(routes_lis_history.router)
 api_router.include_router(routes_ris_history.router)
-api_router.include_router(routes_ot_history.router)
+
 
 api_router.include_router(routes_emr.router, prefix="/emr", tags=["EMR"])
 
@@ -157,8 +165,6 @@ api_router.include_router(
     prefix="/pharmacy",
     tags=["Pharmacy Rx"],
 )
-# api_router.include_router(routes_pharmacy_billing.router,
-#                           prefix="/pharmacy/billing",
-#                           tags=["pharmacy-billing"])
+
 
 api_router.include_router(routes_system.router, tags=["system"])

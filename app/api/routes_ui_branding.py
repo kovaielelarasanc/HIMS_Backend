@@ -1,4 +1,4 @@
-# app/api/routes_ui_branding.py
+# FILE: app/api/routes_ui_branding.py
 from __future__ import annotations
 
 import logging
@@ -14,6 +14,7 @@ from fastapi import (
     File,
     HTTPException,
     UploadFile,
+    Form,
 )
 from fastapi.responses import StreamingResponse
 from reportlab.lib.pagesizes import A4
@@ -30,7 +31,7 @@ from app.schemas.ui_branding import (
     UiBrandingPublicOut,
     UiBrandingUpdate,
 )
-from app.services.ui_branding import get_or_create_default_ui_branding, get_ui_branding
+from app.services.ui_branding import get_or_create_default_ui_branding
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,13 @@ def has_perm(user: User, code: str) -> bool:
             if p.code == code:
                 return True
     return False
+
+
+def _ensure_branding(db: Session,
+                     current_user: Optional[User] = None) -> UiBranding:
+    """Always return a branding row, creating a default if needed."""
+    updated_by_id = current_user.id if current_user else None
+    return get_or_create_default_ui_branding(db, updated_by_id=updated_by_id)
 
 
 def _path_to_url(rel_path: Optional[str]) -> Optional[str]:
@@ -90,6 +98,8 @@ def _branding_to_out(branding: UiBranding) -> UiBrandingOut:
         favicon_url=_path_to_url(branding.favicon_path),
         pdf_header_url=_path_to_url(branding.pdf_header_path),
         pdf_footer_url=_path_to_url(branding.pdf_footer_path),
+        letterhead_url=_path_to_url(branding.letterhead_path),
+        letterhead_position=branding.letterhead_position,
         updated_at=branding.updated_at.isoformat()
         if branding.updated_at else None,
         updated_by_name=branding.updated_by.email
@@ -102,39 +112,111 @@ def _branding_to_public(branding: UiBranding) -> UiBrandingPublicOut:
         org_name=branding.org_name,
         org_tagline=branding.org_tagline,
         primary_color=branding.primary_color,
+        primary_color_dark=branding.primary_color_dark,
         sidebar_bg_color=branding.sidebar_bg_color,
         content_bg_color=branding.content_bg_color,
+        card_bg_color=branding.card_bg_color,
+        border_color=branding.border_color,
         text_color=branding.text_color,
+        text_muted_color=branding.text_muted_color,
+        icon_color=branding.icon_color,
+        icon_bg_color=branding.icon_bg_color,
         logo_url=_path_to_url(branding.logo_path),
         login_logo_url=_path_to_url(branding.login_logo_path),
         favicon_url=_path_to_url(branding.favicon_path),
     )
 
 
-def _save_branding_file(upload: UploadFile, prefix: str) -> str:
+def _save_any_branding_file(upload: UploadFile, prefix: str) -> str:
+    """
+    For letterhead: allow images + PDFs + DOC/DOCX (stored, even if not directly used).
+    """
     if not upload.filename:
         raise HTTPException(status_code=400, detail="Empty file")
 
-    content_type = upload.content_type or ""
-    if not content_type.startswith("image/"):
+    allowed = [
+        "image/png",
+        "image/jpeg",
+        "image/jpg",
+        "application/pdf",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/msword",
+    ]
+
+    if upload.content_type not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file format: {upload.content_type}",
+        )
+
+    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    safe = upload.filename.replace(" ", "_")
+    dest = BRANDING_DIR.joinpath(f"{prefix}_{ts}_{safe}")
+
+    with dest.open("wb") as f:
+        shutil.copyfileobj(upload.file, f)
+
+    rel = dest.relative_to(settings.STORAGE_DIR).as_posix()
+    return rel
+
+
+def _save_image_branding_file(upload: UploadFile, prefix: str) -> str:
+    """
+    For logo / header / footer: restrict to images.
+    """
+    if not upload.filename:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    if not (upload.content_type or "").startswith("image/"):
         raise HTTPException(status_code=400,
                             detail="Only image files are allowed")
 
     ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-    safe_name = upload.filename.replace(" ", "_")
-    dest = BRANDING_DIR.joinpath(f"{prefix}_{ts}_{safe_name}")
+    safe = upload.filename.replace(" ", "_")
+    dest = BRANDING_DIR.joinpath(f"{prefix}_{ts}_{safe}")
 
-    try:
-        with dest.open("wb") as f:
-            shutil.copyfileobj(upload.file, f)
-    finally:
-        upload.file.close()
+    with dest.open("wb") as f:
+        shutil.copyfileobj(upload.file, f)
 
-    rel_path = dest.relative_to(settings.STORAGE_DIR).as_posix()
-    return rel_path
+    rel = dest.relative_to(settings.STORAGE_DIR).as_posix()
+    return rel
 
 
 # --- API Endpoints ---------------------------------------------------------
+
+
+@router.post("/ui-branding/letterhead", response_model=UiBrandingOut)
+def upload_letterhead(
+        file: UploadFile = File(...),
+        position: str = Form("background"),  # ✅ from form, not query
+        db: Session = Depends(get_db),
+        current_user: User = Depends(auth_current_user),
+):
+    if not has_perm(current_user, "settings.customization.manage"):
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+
+    branding = _ensure_branding(db, current_user)
+
+    rel_path = _save_any_branding_file(file, "letterhead")
+
+    # detect type
+    if file.content_type.startswith("image/"):
+        branding.letterhead_type = "image"
+    elif file.content_type == "application/pdf":
+        branding.letterhead_type = "pdf"
+    else:
+        branding.letterhead_type = "doc"
+
+    # ✅ store both path + position
+    branding.letterhead_path = rel_path
+    branding.letterhead_position = position
+    branding.updated_by_id = current_user.id
+
+    db.add(branding)
+    db.commit()
+    db.refresh(branding)
+
+    return _branding_to_out(branding)
 
 
 @router.get("/ui-branding", response_model=UiBrandingOut)
@@ -142,23 +224,16 @@ def get_ui_branding_admin(
         db: Session = Depends(get_db),
         current_user: User = Depends(auth_current_user),
 ):
-    """
-    Full branding object for authenticated admin screens.
-    """
     if not has_perm(current_user, "settings.customization.view"):
         raise HTTPException(status_code=403, detail="Not enough permissions")
 
-    branding = get_or_create_default_ui_branding(db,
-                                                 updated_by_id=current_user.id)
+    branding = _ensure_branding(db, current_user)
     return _branding_to_out(branding)
 
 
 @router.get("/ui-branding/public", response_model=UiBrandingPublicOut)
-def get_ui_branding_public(db: Session = Depends(get_db), ):
-    """
-    Lightweight branding without auth – for login page / marketing site.
-    """
-    branding = get_or_create_default_ui_branding(db)
+def get_ui_branding_public(db: Session = Depends(get_db)):
+    branding = _ensure_branding(db)
     return _branding_to_public(branding)
 
 
@@ -168,15 +243,10 @@ def update_ui_branding(
         db: Session = Depends(get_db),
         current_user: User = Depends(auth_current_user),
 ):
-    """
-    Update organisation details, colors & PDF options.
-    File uploads are handled via /ui-branding/assets.
-    """
     if not has_perm(current_user, "settings.customization.manage"):
         raise HTTPException(status_code=403, detail="Not enough permissions")
 
-    branding = get_or_create_default_ui_branding(db,
-                                                 updated_by_id=current_user.id)
+    branding = _ensure_branding(db, current_user)
 
     data = payload.model_dump(exclude_unset=True)
     for field, value in data.items():
@@ -206,42 +276,35 @@ def upload_ui_branding_assets(
         db: Session = Depends(get_db),
         current_user: User = Depends(auth_current_user),
 ):
-    """
-    Upload assets:
-    - logo        -> sidebar/topbar
-    - login_logo  -> login page (optional)
-    - favicon     -> browser tab (future)
-    - pdf_header  -> header on ALL PDFs (mandatory recommended)
-    - pdf_footer  -> footer on ALL PDFs
-    """
     if not has_perm(current_user, "settings.customization.manage"):
         raise HTTPException(status_code=403, detail="Not enough permissions")
 
-    branding = get_or_create_default_ui_branding(db,
-                                                 updated_by_id=current_user.id)
+    branding = _ensure_branding(db, current_user)
 
     try:
         changed = False
 
         if logo is not None:
-            branding.logo_path = _save_branding_file(logo, "logo")
+            branding.logo_path = _save_image_branding_file(logo, "logo")
             changed = True
 
         if login_logo is not None:
-            branding.login_logo_path = _save_branding_file(login_logo, "login")
+            branding.login_logo_path = _save_image_branding_file(
+                login_logo, "login")
             changed = True
 
         if favicon is not None:
-            branding.favicon_path = _save_branding_file(favicon, "favicon")
+            branding.favicon_path = _save_image_branding_file(
+                favicon, "favicon")
             changed = True
 
         if pdf_header is not None:
-            branding.pdf_header_path = _save_branding_file(
+            branding.pdf_header_path = _save_image_branding_file(
                 pdf_header, "pdf_header")
             changed = True
 
         if pdf_footer is not None:
-            branding.pdf_footer_path = _save_branding_file(
+            branding.pdf_footer_path = _save_image_branding_file(
                 pdf_footer, "pdf_footer")
             changed = True
 
@@ -267,15 +330,12 @@ def preview_branding_pdf(
         db: Session = Depends(get_db),
         current_user: User = Depends(auth_current_user),
 ):
-    """
-    Generate a 1-page sample PDF to validate header/footer + hospital details.
-    """
     if not has_perm(current_user, "settings.customization.view"):
         raise HTTPException(status_code=403, detail="Not enough permissions")
 
-    branding = get_or_create_default_ui_branding(db)
+    branding = _ensure_branding(db, current_user)
     buf = BytesIO()
-    from reportlab.pdfgen import canvas  # import locally to avoid circular
+    from reportlab.pdfgen import canvas
 
     c = canvas.Canvas(buf, pagesize=A4)
     width, height = A4
@@ -285,6 +345,26 @@ def preview_branding_pdf(
 
     header_h = header_height_mm * mm
     footer_h = footer_height_mm * mm
+
+    # --- LETTERHEAD (if image) as full-page background ---
+    if (branding.letterhead_path and branding.letterhead_type == "image" and
+        (branding.letterhead_position or "background") == "background"):
+        letter_path = Path(settings.STORAGE_DIR).joinpath(
+            branding.letterhead_path)
+        if letter_path.exists():
+            try:
+                img = ImageReader(str(letter_path))
+                c.drawImage(
+                    img,
+                    x=0,
+                    y=0,
+                    width=width,
+                    height=height,
+                    preserveAspectRatio=True,
+                    mask="auto",
+                )
+            except Exception:
+                logger.exception("Failed to draw letterhead background")
 
     # HEADER IMAGE
     if branding.pdf_header_path:
@@ -333,7 +413,7 @@ def preview_branding_pdf(
     c.drawString(
         20 * mm,
         height / 2,
-        "This is a sample PDF to preview header/footer & hospital details.",
+        "This is a sample PDF to preview letterhead, header/footer & hospital details.",
     )
 
     if branding.pdf_show_page_number:

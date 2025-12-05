@@ -18,7 +18,7 @@ from app.models.pharmacy_prescription import (
 )
 from app.models.lis import LisOrder, LisOrderItem
 from app.models.ris import RisOrder
-from app.models.ot import OtOrder
+from app.models.ot import OtSchedule
 # ✅ include Payment for payment-mode widget
 from app.models.billing import Invoice, InvoiceItem, Payment
 from app.schemas.dashboard import DashboardDataResponse, DashboardWidget
