@@ -9,46 +9,48 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_db, current_user
 from app.models.ot import (
     OtSpeciality,
-    OtTheatre,
     OtEquipmentMaster,
-    OtEnvironmentSetting,
+    OtProcedure,
 )
 from app.schemas.ot import (
     # Speciality
     OtSpecialityCreate,
     OtSpecialityUpdate,
     OtSpecialityOut,
-    # Theatre
-    OtTheatreCreate,
-    OtTheatreUpdate,
-    OtTheatreOut,
     # Equipment
     OtEquipmentMasterCreate,
     OtEquipmentMasterUpdate,
     OtEquipmentMasterOut,
-    # Environment
-    OtEnvironmentSettingCreate,
-    OtEnvironmentSettingUpdate,
-    OtEnvironmentSettingOut,
+    # Procedures
+    OtProcedureCreate,
+    OtProcedureOut,
+    OtProcedureUpdate,
 )
 from app.models.user import User
-
 
 router = APIRouter(prefix="/ot", tags=["OT - Masters"])
 
 # ============================================================
-#  OT SPECIALITIES
+#  RBAC Helper
 # ============================================================
 
 
-# ---------------- RBAC ----------------
 def _need_any(user: User, codes: list[str]) -> None:
+    """
+    Basic permission helper.
+    Admin (is_admin=True) bypasses checks.
+    """
     if getattr(user, "is_admin", False):
         return
     have = {p.code for r in (user.roles or []) for p in (r.permissions or [])}
     if have.intersection(set(codes)):
         return
     raise HTTPException(403, "Not permitted")
+
+
+# ============================================================
+#  OT SPECIALITIES
+# ============================================================
 
 
 @router.get("/specialities", response_model=List[OtSpecialityOut])
@@ -135,8 +137,9 @@ def update_ot_speciality(
     if not speciality:
         raise HTTPException(status_code=404, detail="OT Speciality not found")
 
-    # if code is changing, check uniqueness
     data = payload.model_dump(exclude_unset=True)
+
+    # if code is changing, check uniqueness
     new_code = data.get("code")
     if new_code and new_code != speciality.code:
         exists = (db.query(OtSpeciality).filter(
@@ -156,8 +159,10 @@ def update_ot_speciality(
     return speciality
 
 
-@router.delete("/specialities/{speciality_id}",
-               status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/specialities/{speciality_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
 def delete_ot_speciality(
         speciality_id: int,
         db: Session = Depends(get_db),
@@ -179,139 +184,148 @@ def delete_ot_speciality(
 
 
 # ============================================================
-#  OT THEATRES
+#  OT PROCEDURES MASTER
 # ============================================================
 
 
-@router.get("/theatres", response_model=List[OtTheatreOut])
-def list_ot_theatres(
-        active: Optional[bool] = Query(None),
-        search: Optional[str] = Query(
-            None, description="Search by code, name or location"),
-        speciality_id: Optional[int] = Query(
-            None, description="Filter by speciality_id"),
+@router.get(
+    "/procedures",
+    response_model=List[OtProcedureOut],
+)
+def list_ot_procedures(
         db: Session = Depends(get_db),
         user=Depends(current_user),
+        search: Optional[str] = Query(None),
+        speciality_id: Optional[int] = Query(None),
+        is_active: Optional[bool] = Query(None),
+        limit: int = Query(100, ge=1, le=500),
 ):
-    _need_any(user, ["ot.masters.view", "ot.theatres.view"])
+    _need_any(user, ["ot.masters.view", "ot.procedures.view"])
 
-    q = db.query(OtTheatre)
-
-    if active is not None:
-        q = q.filter(OtTheatre.is_active == active)
-
-    if speciality_id is not None:
-        q = q.filter(OtTheatre.speciality_id == speciality_id)
+    q = db.query(OtProcedure)
 
     if search:
-        like = f"%{search.strip()}%"
-        q = q.filter((OtTheatre.name.ilike(like))
-                     | (OtTheatre.code.ilike(like))
-                     | (OtTheatre.location.ilike(like)))
+        pattern = f"%{search.strip()}%"
+        q = q.filter((OtProcedure.name.ilike(pattern))
+                     | (OtProcedure.code.ilike(pattern)))
 
-    q = q.order_by(OtTheatre.is_active.desc(), OtTheatre.name.asc())
+    if speciality_id:
+        q = q.filter(OtProcedure.speciality_id == speciality_id)
+
+    if is_active is not None:
+        q = q.filter(OtProcedure.is_active == is_active)
+
+    q = q.order_by(OtProcedure.name.asc()).limit(limit)
     return q.all()
 
 
-@router.get("/theatres/{theatre_id}", response_model=OtTheatreOut)
-def get_ot_theatre(
-        theatre_id: int,
+@router.get(
+    "/procedures/{procedure_id}",
+    response_model=OtProcedureOut,
+)
+def get_ot_procedure(
+        procedure_id: int,
         db: Session = Depends(get_db),
         user=Depends(current_user),
 ):
-    _need_any(user, ["ot.masters.view", "ot.theatres.view"])
-
-    theatre = db.query(OtTheatre).get(theatre_id)
-    if not theatre:
-        raise HTTPException(status_code=404, detail="OT Theatre not found")
-    return theatre
+    _need_any(user, ["ot.masters.view", "ot.procedures.view"])
+    proc = db.query(OtProcedure).get(procedure_id)
+    if not proc:
+        raise HTTPException(status_code=404, detail="OT procedure not found")
+    return proc
 
 
 @router.post(
-    "/theatres",
-    response_model=OtTheatreOut,
+    "/procedures",
+    response_model=OtProcedureOut,
     status_code=status.HTTP_201_CREATED,
 )
-def create_ot_theatre(
-        payload: OtTheatreCreate,
+def create_ot_procedure(
+        payload: OtProcedureCreate,
         db: Session = Depends(get_db),
         user=Depends(current_user),
 ):
-    _need_any(user, ["ot.masters.create", "ot.theatres.create"])
+    _need_any(user, ["ot.masters.manage", "ot.procedures.create"])
 
-    existing = (db.query(OtTheatre).filter(
-        OtTheatre.code == payload.code).first())
+    # enforce unique code
+    existing = (db.query(OtProcedure).filter(
+        OtProcedure.code == payload.code).first())
     if existing:
         raise HTTPException(
             status_code=400,
-            detail="OT Theatre code already exists",
+            detail="Procedure code already exists",
         )
 
-    theatre = OtTheatre(
+    proc = OtProcedure(
         code=payload.code,
         name=payload.name,
-        location=payload.location,
         speciality_id=payload.speciality_id,
+        default_duration_min=payload.default_duration_min,
+        rate_per_hour=payload.rate_per_hour,
+        description=payload.description,
         is_active=payload.is_active,
     )
-    db.add(theatre)
+
+    db.add(proc)
     db.commit()
-    db.refresh(theatre)
-    return theatre
+    db.refresh(proc)
+    return proc
 
 
-@router.put("/theatres/{theatre_id}", response_model=OtTheatreOut)
-def update_ot_theatre(
-        theatre_id: int,
-        payload: OtTheatreUpdate,
+@router.put(
+    "/procedures/{procedure_id}",
+    response_model=OtProcedureOut,
+)
+def update_ot_procedure(
+        procedure_id: int,
+        payload: OtProcedureUpdate,
         db: Session = Depends(get_db),
         user=Depends(current_user),
 ):
-    _need_any(user, ["ot.masters.update", "ot.theatres.update"])
+    _need_any(user, ["ot.masters.manage", "ot.procedures.update"])
 
-    theatre = db.query(OtTheatre).get(theatre_id)
-    if not theatre:
-        raise HTTPException(status_code=404, detail="OT Theatre not found")
+    proc = db.query(OtProcedure).get(procedure_id)
+    if not proc:
+        raise HTTPException(status_code=404, detail="OT procedure not found")
 
     data = payload.model_dump(exclude_unset=True)
-    new_code = data.get("code")
 
-    if new_code and new_code != theatre.code:
-        existing = (db.query(OtTheatre).filter(
-            OtTheatre.code == new_code).first())
+    # if code changed, ensure uniqueness
+    new_code = data.get("code")
+    if new_code and new_code != proc.code:
+        existing = (db.query(OtProcedure).filter(
+            OtProcedure.code == new_code).first())
         if existing:
             raise HTTPException(
                 status_code=400,
-                detail="Another OT Theatre with this code already exists",
+                detail="Another procedure with this code already exists",
             )
 
     for field, value in data.items():
-        setattr(theatre, field, value)
+        setattr(proc, field, value)
 
-    db.add(theatre)
+    db.add(proc)
     db.commit()
-    db.refresh(theatre)
-    return theatre
+    db.refresh(proc)
+    return proc
 
 
-@router.delete("/theatres/{theatre_id}",
-               status_code=status.HTTP_204_NO_CONTENT)
-def delete_ot_theatre(
-        theatre_id: int,
+@router.delete(
+    "/procedures/{procedure_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_ot_procedure(
+        procedure_id: int,
         db: Session = Depends(get_db),
         user=Depends(current_user),
 ):
-    """
-    Soft delete – mark inactive instead of hard delete.
-    """
-    _need_any(user, ["ot.masters.delete", "ot.theatres.delete"])
+    _need_any(user, ["ot.masters.manage", "ot.procedures.delete"])
 
-    theatre = db.query(OtTheatre).get(theatre_id)
-    if not theatre:
-        raise HTTPException(status_code=404, detail="OT Theatre not found")
+    proc = db.query(OtProcedure).get(procedure_id)
+    if not proc:
+        raise HTTPException(status_code=404, detail="OT procedure not found")
 
-    theatre.is_active = False
-    db.add(theatre)
+    db.delete(proc)
     db.commit()
     return None
 
@@ -437,8 +451,10 @@ def update_ot_equipment(
     return equipment
 
 
-@router.delete("/equipment/{equipment_id}",
-               status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/equipment/{equipment_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
 def delete_ot_equipment(
         equipment_id: int,
         db: Session = Depends(get_db),
@@ -455,150 +471,5 @@ def delete_ot_equipment(
 
     equipment.is_active = False
     db.add(equipment)
-    db.commit()
-    return None
-
-
-# ============================================================
-#  OT ENVIRONMENT SETTINGS
-# ============================================================
-
-
-@router.get(
-    "/environment-settings",
-    response_model=List[OtEnvironmentSettingOut],
-)
-def list_ot_environment_settings(
-        theatre_id: Optional[int] = Query(None,
-                                          description="Filter by theatre_id"),
-        db: Session = Depends(get_db),
-        user=Depends(current_user),
-):
-    _need_any(user, ["ot.masters.view", "ot.environment.view"])
-
-    q = db.query(OtEnvironmentSetting)
-
-    if theatre_id is not None:
-        q = q.filter(OtEnvironmentSetting.theatre_id == theatre_id)
-
-    q = q.order_by(OtEnvironmentSetting.theatre_id.asc(),
-                   OtEnvironmentSetting.id.asc())
-    return q.all()
-
-
-@router.get(
-    "/environment-settings/{setting_id}",
-    response_model=OtEnvironmentSettingOut,
-)
-def get_ot_environment_setting(
-        setting_id: int,
-        db: Session = Depends(get_db),
-        user=Depends(current_user),
-):
-    _need_any(user, ["ot.masters.view", "ot.environment.view"])
-
-    setting = db.query(OtEnvironmentSetting).get(setting_id)
-    if not setting:
-        raise HTTPException(status_code=404,
-                            detail="OT Environment setting not found")
-    return setting
-
-
-@router.post(
-    "/environment-settings",
-    response_model=OtEnvironmentSettingOut,
-    status_code=status.HTTP_201_CREATED,
-)
-def create_ot_environment_setting(
-        payload: OtEnvironmentSettingCreate,
-        db: Session = Depends(get_db),
-        user=Depends(current_user),
-):
-    """
-    One environment setting per theatre is recommended.
-    """
-    _need_any(user, ["ot.masters.create", "ot.environment.create"])
-
-    existing = (db.query(OtEnvironmentSetting).filter(
-        OtEnvironmentSetting.theatre_id == payload.theatre_id).first())
-    if existing:
-        raise HTTPException(
-            status_code=400,
-            detail=
-            "Environment setting already exists for this theatre. Use update.",
-        )
-
-    setting = OtEnvironmentSetting(
-        theatre_id=payload.theatre_id,
-        min_temperature_c=payload.min_temperature_c,
-        max_temperature_c=payload.max_temperature_c,
-        min_humidity_percent=payload.min_humidity_percent,
-        max_humidity_percent=payload.max_humidity_percent,
-        min_pressure_diff_pa=payload.min_pressure_diff_pa,
-        max_pressure_diff_pa=payload.max_pressure_diff_pa,
-    )
-    db.add(setting)
-    db.commit()
-    db.refresh(setting)
-    return setting
-
-
-@router.put(
-    "/environment-settings/{setting_id}",
-    response_model=OtEnvironmentSettingOut,
-)
-def update_ot_environment_setting(
-        setting_id: int,
-        payload: OtEnvironmentSettingUpdate,
-        db: Session = Depends(get_db),
-        user=Depends(current_user),
-):
-    _need_any(user, ["ot.masters.update", "ot.environment.update"])
-
-    setting = db.query(OtEnvironmentSetting).get(setting_id)
-    if not setting:
-        raise HTTPException(status_code=404,
-                            detail="OT Environment setting not found")
-
-    data = payload.model_dump(exclude_unset=True)
-
-    # If theatre_id is changing, check there is not another setting for that theatre
-    new_theatre_id = data.get("theatre_id")
-    if new_theatre_id and new_theatre_id != setting.theatre_id:
-        existing = (db.query(OtEnvironmentSetting).filter(
-            OtEnvironmentSetting.theatre_id == new_theatre_id).first())
-        if existing:
-            raise HTTPException(
-                status_code=400,
-                detail=
-                "Another environment setting already exists for this theatre",
-            )
-
-    for field, value in data.items():
-        setattr(setting, field, value)
-
-    db.add(setting)
-    db.commit()
-    db.refresh(setting)
-    return setting
-
-
-@router.delete(
-    "/environment-settings/{setting_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-)
-def delete_ot_environment_setting(
-        setting_id: int,
-        db: Session = Depends(get_db),
-        user=Depends(current_user),
-):
-    _need_any(user, ["ot.masters.delete", "ot.environment.delete"])
-
-    setting = db.query(OtEnvironmentSetting).get(setting_id)
-    if not setting:
-        raise HTTPException(status_code=404,
-                            detail="OT Environment setting not found")
-
-    db.delete(setting)
     db.commit()
     return None

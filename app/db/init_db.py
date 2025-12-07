@@ -107,7 +107,7 @@ def seed_permissions(db: Session) -> None:
         ("ot.cases", ["view", "create", "update", "delete", "close"]),
         ("ot.pre_anaesthesia", ["view", "create", "update"]),
         ("ot.preop_checklist", ["view", "create", "update"]),
-        ("ot.surgical_safety", ["view", "create", "update"]),
+        ("ot.safety", ["view", "create", "update", "manage"]),
         ("ot.anaesthesia_record", ["view", "create", "update"]),
         ("ot.anaesthesia_vitals", ["view", "create", "update", "delete"]),
         ("ot.anaesthesia_drugs", ["view", "create", "update", "delete"]),
@@ -120,6 +120,7 @@ def seed_permissions(db: Session) -> None:
         ("ot.equipment_checklist", ["view", "create", "update", "delete"]),
         ("ot.cleaning_log", ["view", "create", "update", "delete"]),
         ("ot.environment_log", ["view", "create", "update", "delete"]),
+        ("ot.procedures", ["view", "create", "update", "delete"]),
 
         # -------- Billing ----------
         ("billing", ["view", "create", "finalize"]),

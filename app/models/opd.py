@@ -158,6 +158,10 @@ class Visit(Base):
     patient = relationship("Patient", foreign_keys=[patient_id])
     doctor = relationship("User", foreign_keys=[doctor_user_id])
     department = relationship("Department", foreign_keys=[department_id])
+    @property
+    def op_no(self) -> str:
+        # prefer your episode_id (OP-YYYYMM-XXXX pattern)
+        return self.episode_id or f"OP-{self.id:06d}"
 
 
 class Vitals(Base):

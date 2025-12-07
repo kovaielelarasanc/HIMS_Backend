@@ -3,8 +3,10 @@ from __future__ import annotations
 
 from datetime import date, time, datetime
 from typing import Any, Dict, List, Optional, Union
-
+from sqlalchemy import Boolean, Text, JSON, Column
 from pydantic import BaseModel, ConfigDict, Field
+from .user import UserOut, UserMiniOut
+from .patient import PatientOut
 
 JsonDict = Dict[str, Any]
 JsonValue = Union[JsonDict, List[Any], None]
@@ -25,6 +27,65 @@ class OtSpecialityBase(BaseModel):
 
 class OtSpecialityCreate(OtSpecialityBase):
     pass
+
+
+class OtProcedureBase(BaseModel):
+    code: str = Field(..., max_length=50)
+    name: str = Field(..., max_length=255)
+
+    # ✅ must match DB + route + frontend
+    speciality_id: Optional[int] = None
+    default_duration_min: Optional[int] = Field(None, ge=0)
+    rate_per_hour: Optional[float] = Field(None, ge=0)
+
+    description: Optional[str] = None
+    is_active: bool = True
+
+
+class OtProcedureCreate(OtProcedureBase):
+    """
+    Used for POST /ot/procedures
+    All fields allowed, code + name required.
+    """
+    pass
+
+
+class OtProcedureUpdate(BaseModel):
+    """
+    Used for PUT /ot/procedures/{id}
+    All fields optional; we use exclude_unset=True in the route.
+    """
+    code: Optional[str] = Field(None, max_length=50)
+    name: Optional[str] = Field(None, max_length=255)
+
+    speciality_id: Optional[int] = None
+    default_duration_min: Optional[int] = Field(None, ge=0)
+    rate_per_hour: Optional[float] = Field(None, ge=0)
+
+    description: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class OtProcedureOut(OtProcedureBase):
+    id: int
+    model_config = ConfigDict(from_attributes=True)
+
+
+class OtPreopChecklistIn(BaseModel):
+    """
+    Input payload from frontend for pre-op checklist.
+    Matches the fields you send in handleSubmit.
+    """
+    patient_identity_confirmed: bool = False
+    consent_checked: bool = False
+    site_marked: bool = False
+    investigations_checked: bool = False
+    implants_available: bool = False
+    blood_products_arranged: bool = False
+    fasting_status: Optional[str] = None
+    device_checks: Optional[str] = None
+    notes: Optional[str] = None
+    completed: bool = False
 
 
 class OtSpecialityUpdate(BaseModel):
@@ -75,136 +136,69 @@ class OtEquipmentMasterOut(OtEquipmentMasterBase):
     updated_at: datetime
 
 
-# ---------- OtEnvironmentSetting ----------
-
-
-class OtEnvironmentSettingBase(BaseModel):
-    theatre_id: int
-    min_temperature_c: Optional[float] = None
-    max_temperature_c: Optional[float] = None
-    min_humidity_percent: Optional[float] = None
-    max_humidity_percent: Optional[float] = None
-    min_pressure_diff_pa: Optional[float] = None
-    max_pressure_diff_pa: Optional[float] = None
-
-
-class OtEnvironmentSettingCreate(OtEnvironmentSettingBase):
-    pass
-
-
-class OtEnvironmentSettingUpdate(BaseModel):
-    theatre_id: Optional[int] = None
-    min_temperature_c: Optional[float] = None
-    max_temperature_c: Optional[float] = None
-    min_humidity_percent: Optional[float] = None
-    max_humidity_percent: Optional[float] = None
-    min_pressure_diff_pa: Optional[float] = None
-    max_pressure_diff_pa: Optional[float] = None
-
-
-class OtEnvironmentSettingOut(OtEnvironmentSettingBase):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    created_at: datetime
-    updated_at: datetime
-
-
-# ---------- OtTheatre ----------
-
-
-class OtTheatreBase(BaseModel):
-    code: str = Field(..., max_length=50)
-    name: str = Field(..., max_length=255)
-    location: Optional[str] = Field(None, max_length=255)
-    speciality_id: Optional[int] = None
-    is_active: bool = True
-
-
-class OtTheatreCreate(OtTheatreBase):
-    pass
-
-
-class OtTheatreUpdate(BaseModel):
-    code: Optional[str] = Field(None, max_length=50)
-    name: Optional[str] = Field(None, max_length=255)
-    location: Optional[str] = Field(None, max_length=255)
-    speciality_id: Optional[int] = None
-    is_active: Optional[bool] = None
-
-
-class OtTheatreOut(OtTheatreBase):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    created_at: datetime
-    updated_at: datetime
-
-
-# ============================================================
-#  CORE TRANSACTIONS: SCHEDULE & CASE
-# ============================================================
-
 # ---------- OtSchedule ----------
 
 
+class OtScheduleBedOut(BaseModel):
+    id: int
+    code: str
+    ward_name: Optional[str] = None
+    room_name: Optional[str] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class OtScheduleAdmissionOut(BaseModel):
+    id: int
+    admission_code: Optional[str] = None
+    display_code: str  # from IpdAdmission.display_code
+    admitted_at: Optional[datetime] = None
+
+    # Ward/room/bed if you want to show *ward bed* instead of OT bed
+    current_bed: Optional[OtScheduleBedOut] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class OtScheduleProcedureLinkOut(BaseModel):
+    id: int
+    procedure_id: int
+    is_primary: bool
+    procedure: Optional[OtProcedureOut] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class OtScheduleBase(BaseModel):
-    theatre_id: int
-    theatre: Optional[OtTheatreOut] = None
+    # OT is now *bed-based*, not theatre-based
     date: date
     planned_start_time: time
     planned_end_time: Optional[time] = None
 
     patient_id: Optional[int] = None
     admission_id: Optional[int] = None
-    patient: Optional[OtSchedulePatientOut] = None
+
+    # Location
+    bed_id: Optional[int] = None  # OT location via Ward/Room/Bed
+
+    # Surgeon / anaesthetist
     surgeon_user_id: int
     anaesthetist_user_id: Optional[int] = None
-    surgeon: Optional[OtScheduleUserOut] = None
-    anaesthetist_user_id: Optional[int] = None
-    anaesthetist: Optional[OtScheduleUserOut] = None
-    procedure_name: str = Field(..., max_length=255)
-    side: Optional[str] = Field(None,
-                                max_length=50)  # Left / Right / Bilateral / NA
-    priority: str = Field(default="Elective",
-                          max_length=50)  # Elective / Emergency
-    status: str = Field(
-        default="planned",
-        max_length=50)  # planned / in_progress / completed / cancelled
+
+    # Clinical details
+    procedure_name: str
+    side: Optional[str] = None
+    priority: str = "Elective"
     notes: Optional[str] = None
-    model_config = ConfigDict(from_attributes=True)
 
 
 class OtScheduleCreate(OtScheduleBase):
-    # ignore status from client, always start as 'planned'
-    status: str = Field(default="planned", max_length=50)
-
-
-class OtSchedulePatientOut(BaseModel):
-    """
-    Minimal patient info returned along with an OT schedule.
-    This should match fields on app.models.patient.Patient.
-    """
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    uhid: Optional[str] = None
-
-    first_name: Optional[str] = None
-    last_name: Optional[str] = None
-    full_name: Optional[str] = None  # if you have a hybrid_property
-
-    gender: Optional[str] = None  # 'M' / 'F' / 'O' or full text
-    dob: Optional[date] = None
-    age_years: Optional[
-        int] = None  # optional helper fields if you compute them
-    age_months: Optional[int] = None
-
-    phone: Optional[str] = None
+    # 🔹 master procedure ids (write-only)
+    primary_procedure_id: Optional[int] = None
+    additional_procedure_ids: List[int] = []
 
 
 class OtScheduleUpdate(BaseModel):
-    theatre_id: Optional[int] = None
     date: Optional[date] = None
     planned_start_time: Optional[time] = None
     planned_end_time: Optional[time] = None
@@ -212,14 +206,49 @@ class OtScheduleUpdate(BaseModel):
     patient_id: Optional[int] = None
     admission_id: Optional[int] = None
 
+    bed_id: Optional[int] = None
+
     surgeon_user_id: Optional[int] = None
     anaesthetist_user_id: Optional[int] = None
 
     procedure_name: Optional[str] = None
     side: Optional[str] = None
     priority: Optional[str] = None
-    status: Optional[str] = None
     notes: Optional[str] = None
+
+    primary_procedure_id: Optional[int] = None
+    additional_procedure_ids: Optional[List[int]] = None
+
+
+class OtScheduleOut(OtScheduleBase):
+    """
+    Main DTO for listing / viewing OT schedules (bed-based).
+    """
+    id: int
+    status: str
+    case_id: Optional[int] = None
+
+    primary_procedure_id: Optional[int] = None
+
+    # Nested objects
+    patient: Optional["PatientOut"] = None
+    surgeon: Optional["UserMiniOut"] = None
+    anaesthetist: Optional["UserMiniOut"] = None
+
+    # NEW 🔹 admission + OT bed
+    admission: Optional["OtScheduleAdmissionOut"] = None
+    bed: Optional["OtScheduleBedOut"] = None
+
+    # NEW 🔹 latest OP number (filled in route)
+    op_no: Optional[str] = None
+
+    primary_procedure: Optional[OtProcedureOut] = None
+    procedures: List[OtScheduleProcedureLinkOut] = []
+
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class OtScheduleUserOut(BaseModel):
@@ -242,19 +271,8 @@ class OtScheduleUserOut(BaseModel):
     registration_no: Optional[str] = None
 
 
-class OtScheduleOut(OtScheduleBase):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    created_at: datetime
-    updated_at: datetime
-
-
-# ---------- OtCase ----------
-
-
 class OtCaseBase(BaseModel):
-    schedule_id: int
+
     preop_diagnosis: Optional[str] = None
     postop_diagnosis: Optional[str] = None
     final_procedure_name: Optional[str] = None
@@ -271,7 +289,7 @@ class OtCaseBase(BaseModel):
 
 
 class OtCaseCreate(OtCaseBase):
-    pass
+    schedule_id: int
 
 
 class OtCaseUpdate(BaseModel):
@@ -295,6 +313,7 @@ class OtCaseOut(OtCaseBase):
     id: int
     created_at: datetime
     updated_at: datetime
+    schedule_id: Optional[int] = None
 
 
 # ============================================================
@@ -370,50 +389,171 @@ class PreOpChecklistOut(PreOpChecklistBase):
     created_at: datetime
 
 
+class OtPreopChecklistRow(BaseModel):
+    handover: bool = False
+    receiving: bool = False
+    comments: Optional[str] = None
+
+
+class OtPreopInvestigations(BaseModel):
+    hb: Optional[str] = None
+    platelet: Optional[str] = None
+    urea: Optional[str] = None
+    creatinine: Optional[str] = None
+    potassium: Optional[str] = None
+    rbs: Optional[str] = None
+    other: Optional[str] = None
+
+
+class OtPreopVitals(BaseModel):
+    temp: Optional[str] = None
+    pulse: Optional[str] = None
+    resp: Optional[str] = None
+    bp: Optional[str] = None
+    spo2: Optional[str] = None
+    height: Optional[str] = None
+    weight: Optional[str] = None
+
+
+class OtPreopChecklistIn(BaseModel):
+    """
+    Payload from UI for OT Pre-op checklist.
+    This goes into PreOpChecklist.data (except `completed`).
+    """
+
+    # 🔹 FULL CHECKLIST (all rows)
+    checklist: Dict[str, OtPreopChecklistRow] = Field(
+        default_factory=dict,
+        description=
+        "All checklist rows keyed by item key (allergy, consent_form_signed, ...)",
+    )
+
+    # 🔹 Boxes on right side
+    investigations: OtPreopInvestigations = OtPreopInvestigations()
+    vitals: OtPreopVitals = OtPreopVitals()
+
+    # 🔹 Extra fields
+    shave_completed: Optional[str] = None  # "yes" / "no"
+    nurse_signature: Optional[str] = None
+
+    # 🔹 Summary flags (for reporting, filters, etc.)
+    patient_identity_confirmed: bool = False
+    consent_checked: bool = False
+    site_marked: bool = False
+    investigations_checked: bool = False
+    implants_available: bool = False
+    blood_products_arranged: bool = False
+    fasting_status: Optional[str] = None
+    device_checks: Optional[str] = None
+    notes: Optional[str] = None
+
+    # 🔹 Status
+    completed: bool = False
+
+
+class OtPreopChecklistOut(OtPreopChecklistIn):
+    """
+    Response to UI: everything from In + case_id & timestamps.
+    """
+    case_id: int
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
 # ---------- SurgicalSafetyChecklist ----------
+# ---------- OT WHO Surgical Safety Checklist (UI DTO) ----------
 
 
-class SurgicalSafetyChecklistBase(BaseModel):
+class OtSafetyPhaseSignIn(BaseModel):
+    """
+    BEFORE INDUCTION OF ANAESTHESIA
+    (with at least nurse + anaesthetist)
+    """
+    identity_site_procedure_consent_confirmed: bool = False
+    site_marked: Optional[str] = None  # 'yes' | 'no' | 'na'
+    machine_and_medication_check_complete: bool = False
+    known_allergy: Optional[str] = None  # 'yes' | 'no'
+    difficult_airway_or_aspiration_risk: Optional[str] = None  # 'yes' | 'no'
+    blood_loss_risk_gt500ml_or_7mlkg: Optional[str] = None  # 'yes' | 'no'
+    equipment_assistance_available: bool = False  # “Yes, and equipment / assistance available”
+    iv_central_access_and_fluids_planned: bool = False  # “Yes, and two IVs / central access and fluids planned”
+
+
+class OtSafetyPhaseTimeOut(BaseModel):
+    """
+    BEFORE SKIN INCISION (Time-out)
+    """
+    team_members_introduced: bool = False
+    patient_name_procedure_incision_site_confirmed: bool = False
+    antibiotic_prophylaxis_given: Optional[str] = None  # 'yes' | 'no' | 'na'
+
+    # To surgeon
+    surgeon_critical_steps: Optional[str] = None
+    surgeon_case_duration_estimate: Optional[str] = None
+    surgeon_anticipated_blood_loss: Optional[str] = None
+
+    # To anaesthetist
+    anaesthetist_patient_specific_concerns: Optional[str] = None
+
+    # To nursing team
+    sterility_confirmed: bool = False
+    equipment_issues_or_concerns: bool = False
+    essential_imaging_displayed: Optional[str] = None  # 'yes' | 'no' | 'na'
+
+
+class OtSafetyPhaseSignOut(BaseModel):
+    """
+    BEFORE PATIENT LEAVES OPERATING ROOM (Sign-out)
+    """
+    procedure_name_confirmed: bool = False
+    counts_complete: bool = False  # instruments / sponge / needle
+    specimens_labelled_correctly: bool = False  # with patient name etc.
+    equipment_problems_to_be_addressed: Optional[str] = None
+    key_concerns_for_recovery_and_management: Optional[str] = None
+
+
+class OtSafetyChecklistIn(BaseModel):
+    """
+    Payload used by the SafetyTab frontend.
+    Times are simple 'HH:MM' strings.
+    """
+    sign_in_done: bool = False
+    sign_in_time: Optional[str] = None
+
+    time_out_done: bool = False
+    time_out_time: Optional[str] = None
+
+    sign_out_done: bool = False
+    sign_out_time: Optional[str] = None
+
+    sign_in: OtSafetyPhaseSignIn = Field(default_factory=OtSafetyPhaseSignIn)
+    time_out: OtSafetyPhaseTimeOut = Field(
+        default_factory=OtSafetyPhaseTimeOut)
+    sign_out: OtSafetyPhaseSignOut = Field(
+        default_factory=OtSafetyPhaseSignOut)
+
+
+class OtSafetyChecklistOut(BaseModel):
+    """
+    What we send back to the SafetyTab.
+    """
     case_id: int
 
-    sign_in_data: Optional[JsonValue] = None
-    sign_in_done_by_id: Optional[int] = None
-    sign_in_time: Optional[datetime] = None
+    sign_in_done: bool = False
+    sign_in_time: Optional[str] = None
 
-    time_out_data: Optional[JsonValue] = None
-    time_out_done_by_id: Optional[int] = None
-    time_out_time: Optional[datetime] = None
+    time_out_done: bool = False
+    time_out_time: Optional[str] = None
 
-    sign_out_data: Optional[JsonValue] = None
-    sign_out_done_by_id: Optional[int] = None
-    sign_out_time: Optional[datetime] = None
+    sign_out_done: bool = False
+    sign_out_time: Optional[str] = None
 
+    sign_in: OtSafetyPhaseSignIn
+    time_out: OtSafetyPhaseTimeOut
+    sign_out: OtSafetyPhaseSignOut
 
-class SurgicalSafetyChecklistCreate(SurgicalSafetyChecklistBase):
-    pass
-
-
-class SurgicalSafetyChecklistUpdate(BaseModel):
-    case_id: Optional[int] = None
-
-    sign_in_data: Optional[JsonValue] = None
-    sign_in_done_by_id: Optional[int] = None
-    sign_in_time: Optional[datetime] = None
-
-    time_out_data: Optional[JsonValue] = None
-    time_out_done_by_id: Optional[int] = None
-    time_out_time: Optional[datetime] = None
-
-    sign_out_data: Optional[JsonValue] = None
-    sign_out_done_by_id: Optional[int] = None
-    sign_out_time: Optional[datetime] = None
-
-
-class SurgicalSafetyChecklistOut(SurgicalSafetyChecklistBase):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
     created_at: datetime
+    updated_at: Optional[datetime] = None
 
 
 # ---------- AnaesthesiaRecord + vitals + drugs ----------
@@ -445,11 +585,187 @@ class AnaesthesiaRecordUpdate(BaseModel):
     complications: Optional[str] = None
 
 
-class AnaesthesiaRecordOut(AnaesthesiaRecordBase):
+# FILE: app/schemas/ot.py
+
+# FILE: app/schemas/ot.py
+
+
+class OtAnaesthesiaRecordIn(BaseModel):
+    # ============================================================
+    # PRE-OP RECORD (from pre-anaesthetic sheet)
+    # ============================================================
+
+    # General assessment
+    anaesthesia_type: Optional[str] = None  # GA / Spinal / Epidural / MAC etc.
+    asa_grade: Optional[str] = None  # I / II / III / IV / V / E
+    airway_assessment: Optional[str] = None
+    comorbidities: Optional[str] = None
+    allergies: Optional[str] = None
+
+    # Baseline vitals + systems exam
+    preop_pulse: Optional[int] = None
+    preop_bp: Optional[str] = None  # "120/80"
+    preop_rr: Optional[int] = None
+    preop_temp_c: Optional[float] = None
+    preop_cvs: Optional[str] = None
+    preop_rs: Optional[str] = None
+    preop_cns: Optional[str] = None
+    preop_pa: Optional[str] = None
+    preop_veins: Optional[str] = None
+    preop_spine: Optional[str] = None
+
+    # Airway examination details
+    airway_teeth_status: Optional[
+        str] = None  # "Intact" / "Loose" / "Partially edentulous"
+    airway_denture: Optional[str] = None  # "Present" / "Absent"
+    airway_neck_movements: Optional[str] = None
+    airway_mallampati_class: Optional[str] = None  # "Class 1/2/3/4"
+    difficult_airway_anticipated: Optional[bool] = None
+
+    # Risk & plan
+    risk_factors: Optional[str] = None
+    anaesthetic_plan_detail: Optional[str] = None  # free text plan
+    preop_instructions: Optional[str] = None
+
+    # ============================================================
+    # INTRA-OP SETTINGS (from yellow sheet)
+    # ============================================================
+
+    # Airway / induction / intubation
+    preoxygenation: Optional[bool] = None
+    cricoid_pressure: Optional[bool] = None
+    induction_route: Optional[
+        str] = None  # "Intravenous" / "Inhalational" / "Rapid sequence"
+
+    intubation_done: Optional[bool] = None
+    intubation_route: Optional[str] = None  # Oral / Nasal
+    intubation_state: Optional[str] = None  # "Awake" / "Anaesthetised"
+    intubation_technique: Optional[
+        str] = None  # "Visual" / "Blind" / "Fibreoptic" / "Retrograde"
+
+    tube_type: Optional[str] = None  # ETT, LMA, Tracheostomy, etc.
+    tube_size: Optional[str] = None  # e.g. "7.0"
+    tube_fixed_at: Optional[str] = None  # e.g. "20 cm"
+    cuff_used: Optional[bool] = None
+    cuff_medium: Optional[str] = None  # Air / Saline / Not inflated
+    bilateral_breath_sounds: Optional[str] = None
+    added_sounds: Optional[str] = None
+    laryngoscopy_grade: Optional[str] = None  # Grade I/II/III/IV
+
+    airway_devices: Optional[list[str]] = None
+    # eg: ["Face mask", "LMA/ILMA", "Oral airway", "Throat pack", "NG tube", "Other"]
+
+    # Ventilation + breathing system (static settings)
+    ventilation_mode_baseline: Optional[
+        str] = None  # Spontaneous / Controlled / Manual / Ventilator
+    ventilator_vt: Optional[int] = None  # Vt
+    ventilator_rate: Optional[int] = None  # f
+    ventilator_peep: Optional[int] = None  # PEEP
+    breathing_system: Optional[str] = None  # Mapleson A/D/F, Circle, Other
+
+    # Monitors (checklist)
+    monitors: Optional[dict] = None
+    # {
+    #   "ecg": true, "nibp": true, "pulse_oximeter": true, "capnograph": true,
+    #   "agent_monitor": false, "pns": false, "temperature": true,
+    #   "urinary_catheter": false, "ibp": false, "cvp": false,
+    #   "precordial_steth": false, "oesophageal_steth": false
+    # }
+
+    # Lines & tourniquet
+    lines: Optional[dict] = None
+    # e.g. {"peripheral_iv": true, "central_line": false, "arterial_line": false}
+    tourniquet_used: Optional[bool] = None
+
+    # Position & eye care
+    patient_position: Optional[
+        str] = None  # Supine / Lateral / Prone / Lithotomy / Other
+    eyes_taped: Optional[bool] = None
+    eyes_covered_with_foil: Optional[bool] = None
+    pressure_points_padded: Optional[bool] = None
+
+    # Fluids + blood components (plan / summary)
+    iv_fluids_plan: Optional[str] = None  # RL / NS etc.
+    blood_components_plan: Optional[str] = None  # PRBC / FFP, etc.
+
+    # Regional technique / block details
+    regional_block_type: Optional[
+        str] = None  # Spinal / Epidural / Nerve block / None
+    regional_position: Optional[str] = None
+    regional_approach: Optional[str] = None
+    regional_space_depth: Optional[str] = None
+    regional_needle_type: Optional[str] = None
+    regional_drug_dose: Optional[str] = None
+    regional_level: Optional[str] = None
+    regional_complications: Optional[str] = None
+
+    # Adequacy of block section
+    block_adequacy: Optional[str] = None  # Excellent / Adequate / Poor
+    sedation_needed: Optional[bool] = None
+    conversion_to_ga: Optional[bool] = None
+
+    # Free-form notes (used for intra-op summary)
+    notes: Optional[str] = None
+
+
+class OtAnaesthesiaRecordOut(OtAnaesthesiaRecordIn):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    case_id: int
+    anaesthetist_user_id: Optional[int] = None
     created_at: datetime
+    # we don’t have updated_at column; just expose created_at as “last updated”
+    updated_at: Optional[datetime] = None
+
+
+# FILE: app/schemas/ot.py
+
+
+class OtAnaesthesiaVitalIn(BaseModel):
+    # "HH:MM" from the UI; we convert to datetime in the route
+    time: Optional[str] = None
+    hr: Optional[int] = None  # maps to pulse
+    bp: Optional[str] = None  # e.g. "120/80"
+    spo2: Optional[int] = None
+    rr: Optional[int] = None
+    temp_c: Optional[float] = None
+    etco2: Optional[float] = None  # <<--- NEW
+    comments: Optional[str] = None
+
+    # 🔸 NEW intra-op rows
+    ventilation_mode: Optional[
+        str] = None  # 'Spont', 'Assist', 'Control', 'Manual', 'Vent'
+    peak_airway_pressure: Optional[float] = None
+    cvp_pcwp: Optional[float] = None
+    st_segment: Optional[str] = None  # eg. 'Normal', 'ST↑', 'ST↓'
+    urine_output_ml: Optional[int] = None
+    blood_loss_ml: Optional[int] = None
+
+
+class OtAnaesthesiaVitalOut(OtAnaesthesiaVitalIn):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    record_id: int
+    # keep time as "HH:MM" string for the UI
+    time: Optional[str] = None
+
+
+class OtAnaesthesiaDrugIn(BaseModel):
+    time: Optional[str] = None  # "HH:MM"
+    drug_name: Optional[str] = Field(None, max_length=255)
+    dose: Optional[str] = Field(None, max_length=50)
+    route: Optional[str] = Field(None, max_length=50)
+    remarks: Optional[str] = Field(None, max_length=255)
+
+
+class OtAnaesthesiaDrugOut(OtAnaesthesiaDrugIn):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    record_id: int
+    time: Optional[str] = None
 
 
 class AnaesthesiaVitalLogBase(BaseModel):
@@ -516,21 +832,43 @@ class AnaesthesiaDrugLogOut(AnaesthesiaDrugLogBase):
     id: int
 
 
-# ---------- OtNursingRecord ----------
+class OtUserBasic(BaseModel):
+    id: int
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    email: Optional[str] = None
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class OtNursingRecordBase(BaseModel):
     case_id: int
-    primary_nurse_id: int
+
+    # optional – if not sent, backend will use current user
+    primary_nurse_id: Optional[int] = None
+
+    scrub_nurse_name: Optional[str] = Field(None, max_length=255)
+    circulating_nurse_name: Optional[str] = Field(None, max_length=255)
 
     positioning: Optional[str] = Field(None, max_length=255)
-    skin_prep_details: Optional[str] = None
-    catheter_details: Optional[str] = None
-    drains_details: Optional[str] = None
+    skin_prep: Optional[str] = None
+    catheterisation: Optional[str] = None
+    diathermy_plate_site: Optional[str] = None
+
+    counts_initial_done: Optional[bool] = False
+    counts_closure_done: Optional[bool] = False
+
+    antibiotics_time: Optional[time] = None
+
+    warming_measures: Optional[str] = None
     notes: Optional[str] = None
 
 
 class OtNursingRecordCreate(OtNursingRecordBase):
+    """
+    For create, everything is still optional except case_id.
+    primary_nurse_id will default to current user in route if absent.
+    """
     pass
 
 
@@ -538,10 +876,20 @@ class OtNursingRecordUpdate(BaseModel):
     case_id: Optional[int] = None
     primary_nurse_id: Optional[int] = None
 
+    scrub_nurse_name: Optional[str] = Field(None, max_length=255)
+    circulating_nurse_name: Optional[str] = Field(None, max_length=255)
+
     positioning: Optional[str] = Field(None, max_length=255)
-    skin_prep_details: Optional[str] = None
-    catheter_details: Optional[str] = None
-    drains_details: Optional[str] = None
+    skin_prep: Optional[str] = None
+    catheterisation: Optional[str] = None
+    diathermy_plate_site: Optional[str] = None
+
+    counts_initial_done: Optional[bool] = None
+    counts_closure_done: Optional[bool] = None
+
+    antibiotics_time: Optional[time] = None
+
+    warming_measures: Optional[str] = None
     notes: Optional[str] = None
 
 
@@ -550,6 +898,8 @@ class OtNursingRecordOut(OtNursingRecordBase):
 
     id: int
     created_at: datetime
+    updated_at: Optional[datetime] = None
+    primary_nurse: Optional[OtUserBasic] = None
 
 
 # ---------- OtSpongeInstrumentCount ----------
@@ -620,10 +970,13 @@ class OtImplantRecordOut(OtImplantRecordBase):
 
 # ---------- OperationNote ----------
 
+# ---------- OperationNote ----------
+
 
 class OperationNoteBase(BaseModel):
     case_id: int
-    surgeon_user_id: int
+    # optional – backend will default to current user if None
+    surgeon_user_id: Optional[int] = None
 
     preop_diagnosis: Optional[str] = None
     postop_diagnosis: Optional[str] = None
@@ -660,6 +1013,8 @@ class OperationNoteOut(OperationNoteBase):
 
     id: int
     created_at: datetime
+    updated_at: Optional[datetime] = None
+    surgeon: Optional[UserMiniOut] = None
 
 
 # ---------- OtBloodTransfusionRecord ----------
@@ -698,43 +1053,63 @@ class OtBloodTransfusionRecordOut(OtBloodTransfusionRecordBase):
     created_at: datetime
 
 
-# ---------- PacuRecord ----------
+# ---------- OT Sponge / Instrument Count (UI) ----------
 
 
-class PacuRecordBase(BaseModel):
+class OtCountsIn(BaseModel):
+    sponges_initial: Optional[int] = None
+    sponges_added: Optional[int] = None
+    sponges_final: Optional[int] = None
+
+    instruments_initial: Optional[int] = None
+    instruments_final: Optional[int] = None
+
+    needles_initial: Optional[int] = None
+    needles_final: Optional[int] = None
+
+    discrepancy_text: Optional[str] = None
+    xray_done: bool = False
+    resolved_by: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class OtCountsOut(OtCountsIn):
+    model_config = ConfigDict(from_attributes=False)
+
+    id: int
     case_id: int
-    nurse_user_id: int
+    created_at: datetime
+    updated_at: Optional[datetime] = None
 
-    admission_time: Optional[datetime] = None
-    discharge_time: Optional[datetime] = None
-    pain_scores: Optional[JsonValue] = None  # {time: score}
-    vitals: Optional[JsonValue] = None  # time-series or summary
+
+class PacuUiBase(BaseModel):
+    # string "HH:MM" coming from <input type="time">
+    arrival_time: Optional[str] = None
+    departure_time: Optional[str] = None
+
+    pain_score: Optional[str] = None
+    nausea_vomiting: Optional[str] = None
+    airway_status: Optional[str] = None
+    vitals_summary: Optional[str] = None
     complications: Optional[str] = None
-    disposition: Optional[str] = Field(None,
-                                       max_length=100)  # ward / ICU / etc.
+    discharge_criteria_met: Optional[bool] = False
+    notes: Optional[str] = None
 
 
-class PacuRecordCreate(PacuRecordBase):
+class PacuUiIn(PacuUiBase):
+    """Payload from PACU tab."""
     pass
 
 
-class PacuRecordUpdate(BaseModel):
-    case_id: Optional[int] = None
-    nurse_user_id: Optional[int] = None
-
-    admission_time: Optional[datetime] = None
-    discharge_time: Optional[datetime] = None
-    pain_scores: Optional[JsonValue] = None
-    vitals: Optional[JsonValue] = None
-    complications: Optional[str] = None
-    disposition: Optional[str] = Field(None, max_length=100)
-
-
-class PacuRecordOut(PacuRecordBase):
-    model_config = ConfigDict(from_attributes=True)
-
+class PacuUiOut(PacuUiBase):
+    """Response back to PACU tab."""
     id: int
+    case_id: int
+    nurse_user_id: int
     created_at: datetime
+    updated_at: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=False)
 
 
 # ============================================================
@@ -745,7 +1120,7 @@ class PacuRecordOut(PacuRecordBase):
 
 
 class OtEquipmentDailyChecklistBase(BaseModel):
-    theatre_id: int
+    bed_id: Optional[int] = None  # ward/room/bed location
     date: date
     shift: Optional[str] = Field(None,
                                  max_length=50)  # Morning / Evening / Night
@@ -758,7 +1133,7 @@ class OtEquipmentDailyChecklistCreate(OtEquipmentDailyChecklistBase):
 
 
 class OtEquipmentDailyChecklistUpdate(BaseModel):
-    theatre_id: Optional[int] = None
+    bed_id: Optional[int] = None
     date: Optional[date] = None
     shift: Optional[str] = Field(None, max_length=50)
     checked_by_user_id: Optional[int] = None
@@ -776,7 +1151,7 @@ class OtEquipmentDailyChecklistOut(OtEquipmentDailyChecklistBase):
 
 
 class OtCleaningLogBase(BaseModel):
-    theatre_id: int
+    bed_id: Optional[int] = None
     date: date
     session: Optional[str] = Field(
         None, max_length=50)  # pre-list / between-cases / end-of-day
@@ -793,7 +1168,7 @@ class OtCleaningLogCreate(OtCleaningLogBase):
 
 
 class OtCleaningLogUpdate(BaseModel):
-    theatre_id: Optional[int] = None
+    bed_id: Optional[int] = None
     date: Optional[date] = None
     session: Optional[str] = Field(None, max_length=50)
     case_id: Optional[int] = None
@@ -808,13 +1183,17 @@ class OtCleaningLogOut(OtCleaningLogBase):
 
     id: int
     created_at: datetime
+    done_by: Optional[UserMini] = None
+
+    # convenience flat fields if you want
+    done_by_name: Optional[str] = None
 
 
 # ---------- OtEnvironmentLog ----------
 
 
 class OtEnvironmentLogBase(BaseModel):
-    theatre_id: int
+    bed_id: Optional[int] = None
     date: date
     time: time
 
@@ -830,7 +1209,7 @@ class OtEnvironmentLogCreate(OtEnvironmentLogBase):
 
 
 class OtEnvironmentLogUpdate(BaseModel):
-    theatre_id: Optional[int] = None
+    bed_id: Optional[int] = None
     date: Optional[date] = None
     time: Optional[time] = None
 
@@ -846,3 +1225,17 @@ class OtEnvironmentLogOut(OtEnvironmentLogBase):
 
     id: int
     created_at: datetime
+
+
+# class OtTheatreMini(BaseModel):
+#     id: int
+#     name: str
+
+#     model_config = ConfigDict(from_attributes=True)
+
+
+class UserMini(BaseModel):
+    id: int
+    full_name: str
+
+    model_config = ConfigDict(from_attributes=True)

@@ -36,3 +36,12 @@ class UserLite(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class UserMiniOut(BaseModel):
+    id: int
+    name: Optional[str] = None
+    email: Optional[str] = None
+
+    class Config:
+        from_attributes = True

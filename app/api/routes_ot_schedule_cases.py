@@ -8,9 +8,19 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import and_, or_
-
+from app.models.ipd import IpdBed, IpdAdmission, IpdRoom, IpdWard  # 👈 add
+from app.models.opd import Visit
+from app.models.patient import Patient  # 👈 add
+from app.models.user import User as UserModel  # 👈 alias to avoid clash
+from sqlalchemy.exc import IntegrityError
 from app.api.deps import get_db, current_user
-from app.models.ot import OtSchedule, OtTheatre, OtCase
+from app.models.ot import (
+    OtSchedule,
+    OtCase,
+    PreOpChecklist as PreOpChecklistModel,
+    OtScheduleProcedure,
+    OtProcedure,
+)
 from app.schemas.ot import (
     OtScheduleCreate,
     OtScheduleUpdate,
@@ -18,6 +28,10 @@ from app.schemas.ot import (
     OtCaseCreate,
     OtCaseUpdate,
     OtCaseOut,
+    OtPreopChecklistIn,
+    OtPreopInvestigations,
+    OtPreopVitals,
+    OtPreopChecklistOut,
 )
 from app.models.user import User
 
@@ -28,7 +42,6 @@ router = APIRouter(prefix="/ot", tags=["OT - Schedule & Cases"])
 # ============================================================
 
 
-# ---------------- RBAC ----------------
 def _need_any(user: User, codes: list[str]) -> None:
     """
     Enforce that user has at least ONE of the given permission codes.
@@ -58,22 +71,26 @@ def _validate_time_order(start: time, end: Optional[time]) -> None:
 
 def _check_schedule_conflict(
     db: Session,
-    theatre_id: int,
+    bed_id: int,
     date_: date,
     start: time,
     end: Optional[time],
     exclude_id: Optional[int] = None,
 ) -> None:
     """
-    Check for OT booking overlap in same theatre/date.
+    Check for OT booking overlap **on the same IPD bed (OT bed)** and date.
     Conflicts if:
-      - Same theatre
+      - Same bed
       - Same date
       - Status != cancelled
       - Time ranges overlap.
     """
+    if not bed_id:
+        # If no bed assigned yet, skip conflict validation
+        return
+
     q = db.query(OtSchedule).filter(
-        OtSchedule.theatre_id == theatre_id,
+        OtSchedule.bed_id == bed_id,
         OtSchedule.date == date_,
         OtSchedule.status != "cancelled",
     )
@@ -118,7 +135,7 @@ def _check_schedule_conflict(
     if q.first():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="OT schedule conflict in this theatre & time range",
+            detail="OT schedule conflict for this bed & time range",
         )
 
 
@@ -147,7 +164,10 @@ def list_ot_schedules(
             alias="date",
             description="Filter by date (yyyy-mm-dd)",
         ),
-        theatre_id: Optional[int] = Query(None),
+        bed_id: Optional[int] = Query(
+            None,
+            description="Filter by IPD bed (OT location via Ward/Room/Bed)",
+        ),
         surgeon_user_id: Optional[int] = Query(None),
         patient_id: Optional[int] = Query(None),
         status_: Optional[str] = Query(None, alias="status"),
@@ -156,18 +176,26 @@ def list_ot_schedules(
 ):
     _need_any(user, ["ot.schedule.view"])
 
-    q = (db.query(OtSchedule).options(
-        joinedload(OtSchedule.theatre),
-        joinedload(OtSchedule.patient),
-        joinedload(OtSchedule.surgeon),
-        joinedload(OtSchedule.anaesthetist),
-        joinedload(OtSchedule.case),
-    ))
+    q = (
+        db.query(OtSchedule).options(
+            joinedload(OtSchedule.patient),
+            joinedload(OtSchedule.surgeon),
+            joinedload(OtSchedule.anaesthetist),
+            # OT bed (location)
+            joinedload(OtSchedule.bed).joinedload(IpdBed.room
+                                                  ).joinedload(IpdRoom.ward),
+            # Admission + ward bed (if patient admitted)
+            joinedload(OtSchedule.admission
+                       ).joinedload(IpdAdmission.current_bed
+                                    ).joinedload(IpdBed.room
+                                                 ).joinedload(IpdRoom.ward),
+            joinedload(OtSchedule.case),
+        ))
 
     if date_:
         q = q.filter(OtSchedule.date == date_)
-    if theatre_id:
-        q = q.filter(OtSchedule.theatre_id == theatre_id)
+    if bed_id:
+        q = q.filter(OtSchedule.bed_id == bed_id)
     if surgeon_user_id:
         q = q.filter(OtSchedule.surgeon_user_id == surgeon_user_id)
     if patient_id:
@@ -191,10 +219,14 @@ def get_ot_schedule(
     _need_any(user, ["ot.schedule.view"])
 
     schedule = (db.query(OtSchedule).options(
-        joinedload(OtSchedule.theatre),
         joinedload(OtSchedule.patient),
         joinedload(OtSchedule.surgeon),
         joinedload(OtSchedule.anaesthetist),
+        joinedload(OtSchedule.bed).joinedload(IpdBed.room).joinedload(
+            IpdRoom.ward),
+        joinedload(OtSchedule.admission).joinedload(
+            IpdAdmission.current_bed).joinedload(IpdBed.room).joinedload(
+                IpdRoom.ward),
         joinedload(OtSchedule.case),
     ).get(schedule_id))
     if not schedule:
@@ -202,11 +234,7 @@ def get_ot_schedule(
     return schedule
 
 
-@router.post(
-    "/schedule",
-    response_model=OtScheduleOut,
-    status_code=status.HTTP_201_CREATED,
-)
+@router.post("/schedules", response_model=OtScheduleOut)
 def create_ot_schedule(
         payload: OtScheduleCreate,
         db: Session = Depends(get_db),
@@ -214,45 +242,110 @@ def create_ot_schedule(
 ):
     _need_any(user, ["ot.schedule.create"])
 
-    theatre = db.query(OtTheatre).get(payload.theatre_id)
-    if not theatre or not theatre.is_active:
+    if payload.planned_start_time:
+        _validate_time_order(payload.planned_start_time,
+                             payload.planned_end_time)
+
+    # ---------- FK validations (tell exactly which ID is wrong) ----------
+    missing_refs: list[str] = []
+
+    print("DEBUG OT SCHEDULE PAYLOAD:", payload.model_dump())
+
+    if payload.patient_id:
+        if not db.get(Patient, payload.patient_id):
+            missing_refs.append(f"patient_id={payload.patient_id}")
+
+    if payload.bed_id:
+        bed = db.get(IpdBed, payload.bed_id)
+        print(
+            "DEBUG OT SCHEDULE BED CHECK: payload.bed_id =",
+            payload.bed_id,
+            "| bed found in DB:",
+            (bed.id if bed else None),
+        )
+        if not bed:
+            missing_refs.append(f"bed_id={payload.bed_id}")
+
+    if payload.admission_id:
+        if not db.get(IpdAdmission, payload.admission_id):
+            missing_refs.append(f"admission_id={payload.admission_id}")
+
+    if payload.surgeon_user_id:
+        if not db.get(UserModel, payload.surgeon_user_id):
+            missing_refs.append(f"surgeon_user_id={payload.surgeon_user_id}")
+
+    if payload.anaesthetist_user_id:
+        if not db.get(UserModel, payload.anaesthetist_user_id):
+            missing_refs.append(
+                f"anaesthetist_user_id={payload.anaesthetist_user_id}")
+
+    if missing_refs:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid or inactive OT Theatre",
+            status_code=400,
+            detail=f"Invalid FK reference(s): {', '.join(missing_refs)}",
         )
 
-    _validate_time_order(payload.planned_start_time, payload.planned_end_time)
-    _check_schedule_conflict(
-        db=db,
-        theatre_id=payload.theatre_id,
-        date_=payload.date,
-        start=payload.planned_start_time,
-        end=payload.planned_end_time,
-    )
+    # ---------- Procedure master validation ----------
+    if payload.primary_procedure_id:
+        proc = db.get(OtProcedure, payload.primary_procedure_id)
+        if not proc:
+            raise HTTPException(
+                status_code=400,
+                detail=
+                f"Invalid primary_procedure_id={payload.primary_procedure_id}",
+            )
 
-    schedule = OtSchedule(
-        theatre_id=payload.theatre_id,
-        date=payload.date,
-        planned_start_time=payload.planned_start_time,
-        planned_end_time=payload.planned_end_time,
-        patient_id=payload.patient_id,
-        admission_id=payload.admission_id,
-        surgeon_user_id=payload.surgeon_user_id,
-        anaesthetist_user_id=payload.anaesthetist_user_id,
-        procedure_name=payload.procedure_name,
-        side=payload.side,
-        priority=payload.priority,
-        status="planned",
-        notes=payload.notes,
-    )
+    # ---------- Conflict check ----------
+    if payload.bed_id:
+        _check_schedule_conflict(
+            db=db,
+            bed_id=payload.bed_id,
+            date_=payload.date,
+            start=payload.planned_start_time,
+            end=payload.planned_end_time,
+            exclude_id=None,
+        )
 
-    db.add(schedule)
-    db.commit()
-    db.refresh(schedule)
-    return schedule
+    # ---------- Create schedule ----------
+    try:
+        schedule = OtSchedule(
+            date=payload.date,
+            planned_start_time=payload.planned_start_time,
+            planned_end_time=payload.planned_end_time,
+            patient_id=payload.patient_id,
+            admission_id=payload.admission_id,
+            bed_id=payload.bed_id,
+            surgeon_user_id=payload.surgeon_user_id,
+            anaesthetist_user_id=payload.anaesthetist_user_id,
+            procedure_name=payload.procedure_name,
+            side=payload.side,
+            priority=payload.priority or "Elective",
+            notes=payload.notes,
+            status="planned",
+            primary_procedure_id=payload.primary_procedure_id,
+        )
+
+        db.add(schedule)
+        db.flush()
+
+        # ... add OtScheduleProcedure links ...
+
+        db.commit()
+        db.refresh(schedule)
+        return schedule
+
+    except IntegrityError as e:
+        db.rollback()
+        print("DEBUG INTEGRITY ERROR:", str(e.orig))
+        raise HTTPException(
+            status_code=400,
+            detail=
+            ("Database constraint error (check patient/bed/admission/procedure IDs): "
+             f"{str(e.orig)}"),
+        )
 
 
-@router.put("/schedule/{schedule_id}", response_model=OtScheduleOut)
+@router.put("/schedules/{schedule_id}", response_model=OtScheduleOut)
 def update_ot_schedule(
         schedule_id: int,
         payload: OtScheduleUpdate,
@@ -261,43 +354,83 @@ def update_ot_schedule(
 ):
     _need_any(user, ["ot.schedule.update"])
 
-    schedule = db.query(OtSchedule).get(schedule_id)
+    schedule = db.get(OtSchedule, schedule_id)
     if not schedule:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="OT Schedule not found",
-        )
+        raise HTTPException(status_code=404, detail="Schedule not found")
 
     data = payload.model_dump(exclude_unset=True)
 
-    new_theatre_id = data.get("theatre_id", schedule.theatre_id)
+    # Pre-calculate potential new values for conflict check
     new_date = data.get("date", schedule.date)
     new_start = data.get("planned_start_time", schedule.planned_start_time)
     new_end = data.get("planned_end_time", schedule.planned_end_time)
+    new_bed_id = data.get("bed_id", schedule.bed_id)
 
-    _validate_time_order(new_start, new_end)
-    _check_schedule_conflict(
-        db=db,
-        theatre_id=new_theatre_id,
-        date_=new_date,
-        start=new_start,
-        end=new_end,
-        exclude_id=schedule.id,
-    )
+    if new_start:
+        _validate_time_order(new_start, new_end)
 
-    # If theatre changed, verify active
-    if "theatre_id" in data:
-        theatre = db.query(OtTheatre).get(new_theatre_id)
-        if not theatre or not theatre.is_active:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid or inactive OT Theatre",
-            )
+    # conflict check for updated bed/date/time
+    if new_bed_id:
+        _check_schedule_conflict(
+            db=db,
+            bed_id=new_bed_id,
+            date_=new_date,
+            start=new_start,
+            end=new_end,
+            exclude_id=schedule.id,
+        )
 
-    for field, value in data.items():
-        setattr(schedule, field, value)
+    # handle simple fields
+    for field in [
+            "date",
+            "planned_start_time",
+            "planned_end_time",
+            "patient_id",
+            "admission_id",
+            "bed_id",
+            "surgeon_user_id",
+            "anaesthetist_user_id",
+            "procedure_name",
+            "side",
+            "priority",
+            "notes",
+    ]:
+        if field in data:
+            setattr(schedule, field, data[field])
 
-    db.add(schedule)
+    # primary_procedure_id + additional_procedure_ids
+    if "primary_procedure_id" in data or "additional_procedure_ids" in data:
+        # reset all links and rebuild
+        schedule.procedures.clear()
+        db.flush()
+
+        primary_id = data.get("primary_procedure_id",
+                              schedule.primary_procedure_id)
+        add_ids = data.get("additional_procedure_ids", [])
+
+        schedule.primary_procedure_id = primary_id
+        seen_ids = set()
+
+        if primary_id:
+            db.add(
+                OtScheduleProcedure(
+                    schedule_id=schedule.id,
+                    procedure_id=primary_id,
+                    is_primary=True,
+                ))
+            seen_ids.add(primary_id)
+
+        for pid in add_ids or []:
+            if pid in seen_ids:
+                continue
+            db.add(
+                OtScheduleProcedure(
+                    schedule_id=schedule.id,
+                    procedure_id=pid,
+                    is_primary=False,
+                ))
+            seen_ids.add(pid)
+
     db.commit()
     db.refresh(schedule)
     return schedule
@@ -390,7 +523,10 @@ def list_ot_cases(
             alias="date",
             description="Filter by OT date (Schedule date)",
         ),
-        theatre_id: Optional[int] = Query(None),
+        bed_id: Optional[int] = Query(
+            None,
+            description="Filter by IPD bed (OT location via Ward/Room/Bed)",
+        ),
         surgeon_user_id: Optional[int] = Query(None),
         patient_id: Optional[int] = Query(None),
         db: Session = Depends(get_db),
@@ -402,16 +538,21 @@ def list_ot_cases(
     _need_any(user, ["ot.cases.view"])
 
     q = (db.query(OtCase).join(OtSchedule).options(
-        joinedload(OtCase.schedule).joinedload(OtSchedule.theatre),
         joinedload(OtCase.schedule).joinedload(OtSchedule.patient),
         joinedload(OtCase.schedule).joinedload(OtSchedule.surgeon),
         joinedload(OtCase.schedule).joinedload(OtSchedule.anaesthetist),
+        joinedload(OtCase.schedule).joinedload(
+            OtSchedule.admission).joinedload(
+                IpdAdmission.current_bed).joinedload(IpdBed.room).joinedload(
+                    IpdRoom.ward),
+        joinedload(OtCase.schedule).joinedload(OtSchedule.bed).joinedload(
+            IpdBed.room).joinedload(IpdRoom.ward),
     ))
 
     if date_:
         q = q.filter(OtSchedule.date == date_)
-    if theatre_id:
-        q = q.filter(OtSchedule.theatre_id == theatre_id)
+    if bed_id:
+        q = q.filter(OtSchedule.bed_id == bed_id)
     if surgeon_user_id:
         q = q.filter(OtSchedule.surgeon_user_id == surgeon_user_id)
     if patient_id:
@@ -428,36 +569,61 @@ def list_ot_cases(
 def get_ot_case(
         case_id: int,
         db: Session = Depends(get_db),
-        user: User = Depends(current_user),
+        user=Depends(current_user),
 ):
     _need_any(user, ["ot.cases.view"])
-    case = (db.query(OtCase).options(
-        joinedload(OtCase.schedule).joinedload(OtSchedule.theatre),
-        joinedload(OtCase.schedule).joinedload(OtSchedule.patient),
-        joinedload(OtCase.schedule).joinedload(OtSchedule.surgeon),
-        joinedload(OtCase.schedule).joinedload(OtSchedule.anaesthetist),
-    ).get(case_id))
+    case = (
+        db.query(OtCase).options(
+            # schedule + patient
+            joinedload(OtCase.schedule).joinedload(OtSchedule.patient),
+            # surgeon + anaesthetist
+            joinedload(OtCase.schedule).joinedload(OtSchedule.surgeon),
+            joinedload(OtCase.schedule).joinedload(OtSchedule.anaesthetist),
+            # admission + its current bed
+            joinedload(OtCase.schedule
+                       ).joinedload(OtSchedule.admission).joinedload(
+                           IpdAdmission.current_bed
+                       ).joinedload(IpdBed.room).joinedload(IpdRoom.ward),
+            # OT bed (location)
+            joinedload(OtCase.schedule).joinedload(OtSchedule.bed).joinedload(
+                IpdBed.room).joinedload(IpdRoom.ward),
+        ).get(case_id))
+
     if not case:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="OT Case not found",
-        )
-    return case
+        raise HTTPException(status_code=404, detail="OT case not found")
+
+    sched = case.schedule
+    op_no = None
+
+    # 🔹 resolve latest OP visit for this patient (if any)
+    if sched and sched.patient_id:
+        latest_visit = (db.query(Visit).filter(
+            Visit.patient_id == sched.patient_id).order_by(
+                Visit.visit_at.desc()).first())
+        if latest_visit:
+            op_no = latest_visit.op_no  # property we added above
+
+    # Let Pydantic build the base object from ORM…
+    data = OtCaseOut.model_validate(case, from_attributes=True)
+
+    # …then inject op_no into nested schedule for the UI
+    if data.schedule:
+        data.schedule.op_no = op_no
+
+    return data
 
 
-@router.post(
-    "/cases",
-    response_model=OtCaseOut,
-    status_code=status.HTTP_201_CREATED,
-)
+# FILE: app/api/routes_ot_schedule_cases.py
+
+
+@router.post("/cases",
+             response_model=OtCaseOut,
+             status_code=status.HTTP_201_CREATED)
 def create_ot_case(
         payload: OtCaseCreate,
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
 ):
-    """
-    Generic case create. In practice, prefer /schedule/{id}/open-case.
-    """
     _need_any(user, ["ot.cases.create"])
 
     schedule = db.query(OtSchedule).get(payload.schedule_id)
@@ -473,8 +639,8 @@ def create_ot_case(
             detail="Case already exists for this schedule",
         )
 
+    # ❌ DON'T PASS schedule_id INTO OtCase(...)
     case = OtCase(
-        schedule_id=payload.schedule_id,
         preop_diagnosis=payload.preop_diagnosis,
         postop_diagnosis=payload.postop_diagnosis,
         final_procedure_name=payload.final_procedure_name,
@@ -487,10 +653,13 @@ def create_ot_case(
     )
 
     db.add(case)
-    # Mark schedule as in_progress if case has started
+    db.flush()  # get case.id
+
+    # 🔗 link via schedule.case_id
+    schedule.case_id = case.id
     if case.actual_start_time:
         schedule.status = "in_progress"
-        db.add(schedule)
+    db.add(schedule)
 
     db.commit()
     db.refresh(case)
@@ -512,22 +681,36 @@ def update_ot_case(
 
     data = payload.model_dump(exclude_unset=True)
 
-    if "schedule_id" in data:
+    # 🔁 re-link to another schedule if requested
+    if "schedule_id" in data and data["schedule_id"] is not None:
         new_schedule_id = data["schedule_id"]
-        if new_schedule_id != case.schedule_id:
-            schedule = db.query(OtSchedule).get(new_schedule_id)
-            if not schedule:
+        current_schedule_id = case.schedule.id if case.schedule else None
+
+        if new_schedule_id != current_schedule_id:
+            new_schedule = db.query(OtSchedule).get(new_schedule_id)
+            if not new_schedule:
                 raise HTTPException(
                     status_code=400,
                     detail="Invalid new OT Schedule",
                 )
-            if schedule.case and schedule.case.id != case.id:
+            if new_schedule.case and new_schedule.case.id != case.id:
                 raise HTTPException(
                     status_code=400,
                     detail="Target schedule already has a case",
                 )
 
+            # unlink old schedule
+            if case.schedule:
+                case.schedule.case_id = None
+
+            # link new schedule
+            new_schedule.case_id = case.id
+            db.add(new_schedule)
+
+    # apply other fields
     for field, value in data.items():
+        if field == "schedule_id":
+            continue
         setattr(case, field, value)
 
     db.add(case)
@@ -591,22 +774,13 @@ class OtCaseClosePayload(BaseModel):
     immediate_postop_condition: Optional[str] = None
 
 
-@router.post(
-    "/schedule/{schedule_id}/open-case",
-    response_model=OtCaseOut,
-)
+@router.post("/schedule/{schedule_id}/open-case", response_model=OtCaseOut)
 def open_ot_case_for_schedule(
         schedule_id: int,
         payload: OtCaseOpenPayload,
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
 ):
-    """
-    Open an OT case for a scheduled surgery.
-    - Creates OtCase if not exists.
-    - Sets actual_start_time.
-    - Sets schedule.status = 'in_progress'.
-    """
     _need_any(user, ["ot.cases.create", "ot.schedule.update"])
 
     schedule = db.query(OtSchedule).get(schedule_id)
@@ -623,8 +797,8 @@ def open_ot_case_for_schedule(
     now = datetime.utcnow()
 
     if not case:
+        # ❌ no schedule_id here
         case = OtCase(
-            schedule_id=schedule.id,
             preop_diagnosis=payload.preop_diagnosis,
             final_procedure_name=payload.final_procedure_name,
             speciality_id=payload.speciality_id,
@@ -633,6 +807,11 @@ def open_ot_case_for_schedule(
             immediate_postop_condition=payload.immediate_postop_condition,
         )
         db.add(case)
+        db.flush()  # get case.id
+
+        # 🔗 link both sides
+        schedule.case_id = case.id
+        db.add(schedule)
     else:
         if not case.actual_start_time:
             case.actual_start_time = payload.actual_start_time or now
@@ -647,7 +826,6 @@ def open_ot_case_for_schedule(
     db.add(schedule)
 
     db.commit()
-    # reload with schedule + nested
     db.refresh(case)
     return case
 
@@ -667,8 +845,10 @@ def close_ot_case(
     - Sets outcome & actual_end_time.
     - Updates schedule.status appropriately.
     """
-    _need_any(user,
-              ["ot.cases.close", "ot.cases.update", "ot.schedule.update"])
+    _need_any(
+        user,
+        ["ot.cases.close", "ot.cases.update", "ot.schedule.update"],
+    )
 
     case = db.query(OtCase).get(case_id)
     if not case:
@@ -677,8 +857,8 @@ def close_ot_case(
     if not case.actual_start_time:
         raise HTTPException(
             status_code=400,
-            detail=
-            "Cannot close a case that has not been started (no actual_start_time)",
+            detail=("Cannot close a case that has not been started "
+                    "(no actual_start_time)"),
         )
 
     now = datetime.utcnow()
@@ -710,71 +890,17 @@ def close_ot_case(
 
 
 # ============================================================
-#  OT CASE SUB-RESOURCES (STUB IMPLEMENTATIONS)
-#  These make your OtCaseDetailPage load without 404/405,
-#  and can be wired to real DB models later.
+#  OT CASE SUB-RESOURCES – PRE-OP CHECKLIST
 # ============================================================
 
-# --------- Pydantic DTOs for sub-resources ----------
 
-
-class OtPreopChecklistOut(BaseModel):
-    case_id: int
-    completed: bool = False
-    items: list[dict] = []  # you can structure later
-
-
-class OtSafetyChecklistOut(BaseModel):
-    case_id: int
-    sign_in: Optional[datetime] = None
-    time_out: Optional[datetime] = None
-    sign_out: Optional[datetime] = None
-
-
-class OtAnaesthesiaRecordOut(BaseModel):
-    case_id: int
-    events: list[dict] = []
-    vitals: list[dict] = []
-
-
-class OtNursingRecordOut(BaseModel):
-    case_id: int
-    entries: list[dict] = []
-
-
-class OtCountsOut(BaseModel):
-    case_id: int
-    initial: list[dict] = []
-    final: list[dict] = []
-    discrepancies: list[dict] = []
-
-
-class OtTransfusionsOut(BaseModel):
-    case_id: int
-    events: list[dict] = []
-
-
-class OtOperationNoteOut(BaseModel):
-    case_id: int
-    note: str = ""
-
-
-class OtPacuRecordOut(BaseModel):
-    case_id: int
-    observations: list[dict] = []
-    discharge_status: Optional[str] = None
-
-
-class OtCleaningLogOut(BaseModel):
-    id: int
-    case_id: Optional[int] = None
-    theatre_id: Optional[int] = None
-    cleaned_at: Optional[datetime] = None
-    cleaned_by: Optional[str] = None
-    remarks: Optional[str] = None
-
-
-# ---------- Pre-op checklist ----------
+def _build_preop_data_from_payload(payload: OtPreopChecklistIn) -> dict:
+    """
+    Convert OtPreopChecklistIn into a JSON-friendly dict
+    that we store in PreOpChecklist.data.
+    We keep `completed` as a separate DB column, so we exclude it from data.
+    """
+    return payload.model_dump(exclude={"completed"})
 
 
 @router.get(
@@ -788,30 +914,70 @@ def get_preop_checklist(
 ):
     _need_any(user, ["ot.cases.view"])
     _get_case_or_404(db, case_id)
-    # TODO: plug into real table later
-    return OtPreopChecklistOut(case_id=case_id)
+
+    checklist = (db.query(PreOpChecklistModel).filter(
+        PreOpChecklistModel.case_id == case_id).first())
+
+    if not checklist:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pre-op checklist not found for this case",
+        )
+
+    data = checklist.data or {}
+
+    return OtPreopChecklistOut(
+        case_id=case_id,
+        completed=checklist.completed,
+        created_at=checklist.created_at,
+        updated_at=checklist.completed_at or checklist.created_at,
+        **data,  # 🔥 includes checklist, investigations, vitals, flags, etc.
+    )
 
 
-# ---------- Safety checklist ----------
 @router.post(
     "/cases/{case_id}/preop-checklist",
     response_model=OtPreopChecklistOut,
+    status_code=status.HTTP_201_CREATED,
 )
 def create_preop_checklist(
         case_id: int,
         payload: OtPreopChecklistIn,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.cases.update"])
     _get_case_or_404(db, case_id)
 
-    # TODO: save to DB
-    # For now just echo:
+    existing = (db.query(PreOpChecklistModel).filter(
+        PreOpChecklistModel.case_id == case_id).first())
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Pre-op checklist already exists. Use PUT to update.",
+        )
+
+    data = _build_preop_data_from_payload(payload)
+    now = datetime.utcnow() if payload.completed else None
+
+    checklist = PreOpChecklistModel(
+        case_id=case_id,
+        nurse_user_id=user.id,
+        data=data,
+        completed=payload.completed,
+        completed_at=now,
+    )
+
+    db.add(checklist)
+    db.commit()
+    db.refresh(checklist)
+
     return OtPreopChecklistOut(
         case_id=case_id,
-        completed=payload.completed,
-        items=[payload.model_dump()],
+        created_at=checklist.created_at,
+        updated_at=checklist.completed_at or checklist.created_at,
+        completed=checklist.completed,
+        **data,
     )
 
 
@@ -823,170 +989,35 @@ def update_preop_checklist(
         case_id: int,
         payload: OtPreopChecklistIn,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.cases.update"])
     _get_case_or_404(db, case_id)
 
-    # TODO: update in DB
-    # For now just echo updated payload
+    checklist = (db.query(PreOpChecklistModel).filter(
+        PreOpChecklistModel.case_id == case_id).first())
+    if not checklist:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pre-op checklist not found for this case",
+        )
+
+    data = _build_preop_data_from_payload(payload)
+    now = datetime.utcnow() if payload.completed else None
+
+    checklist.data = data
+    checklist.completed = payload.completed
+    checklist.completed_at = now
+    checklist.nurse_user_id = user.id
+
+    db.add(checklist)
+    db.commit()
+    db.refresh(checklist)
+
     return OtPreopChecklistOut(
         case_id=case_id,
-        completed=payload.completed,
-        items=[payload.model_dump()],
+        created_at=checklist.created_at,
+        updated_at=checklist.completed_at or checklist.created_at,
+        completed=checklist.completed,
+        **data,
     )
-
-
-@router.get(
-    "/cases/{case_id}/safety-checklist",
-    response_model=OtSafetyChecklistOut,
-)
-def get_safety_checklist(
-        case_id: int,
-        db: Session = Depends(get_db),
-        user=Depends(current_user),
-):
-    _need_any(user, ["ot.cases.view"])
-    _get_case_or_404(db, case_id)
-    return OtSafetyChecklistOut(case_id=case_id)
-
-
-# ---------- Anaesthesia record ----------
-
-
-@router.get(
-    "/cases/{case_id}/anaesthesia-record",
-    response_model=OtAnaesthesiaRecordOut,
-)
-def get_anaesthesia_record(
-        case_id: int,
-        db: Session = Depends(get_db),
-        user=Depends(current_user),
-):
-    _need_any(user, ["ot.cases.view"])
-    _get_case_or_404(db, case_id)
-    return OtAnaesthesiaRecordOut(case_id=case_id)
-
-
-# ---------- Intra-op nursing ----------
-
-
-@router.get(
-    "/cases/{case_id}/nursing",
-    response_model=OtNursingRecordOut,
-)
-def get_nursing_record(
-        case_id: int,
-        db: Session = Depends(get_db),
-        user=Depends(current_user),
-):
-    """
-    Only GET is implemented here so your UI can load without 405.
-    Create/update endpoints can be added separately.
-    """
-    _need_any(user, ["ot.cases.view"])
-    _get_case_or_404(db, case_id)
-    return OtNursingRecordOut(case_id=case_id)
-
-
-# ---------- Instrument / sponge counts ----------
-
-
-@router.get(
-    "/cases/{case_id}/counts",
-    response_model=OtCountsOut,
-)
-def get_counts(
-        case_id: int,
-        db: Session = Depends(get_db),
-        user=Depends(current_user),
-):
-    _need_any(user, ["ot.cases.view"])
-    _get_case_or_404(db, case_id)
-    return OtCountsOut(case_id=case_id)
-
-
-# ---------- Blood transfusions ----------
-
-
-@router.get(
-    "/cases/{case_id}/transfusions",
-    response_model=OtTransfusionsOut,
-)
-def get_transfusions(
-        case_id: int,
-        db: Session = Depends(get_db),
-        user=Depends(current_user),
-):
-    """
-    Only GET is implemented so that your page load doesn't 405.
-    """
-    _need_any(user, ["ot.cases.view"])
-    _get_case_or_404(db, case_id)
-    return OtTransfusionsOut(case_id=case_id)
-
-
-# ---------- Operation note ----------
-
-
-@router.get(
-    "/cases/{case_id}/operation-note",
-    response_model=OtOperationNoteOut,
-)
-def get_operation_note(
-        case_id: int,
-        db: Session = Depends(get_db),
-        user=Depends(current_user),
-):
-    _need_any(user, ["ot.cases.view"])
-    _get_case_or_404(db, case_id)
-    return OtOperationNoteOut(case_id=case_id)
-
-
-# ---------- PACU / Recovery ----------
-
-
-@router.get(
-    "/cases/{case_id}/pacu",
-    response_model=OtPacuRecordOut,
-)
-def get_pacu_record(
-        case_id: int,
-        db: Session = Depends(get_db),
-        user=Depends(current_user),
-):
-    _need_any(user, ["ot.cases.view"])
-    _get_case_or_404(db, case_id)
-    return OtPacuRecordOut(case_id=case_id)
-
-
-# ---------- Cleaning logs (outside case sub-path) ----------
-
-
-@router.get(
-    "/cleaning-logs",
-    response_model=List[OtCleaningLogOut],
-)
-def list_cleaning_logs(
-        case_id: Optional[int] = Query(
-            None,
-            description="Optional filter by OT case id",
-        ),
-        db: Session = Depends(get_db),
-        user=Depends(current_user),
-):
-    """
-    Stub list endpoint to satisfy UI calls like:
-    GET /api/ot/cleaning-logs?case_id=1
-
-    Currently returns an empty list; you can later
-    wire this to a real OtCleaningLog model.
-    """
-    _need_any(user, ["ot.cases.view"])
-
-    # If you want, you can at least validate that the case exists
-    if case_id is not None:
-        _get_case_or_404(db, case_id)
-
-    # No DB model yet → return empty list
-    return []

@@ -12,18 +12,36 @@ from app.db.base import Base
 
 class IpdWard(Base):
     __tablename__ = "ipd_wards"
+    __table_args__ = {
+        "mysql_engine": "InnoDB",
+        "mysql_charset": "utf8mb4",
+    }
+
     id = Column(Integer, primary_key=True)
     name = Column(String(100), unique=True, nullable=False)
     code = Column(String(20), unique=True, nullable=False)
     floor = Column(String(50), default="")
     is_active = Column(Boolean, default=True)
-    rooms = relationship("IpdRoom",
-                         back_populates="ward",
-                         cascade="all, delete-orphan")
+    rooms = relationship(
+        "IpdRoom",
+        back_populates="ward",
+        cascade="all, delete-orphan",
+    )
 
 
 class IpdRoom(Base):
     __tablename__ = "ipd_rooms"
+    __table_args__ = (
+        UniqueConstraint("ward_id",
+                         "number",
+                         name="uq_ipd_room_number_per_ward"),
+        Index("ix_ipd_rooms_ward_active", "ward_id", "is_active"),
+        {
+            "mysql_engine": "InnoDB",
+            "mysql_charset": "utf8mb4",
+        },
+    )
+
     id = Column(Integer, primary_key=True)
     ward_id = Column(Integer,
                      ForeignKey("ipd_wards.id"),
@@ -33,22 +51,25 @@ class IpdRoom(Base):
     type = Column(String(30), default="General")
     is_active = Column(Boolean, default=True)
 
-    # NEW: enforce “room number unique within a ward” and speed up lists by ward+active
-    __table_args__ = (
-        UniqueConstraint("ward_id",
-                         "number",
-                         name="uq_ipd_room_number_per_ward"),
-        Index("ix_ipd_rooms_ward_active", "ward_id", "is_active"),
-    )
-
     ward = relationship("IpdWard", back_populates="rooms")
-    beds = relationship("IpdBed",
-                        back_populates="room",
-                        cascade="all, delete-orphan")
+    beds = relationship(
+        "IpdBed",
+        back_populates="room",
+        cascade="all, delete-orphan",
+    )
 
 
 class IpdBed(Base):
     __tablename__ = "ipd_beds"
+    __table_args__ = (
+        Index("ix_ipd_beds_state", "state"),
+        Index("ix_ipd_beds_room_state", "room_id", "state"),
+        {
+            "mysql_engine": "InnoDB",
+            "mysql_charset": "utf8mb4",
+        },
+    )
+
     id = Column(Integer, primary_key=True)
     room_id = Column(Integer,
                      ForeignKey("ipd_rooms.id"),
@@ -60,13 +81,15 @@ class IpdBed(Base):
     reserved_until = Column(DateTime, nullable=True)
     note = Column(String(255), default="")
 
-    # NEW: common filters get faster
-    __table_args__ = (
-        Index("ix_ipd_beds_state", "state"),
-        Index("ix_ipd_beds_room_state", "room_id", "state"),
-    )
-
     room = relationship("IpdRoom", back_populates="beds")
+    
+    @property
+    def ward_name(self) -> str | None:
+        return self.room.ward.name if self.room and self.room.ward else None
+
+    @property
+    def room_name(self) -> str | None:
+        return self.room.number if self.room else None
 
 
 class IpdBedRate(Base):
@@ -111,9 +134,6 @@ class IpdPackage(Base):
 # ---------------------------------------------------------------------
 # Bed Rates (dynamic, by Room Type with validity dates)
 # ---------------------------------------------------------------------
-
-
-
 
 # ---------------------------------------------------------------------
 # IPD Core Workflow
@@ -161,6 +181,7 @@ class IpdAdmission(Base):
 
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    current_bed = relationship("IpdBed")
 
     @property
     def display_code(self) -> str:
