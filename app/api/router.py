@@ -24,6 +24,8 @@ from app.api import (
     # IPD
     routes_ipd_masters,
     routes_ipd,
+    routes_ipd_medications,
+    routes_ipd_discharge,
     routes_pharmacy,
  
     routes_pharmacy_rx_list,
@@ -109,7 +111,8 @@ api_router.include_router(routes_ipd_masters.router,
                           prefix="/ipd",
                           tags=["ipd"])
 api_router.include_router(routes_ipd.router, prefix="/ipd", tags=["ipd"])
-
+api_router.include_router(routes_ipd_medications.router)
+api_router.include_router(routes_ipd_discharge.router)
 
 # ---- Masters
 api_router.include_router(routes_masters.router,

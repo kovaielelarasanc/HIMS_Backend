@@ -1,14 +1,23 @@
+# FILE: app/schemas/ipd.py
 from __future__ import annotations
-from datetime import datetime, date
+
+from datetime import datetime, date, time
 from typing import Optional, List
-from pydantic import BaseModel
+from decimal import Decimal
+from pydantic import BaseModel, Field, validator, ConfigDict, model_validator, field_validator
 
-# ---------------- Masters ----------------
+# =====================================================================
+# ------------------------------- Masters ------------------------------
+# =====================================================================
+class Paginated(BaseModel):
+    total: int
+    items: list
 
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
 class WardIn(BaseModel):
-    name: str
-    code: str
+    name: str = Field(..., min_length=1, max_length=100)
+    code: str = Field(..., min_length=1, max_length=20)
     floor: Optional[str] = ""
 
 
@@ -16,13 +25,12 @@ class WardOut(WardIn):
     id: int
     is_active: bool = True
 
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class RoomIn(BaseModel):
-    ward_id: int
-    number: str
+    ward_id: int = Field(..., gt=0)
+    number: str = Field(..., min_length=1, max_length=30)
     type: Optional[str] = "General"
 
 
@@ -35,8 +43,8 @@ class RoomOut(RoomIn):
 
 
 class BedIn(BaseModel):
-    room_id: int
-    code: str
+    room_id: int = Field(..., gt=0)
+    code: str = Field(..., min_length=1, max_length=30)
 
 
 class BedOut(BedIn):
@@ -50,10 +58,10 @@ class BedOut(BedIn):
 
 
 class PackageIn(BaseModel):
-    name: str
+    name: str = Field(..., min_length=1, max_length=120)
     included: Optional[str] = ""
     excluded: Optional[str] = ""
-    charges: float = 0.0
+    charges: float = Field(0.0, ge=0)
 
 
 class PackageOut(PackageIn):
@@ -63,26 +71,41 @@ class PackageOut(PackageIn):
         orm_mode = True
 
 
-# ---------------- Bed Rates ----------------
+# =====================================================================
+# ----------------------------- Bed Rates ------------------------------
+# =====================================================================
 
 
 class BedRateIn(BaseModel):
     room_type: str  # e.g., "General", "Private", "ICU"
-    daily_rate: float
+    daily_rate: float = Field(..., ge=0)
     effective_from: date
     effective_to: Optional[date] = None  # inclusive; null = open-ended
+
+    @model_validator(mode="after")
+    def validate_dates(self) -> "BedRateIn":
+        """
+        Ensure effective_to is not before effective_from.
+        Replaces old @root_validator from Pydantic v1.
+        """
+        if self.effective_to is not None and self.effective_to < self.effective_from:
+            raise ValueError("effective_to must be >= effective_from")
+        return self
 
 
 class BedRateOut(BedRateIn):
     id: int
     is_active: bool = True
 
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
 
 
-# ---------------- Admissions ----------------
-# NOTE: add `admitted_at` (manual entry allowed)
+# =====================================================================
+# ---------------------------- Admissions ------------------------------
+# =====================================================================
+
+ADMISSION_TYPES = {"planned", "emergency", "daycare"}
+PAYOR_TYPES = {"cash", "insurance", "tpa"}
 
 
 class AdmissionUpdateIn(BaseModel):
@@ -97,6 +120,18 @@ class AdmissionUpdateIn(BaseModel):
     preliminary_diagnosis: Optional[str] = None
     history: Optional[str] = None
     care_plan: Optional[str] = None
+
+    @validator("admission_type")
+    def validate_admission_type(cls, v):
+        if v is not None and v not in ADMISSION_TYPES:
+            raise ValueError(f"admission_type must be one of {sorted(ADMISSION_TYPES)}")
+        return v
+
+    @validator("payor_type")
+    def validate_payor_type(cls, v):
+        if v is not None and v not in PAYOR_TYPES:
+            raise ValueError(f"payor_type must be one of {sorted(PAYOR_TYPES)}")
+        return v
 
 
 class AdmissionOut(BaseModel):
@@ -130,15 +165,16 @@ class AdmissionDetailOut(BaseModel):
     current_room_number: Optional[str] = None
     current_ward_name: Optional[str] = None
 
+    class Config:
+        orm_mode = True
+
 
 class AdmissionIn(BaseModel):
-    patient_id: int
+    patient_id: int = Field(..., gt=0)
     department_id: Optional[int] = None
     practitioner_user_id: Optional[int] = None
-    # NOTE: keep primary_nurse_user_id optional; FE can simply omit it
     primary_nurse_user_id: Optional[int] = None
     admission_type: str = "planned"  # planned/emergency/daycare
-    # Allow manual admission timestamp (for pre-booked / preoccupied flows)
     admitted_at: Optional[datetime] = None
     expected_discharge_at: Optional[datetime] = None
     package_id: Optional[int] = None
@@ -148,11 +184,23 @@ class AdmissionIn(BaseModel):
     preliminary_diagnosis: Optional[str] = ""
     history: Optional[str] = ""
     care_plan: Optional[str] = ""
-    bed_id: int  # allocate on create
+    bed_id: int = Field(..., gt=0)  # allocate on create
+
+    @validator("admission_type")
+    def validate_admission_type(cls, v):
+        if v not in ADMISSION_TYPES:
+            raise ValueError(f"admission_type must be one of {sorted(ADMISSION_TYPES)}")
+        return v
+
+    @validator("payor_type")
+    def validate_payor_type(cls, v):
+        if v not in PAYOR_TYPES:
+            raise ValueError(f"payor_type must be one of {sorted(PAYOR_TYPES)}")
+        return v
 
 
 class TransferIn(BaseModel):
-    to_bed_id: int
+    to_bed_id: int = Field(..., gt=0)
     reason: Optional[str] = ""
 
 
@@ -168,28 +216,161 @@ class TransferOut(BaseModel):
         orm_mode = True
 
 
-# ---------------- Nursing & Clinical ----------------
+# =====================================================================
+# ---------------------- Nursing & Clinical Core ----------------------
+# =====================================================================
 
 
-class NursingNoteIn(BaseModel):
+class NurseMini(BaseModel):
+    id: int
+    full_name: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class NursingNoteBase(BaseModel):
+    
+    note_type: str = Field(
+        "routine",
+        description="Type of note: routine / incident / shift_handover",
+    )
+    # 🔹 NABH – core description fields
+    patient_condition: str = Field(
+        "",
+        description="Conscious / oriented / stable / drowsy / critical / breathless…",
+    )
+    significant_events: str = Field(
+        "",
+        description="Shifting, fall, vomiting, seizure, desaturation, transfusion, etc.",
+    )
+    nursing_interventions: str = Field(
+        "",
+        description="Medications given, oxygen started, IV fluids, dressing, catheter care, etc.",
+    )
+    response_progress: str = Field(
+        "",
+        description="Improved / no change / worsened, tolerated procedure, etc.",
+    )
+    handover_note: str = Field(
+        "",
+        description="What next nurse should watch / continue.",
+    )
+
+    # 🔹 Structured clinical observation fields (replaces clinical_finding)
+    wound_status: str = Field(
+        "",
+        description="Clean / dry / soaked / oozing / dressing intact etc.",
+    )
+    oxygen_support: str = Field(
+        "",
+        description="Room air / NC 2L / NRBM 10L / BiPAP / Ventilator settings etc.",
+    )
+    urine_output: str = Field(
+        "",
+        description="E.g. '200 ml clear in last 4 hrs; catheter in situ'.",
+    )
+    drains_tubes: str = Field(
+        "",
+        description="Status of drains / tubes (ICD, RT, etc.).",
+    )
+    pain_score: str = Field(
+        "",
+        description="E.g. 'Pain 3/10 on VAS'.",
+    )
+    other_findings: str = Field(
+        "",
+        description="Any other clinical findings not covered above.",
+    )
+
+    shift: Optional[str] = Field(
+        None,
+        description="Morning / Evening / Night",
+    )
+    is_icu: bool = Field(
+        False,
+        description="ICU patient? (hourly notes expected).",
+    )
+     # 🔹 Shift handover specific fields
+    vital_signs_summary: str = Field(
+        "",
+        description="Short summary of vitals at handover.",
+    )
+    todays_procedures: str = Field(
+        "",
+        description="Procedures / interventions done today or this shift.",
+    )
+    current_condition: str = Field(
+        "",
+        description="Current overall condition at handover.",
+    )
+    recent_changes: str = Field(
+        "",
+        description="New symptoms, changes in vitals, changes in treatment during shift.",
+    )
+    ongoing_treatment: str = Field(
+        "",
+        description="Ongoing IV fluids, infusions, oxygen, antibiotics, etc.",
+    )
+    watch_next_shift: str = Field(
+        "",
+        description="What next shift must watch – risks, pending results, etc.",
+    )
+
+class NursingNoteCreate(NursingNoteBase):
+    entry_time: Optional[datetime] = Field(
+        None,
+        description="If not provided, server uses current time.",
+    )
+
+    # 💡 How to link vitals:
+    # 1) If frontend passes linked_vital_id → link that row
+    # 2) Else backend auto-links latest vitals for this admission
+    linked_vital_id: Optional[int] = Field(
+        None,
+        description="Optional – ID of vitals row to link; if omitted, server will link latest vitals for this admission (if exists).",
+    )
+
+
+class NursingNoteUpdate(BaseModel):
+    patient_condition: Optional[str] = None
+    significant_events: Optional[str] = None
+    nursing_interventions: Optional[str] = None
+    response_progress: Optional[str] = None
+    handover_note: Optional[str] = None
+
+    wound_status: Optional[str] = None
+    oxygen_support: Optional[str] = None
+    urine_output: Optional[str] = None
+    drains_tubes: Optional[str] = None
+    pain_score: Optional[str] = None
+    other_findings: Optional[str] = None
+    
+    vital_signs_summary: Optional[str] = None
+    todays_procedures: Optional[str] = None
+    current_condition: Optional[str] = None
+    recent_changes: Optional[str] = None
+    ongoing_treatment: Optional[str] = None
+    watch_next_shift: Optional[str] = None
+
+    shift: Optional[str] = None
     entry_time: Optional[datetime] = None
-    patient_condition: Optional[str] = ""
-    clinical_finding: Optional[str] = ""
-    significant_events: Optional[str] = ""
-    response_progress: Optional[str] = ""
+    # DO NOT allow changing linked_vital_id from UI easily unless you want to
 
 
-class NursingNoteOut(NursingNoteIn):
+class NursingNoteOut(NursingNoteBase):
     id: int
     admission_id: int
     nurse_id: int
     entry_time: datetime
+    created_at: datetime
+    updated_at: datetime
+    is_locked: bool
 
-    class Config:
-        orm_mode = True
+    linked_vital_id: Optional[int] = None
+    nurse: Optional[NurseMini] = None
+    vitals: Optional[VitalSnapshot] = None  # 👈 for UI
 
-
-
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ShiftHandoverIn(BaseModel):
@@ -213,32 +394,57 @@ class ShiftHandoverOut(ShiftHandoverIn):
         orm_mode = True
 
 
-class VitalIn(BaseModel):
-    recorded_at: Optional[datetime] = None
-    bp_systolic: Optional[int] = None
-    bp_diastolic: Optional[int] = None
-    temp_c: Optional[float] = None
-    rr: Optional[int] = None
-    spo2: Optional[int] = None
-    pulse: Optional[int] = None
+# ---------- Base (common fields) ----------
+class VitalBase(BaseModel):
+    bp_systolic: Optional[int] = Field(
+        None, description="Systolic BP in mmHg"
+    )
+    bp_diastolic: Optional[int] = Field(
+        None, description="Diastolic BP in mmHg"
+    )
+    temp_c: Optional[float] = Field(
+        None, description="Temperature in °C"
+    )
+    rr: Optional[int] = Field(
+        None, description="Respiratory rate per minute"
+    )
+    spo2: Optional[int] = Field(
+        None, description="SpO₂ percentage"
+    )
+    pulse: Optional[int] = Field(
+        None, description="Pulse rate per minute"
+    )
 
 
-class VitalOut(VitalIn):
+# ---------- Create (input from UI) ----------
+class VitalCreate(VitalBase):
+    recorded_at: Optional[datetime] = Field(
+        None,
+        description="Optional; if not provided, server uses current time",
+    )
+
+
+# ---------- Full output for vitals module ----------
+class VitalOut(VitalBase):
     id: int
     admission_id: int
     recorded_by: int
     recorded_at: datetime
 
-    class Config:
-        orm_mode = True
+    model_config = ConfigDict(from_attributes=True)
 
+class VitalSnapshot(VitalBase):
+    id: int
+    recorded_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
 
 class IOIn(BaseModel):
     recorded_at: Optional[datetime] = None
-    intake_ml: int = 0
-    urine_ml: int = 0
-    drains_ml: int = 0
-    stools_count: int = 0
+    intake_ml: int = Field(0, ge=0)
+    urine_ml: int = Field(0, ge=0)
+    drains_ml: int = Field(0, ge=0)
+    stools_count: int = Field(0, ge=0)
     remarks: Optional[str] = ""
 
 
@@ -281,29 +487,427 @@ class ProgressOut(ProgressIn):
         orm_mode = True
 
 
-# ---------------- Discharge ----------------
+# =====================================================================
+# -------------------- NEW: Risk / Clinical Assessments ---------------
+# =====================================================================
 
 
-class DischargeSummaryIn(BaseModel):
-    demographics: Optional[str] = ""
-    medical_history: Optional[str] = ""
-    treatment_summary: Optional[str] = ""
-    medications: Optional[str] = ""
-    follow_up: Optional[str] = ""
-    icd10_codes: Optional[str] = ""  # CSV/JSON text
-    finalize: bool = False
+class PainAssessmentIn(BaseModel):
+    recorded_at: Optional[datetime] = None
+    scale_type: Optional[str] = None  # NRS, VAS, etc.
+    score: Optional[int] = Field(None, ge=0, le=10)
+    location: Optional[str] = None
+    character: Optional[str] = None
+    intervention: Optional[str] = None
+    post_intervention_score: Optional[int] = Field(None, ge=0, le=10)
 
 
-class DischargeSummaryOut(DischargeSummaryIn):
+class PainAssessmentOut(PainAssessmentIn):
     id: int
     admission_id: int
-    finalized: bool
-    finalized_by: Optional[int]
-    finalized_at: Optional[datetime]
+    recorded_by: Optional[int]
 
     class Config:
         orm_mode = True
 
+
+class FallRiskAssessmentIn(BaseModel):
+    recorded_at: Optional[datetime] = None
+    tool: Optional[str] = None
+    score: Optional[int] = None
+    risk_level: Optional[str] = None  # low / moderate / high
+    precautions: Optional[str] = None
+
+
+class FallRiskAssessmentOut(FallRiskAssessmentIn):
+    id: int
+    admission_id: int
+    recorded_by: Optional[int]
+
+    class Config:
+        orm_mode = True
+
+
+class PressureUlcerAssessmentIn(BaseModel):
+    recorded_at: Optional[datetime] = None
+    tool: Optional[str] = None
+    score: Optional[int] = None
+    risk_level: Optional[str] = None
+    existing_ulcer: bool = False
+    site: Optional[str] = None
+    stage: Optional[str] = None
+    management_plan: Optional[str] = None
+
+
+class PressureUlcerAssessmentOut(PressureUlcerAssessmentIn):
+    id: int
+    admission_id: int
+    recorded_by: Optional[int]
+
+    class Config:
+        orm_mode = True
+
+
+class NutritionAssessmentIn(BaseModel):
+    recorded_at: Optional[datetime] = None
+    bmi: Optional[float] = Field(None, ge=0)
+    weight_kg: Optional[float] = Field(None, ge=0)
+    height_cm: Optional[float] = Field(None, ge=0)
+    screening_tool: Optional[str] = None
+    score: Optional[int] = None
+    risk_level: Optional[str] = None
+    dietician_referral: bool = False
+
+
+class NutritionAssessmentOut(NutritionAssessmentIn):
+    id: int
+    admission_id: int
+    recorded_by: Optional[int]
+
+    class Config:
+        orm_mode = True
+
+
+# =====================================================================
+# ----------------- NEW: Orders & Medication / Drug Chart -------------
+# =====================================================================
+
+
+class OrderIn(BaseModel):
+    order_type: str  # lab / radiology / procedure / diet / nursing / device
+    linked_order_id: Optional[int] = None
+    order_text: Optional[str] = ""
+    order_status: str = "ordered"
+    ordered_at: Optional[datetime] = None
+    performed_at: Optional[datetime] = None
+
+    @validator("order_status")
+    def validate_order_status(cls, v):
+        allowed = {"ordered", "in_progress", "completed", "cancelled"}
+        if v not in allowed:
+            raise ValueError(f"order_status must be one of {sorted(allowed)}")
+        return v
+
+
+class OrderOut(OrderIn):
+    id: int
+    admission_id: int
+    ordered_by: Optional[int]
+    performed_by: Optional[int]
+
+    class Config:
+        orm_mode = True
+
+
+class MedicationOrderBase(BaseModel):
+    drug_id: Optional[int] = None
+    drug_name: str
+
+    dose: Optional[Decimal] = Field(None, ge=0)
+    dose_unit: Optional[str] = ""
+    route: Optional[str] = ""
+    frequency: Optional[str] = ""
+    duration_days: Optional[int] = Field(None, ge=0)
+
+    start_datetime: Optional[datetime] = None
+    stop_datetime: Optional[datetime] = None
+
+    special_instructions: Optional[str] = ""
+
+    # NEW: match model column
+    order_type: Optional[str] = "regular"  # regular / sos / stat / premed
+
+    order_status: Optional[str] = "active"
+    ordered_by_id: Optional[int] = None
+
+    @validator("order_status")
+    def validate_med_order_status(cls, v):
+        if v is None:
+            return v
+        allowed = {"active", "stopped", "completed"}
+        if v not in allowed:
+            raise ValueError(f"order_status must be one of {sorted(allowed)}")
+        return v
+
+    @validator("order_type")
+    def validate_order_type(cls, v):
+        if v is None:
+            return v
+        allowed = {"regular", "sos", "stat", "premed"}
+        if v not in allowed:
+            raise ValueError(f"order_type must be one of {sorted(allowed)}")
+        return v
+
+
+class IpdMedicationOrderCreate(MedicationOrderBase):
+    admission_id: Optional[int] = None  # set from path in router
+
+
+class IpdMedicationOrderUpdate(BaseModel):
+    # same fields as before, but ensure they include order_type
+    drug_id: Optional[int] = None
+    drug_name: Optional[str] = None
+    dose: Optional[float] = Field(None, ge=0)
+    dose_unit: Optional[str] = None
+    route: Optional[str] = None
+    frequency: Optional[str] = None
+    duration_days: Optional[int] = Field(None, ge=0)
+    start_datetime: Optional[datetime] = None
+    stop_datetime: Optional[datetime] = None
+    special_instructions: Optional[str] = None
+    order_status: Optional[str] = None
+    order_type: Optional[str] = None
+    ordered_by_id: Optional[int] = None
+
+    # validators for order_status + order_type as above
+    @validator("order_status")
+    def validate_med_order_status(cls, v):
+        if v is None:
+            return v
+        allowed = {"active", "stopped", "completed"}
+        if v not in allowed:
+            raise ValueError(f"order_status must be one of {sorted(allowed)}")
+        return v
+
+    @validator("order_type")
+    def validate_order_type(cls, v):
+        if v is None:
+            return v
+        allowed = {"regular", "sos", "stat", "premed"}
+        if v not in allowed:
+            raise ValueError(f"order_type must be one of {sorted(allowed)}")
+        return v
+
+
+class IpdMedicationOrderOut(MedicationOrderBase):
+    id: int
+    admission_id: int
+
+    class Config:
+        orm_mode = True
+
+
+class IpdMedicationAdministrationBase(BaseModel):
+    admission_id: int
+    med_order_id: int
+    scheduled_datetime: datetime
+    given_status: str = "pending"
+    given_datetime: Optional[datetime] = None
+    given_by: Optional[int] = None
+    remarks: Optional[str] = None
+
+    @validator("given_status")
+    def validate_given_status(cls, v):
+        allowed = {"pending", "given", "missed", "refused", "held"}
+        if v not in allowed:
+            raise ValueError(f"given_status must be one of {sorted(allowed)}")
+        return v
+
+
+class IpdMedicationAdministrationCreate(IpdMedicationAdministrationBase):
+    pass
+
+
+class IpdMedicationAdministrationUpdate(BaseModel):
+    scheduled_datetime: Optional[datetime] = None
+    given_status: Optional[str] = None
+    given_datetime: Optional[datetime] = None
+    given_by: Optional[int] = None
+    remarks: Optional[str] = None
+
+    @validator("given_status")
+    def validate_given_status(cls, v):
+        if v is None:
+            return v
+        allowed = {"pending", "given", "missed", "refused", "held"}
+        if v not in allowed:
+            raise ValueError(f"given_status must be one of {sorted(allowed)}")
+        return v
+
+
+class IpdMedicationAdministrationOut(IpdMedicationAdministrationBase):
+    id: int
+
+    class Config:
+        orm_mode = True
+
+
+# =====================================================================
+# -------- NEW: Dressing, Transfusion, Restraint, Isolation, ICU ------
+# =====================================================================
+
+
+class DressingRecordIn(BaseModel):
+    wound_site: Optional[str] = None
+    dressing_type: Optional[str] = None
+    indication: Optional[str] = None
+    date_time: Optional[datetime] = None
+    findings: Optional[str] = None
+    next_dressing_due: Optional[datetime] = None
+
+
+class DressingRecordOut(DressingRecordIn):
+    id: int
+    admission_id: int
+    done_by: Optional[int]
+
+    class Config:
+        orm_mode = True
+
+
+class BloodTransfusionIn(BaseModel):
+    component_type: Optional[str] = None
+    bag_number: Optional[str] = None
+    start_time: datetime
+    end_time: Optional[datetime] = None
+    pre_vitals: Optional[str] = None  # JSON text
+    post_vitals: Optional[str] = None
+    reaction_occurred: bool = False
+    reaction_notes: Optional[str] = None
+
+
+class BloodTransfusionOut(BloodTransfusionIn):
+    id: int
+    admission_id: int
+    notified_to: Optional[int]
+
+    class Config:
+        orm_mode = True
+
+
+class RestraintRecordIn(BaseModel):
+    type: Optional[str] = None  # physical / chemical
+    reason: Optional[str] = None
+    start_time: datetime
+    end_time: Optional[datetime] = None
+    monitoring_notes: Optional[str] = None
+
+
+class RestraintRecordOut(RestraintRecordIn):
+    id: int
+    admission_id: int
+    doctor_order_id: Optional[int]
+
+    class Config:
+        orm_mode = True
+
+
+class IsolationPrecautionIn(BaseModel):
+    indication: Optional[str] = None  # Airborne / Droplet / Contact
+    start_date: datetime
+    end_date: Optional[datetime] = None
+    measures: Optional[str] = None
+    status: str = "active"
+
+    @validator("status")
+    def validate_isolation_status(cls, v):
+        allowed = {"active", "stopped"}
+        if v not in allowed:
+            raise ValueError(f"status must be one of {sorted(allowed)}")
+        return v
+
+
+class IsolationPrecautionOut(IsolationPrecautionIn):
+    id: int
+    admission_id: int
+
+    class Config:
+        orm_mode = True
+
+
+class IcuFlowSheetIn(BaseModel):
+    recorded_at: Optional[datetime] = None
+    vital_data: Optional[str] = None   # JSON text
+    ventilator_settings: Optional[str] = None
+    infusions: Optional[str] = None
+    gcs_score: Optional[int] = Field(None, ge=0, le=15)
+    urine_output_ml: Optional[int] = Field(None, ge=0)
+    notes: Optional[str] = None
+
+
+class IcuFlowSheetOut(IcuFlowSheetIn):
+    id: int
+    admission_id: int
+    recorded_by: Optional[int]
+
+    class Config:
+        orm_mode = True
+
+
+# =====================================================================
+# --------------------------- Discharge -------------------------------
+# =====================================================================
+
+
+# ---------------- Discharge Summary ----------------
+
+class DischargeSummaryBase(BaseModel):
+    # NOTE: demographics is NOT editable from UI now, so not in Base/In.
+    # It will still exist in the model & be auto-filled for PDF.
+
+    medical_history: Optional[str] = ""
+    treatment_summary: Optional[str] = ""
+    medications: Optional[str] = ""
+    follow_up: Optional[str] = ""
+    icd10_codes: Optional[str] = ""  # human readable, one per line
+
+    # A. MUST-HAVE
+    final_diagnosis_primary: Optional[str] = ""
+    final_diagnosis_secondary: Optional[str] = ""
+    hospital_course: Optional[str] = ""
+    discharge_condition: Optional[str] = "stable"
+    discharge_type: Optional[str] = "routine"
+    allergies: Optional[str] = ""
+
+    # B. Recommended
+    procedures: Optional[str] = ""
+    investigations: Optional[str] = ""
+    diet_instructions: Optional[str] = ""
+    activity_instructions: Optional[str] = ""
+    warning_signs: Optional[str] = ""
+    referral_details: Optional[str] = ""
+
+    # C. Operational / billing
+    insurance_details: Optional[str] = ""
+    stay_summary: Optional[str] = ""
+    patient_ack_name: Optional[str] = ""
+    patient_ack_datetime: Optional[datetime] = None
+
+    # D. Doctor & system validation
+    prepared_by_name: Optional[str] = ""
+    reviewed_by_name: Optional[str] = ""
+    reviewed_by_regno: Optional[str] = ""
+    discharge_datetime: Optional[datetime] = None
+
+    # E. Safety & quality
+    implants: Optional[str] = ""
+    pending_reports: Optional[str] = ""
+    patient_education: Optional[str] = ""
+    followup_appointment_ref: Optional[str] = ""
+
+
+class DischargeSummaryIn(DischargeSummaryBase):
+    # UI flag to mark as finalized
+    finalize: bool = False
+
+
+class DischargeSummaryOut(DischargeSummaryBase):
+    id: int
+    admission_id: int
+
+    # system fields
+    finalized: bool
+    finalized_by: Optional[int]
+    finalized_at: Optional[datetime]
+
+    # OPTIONAL: expose demographics only in OUT (for PDFs/debug)
+    demographics: Optional[str] = ""
+
+    class Config:
+        orm_mode = True
+
+
+# ---------------- Discharge Checklist ----------------
 
 class DischargeChecklistIn(BaseModel):
     financial_clearance: Optional[bool] = None
@@ -322,6 +926,8 @@ class DischargeChecklistOut(DischargeChecklistIn):
         orm_mode = True
 
 
+# ---------------- Due Discharges (queue) ----------------
+
 class DueDischargeOut(BaseModel):
     admission_id: int
     patient_id: int
@@ -332,7 +938,29 @@ class DueDischargeOut(BaseModel):
         orm_mode = True
 
 
-# ---------------- Referrals ----------------
+# ---------------- Structured Discharge Medications ----------------
+
+class DischargeMedicationIn(BaseModel):
+    drug_name: str
+    dose: Optional[float] = Field(None, ge=0)
+    dose_unit: Optional[str] = None
+    route: Optional[str] = None
+    frequency: Optional[str] = None
+    duration_days: Optional[int] = Field(None, ge=0)
+    advice_text: Optional[str] = None
+
+
+class DischargeMedicationOut(DischargeMedicationIn):
+    id: int
+    admission_id: int
+
+    class Config:
+        orm_mode = True
+
+
+# =====================================================================
+# ---------------------------- Referrals -------------------------------
+# =====================================================================
 
 
 class ReferralIn(BaseModel):
@@ -352,7 +980,9 @@ class ReferralOut(ReferralIn):
         orm_mode = True
 
 
-# ---------------- OT ----------------
+# =====================================================================
+# ------------------------------- OT ----------------------------------
+# =====================================================================
 
 
 class OtCaseIn(BaseModel):
@@ -366,6 +996,7 @@ class OtCaseIn(BaseModel):
     staff_tags: Optional[str] = ""
     preop_notes: Optional[str] = ""
 
+
 class OtCaseForAdmissionIn(BaseModel):
     surgery_name: str
     scheduled_start: Optional[datetime] = None
@@ -375,6 +1006,8 @@ class OtCaseForAdmissionIn(BaseModel):
     anaesthetist_id: Optional[int] = None
     staff_tags: Optional[str] = ""
     preop_notes: Optional[str] = ""
+
+
 class OtCaseOut(OtCaseIn):
     id: int
     actual_start: Optional[datetime]
@@ -402,7 +1035,9 @@ class AnaesthesiaOut(AnaesthesiaIn):
         orm_mode = True
 
 
-# ---------------- Bed Charge Preview ----------------
+# =====================================================================
+# ---------------------- Bed Charge Preview ---------------------------
+# =====================================================================
 
 
 class BedChargeDay(BaseModel):
@@ -420,3 +1055,503 @@ class BedChargePreviewOut(BaseModel):
     days: List[BedChargeDay]
     total_amount: float
     missing_rate_days: int = 0
+
+
+# =====================================================================
+# ----------------------------- Feedback -------------------------------
+# =====================================================================
+
+
+class IpdFeedbackIn(BaseModel):
+    rating_overall: Optional[int] = Field(None, ge=1, le=5)
+    rating_nursing: Optional[int] = Field(None, ge=1, le=5)
+    rating_doctor: Optional[int] = Field(None, ge=1, le=5)
+    rating_cleanliness: Optional[int] = Field(None, ge=1, le=5)
+    comments: Optional[str] = None
+
+
+class IpdFeedbackOut(IpdFeedbackIn):
+    id: int
+    admission_id: int
+    patient_id: int
+    collected_at: datetime
+    collected_by: Optional[int]
+
+    class Config:
+        orm_mode = True
+
+
+# ===========================================
+# Assessments
+# ===========================================
+class IpdAssessmentBase(BaseModel):
+    assessment_type: str = "nursing"
+    assessed_at: Optional[datetime] = None
+    summary: Optional[str] = None
+    plan: Optional[str] = None
+
+
+class IpdAssessmentCreate(IpdAssessmentBase):
+    pass
+
+
+class IpdAssessmentOut(IpdAssessmentBase):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    admission_id: int
+    created_by_id: Optional[int] = None
+    created_at: datetime
+
+
+# ===========================================
+# Medications
+# ===========================================
+class IpdMedicationBase(BaseModel):
+    drug_name: str
+    route: str = "oral"
+    frequency: str = "od"
+    dose: Optional[str] = None
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    instructions: Optional[str] = None
+    status: Optional[str] = "active"
+
+
+class IpdMedicationCreate(IpdMedicationBase):
+    pass
+
+
+class IpdMedicationUpdate(BaseModel):
+    drug_name: Optional[str] = None
+    route: Optional[str] = None
+    frequency: Optional[str] = None
+    dose: Optional[str] = None
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    instructions: Optional[str] = None
+    status: Optional[str] = None
+
+
+class IpdMedicationOut(IpdMedicationBase):
+    id: int
+    admission_id: int
+    created_by_id: Optional[int] = None
+    created_at: datetime
+    updated_at: datetime
+    
+    model_config = ConfigDict(from_attributes=True)
+
+# ===========================================
+# Dressing / Transfusion
+# ===========================================
+class IpdDressingTransfusionBase(BaseModel):
+    entry_type: str = "dressing"   # dressing | transfusion
+    done_at: Optional[datetime] = None
+    site: Optional[str] = None
+    product: Optional[str] = None
+    volume: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class IpdDressingTransfusionCreate(IpdDressingTransfusionBase):
+    pass
+
+
+class IpdDressingTransfusionOut(IpdDressingTransfusionBase):
+    id: int
+    admission_id: int
+    created_by_id: Optional[int] = None
+    created_at: datetime
+    
+    model_config = ConfigDict(from_attributes=True)
+
+# ===========================================
+# Discharge Medications
+# ===========================================
+class IpdDischargeMedicationBase(BaseModel):
+    drug_name: str
+    dose: Optional[Decimal] = None
+    dose_unit: Optional[str] = ""
+    route: Optional[str] = ""
+    frequency: Optional[str] = ""
+    duration_days: Optional[int] = None
+    advice_text: Optional[str] = ""
+
+
+class IpdDischargeMedicationCreate(IpdDischargeMedicationBase):
+    pass
+
+
+class IpdDischargeMedicationOut(IpdDischargeMedicationBase):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    admission_id: int
+    created_by_id: Optional[int] = None
+    created_at: datetime
+
+
+# ===========================================
+# Feedback
+# ===========================================
+class IpdAdmissionFeedbackBase(BaseModel):
+    rating_nursing: Optional[int] = None
+    rating_doctor: Optional[int] = None
+    rating_cleanliness: Optional[int] = None
+    comments: Optional[str] = None
+    suggestions: Optional[str] = None
+
+
+class IpdAdmissionFeedbackCreate(IpdAdmissionFeedbackBase):
+    pass
+
+
+class IpdAdmissionFeedbackOut(IpdAdmissionFeedbackBase):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    admission_id: int
+    created_by_id: Optional[int] = None
+    created_at: datetime
+    updated_at: datetime
+
+class RestraintRecordBase(BaseModel):
+    type: str = ""  # physical / chemical
+    reason: str = ""
+    start_time: datetime
+    end_time: Optional[datetime] = None
+    monitoring_notes: str = ""
+
+
+class RestraintRecordIn(RestraintRecordBase):
+    pass
+
+
+class RestraintRecordOut(RestraintRecordBase):
+    id: int
+    admission_id: int
+    doctor_order_id: Optional[int] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# -------------------------------
+# Isolation Precautions
+# -------------------------------
+class IsolationPrecautionBase(BaseModel):
+    indication: str = ""         # Airborne / Droplet / Contact
+    start_date: datetime
+    end_date: Optional[datetime] = None
+    measures: str = ""           # mask / gown / etc.
+    status: str = "active"       # active / stopped
+
+
+class IsolationPrecautionIn(IsolationPrecautionBase):
+    pass
+
+
+class IsolationPrecautionOut(IsolationPrecautionBase):
+    id: int
+    admission_id: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# -------------------------------
+# ICU Flow Sheet
+# -------------------------------
+class IcuFlowSheetBase(BaseModel):
+    recorded_at: Optional[datetime] = None
+
+    vital_data: str = ""            # JSON/string
+    ventilator_settings: str = ""   # JSON/string
+    infusions: str = ""             # JSON/string
+
+    gcs_score: Optional[int] = None
+    urine_output_ml: Optional[int] = None
+    notes: str = ""
+
+
+class IcuFlowSheetIn(IcuFlowSheetBase):
+    pass
+
+
+class IcuFlowSheetOut(IcuFlowSheetBase):
+    id: int
+    admission_id: int
+    recorded_by: Optional[int] = None
+
+    model_config = ConfigDict(from_attributes=True)
+    
+class DischargeSummaryIn(BaseModel):
+    demographics: str = ""
+    medical_history: str = ""
+    treatment_summary: str = ""
+    medications: str = ""
+    follow_up: str = ""
+    icd10_codes: str = ""
+
+    final_diagnosis_primary: str = ""
+    final_diagnosis_secondary: str = ""
+    hospital_course: str = ""
+    discharge_condition: str = "stable"
+    discharge_type: str = "routine"
+    allergies: str = ""
+
+    procedures: str = ""
+    investigations: str = ""
+    diet_instructions: str = ""
+    activity_instructions: str = ""
+    warning_signs: str = ""
+    referral_details: str = ""
+
+    insurance_details: str = ""
+    stay_summary: str = ""
+
+    patient_ack_name: str = ""
+    patient_ack_datetime: Optional[datetime] = None
+
+    prepared_by_name: str = ""
+    reviewed_by_name: str = ""
+    reviewed_by_regno: str = ""
+    discharge_datetime: Optional[datetime] = None
+
+    implants: str = ""
+    pending_reports: str = ""
+    patient_education: str = ""
+    followup_appointment_ref: str = ""
+
+    finalize: bool = False
+
+
+class DischargeSummaryOut(BaseModel):
+    id: int
+    admission_id: int
+
+    demographics: str = ""
+    medical_history: str = ""
+    treatment_summary: str = ""
+    medications: str = ""
+    follow_up: str = ""
+    icd10_codes: str = ""
+
+    final_diagnosis_primary: str | None = None
+    final_diagnosis_secondary: str | None = None
+    hospital_course: str | None = None
+    discharge_condition: str | None = None
+    discharge_type: str | None = None
+    allergies: str | None = None
+
+    procedures: str | None = None
+    investigations: str | None = None
+    diet_instructions: str | None = None
+    activity_instructions: str | None = None
+    warning_signs: str | None = None
+    referral_details: str | None = None
+
+    insurance_details: str | None = None
+    stay_summary: str | None = None
+    patient_ack_name: str | None = None
+    patient_ack_datetime: Optional[datetime] = None
+
+    prepared_by_name: str | None = None
+    reviewed_by_name: str | None = None
+    reviewed_by_regno: str | None = None
+    discharge_datetime: Optional[datetime] = None
+
+    implants: str | None = None
+    pending_reports: str | None = None
+    patient_education: str | None = None
+    followup_appointment_ref: str | None = None
+
+    finalized: bool = False
+    finalized_at: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
+    
+    @field_validator("patient_ack_datetime", "discharge_datetime", mode="before")
+    @classmethod
+    def _normalize_zero_datetime(cls, v):
+        # Accept already-parsed None/datetime
+        if v is None:
+            return None
+        # In case driver gives a string "0000-00-00 00:00:00"
+        if isinstance(v, str) and v.startswith("0000-00-00"):
+            return None
+        return v
+    
+class IpdDrugChartMetaBase(BaseModel):
+    admission_id: int
+
+    allergic_to: Optional[str] = ""
+    diagnosis: Optional[str] = ""
+
+    weight_kg: Optional[Decimal] = Field(None, ge=0)
+    height_cm: Optional[Decimal] = Field(None, ge=0)
+    blood_group: Optional[str] = ""
+    bsa: Optional[Decimal] = Field(None, ge=0)
+    bmi: Optional[Decimal] = Field(None, ge=0)
+
+    oral_fluid_per_day_ml: Optional[int] = Field(None, ge=0)
+    salt_gm_per_day: Optional[Decimal] = Field(None, ge=0)
+    calorie_per_day_kcal: Optional[int] = Field(None, ge=0)
+    protein_gm_per_day: Optional[Decimal] = Field(None, ge=0)
+    diet_remarks: Optional[str] = ""
+
+
+class IpdDrugChartMetaCreate(IpdDrugChartMetaBase):
+
+    @model_validator(mode="before")
+    @classmethod
+    def auto_calc_bmi(cls, values: dict):
+        weight = values.get("weight_kg")
+        height_cm = values.get("height_cm")
+        bmi = values.get("bmi")
+
+        if bmi is None and weight is not None and height_cm is not None and height_cm > 0:
+            h_m = float(height_cm) / 100.0
+            bmi_val = float(weight) / (h_m * h_m)
+            values["bmi"] = Decimal(str(round(bmi_val, 2)))
+
+        return values
+
+
+class IpdDrugChartMetaUpdate(BaseModel):
+    allergic_to: Optional[str] = None
+    diagnosis: Optional[str] = None
+    weight_kg: Optional[Decimal] = Field(None, ge=0)
+    height_cm: Optional[Decimal] = Field(None, ge=0)
+    blood_group: Optional[str] = None
+    bsa: Optional[Decimal] = Field(None, ge=0)
+    bmi: Optional[Decimal] = Field(None, ge=0)
+    oral_fluid_per_day_ml: Optional[int] = Field(None, ge=0)
+    salt_gm_per_day: Optional[Decimal] = Field(None, ge=0)
+    calorie_per_day_kcal: Optional[int] = Field(None, ge=0)
+    protein_gm_per_day: Optional[Decimal] = Field(None, ge=0)
+    diet_remarks: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def auto_calc_bmi(cls, values):
+        # Only recompute if bmi not provided but weight+height changed
+        if values.get("bmi") is not None:
+            return values
+        weight = values.get("weight_kg")
+        height_cm = values.get("height_cm")
+        if weight is not None and height_cm is not None and height_cm > 0:
+            h_m = float(height_cm) / 100.0
+            bmi_val = float(weight) / (h_m * h_m)
+            values["bmi"] = Decimal(str(round(bmi_val, 2)))
+        return values
+
+
+class IpdDrugChartMetaOut(IpdDrugChartMetaBase):
+    id: int
+
+    class Config:
+        orm_mode = True
+
+class IpdIvFluidOrderBase(BaseModel):
+    admission_id: int
+
+    ordered_datetime: Optional[datetime] = None
+
+    fluid: str
+    additive: Optional[str] = ""
+    dose_ml: Optional[Decimal] = Field(None, ge=0)
+    rate_ml_per_hr: Optional[Decimal] = Field(None, ge=0)
+
+    doctor_name: Optional[str] = ""
+    doctor_id: Optional[int] = None
+
+    start_datetime: Optional[datetime] = None
+    start_nurse_name: Optional[str] = ""
+    start_nurse_id: Optional[int] = None
+
+    stop_datetime: Optional[datetime] = None
+    stop_nurse_name: Optional[str] = ""
+    stop_nurse_id: Optional[int] = None
+
+    remarks: Optional[str] = ""
+
+
+class IpdIvFluidOrderCreate(IpdIvFluidOrderBase):
+    admission_id: Optional[int] = None
+
+
+class IpdIvFluidOrderUpdate(BaseModel):
+    fluid: Optional[str] = None
+    additive: Optional[str] = None
+    dose_ml: Optional[Decimal] = Field(None, ge=0)
+    rate_ml_per_hr: Optional[Decimal] = Field(None, ge=0)
+    doctor_name: Optional[str] = None
+    doctor_id: Optional[int] = None
+    ordered_datetime: Optional[datetime] = None
+    start_datetime: Optional[datetime] = None
+    start_nurse_name: Optional[str] = None
+    start_nurse_id: Optional[int] = None
+    stop_datetime: Optional[datetime] = None
+    stop_nurse_name: Optional[str] = None
+    stop_nurse_id: Optional[int] = None
+    remarks: Optional[str] = None
+
+
+class IpdIvFluidOrderOut(IpdIvFluidOrderBase):
+    id: int
+
+    class Config:
+        orm_mode = True
+
+class IpdDrugChartNurseRowBase(BaseModel):
+    admission_id: int
+    serial_no: Optional[int] = None
+    nurse_name: str
+    specimen_sign: Optional[str] = ""
+    emp_no: Optional[str] = ""
+
+
+class IpdDrugChartNurseRowCreate(IpdDrugChartNurseRowBase):
+    pass
+
+
+class IpdDrugChartNurseRowUpdate(BaseModel):
+    serial_no: Optional[int] = None
+    nurse_name: Optional[str] = None
+    specimen_sign: Optional[str] = None
+    emp_no: Optional[str] = None
+
+
+class IpdDrugChartNurseRowOut(IpdDrugChartNurseRowBase):
+    id: int
+
+    class Config:
+        orm_mode = True
+
+class IpdDrugChartDoctorAuthBase(BaseModel):
+    admission_id: int
+    auth_date: date
+
+    doctor_name: Optional[str] = ""
+    doctor_id: Optional[int] = None
+    doctor_sign: Optional[str] = ""
+    remarks: Optional[str] = ""
+
+
+class IpdDrugChartDoctorAuthCreate(IpdDrugChartDoctorAuthBase):
+    pass
+
+
+class IpdDrugChartDoctorAuthUpdate(BaseModel):
+    auth_date: Optional[date] = None
+    doctor_name: Optional[str] = None
+    doctor_id: Optional[int] = None
+    doctor_sign: Optional[str] = None
+    remarks: Optional[str] = None
+
+
+class IpdDrugChartDoctorAuthOut(IpdDrugChartDoctorAuthBase):
+    id: int
+
+    class Config:
+        orm_mode = True

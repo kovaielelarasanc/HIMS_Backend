@@ -1,0 +1,585 @@
+<!-- FILE: app/templates/ipd/drug_chart.html -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <title>Drug Chart</title>
+    <style>
+        @page {
+            size: A4 portrait;
+            margin: 12mm 10mm 12mm 10mm;
+        }
+
+        body {
+            font-family: "DejaVu Sans", Arial, sans-serif;
+            font-size: 10px;
+            color: #111827;
+        }
+
+        .page {
+            width: 100%;
+        }
+
+        .section-title {
+            font-weight: bold;
+            text-transform: uppercase;
+            font-size: 10px;
+            margin-bottom: 2px;
+        }
+
+        .table {
+            width: 100%;
+            border-collapse: collapse;
+            border: 0.3pt solid #000;
+            margin-bottom: 4px;
+        }
+
+        .table th,
+        .table td {
+            border: 0.3pt solid #000;
+            padding: 2px 3px;
+            vertical-align: top;
+        }
+
+        .table th {
+            background: #f3f4f6;
+            font-weight: bold;
+            text-align: left;
+        }
+
+        .small {
+            font-size: 9px;
+        }
+
+        .center {
+            text-align: center;
+        }
+
+        .right {
+            text-align: right;
+        }
+
+        .text-muted {
+            color: #6b7280;
+        }
+
+        .mt-4 {
+            margin-top: 4px;
+        }
+
+        .mt-6 {
+            margin-top: 6px;
+        }
+
+        .mt-8 {
+            margin-top: 8px;
+        }
+
+        .mb-4 {
+            margin-bottom: 4px;
+        }
+
+        .mb-6 {
+            margin-bottom: 6px;
+        }
+
+        .bold {
+            font-weight: bold;
+        }
+
+        .header-hospital {
+            text-align: center;
+            font-weight: bold;
+            font-size: 12px;
+            margin-bottom: 2px;
+            text-transform: uppercase;
+        }
+
+        .header-sub {
+            text-align: center;
+            font-size: 9px;
+            margin-bottom: 6px;
+        }
+
+        .note {
+            font-size: 8px;
+            margin-top: 4px;
+        }
+
+        .no-border {
+            border: none !important;
+        }
+
+        .border-top-none {
+            border-top: none !important;
+        }
+
+        .border-bottom-none {
+            border-bottom: none !important;
+        }
+
+        .border-left-none {
+            border-left: none !important;
+        }
+
+        .border-right-none {
+            border-right: none !important;
+        }
+
+        .nowrap {
+            white-space: nowrap;
+        }
+
+        .w-10 {
+            width: 10%;
+        }
+
+        .w-15 {
+            width: 15%;
+        }
+
+        .w-20 {
+            width: 20%;
+        }
+
+        .w-25 {
+            width: 25%;
+        }
+
+        .w-30 {
+            width: 30%;
+        }
+
+        .w-40 {
+            width: 40%;
+        }
+
+        /* Hrs grid cells small */
+        .hrs-cell {
+            font-size: 7px;
+            text-align: center;
+            padding: 1px 1px;
+        }
+
+        .signature-box {
+            height: 14px;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="page">
+
+        <!-- Hospital header -->
+        <div class="header-hospital">
+            {{ admission.org_name if admission and admission.org_name else "HOSPITAL NAME" }}
+        </div>
+        <div class="header-sub">
+            Drug Chart
+        </div>
+
+        <!-- Patient + Allergy + Diagnosis row -->
+        <table class="table small">
+            <tr>
+                <td class="w-30">
+                    <span class="bold">Patient Name:</span>
+                    {{ patient_name or '' }}{% if age_str or gender %} ({{ age_str }} {{ gender }}){% endif %}
+                    <br />
+                    <span class="bold">UHID:</span> {{ uhid }}
+                    <br />
+                    <span class="bold">Admission No:</span> {{ admission.id if admission else '' }}
+                </td>
+                <td class="w-25">
+                    <span class="bold">Allergic to:</span><br />
+                    {{ meta.allergic_to if meta and meta.allergic_to else '' }}
+                </td>
+                <td class="w-25">
+                    <span class="bold">Diagnosis:</span><br />
+                    {{ meta.diagnosis if meta and meta.diagnosis else '' }}
+                </td>
+                <td class="w-20">
+                    <span class="bold">Date:</span>
+                    {{ generated_at.strftime("%d-%m-%Y") }}
+                    <br />
+                    <span class="bold">Ward / Bed:</span>
+                    {{ admission.ward_name if admission and admission.ward_name else '' }} {{ admission.bed_no if
+                    admission and admission.bed_no else '' }}
+                </td>
+            </tr>
+        </table>
+
+        <!-- Weight / Height / BMI / Blood Group / BSA -->
+        <table class="table small">
+            <tr>
+                <td class="w-15">
+                    <span class="bold">Weight:</span> {{ weight_kg or '' }} kg
+                </td>
+                <td class="w-15">
+                    <span class="bold">Height:</span> {{ height_cm or '' }} cm
+                </td>
+                <td class="w-15">
+                    <span class="bold">Blood Group:</span> {{ meta.blood_group if meta and meta.blood_group else '' }}
+                </td>
+                <td class="w-15">
+                    <span class="bold">BSA:</span> {{ meta.bsa if meta and meta.bsa else '' }}
+                </td>
+                <td class="w-15">
+                    <span class="bold">BMI:</span> {{ bmi or '' }}
+                </td>
+                <td class="w-25">
+                    <span class="bold">Patient ID Sticker</span>
+                </td>
+            </tr>
+        </table>
+
+        <!-- Dietary Advice -->
+        <div class="section-title mt-4">Dietary Advice</div>
+        <table class="table small">
+            <tr>
+                <td>
+                    Oral fluid: {{ meta.oral_fluid_per_day if meta and meta.oral_fluid_per_day else '' }} / day
+                </td>
+                <td>
+                    Salt: {{ meta.salt_gm_per_day if meta and meta.salt_gm_per_day else '' }} gm / day
+                </td>
+                <td>
+                    Calorie: {{ meta.calorie_per_day if meta and meta.calorie_per_day else '' }} / day
+                </td>
+                <td>
+                    Protein: {{ meta.protein_gm_per_day if meta and meta.protein_gm_per_day else '' }} gm / day
+                </td>
+            </tr>
+        </table>
+
+        <!-- Intravenous Fluids section -->
+        <div class="section-title mt-4">Intravenous Fluids</div>
+        <table class="table small">
+            <thead>
+                <tr>
+                    <th class="w-15 center">Date &amp; Time / Hrs</th>
+                    <th class="w-20">Fluid</th>
+                    <th class="w-15">Additive (if any)</th>
+                    <th class="w-10 center">Dose</th>
+                    <th class="w-10 center">Rate of infusion ml/hr</th>
+                    <th class="w-10 center">Doctor Sign</th>
+                    <th class="w-10 center">Start Time / Hrs</th>
+                    <th class="w-10 center">Nurse's Sign</th>
+                    <th class="w-10 center">Stop Time / Hrs</th>
+                    <th class="w-10 center">Nurse's Sign</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for iv in iv_fluids %}
+                <tr>
+                    <td class="center">
+                        {% if iv.ordered_datetime %}
+                        {{ iv.ordered_datetime.strftime("%d-%m-%Y %H:%M") }}
+                        {% endif %}
+                    </td>
+                    <td>{{ iv.fluid or '' }}</td>
+                    <td>{{ iv.additive or '' }}</td>
+                    <td class="center">{{ iv.dose or '' }}</td>
+                    <td class="center">{{ iv.rate_ml_per_hr or '' }}</td>
+                    <td class="center signature-box"></td>
+                    <td class="center">
+                        {% if iv.start_time %}
+                        {{ iv.start_time.strftime("%H:%M") }}
+                        {% endif %}
+                    </td>
+                    <td class="center signature-box"></td>
+                    <td class="center">
+                        {% if iv.stop_time %}
+                        {{ iv.stop_time.strftime("%H:%M") }}
+                        {% endif %}
+                    </td>
+                    <td class="center signature-box"></td>
+                </tr>
+                {% endfor %}
+                {% for _ in range( max(0, 6 - iv_fluids|length) ) %}
+                <tr>
+                    <td class="signature-box"></td>
+                    <td></td>
+                    <td></td>
+                    <td></td>
+                    <td></td>
+                    <td class="signature-box"></td>
+                    <td></td>
+                    <td class="signature-box"></td>
+                    <td></td>
+                    <td class="signature-box"></td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+
+        <!-- Nurse signatures block -->
+        <div class="section-title mt-4">Name of the Nurse, Specimen Sign and Emp. No.</div>
+        <table class="table small">
+            <thead>
+                <tr>
+                    <th class="w-5 center">S. No.</th>
+                    <th class="w-30">Name</th>
+                    <th class="w-20 center">Specimen Sign</th>
+                    <th class="w-15 center">Emp. No.</th>
+
+                    <th class="w-5 center">S. No.</th>
+                    <th class="w-30">Name</th>
+                    <th class="w-20 center">Specimen Sign</th>
+                    <th class="w-15 center">Emp. No.</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% set rows = nurse_rows %}
+                {% for i in range(0, 10) %}
+                <tr>
+                    {% set left = rows[i] if i < rows|length else None %} <td class="center">{{ i + 1 }}</td>
+                        <td>{{ left.nurse_name if left else '' }}</td>
+                        <td class="signature-box"></td>
+                        <td class="center">{{ left.emp_no if left else '' }}</td>
+
+                        {% set j = i + 10 %}
+                        {% set right = rows[j] if j < rows|length else None %} <td class="center">{{ j + 1 }}</td>
+                            <td>{{ right.nurse_name if right else '' }}</td>
+                            <td class="signature-box"></td>
+                            <td class="center">{{ right.emp_no if right else '' }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+
+        <!-- Regular Medications / Drug Chart grid -->
+        <div class="section-title mt-6">Regular Medications</div>
+        <table class="table small">
+            <thead>
+                <tr>
+                    <th class="w-20">Drug Name (CAPITAL)</th>
+                    <th class="w-10 center">Dose &amp; Frequency</th>
+                    <th class="w-10 center">PO</th>
+                    <th class="w-10 center">IM</th>
+                    <th class="w-10 center">SC</th>
+                    <th class="w-10 center">IV</th>
+                    <th class="w-15 center">Doctor Name &amp; Sign</th>
+                    <th class="w-15 center">Time</th>
+                    <th class="w-25 center">Special Instructions</th>
+                </tr>
+                <tr>
+                    <th colspan="2" class="center">DATE / Hrs &amp; Nurse Sign</th>
+                    <th colspan="6" class="center">
+                        {% for h in hour_slots %}
+                        <span class="hrs-cell">{{ "%02d" % h }}<br />Sign</span>
+                        {% endfor %}
+                    </th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for o in regular_orders %}
+                <tr>
+                    <td rowspan="2">
+                        {{ o.drug_name or '' }}
+                    </td>
+                    <td rowspan="2" class="center">
+                        {{ o.dose or '' }} {{ o.dose_unit or '' }}<br />
+                        {{ o.frequency|upper if o.frequency else '' }}
+                    </td>
+                    <td class="center">{% if o.route and 'po' in o.route.lower() %}✔{% endif %}</td>
+                    <td class="center">{% if o.route and 'im' in o.route.lower() %}✔{% endif %}</td>
+                    <td class="center">{% if o.route and 'sc' in o.route.lower() %}✔{% endif %}</td>
+                    <td class="center">{% if o.route and 'iv' in o.route.lower() %}✔{% endif %}</td>
+                    <td rowspan="2">
+                        {% if o.ordered_by_user %}
+                        {{ o.ordered_by_user.full_name if o.ordered_by_user.full_name else o.ordered_by_user.username }}
+                        {% endif %}
+                    </td>
+                    <td rowspan="2" class="center">
+                        {% if o.start_datetime %}
+                        {{ o.start_datetime.strftime("%d-%m-%Y %H:%M") }}
+                        {% endif %}
+                    </td>
+                    <td rowspan="2">
+                        {{ o.special_instructions or '' }}
+                    </td>
+                </tr>
+                <tr>
+                    {% set admins_for_order = admin_by_order.get(o.id, []) %}
+                    {% for h in hour_slots %}
+                    <td class="hrs-cell signature-box">
+                        {# You can later put a symbol based on given_status and hour #}
+                    </td>
+                    {% endfor %}
+                </tr>
+                {% endfor %}
+
+                {% if regular_orders|length == 0 %}
+                {% for _ in range(4) %}
+                <tr>
+                    <td rowspan="2" class="signature-box"></td>
+                    <td rowspan="2"></td>
+                    <td></td>
+                    <td></td>
+                    <td></td>
+                    <td></td>
+                    <td rowspan="2"></td>
+                    <td rowspan="2"></td>
+                    <td rowspan="2"></td>
+                </tr>
+                <tr>
+                    {% for h in hour_slots %}
+                    <td class="hrs-cell signature-box"></td>
+                    {% endfor %}
+                </tr>
+                {% endfor %}
+                {% endif %}
+            </tbody>
+        </table>
+
+        <!-- SOS Medications -->
+        <div class="section-title mt-6">SOS Medications</div>
+        <table class="table small">
+            <thead>
+                <tr>
+                    <th class="w-10 center">Date</th>
+                    <th class="w-25">Drug (CAPITALS)</th>
+                    <th class="w-10 center">Dose</th>
+                    <th class="w-10 center">Route</th>
+                    <th class="w-10 center">Frequency</th>
+                    <th class="w-10 center">Doctor Sign</th>
+                    <th class="w-25 center">Hrs &amp; Nurse Sign</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for o in sos_orders %}
+                <tr>
+                    <td class="center">
+                        {% if o.start_datetime %}
+                        {{ o.start_datetime.strftime("%d-%m-%Y") }}
+                        {% endif %}
+                    </td>
+                    <td>{{ o.drug_name or '' }}</td>
+                    <td class="center">{{ o.dose or '' }} {{ o.dose_unit or '' }}</td>
+                    <td class="center">{{ o.route|upper if o.route else '' }}</td>
+                    <td class="center">{{ o.frequency|upper if o.frequency else '' }}</td>
+                    <td class="center"></td>
+                    <td class="center signature-box"></td>
+                </tr>
+                {% endfor %}
+                {% for _ in range( max(0, 4 - sos_orders|length) ) %}
+                <tr>
+                    <td class="signature-box"></td>
+                    <td></td>
+                    <td></td>
+                    <td></td>
+                    <td></td>
+                    <td class="signature-box"></td>
+                    <td class="signature-box"></td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+
+        <!-- STAT / Premedication -->
+        <div class="section-title mt-6">STAT Medications / Premedication</div>
+        <table class="table small">
+            <thead>
+                <tr>
+                    <th class="w-15 center">Date &amp; Time / Hrs</th>
+                    <th class="w-25">Drug (CAPITALS)</th>
+                    <th class="w-10 center">Dose</th>
+                    <th class="w-10 center">Route</th>
+                    <th class="w-15 center">Doctor Name</th>
+                    <th class="w-10 center">Doctor Sign</th>
+                    <th class="w-10 center">Administered by</th>
+                    <th class="w-10 center">Hrs</th>
+                    <th class="w-10 center">Nurse's Sign</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% set all_stat = stat_orders + premed_orders %}
+                {% for o in all_stat %}
+                <tr>
+                    <td class="center">
+                        {% if o.start_datetime %}
+                        {{ o.start_datetime.strftime("%d-%m-%Y %H:%M") }}
+                        {% endif %}
+                    </td>
+                    <td>{{ o.drug_name or '' }}</td>
+                    <td class="center">{{ o.dose or '' }} {{ o.dose_unit or '' }}</td>
+                    <td class="center">{{ o.route|upper if o.route else '' }}</td>
+                    <td class="center">
+                        {% if o.ordered_by_user %}
+                        {{ o.ordered_by_user.full_name if o.ordered_by_user.full_name else o.ordered_by_user.username }}
+                        {% endif %}
+                    </td>
+                    <td class="center signature-box"></td>
+                    <td class="center"></td>
+                    <td class="center"></td>
+                    <td class="center signature-box"></td>
+                </tr>
+                {% endfor %}
+                {% for _ in range( max(0, 4 - all_stat|length) ) %}
+                <tr>
+                    <td class="signature-box"></td>
+                    <td></td>
+                    <td></td>
+                    <td></td>
+                    <td></td>
+                    <td class="signature-box"></td>
+                    <td></td>
+                    <td></td>
+                    <td class="signature-box"></td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+
+        <!-- Doctor's Daily Authorisation -->
+        <div class="section-title mt-6">Doctor's Daily Authorization</div>
+        <table class="table small">
+            <thead>
+                <tr>
+                    <th class="w-15 center">Date</th>
+                    <th class="w-35">Doctor Name</th>
+                    <th class="w-20 center">Signature</th>
+                    <th class="w-30 center">Remarks</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for d in doctor_auths %}
+                <tr>
+                    <td class="center">
+                        {% if d.auth_date %}
+                        {{ d.auth_date.strftime("%d-%m-%Y") }}
+                        {% endif %}
+                    </td>
+                    <td>{{ d.doctor_name or '' }}</td>
+                    <td class="signature-box"></td>
+                    <td>{{ d.remarks or '' }}</td>
+                </tr>
+                {% endfor %}
+                {% for _ in range( max(0, 4 - doctor_auths|length) ) %}
+                <tr>
+                    <td class="signature-box"></td>
+                    <td></td>
+                    <td class="signature-box"></td>
+                    <td></td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+
+        <!-- NOTE -->
+        <div class="note">
+            <strong>NOTE:</strong><br />
+            &#9679; If medicines are not administered, indicate as <strong>NOT GIVEN</strong> in drug chart and the
+            reason should be documented in nurses notes.<br />
+            &#9679; Verbal orders to be noted as '<strong>V</strong>'. Remember to practice READBACK for all oral
+            orders.
+            VERBAL ORDERS ARE NOT ACCEPTED FOR HIGH RISK DRUGS. Verbal orders to be signed by ordering doctors within 24
+            hours.
+        </div>
+
+    </div>
+</body>
+
+</html>

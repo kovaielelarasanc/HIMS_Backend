@@ -1,18 +1,48 @@
+# FILE: app/api/routes_ipd.py
 from __future__ import annotations
 from datetime import datetime, date, timedelta, time
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Body
-from sqlalchemy.orm import Session
-
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.exc import SQLAlchemyError
 from app.api.deps import get_db, current_user as auth_current_user
 from app.models.user import User as UserModel
-from app.models.ipd import (IpdBed, IpdAdmission, IpdBedAssignment,
-                            IpdTransfer, IpdNursingNote, IpdShiftHandover,
-                            IpdVital, IpdIntakeOutput, IpdRound,
-                            IpdProgressNote, IpdDischargeSummary,
-                            IpdDischargeChecklist, IpdReferral, IpdOtCase,
-                            IpdAnaesthesiaRecord, IpdRoom, IpdBedRate, IpdWard)
+from app.models.ipd import (
+    IpdBed,
+    IpdAdmission,
+    IpdBedAssignment,
+    IpdTransfer,
+    IpdNursingNote,
+    IpdShiftHandover,
+    IpdVital,
+    IpdIntakeOutput,
+    IpdRound,
+    IpdProgressNote,
+    IpdDischargeSummary,
+    IpdDischargeChecklist,
+    IpdReferral,
+    IpdOtCase,
+    IpdAnaesthesiaRecord,
+    IpdRoom,
+    IpdBedRate,
+    IpdWard,
+    # NEW models
+    IpdPainAssessment,
+    IpdFallRiskAssessment,
+    IpdPressureUlcerAssessment,
+    IpdNutritionAssessment,
+    IpdOrder,
+    IpdDressingRecord,
+    IpdBloodTransfusion,
+    IpdRestraintRecord,
+    IpdIsolationPrecaution,
+    IcuFlowSheet,
+    IpdDischargeMedication,
+    IpdFeedback,
+    IpdMedication,
+    IpdDressingTransfusion
+)
 from app.models.patient import Patient
 from app.models.user import User
 from app.schemas.ipd import (
@@ -22,12 +52,12 @@ from app.schemas.ipd import (
     AdmissionDetailOut,
     TransferIn,
     TransferOut,
-    NursingNoteIn,
+    NursingNoteCreate,
+    NursingNoteUpdate,
     NursingNoteOut,
     ShiftHandoverIn,
     ShiftHandoverOut,
-    VitalIn,
-    VitalOut,
+    VitalCreate, VitalOut,
     IOIn,
     IOOut,
     RoundIn,
@@ -48,10 +78,53 @@ from app.schemas.ipd import (
     BedChargePreviewOut,
     BedChargeDay,
     OtCaseForAdmissionIn,
+    # NEW schemas
+    PainAssessmentIn,
+    PainAssessmentOut,
+    FallRiskAssessmentIn,
+    FallRiskAssessmentOut,
+    PressureUlcerAssessmentIn,
+    PressureUlcerAssessmentOut,
+    NutritionAssessmentIn,
+    NutritionAssessmentOut,
+    OrderIn,
+    OrderOut,
+    DressingRecordIn,
+    DressingRecordOut,
+    BloodTransfusionIn,
+    BloodTransfusionOut,
+    RestraintRecordIn,
+    RestraintRecordOut,
+    IsolationPrecautionIn,
+    IsolationPrecautionOut,
+    IcuFlowSheetIn,
+    IcuFlowSheetOut,
+    DischargeMedicationIn,
+    DischargeMedicationOut,
+    IpdFeedbackIn,
+    IpdFeedbackOut,
+    IpdAssessmentOut,
+    IpdAssessmentCreate, 
+    IpdMedicationOut,
+    IpdMedicationCreate,
+    IpdMedicationUpdate,
+    IpdDressingTransfusionOut,
+    IpdDressingTransfusionCreate,
+    IpdDischargeMedicationOut,
+    IpdDischargeMedicationCreate,
+    IpdAdmissionFeedbackOut,
+    IpdAdmissionFeedbackCreate,
+    VitalSnapshot
 )
 from app.services.ipd_billing import auto_finalize_ipd_on_discharge
 
 router = APIRouter()
+
+def _get_admission_or_404(db: Session, admission_id: int) -> IpdAdmission:
+    adm = db.query(IpdAdmission).get(admission_id)
+    if not adm:
+        raise HTTPException(status_code=404, detail="Admission not found")
+    return adm
 
 
 def has_perm(user: UserModel, code: str) -> bool:
@@ -63,26 +136,35 @@ def has_perm(user: UserModel, code: str) -> bool:
                 return True
     return False
 
+def _need_any(user: User, codes: list[str]) -> None:
+    if getattr(user, "is_admin", False):
+        return
+    have = {p.code for r in (user.roles or []) for p in (r.permissions or [])}
+    if have.intersection(set(codes)):
+        return
+    raise HTTPException(403, "Not permitted")
 
 # ---------------- Utils ----------------
-
-
 def _adm_display_code(adm_id: int) -> str:
-    # friendly, non-PII admission code
     return f"IP-{adm_id:06d}"
 
 
 def _admission_detail(db: Session, adm: IpdAdmission) -> AdmissionDetailOut:
     patient = db.query(Patient).get(adm.patient_id)
-    bed = db.query(IpdBed).get(
-        adm.current_bed_id) if adm.current_bed_id else None
+    bed = db.query(IpdBed).get(adm.current_bed_id) if adm.current_bed_id else None
     room = db.query(IpdRoom).get(bed.room_id) if bed else None
     ward = db.query(IpdWard).get(room.ward_id) if room else None
-    doc = db.query(UserModel).get(
-        adm.practitioner_user_id) if adm.practitioner_user_id else None
+    doc = (
+        db.query(UserModel).get(adm.practitioner_user_id)
+        if adm.practitioner_user_id
+        else None
+    )
 
-    patient_name = f"{(patient.first_name or '').strip()} {(patient.last_name or '').strip()}".strip(
-    ) if patient else ""
+    patient_name = (
+        f"{(patient.first_name or '').strip()} {(patient.last_name or '').strip()}".strip()
+        if patient
+        else ""
+    )
     return AdmissionDetailOut(
         id=adm.id,
         display_code=_adm_display_code(adm.id),
@@ -104,12 +186,12 @@ def _admission_detail(db: Session, adm: IpdAdmission) -> AdmissionDetailOut:
 
 
 # ---------------- Admissions ----------------
-
-
 @router.post("/admissions", response_model=AdmissionOut)
-def create_admission(payload: AdmissionIn,
-                     db: Session = Depends(get_db),
-                     user: User = Depends(auth_current_user)):
+def create_admission(
+    payload: AdmissionIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
     if not has_perm(user, "ipd.manage"):
         raise HTTPException(403, "Not permitted")
 
@@ -119,32 +201,37 @@ def create_admission(payload: AdmissionIn,
     if bed.state not in ("vacant", "reserved"):
         raise HTTPException(400, "Bed not available")
 
-    adm = IpdAdmission(patient_id=payload.patient_id,
-                       department_id=payload.department_id,
-                       practitioner_user_id=payload.practitioner_user_id,
-                       primary_nurse_user_id=payload.primary_nurse_user_id,
-                       admission_type=payload.admission_type,
-                       expected_discharge_at=payload.expected_discharge_at,
-                       package_id=payload.package_id,
-                       payor_type=payload.payor_type,
-                       insurer_name=payload.insurer_name,
-                       policy_number=payload.policy_number,
-                       preliminary_diagnosis=payload.preliminary_diagnosis,
-                       history=payload.history,
-                       care_plan=payload.care_plan,
-                       current_bed_id=payload.bed_id,
-                       status="admitted",
-                       created_by=user.id)
+    adm = IpdAdmission(
+        patient_id=payload.patient_id,
+        department_id=payload.department_id,
+        practitioner_user_id=payload.practitioner_user_id,
+        primary_nurse_user_id=payload.primary_nurse_user_id,
+        admission_type=payload.admission_type,
+        admitted_at=payload.admitted_at or datetime.utcnow(),
+        expected_discharge_at=payload.expected_discharge_at,
+        package_id=payload.package_id,
+        payor_type=payload.payor_type,
+        insurer_name=payload.insurer_name,
+        policy_number=payload.policy_number,
+        preliminary_diagnosis=payload.preliminary_diagnosis,
+        history=payload.history,
+        care_plan=payload.care_plan,
+        current_bed_id=payload.bed_id,
+        status="admitted",
+        created_by=user.id,
+    )
     db.add(adm)
     db.flush()
 
-    # occupy bed + create assignment
     bed.state = "occupied"
     bed.reserved_until = None
     db.add(
-        IpdBedAssignment(admission_id=adm.id,
-                         bed_id=bed.id,
-                         reason="admission"))
+        IpdBedAssignment(
+            admission_id=adm.id,
+            bed_id=bed.id,
+            reason="admission",
+        )
+    )
     db.commit()
     db.refresh(adm)
     return adm
@@ -152,13 +239,13 @@ def create_admission(payload: AdmissionIn,
 
 @router.get("/admissions", response_model=List[AdmissionOut])
 def list_admissions(
-        status: Optional[str] = None,
-        patient_id: Optional[int] = None,
-        practitioner_user_id: Optional[int] = None,
-        department_id: Optional[int] = None,
-        limit: int = 300,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
+    status: Optional[str] = None,
+    patient_id: Optional[int] = None,
+    practitioner_user_id: Optional[int] = None,
+    department_id: Optional[int] = None,
+    limit: int = 300,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
 ):
     if not has_perm(user, "ipd.view"):
         raise HTTPException(403, "Not permitted")
@@ -175,9 +262,11 @@ def list_admissions(
 
 
 @router.get("/admissions/{admission_id}", response_model=AdmissionOut)
-def get_admission(admission_id: int,
-                  db: Session = Depends(get_db),
-                  user: User = Depends(auth_current_user)):
+def get_admission(
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
     if not has_perm(user, "ipd.view"):
         raise HTTPException(403, "Not permitted")
     adm = db.query(IpdAdmission).get(admission_id)
@@ -187,17 +276,18 @@ def get_admission(admission_id: int,
 
 
 @router.put("/admissions/{admission_id}", response_model=AdmissionOut)
-def update_admission(admission_id: int,
-                     payload: AdmissionUpdateIn,
-                     db: Session = Depends(get_db),
-                     user: User = Depends(auth_current_user)):
+def update_admission(
+    admission_id: int,
+    payload: AdmissionUpdateIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
     if not has_perm(user, "ipd.manage"):
         raise HTTPException(403, "Not permitted")
     adm = db.query(IpdAdmission).get(admission_id)
     if not adm:
         raise HTTPException(404, "Admission not found")
 
-    # Only basic fields; bed changes require /transfer
     data = payload.dict(exclude_unset=True)
     for k, v in data.items():
         setattr(adm, k, v)
@@ -207,27 +297,32 @@ def update_admission(admission_id: int,
 
 
 @router.patch("/admissions/{admission_id}/cancel")
-def cancel_admission(admission_id: int,
-                     db: Session = Depends(get_db),
-                     user: User = Depends(auth_current_user)):
+def cancel_admission(
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
     if not has_perm(user, "ipd.manage"):
         raise HTTPException(403, "Not permitted")
     adm = db.query(IpdAdmission).get(admission_id)
     if not adm:
         raise HTTPException(404, "Admission not found")
-    if adm.status in ("discharged", "lama", "dama", "disappeared",
-                      "cancelled"):
+    if adm.status in ("discharged", "lama", "dama", "disappeared", "cancelled"):
         return {"message": f"Already {adm.status}"}
 
-    # release bed & close current assignment
     if adm.current_bed_id:
         bed = db.query(IpdBed).get(adm.current_bed_id)
         if bed:
             bed.state = "vacant"
-        last_assign = db.query(IpdBedAssignment).filter(
-            IpdBedAssignment.admission_id == admission_id,
-            IpdBedAssignment.to_ts.is_(None)).order_by(
-                IpdBedAssignment.id.desc()).first()
+        last_assign = (
+            db.query(IpdBedAssignment)
+            .filter(
+                IpdBedAssignment.admission_id == admission_id,
+                IpdBedAssignment.to_ts.is_(None),
+            )
+            .order_by(IpdBedAssignment.id.desc())
+            .first()
+        )
         if last_assign:
             last_assign.to_ts = datetime.utcnow()
 
@@ -238,13 +333,13 @@ def cancel_admission(admission_id: int,
 
 
 # ---------------- Transfers ----------------
-
-
 @router.post("/admissions/{admission_id}/transfer", response_model=TransferOut)
-def transfer_bed(admission_id: int,
-                 payload: TransferIn,
-                 db: Session = Depends(get_db),
-                 user: User = Depends(auth_current_user)):
+def transfer_bed(
+    admission_id: int,
+    payload: TransferIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
     if not has_perm(user, "ipd.manage"):
         raise HTTPException(403, "Not permitted")
     adm = db.query(IpdAdmission).get(admission_id)
@@ -259,478 +354,580 @@ def transfer_bed(admission_id: int,
 
     from_bed_id = adm.current_bed_id
 
-    # close old assignment
-    last_assign = db.query(IpdBedAssignment).filter(
-        IpdBedAssignment.admission_id == admission_id,
-        IpdBedAssignment.to_ts.is_(None)).order_by(
-            IpdBedAssignment.id.desc()).first()
+    last_assign = (
+        db.query(IpdBedAssignment)
+        .filter(
+            IpdBedAssignment.admission_id == admission_id,
+            IpdBedAssignment.to_ts.is_(None),
+        )
+        .order_by(IpdBedAssignment.id.desc())
+        .first()
+    )
     if last_assign:
         last_assign.to_ts = datetime.utcnow()
 
-    # free old bed
     if from_bed_id:
         old = db.query(IpdBed).get(from_bed_id)
         if old:
             old.state = "vacant"
 
-    # occupy new bed
     to_bed.state = "occupied"
     adm.current_bed_id = to_bed.id
 
-    tr = IpdTransfer(admission_id=admission_id,
-                     from_bed_id=from_bed_id,
-                     to_bed_id=to_bed.id,
-                     reason=payload.reason or "",
-                     requested_by=user.id,
-                     approved_by=user.id)
+    tr = IpdTransfer(
+        admission_id=admission_id,
+        from_bed_id=from_bed_id,
+        to_bed_id=to_bed.id,
+        reason=payload.reason or "",
+        requested_by=user.id,
+        approved_by=user.id,
+    )
     db.add(tr)
     db.add(
-        IpdBedAssignment(admission_id=admission_id,
-                         bed_id=to_bed.id,
-                         reason="transfer"))
+        IpdBedAssignment(
+            admission_id=admission_id,
+            bed_id=to_bed.id,
+            reason="transfer",
+        )
+    )
     db.commit()
     db.refresh(tr)
     return tr
 
 
-# ---------------- Nursing Notes ----------------
+LOCK_AFTER_HOURS = 24
 
 
-@router.post("/admissions/{admission_id}/nursing-notes",
-             response_model=NursingNoteOut)
-def create_nursing_note(admission_id: int,
-                        payload: NursingNoteIn,
-                        db: Session = Depends(get_db),
-                        user: User = Depends(auth_current_user)):
-    if not has_perm(user, "ipd.nursing"):
-        raise HTTPException(403, "Not permitted")
-    adm = db.query(IpdAdmission).get(admission_id)
+# ---------------- Helpers ----------------
+def _ensure_admission(db: Session, admission_id: int) -> IpdAdmission:
+    adm = db.get(IpdAdmission, admission_id)
     if not adm:
-        raise HTTPException(404, "Admission not found")
-    n = IpdNursingNote(
-        admission_id=admission_id,
-        entry_time=payload.entry_time or datetime.utcnow(),
-        nurse_id=user.id,
-        patient_condition=payload.patient_condition or "",
-        clinical_finding=payload.clinical_finding or "",
-        significant_events=payload.significant_events or "",
-        response_progress=payload.response_progress or "",
+        raise HTTPException(status_code=404, detail="Admission not found")
+    return adm
+
+
+def _ensure_editable(note: IpdNursingNote) -> None:
+    """Disallow editing after LOCK_AFTER_HOURS or if note.is_locked."""
+    cutoff = datetime.utcnow() - timedelta(hours=LOCK_AFTER_HOURS)
+    if note.entry_time < cutoff or note.is_locked:
+        raise HTTPException(
+            status_code=400,
+            detail="This nursing note is locked and cannot be edited (older than 24 hours).",
+        )
+
+
+def _resolve_linked_vitals(
+    db: Session,
+    admission_id: int,
+    linked_vital_id: int | None,
+) -> int | None:
+    """
+    Decide which vitals row to attach:
+    - If linked_vital_id is passed → verify it belongs to this admission.
+    - Else → auto-link the latest vitals row (if exists).
+    """
+    if linked_vital_id is not None:
+        v = db.get(IpdVital, linked_vital_id)
+        if not v or v.admission_id != admission_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid vitals reference for this admission.",
+            )
+        return v.id
+
+    # Auto-link latest vitals
+    latest = (
+        db.query(IpdVital)
+        .filter(IpdVital.admission_id == admission_id)
+        .order_by(IpdVital.recorded_at.desc())
+        .first()
     )
-    db.add(n)
+    return latest.id if latest else None
+
+
+# ---------------- Create ----------------
+@router.post(
+    "/admissions/{admission_id}/nursing-notes",
+    response_model=NursingNoteOut,
+)
+def create_nursing_note(
+    admission_id: int,
+    payload: NursingNoteCreate,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    # Suggested permission code: "ipd.nursing.create"
+    if not has_perm(user, "ipd.nursing.create"):
+        raise HTTPException(status_code=403, detail="Not permitted")
+
+    adm = _ensure_admission(db, admission_id)
+
+    linked_vital_id = _resolve_linked_vitals(
+        db=db,
+        admission_id=admission_id,
+        linked_vital_id=payload.linked_vital_id,
+    )
+
+    note = IpdNursingNote(
+        admission_id=admission_id,
+        nurse_id=user.id,
+        entry_time=payload.entry_time or datetime.utcnow(),
+        # Core NABH narrative fields
+        patient_condition=payload.patient_condition or "",
+        significant_events=payload.significant_events or "",
+        nursing_interventions=payload.nursing_interventions or "",
+        response_progress=payload.response_progress or "",
+        handover_note=payload.handover_note or "",
+        # Structured observation fields
+        wound_status=payload.wound_status or "",
+        oxygen_support=payload.oxygen_support or "",
+        urine_output=payload.urine_output or "",
+        drains_tubes=payload.drains_tubes or "",
+        pain_score=payload.pain_score or "",
+        other_findings=payload.other_findings or "",
+        # Shift / ICU flags
+        shift=payload.shift,
+        is_icu=payload.is_icu,
+        note_type=payload.note_type or "routine",
+        vital_signs_summary=payload.vital_signs_summary or "",
+        todays_procedures=payload.todays_procedures or "",
+        current_condition=payload.current_condition or "",
+        recent_changes=payload.recent_changes or "",
+        ongoing_treatment=payload.ongoing_treatment or "",
+        watch_next_shift=payload.watch_next_shift or "",
+        
+        # Vitals linkage
+        linked_vital_id=linked_vital_id,
+    )
+
+    db.add(note)
     db.commit()
-    db.refresh(n)
-    return n
+    db.refresh(note)
+    return note
 
 
-@router.get("/admissions/{admission_id}/nursing-notes",
-            response_model=List[NursingNoteOut])
-def list_nursing_notes(admission_id: int,
-                       db: Session = Depends(get_db),
-                       user: User = Depends(auth_current_user)):
-    if not has_perm(user, "ipd.view"):
-        raise HTTPException(403, "Not permitted")
-    return db.query(IpdNursingNote).filter(
-        IpdNursingNote.admission_id == admission_id).order_by(
-            IpdNursingNote.entry_time.desc()).all()
+# ---------------- List all for an admission ----------------
+@router.get(
+    "/admissions/{admission_id}/nursing-notes",
+    response_model=list[NursingNoteOut],
+)
+def list_nursing_notes(
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    # Suggested permission code: "ipd.nursing.view"
+    if not has_perm(user, "ipd.nursing.view"):
+        raise HTTPException(status_code=403, detail="Not permitted")
+
+    # Eager load nurse + vitals so Pydantic can build NurseMini + VitalSnapshot cleanly
+    notes = (
+        db.query(IpdNursingNote)
+        .options(
+            joinedload(IpdNursingNote.nurse),
+            joinedload(IpdNursingNote.vitals),
+        )
+        .filter(IpdNursingNote.admission_id == admission_id)
+        .order_by(IpdNursingNote.entry_time.desc())
+        .all()
+    )
+    return notes
 
 
-# ---------------- Shift Handover (with plural alias) ----------------
+# ---------------- Get single note ----------------
+@router.get(
+    "/admissions/{admission_id}/nursing-notes/{note_id}",
+    response_model=NursingNoteOut,
+)
+def get_nursing_note(
+    admission_id: int,
+    note_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    if not has_perm(user, "ipd.nursing.view"):
+        raise HTTPException(status_code=403, detail="Not permitted")
+
+    note = (
+        db.query(IpdNursingNote)
+        .options(
+            joinedload(IpdNursingNote.nurse),
+            joinedload(IpdNursingNote.vitals),
+        )
+        .filter(
+            IpdNursingNote.id == note_id,
+            IpdNursingNote.admission_id == admission_id,
+        )
+        .first()
+    )
+
+    if not note:
+        raise HTTPException(status_code=404, detail="Nursing note not found")
+
+    return note
 
 
-@router.post("/admissions/{admission_id}/shift-handover",
-             response_model=ShiftHandoverOut)
-@router.post("/admissions/{admission_id}/shift-handovers",
-             response_model=ShiftHandoverOut)
-def create_shift_handover(admission_id: int,
-                          payload: ShiftHandoverIn,
-                          db: Session = Depends(get_db),
-                          user: User = Depends(auth_current_user)):
+# ---------------- Update (no delete – NABH safe) ----------------
+@router.put(
+    "/admissions/{admission_id}/nursing-notes/{note_id}",
+    response_model=NursingNoteOut,
+)
+def update_nursing_note(
+    admission_id: int,
+    note_id: int,
+    payload: NursingNoteUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    # Suggested permission code: "ipd.nursing.update"
+    if not has_perm(user, "ipd.nursing.update"):
+        raise HTTPException(status_code=403, detail="Not permitted")
+
+    note = (
+        db.query(IpdNursingNote)
+        .options(
+            joinedload(IpdNursingNote.nurse),
+            joinedload(IpdNursingNote.vitals),
+        )
+        .filter(
+            IpdNursingNote.id == note_id,
+            IpdNursingNote.admission_id == admission_id,
+        )
+        .first()
+    )
+
+    if not note:
+        raise HTTPException(status_code=404, detail="Nursing note not found")
+
+    _ensure_editable(note)
+
+    # Core narrative fields
+    if payload.patient_condition is not None:
+        note.patient_condition = payload.patient_condition
+    if payload.significant_events is not None:
+        note.significant_events = payload.significant_events
+    if payload.nursing_interventions is not None:
+        note.nursing_interventions = payload.nursing_interventions
+    if payload.response_progress is not None:
+        note.response_progress = payload.response_progress
+    if payload.handover_note is not None:
+        note.handover_note = payload.handover_note
+
+    # Structured observation fields
+    if payload.wound_status is not None:
+        note.wound_status = payload.wound_status
+    if payload.oxygen_support is not None:
+        note.oxygen_support = payload.oxygen_support
+    if payload.urine_output is not None:
+        note.urine_output = payload.urine_output
+    if payload.drains_tubes is not None:
+        note.drains_tubes = payload.drains_tubes
+    if payload.pain_score is not None:
+        note.pain_score = payload.pain_score
+    if payload.other_findings is not None:
+        note.other_findings = payload.other_findings
+
+    if payload.shift is not None:
+        note.shift = payload.shift
+
+    # Optional: allow correcting entry_time (within same day / shift if you want stricter rules)
+    if payload.entry_time is not None:
+        note.entry_time = payload.entry_time
+
+    db.add(note)
+    db.commit()
+    db.refresh(note)
+    return note
+
+
+# ---------------- Shift Handover ----------------
+@router.post(
+    "/admissions/{admission_id}/shift-handover",
+    response_model=ShiftHandoverOut,
+)
+@router.post(
+    "/admissions/{admission_id}/shift-handovers",
+    response_model=ShiftHandoverOut,
+)
+def create_shift_handover(
+    admission_id: int,
+    payload: ShiftHandoverIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
     if not has_perm(user, "ipd.nursing"):
         raise HTTPException(403, "Not permitted")
     adm = db.query(IpdAdmission).get(admission_id)
     if not adm:
         raise HTTPException(404, "Admission not found")
-    sh = IpdShiftHandover(admission_id=admission_id,
-                          nurse_id=user.id,
-                          **payload.dict())
+    sh = IpdShiftHandover(
+        admission_id=admission_id,
+        nurse_id=user.id,
+        **payload.dict(),
+    )
     db.add(sh)
     db.commit()
     db.refresh(sh)
     return sh
 
 
-@router.get("/admissions/{admission_id}/shift-handover",
-            response_model=List[ShiftHandoverOut])
-@router.get("/admissions/{admission_id}/shift-handovers",
-            response_model=List[ShiftHandoverOut])
-def list_shift_handover(admission_id: int,
-                        db: Session = Depends(get_db),
-                        user: User = Depends(auth_current_user)):
+@router.get(
+    "/admissions/{admission_id}/shift-handover",
+    response_model=List[ShiftHandoverOut],
+)
+@router.get(
+    "/admissions/{admission_id}/shift-handovers",
+    response_model=List[ShiftHandoverOut],
+)
+def list_shift_handover(
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
     if not has_perm(user, "ipd.view"):
         raise HTTPException(403, "Not permitted")
-    return db.query(IpdShiftHandover).filter(
-        IpdShiftHandover.admission_id == admission_id).order_by(
-            IpdShiftHandover.id.desc()).all()
+    return (
+        db.query(IpdShiftHandover)
+        .filter(IpdShiftHandover.admission_id == admission_id)
+        .order_by(IpdShiftHandover.id.desc())
+        .all()
+    )
 
 
 # ---------------- Vitals ----------------
-
-
 @router.post("/admissions/{admission_id}/vitals", response_model=VitalOut)
-def record_vitals(admission_id: int,
-                  payload: VitalIn,
-                  db: Session = Depends(get_db),
-                  user: User = Depends(auth_current_user)):
+def record_vitals(
+    admission_id: int,
+    payload: VitalCreate,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
     if not has_perm(user, "ipd.nursing"):
         raise HTTPException(403, "Not permitted")
     adm = db.query(IpdAdmission).get(admission_id)
     if not adm:
         raise HTTPException(404, "Admission not found")
-    v = IpdVital(admission_id=admission_id,
-                 recorded_by=user.id,
-                 recorded_at=payload.recorded_at or datetime.utcnow(),
-                 bp_systolic=payload.bp_systolic,
-                 bp_diastolic=payload.bp_diastolic,
-                 temp_c=payload.temp_c,
-                 rr=payload.rr,
-                 spo2=payload.spo2,
-                 pulse=payload.pulse)
+    v = IpdVital(
+        admission_id=admission_id,
+        recorded_by=user.id,
+        recorded_at=payload.recorded_at or datetime.utcnow(),
+        bp_systolic=payload.bp_systolic,
+        bp_diastolic=payload.bp_diastolic,
+        temp_c=payload.temp_c,
+        rr=payload.rr,
+        spo2=payload.spo2,
+        pulse=payload.pulse,
+    )
     db.add(v)
     db.commit()
     db.refresh(v)
     return v
 
 
-@router.get("/admissions/{admission_id}/vitals", response_model=List[VitalOut])
-def list_vitals(admission_id: int,
-                db: Session = Depends(get_db),
-                user: User = Depends(auth_current_user)):
+@router.get(
+    "/admissions/{admission_id}/vitals",
+    response_model=List[VitalOut],
+)
+def list_vitals(
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
     if not has_perm(user, "ipd.view"):
         raise HTTPException(403, "Not permitted")
-    return db.query(IpdVital).filter(
-        IpdVital.admission_id == admission_id).order_by(
-            IpdVital.recorded_at.desc()).limit(200).all()
+    return (
+        db.query(IpdVital)
+        .filter(IpdVital.admission_id == admission_id)
+        .order_by(IpdVital.recorded_at.desc())
+        .limit(200)
+        .all()
+    )
 
+@router.get("/admissions/{admission_id}/vitals/latest", response_model=VitalSnapshot)
+def get_latest_vitals(
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    if not has_perm(user, "ipd.vitals.view"):
+        raise HTTPException(403, "Not permitted")
 
-# ---------------- Intake/Output (+ /io alias) ----------------
+    adm = db.get(IpdAdmission, admission_id)
+    if not adm:
+        raise HTTPException(404, "Admission not found")
 
+    v = (
+        db.query(IpdVital)
+        .filter(IpdVital.admission_id == admission_id)
+        .order_by(IpdVital.recorded_at.desc())
+        .first()
+    )
+    if not v:
+        raise HTTPException(404, "No vitals recorded for this admission")
 
-@router.post("/admissions/{admission_id}/intake-output", response_model=IOOut)
+    return v
+# ---------------- Intake/Output ----------------
+@router.post(
+    "/admissions/{admission_id}/intake-output",
+    response_model=IOOut,
+)
 @router.post("/admissions/{admission_id}/io", response_model=IOOut)
-def record_io(admission_id: int,
-              payload: IOIn,
-              db: Session = Depends(get_db),
-              user: User = Depends(auth_current_user)):
+def record_io(
+    admission_id: int,
+    payload: IOIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
     if not has_perm(user, "ipd.nursing"):
         raise HTTPException(403, "Not permitted")
     adm = db.query(IpdAdmission).get(admission_id)
     if not adm:
         raise HTTPException(404, "Admission not found")
-    io = IpdIntakeOutput(admission_id=admission_id,
-                         recorded_by=user.id,
-                         recorded_at=payload.recorded_at or datetime.utcnow(),
-                         intake_ml=payload.intake_ml,
-                         urine_ml=payload.urine_ml,
-                         drains_ml=payload.drains_ml,
-                         stools_count=payload.stools_count,
-                         remarks=payload.remarks or "")
+    io = IpdIntakeOutput(
+        admission_id=admission_id,
+        recorded_by=user.id,
+        recorded_at=payload.recorded_at or datetime.utcnow(),
+        intake_ml=payload.intake_ml,
+        urine_ml=payload.urine_ml,
+        drains_ml=payload.drains_ml,
+        stools_count=payload.stools_count,
+        remarks=payload.remarks or "",
+    )
     db.add(io)
     db.commit()
     db.refresh(io)
     return io
 
 
-@router.get("/admissions/{admission_id}/intake-output",
-            response_model=List[IOOut])
+@router.get(
+    "/admissions/{admission_id}/intake-output",
+    response_model=List[IOOut],
+)
 @router.get("/admissions/{admission_id}/io", response_model=List[IOOut])
-def list_io(admission_id: int,
-            db: Session = Depends(get_db),
-            user: User = Depends(auth_current_user)):
+def list_io(
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
     if not has_perm(user, "ipd.view"):
         raise HTTPException(403, "Not permitted")
-    return db.query(IpdIntakeOutput).filter(
-        IpdIntakeOutput.admission_id == admission_id).order_by(
-            IpdIntakeOutput.recorded_at.desc()).limit(200).all()
+    return (
+        db.query(IpdIntakeOutput)
+        .filter(IpdIntakeOutput.admission_id == admission_id)
+        .order_by(IpdIntakeOutput.recorded_at.desc())
+        .limit(200)
+        .all()
+    )
 
 
 # ---------------- Rounds & Progress ----------------
-
-
 @router.post("/admissions/{admission_id}/rounds", response_model=RoundOut)
-def create_round(admission_id: int,
-                 payload: RoundIn,
-                 db: Session = Depends(get_db),
-                 user: User = Depends(auth_current_user)):
+def create_round(
+    admission_id: int,
+    payload: RoundIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
     if not has_perm(user, "ipd.doctor"):
         raise HTTPException(403, "Not permitted")
     adm = db.query(IpdAdmission).get(admission_id)
     if not adm:
         raise HTTPException(404, "Admission not found")
-    r = IpdRound(admission_id=admission_id,
-                 by_user_id=user.id,
-                 notes=payload.notes or "")
+    r = IpdRound(
+        admission_id=admission_id,
+        by_user_id=user.id,
+        notes=payload.notes or "",
+    )
     db.add(r)
     db.commit()
     db.refresh(r)
     return r
 
 
-@router.get("/admissions/{admission_id}/rounds", response_model=List[RoundOut])
-def list_rounds(admission_id: int,
-                db: Session = Depends(get_db),
-                user: User = Depends(auth_current_user)):
+@router.get(
+    "/admissions/{admission_id}/rounds",
+    response_model=List[RoundOut],
+)
+def list_rounds(
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
     if not has_perm(user, "ipd.view"):
         raise HTTPException(403, "Not permitted")
-    return db.query(IpdRound).filter(
-        IpdRound.admission_id == admission_id).order_by(
-            IpdRound.id.desc()).all()
+    return (
+        db.query(IpdRound)
+        .filter(IpdRound.admission_id == admission_id)
+        .order_by(IpdRound.id.desc())
+        .all()
+    )
 
 
-@router.post("/admissions/{admission_id}/progress-notes",
-             response_model=ProgressOut)
-def create_progress(admission_id: int,
-                    payload: ProgressIn,
-                    db: Session = Depends(get_db),
-                    user: User = Depends(auth_current_user)):
+@router.post(
+    "/admissions/{admission_id}/progress-notes",
+    response_model=ProgressOut,
+)
+def create_progress(
+    admission_id: int,
+    payload: ProgressIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
     if not has_perm(user, "ipd.doctor"):
         raise HTTPException(403, "Not permitted")
     adm = db.query(IpdAdmission).get(admission_id)
     if not adm:
         raise HTTPException(404, "Admission not found")
-    pn = IpdProgressNote(admission_id=admission_id,
-                         by_user_id=user.id,
-                         observation=payload.observation or "",
-                         plan=payload.plan or "")
+    pn = IpdProgressNote(
+        admission_id=admission_id,
+        by_user_id=user.id,
+        observation=payload.observation or "",
+        plan=payload.plan or "",
+    )
     db.add(pn)
     db.commit()
     db.refresh(pn)
     return pn
 
 
-@router.get("/admissions/{admission_id}/progress-notes",
-            response_model=List[ProgressOut])
-def list_progress(admission_id: int,
-                  db: Session = Depends(get_db),
-                  user: User = Depends(auth_current_user)):
-    if not has_perm(user, "ipd.view"):
-        raise HTTPException(403, "Not permitted")
-    return db.query(IpdProgressNote).filter(
-        IpdProgressNote.admission_id == admission_id).order_by(
-            IpdProgressNote.id.desc()).all()
-
-
-# ---------------- Discharge Summary & Checklist ----------------
-
-
-@router.get("/admissions/{admission_id}/discharge-summary",
-            response_model=Optional[DischargeSummaryOut])
-def get_discharge_summary(admission_id: int,
-                          db: Session = Depends(get_db),
-                          user: User = Depends(auth_current_user)):
-    if not has_perm(user, "ipd.view"):
-        raise HTTPException(403, "Not permitted")
-    return db.query(IpdDischargeSummary).filter(
-        IpdDischargeSummary.admission_id == admission_id).first()
-
-
-@router.post("/admissions/{admission_id}/discharge-summary",
-             response_model=DischargeSummaryOut)
-def upsert_discharge_summary(
-        admission_id: int,
-        payload: DischargeSummaryIn,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
+@router.get(
+    "/admissions/{admission_id}/progress-notes",
+    response_model=List[ProgressOut],
+)
+def list_progress(
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
 ):
-    if not has_perm(user, "ipd.doctor"):
-        raise HTTPException(403, "Not permitted")
-
-    adm = db.query(IpdAdmission).get(admission_id)
-    if not adm:
-        raise HTTPException(404, "Admission not found")
-
-    ds = db.query(IpdDischargeSummary).filter(
-        IpdDischargeSummary.admission_id == admission_id).first()
-    if not ds:
-        ds = IpdDischargeSummary(admission_id=admission_id)
-        db.add(ds)
-
-    # Update editable fields (exclude finalize flag itself)
-    data = payload.dict(exclude_unset=True)
-    data.pop("finalize", None)
-    for k, v in data.items():
-        setattr(ds, k, v if v is not None else "")
-
-    # Finalize (idempotent)
-    if payload.finalize and not ds.finalized:
-        ds.finalized = True
-        ds.finalized_by = user.id
-        ds.finalized_at = datetime.utcnow()
-
-        # Free bed & close active assignment
-        if adm.current_bed_id:
-            bed = db.query(IpdBed).get(adm.current_bed_id)
-            if bed:
-                bed.state = "vacant"
-
-        last_assign = db.query(IpdBedAssignment).filter(
-            IpdBedAssignment.admission_id == admission_id,
-            IpdBedAssignment.to_ts.is_(None)).order_by(
-                IpdBedAssignment.id.desc()).first()
-        if last_assign:
-            last_assign.to_ts = datetime.utcnow()
-
-        # Mark discharged
-        adm.status = "discharged"
-        adm.current_bed_id = None
-        # (Optional) if you later add adm.discharge_at column, set it here:
-        # adm.discharge_at = datetime.utcnow()
-
-        # Let billing consolidate
-        db.flush()
-        auto_finalize_ipd_on_discharge(db,
-                                       admission_id=adm.id,
-                                       user_id=user.id)
-
-    db.commit()
-    db.refresh(ds)
-    return ds
-
-
-@router.get("/admissions/{admission_id}/discharge-checklist",
-            response_model=Optional[DischargeChecklistOut])
-def get_discharge_checklist(admission_id: int,
-                            db: Session = Depends(get_db),
-                            user: User = Depends(auth_current_user)):
     if not has_perm(user, "ipd.view"):
         raise HTTPException(403, "Not permitted")
-    return db.query(IpdDischargeChecklist).filter(
-        IpdDischargeChecklist.admission_id == admission_id).first()
+    return (
+        db.query(IpdProgressNote)
+        .filter(IpdProgressNote.admission_id == admission_id)
+        .order_by(IpdProgressNote.id.desc())
+        .all()
+    )
 
 
-@router.post("/admissions/{admission_id}/discharge-checklist",
-             response_model=DischargeChecklistOut)
-def upsert_discharge_checklist(admission_id: int,
-                               payload: DischargeChecklistIn,
-                               db: Session = Depends(get_db),
-                               user: User = Depends(auth_current_user)):
-    if not (has_perm(user, "ipd.nursing") or has_perm(user, "ipd.doctor")
-            or has_perm(user, "ipd.manage")):
-        raise HTTPException(403, "Not permitted")
 
-    chk = db.query(IpdDischargeChecklist).filter(
-        IpdDischargeChecklist.admission_id == admission_id).first()
-    if not chk:
-        chk = IpdDischargeChecklist(admission_id=admission_id)
-        db.add(chk)
-
-    data = payload.dict(exclude_unset=True)
-    if "financial_clearance" in data:
-        chk.financial_clearance = bool(data["financial_clearance"])
-        if chk.financial_clearance:
-            chk.financial_cleared_by = user.id
-    if "clinical_clearance" in data:
-        chk.clinical_clearance = bool(data["clinical_clearance"])
-        if chk.clinical_clearance:
-            chk.clinical_cleared_by = user.id
-    if "delay_reason" in data and data["delay_reason"] is not None:
-        chk.delay_reason = data["delay_reason"]
-    if payload.submit:
-        if not has_perm(user, "ipd.manage"):
-            raise HTTPException(403, "Only IPD managers can submit checklist")
-        chk.submitted = True
-        chk.submitted_at = datetime.utcnow()
-
-    db.commit()
-    db.refresh(chk)
-    return chk
-
-
-# ---------------- Discharge Queue ----------------
-
-
-@router.get("/due-discharges", response_model=List[DueDischargeOut])
-def due_discharges(for_date: date = Query(...),
-                   db: Session = Depends(get_db),
-                   user: User = Depends(auth_current_user)):
-    if not has_perm(user, "ipd.view"):
-        raise HTTPException(403, "Not permitted")
-    start = datetime.combine(for_date, datetime.min.time())
-    end = datetime.combine(for_date, datetime.max.time())
-    q = db.query(IpdAdmission).filter(
-        IpdAdmission.status == "admitted",
-        IpdAdmission.expected_discharge_at.isnot(None),
-        IpdAdmission.expected_discharge_at >= start,
-        IpdAdmission.expected_discharge_at <= end)
-    rows = q.all()
-    return [
-        DueDischargeOut(admission_id=r.id,
-                        patient_id=r.patient_id,
-                        expected_discharge_at=r.expected_discharge_at,
-                        status=r.status) for r in rows
-    ]
-
-
-@router.patch("/admissions/{admission_id}/mark-status")
-def mark_special_status(admission_id: int,
-                        status: str = Query(...,
-                                            regex="^(lama|dama|disappeared)$"),
-                        db: Session = Depends(get_db),
-                        user: User = Depends(auth_current_user)):
-    if not has_perm(user, "ipd.manage"):
-        raise HTTPException(403, "Not permitted")
-    adm = db.query(IpdAdmission).get(admission_id)
-    if not adm:
-        raise HTTPException(404, "Admission not found")
-    adm.status = status
-    if adm.current_bed_id:
-        bed = db.query(IpdBed).get(adm.current_bed_id)
-        if bed:
-            bed.state = "vacant"
-        last_assign = db.query(IpdBedAssignment).filter(
-            IpdBedAssignment.admission_id == admission_id,
-            IpdBedAssignment.to_ts.is_(None)).first()
-        if last_assign:
-            last_assign.to_ts = datetime.utcnow()
-    adm.current_bed_id = None
-    db.commit()
-    return {"message": f"Admission marked {status}"}
-
-
-# ---------------- ABHA linkage (stub) ----------------
-
-
-@router.post("/admissions/{admission_id}/push-to-abha")
-def push_discharge_to_abha(admission_id: int,
-                           db: Session = Depends(get_db),
-                           user: User = Depends(auth_current_user)):
-    if not has_perm(user, "ipd.manage"):
-        raise HTTPException(403, "Not permitted")
-    adm = db.query(IpdAdmission).get(admission_id)
-    if not adm:
-        raise HTTPException(404, "Admission not found")
-    ds = db.query(IpdDischargeSummary).filter(
-        IpdDischargeSummary.admission_id == admission_id).first()
-    if not ds or not ds.finalized:
-        raise HTTPException(400, "Finalize discharge summary first")
-    adm.abha_shared_at = datetime.utcnow()
-    db.commit()
-    return {
-        "message": "Discharge summary pushed to ABHA (stubbed)",
-        "shared_at": adm.abha_shared_at
-    }
 
 
 # ---------------- Referrals ----------------
-
-
-@router.post("/admissions/{admission_id}/referrals",
-             response_model=ReferralOut)
-def create_referral(admission_id: int,
-                    payload: ReferralIn,
-                    db: Session = Depends(get_db),
-                    user: User = Depends(auth_current_user)):
-    if not (has_perm(user, "ipd.nursing") or has_perm(user, "ipd.doctor")
-            or has_perm(user, "ipd.manage")):
+@router.post(
+    "/admissions/{admission_id}/referrals",
+    response_model=ReferralOut,
+)
+def create_referral(
+    admission_id: int,
+    payload: ReferralIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    if not (
+        has_perm(user, "ipd.nursing")
+        or has_perm(user, "ipd.doctor")
+        or has_perm(user, "ipd.manage")
+    ):
         raise HTTPException(403, "Not permitted")
     adm = db.query(IpdAdmission).get(admission_id)
     if not adm:
@@ -742,25 +939,32 @@ def create_referral(admission_id: int,
     return ref
 
 
-@router.get("/admissions/{admission_id}/referrals",
-            response_model=List[ReferralOut])
-def list_referrals(admission_id: int,
-                   db: Session = Depends(get_db),
-                   user: User = Depends(auth_current_user)):
+@router.get(
+    "/admissions/{admission_id}/referrals",
+    response_model=List[ReferralOut],
+)
+def list_referrals(
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
     if not has_perm(user, "ipd.view"):
         raise HTTPException(403, "Not permitted")
-    return db.query(IpdReferral).filter(
-        IpdReferral.admission_id == admission_id).order_by(
-            IpdReferral.id.desc()).all()
+    return (
+        db.query(IpdReferral)
+        .filter(IpdReferral.admission_id == admission_id)
+        .order_by(IpdReferral.id.desc())
+        .all()
+    )
 
 
 # ---------------- OT & Anaesthesia ----------------
-
-
 @router.post("/ot/cases", response_model=OtCaseOut)
-def create_ot_case(payload: OtCaseIn,
-                   db: Session = Depends(get_db),
-                   user: User = Depends(auth_current_user)):
+def create_ot_case(
+    payload: OtCaseIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
     if not has_perm(user, "ipd.manage"):
         raise HTTPException(403, "Not permitted")
     adm = db.query(IpdAdmission).get(payload.admission_id)
@@ -774,10 +978,12 @@ def create_ot_case(payload: OtCaseIn,
 
 
 @router.get("/ot/cases", response_model=List[OtCaseOut])
-def list_ot_cases(admission_id: Optional[int] = None,
-                  status: Optional[str] = None,
-                  db: Session = Depends(get_db),
-                  user: User = Depends(auth_current_user)):
+def list_ot_cases(
+    admission_id: Optional[int] = None,
+    status: Optional[str] = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
     if not has_perm(user, "ipd.view"):
         raise HTTPException(403, "Not permitted")
     q = db.query(IpdOtCase)
@@ -789,10 +995,12 @@ def list_ot_cases(admission_id: Optional[int] = None,
 
 
 @router.patch("/ot/cases/{case_id}/status", response_model=OtCaseOut)
-def update_ot_status(case_id: int,
-                     status: str = Query(...),
-                     db: Session = Depends(get_db),
-                     user: User = Depends(auth_current_user)):
+def update_ot_status(
+    case_id: int,
+    status: str = Query(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
     if not has_perm(user, "ipd.manage"):
         raise HTTPException(403, "Not permitted")
     c = db.query(IpdOtCase).get(case_id)
@@ -805,11 +1013,13 @@ def update_ot_status(case_id: int,
 
 
 @router.patch("/ot/cases/{case_id}/time-log", response_model=OtCaseOut)
-def ot_time_log(case_id: int,
-                actual_start: Optional[datetime] = None,
-                actual_end: Optional[datetime] = None,
-                db: Session = Depends(get_db),
-                user: User = Depends(auth_current_user)):
+def ot_time_log(
+    case_id: int,
+    actual_start: Optional[datetime] = None,
+    actual_end: Optional[datetime] = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
     if not has_perm(user, "ipd.manage"):
         raise HTTPException(403, "Not permitted")
     c = db.query(IpdOtCase).get(case_id)
@@ -824,15 +1034,13 @@ def ot_time_log(case_id: int,
     return c
 
 
-# --- Anaesthesia: main + aliases for your UI ---
-
-
 @router.post("/ot/anaesthesia", response_model=AnaesthesiaOut)
-@router.post("/anaesthesia", response_model=AnaesthesiaOut
-             )  # alias to satisfy POST /api/ipd/anaesthesia
-def create_anaesthesia(payload: AnaesthesiaIn,
-                       db: Session = Depends(get_db),
-                       user: User = Depends(auth_current_user)):
+@router.post("/anaesthesia", response_model=AnaesthesiaOut)
+def create_anaesthesia(
+    payload: AnaesthesiaIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
     if not (has_perm(user, "ipd.manage") or has_perm(user, "ipd.doctor")):
         raise HTTPException(403, "Not permitted")
     case = db.query(IpdOtCase).get(payload.ot_case_id)
@@ -845,59 +1053,77 @@ def create_anaesthesia(payload: AnaesthesiaIn,
     return rec
 
 
-@router.get("/ot-cases/{case_id}/anaesthesia",
-            response_model=List[AnaesthesiaOut])
-def list_anaesthesia_for_case(case_id: int,
-                              db: Session = Depends(get_db),
-                              user: User = Depends(auth_current_user)):
+@router.get(
+    "/ot-cases/{case_id}/anaesthesia",
+    response_model=List[AnaesthesiaOut],
+)
+def list_anaesthesia_for_case(
+    case_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
     if not has_perm(user, "ipd.view"):
         raise HTTPException(403, "Not permitted")
-    return db.query(IpdAnaesthesiaRecord).filter(
-        IpdAnaesthesiaRecord.ot_case_id == case_id).order_by(
-            IpdAnaesthesiaRecord.id.desc()).all()
+    return (
+        db.query(IpdAnaesthesiaRecord)
+        .filter(IpdAnaesthesiaRecord.ot_case_id == case_id)
+        .order_by(IpdAnaesthesiaRecord.id.desc())
+        .all()
+    )
 
 
 # ---------------- Bed Charge PREVIEW ----------------
-# Rule: 1 bed-day per calendar day; pick assignment active at end-of-day.
-
-
-def _resolve_rate(db: Session, room_type: str,
-                  for_date: date) -> Optional[float]:
+def _resolve_rate(db: Session, room_type: str, for_date: date) -> Optional[float]:
     r = (
-        db.query(IpdBedRate).filter(IpdBedRate.is_active.is_(True)).filter(
-            IpdBedRate.room_type == room_type).filter(
-                IpdBedRate.effective_from <= for_date).filter(
-                    (IpdBedRate.effective_to == None) |
-                    (IpdBedRate.effective_to >= for_date))  # noqa: E711
-        .order_by(IpdBedRate.effective_from.desc()).first())
+        db.query(IpdBedRate)
+        .filter(IpdBedRate.is_active.is_(True))
+        .filter(IpdBedRate.room_type == room_type)
+        .filter(IpdBedRate.effective_from <= for_date)
+        .filter(
+            (IpdBedRate.effective_to == None)  # noqa: E711
+            | (IpdBedRate.effective_to >= for_date)
+        )
+        .order_by(IpdBedRate.effective_from.desc())
+        .first()
+    )
     return float(r.daily_rate) if r else None
 
 
-@router.get("/admissions/{admission_id}/bed-charges/preview",
-            response_model=BedChargePreviewOut)
-def preview_bed_charges_for_adm(admission_id: int,
-                                from_date: date = Query(...),
-                                to_date: date = Query(...),
-                                db: Session = Depends(get_db),
-                                user: User = Depends(auth_current_user)):
-    return _preview_bed_charges_core(admission_id, from_date, to_date, db,
-                                     user)
+@router.get(
+    "/admissions/{admission_id}/bed-charges/preview",
+    response_model=BedChargePreviewOut,
+)
+def preview_bed_charges_for_adm(
+    admission_id: int,
+    from_date: date = Query(...),
+    to_date: date = Query(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    return _preview_bed_charges_core(admission_id, from_date, to_date, db, user)
 
 
-@router.get("/bed-charges/preview", response_model=BedChargePreviewOut
-            )  # alias: ?admission_id=…&from_date=…&to_date=…
-def preview_bed_charges_alias(admission_id: int = Query(...),
-                              from_date: date = Query(...),
-                              to_date: date = Query(...),
-                              db: Session = Depends(get_db),
-                              user: User = Depends(auth_current_user)):
-    return _preview_bed_charges_core(admission_id, from_date, to_date, db,
-                                     user)
+@router.get(
+    "/bed-charges/preview",
+    response_model=BedChargePreviewOut,
+)
+def preview_bed_charges_alias(
+    admission_id: int = Query(...),
+    from_date: date = Query(...),
+    to_date: date = Query(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    return _preview_bed_charges_core(admission_id, from_date, to_date, db, user)
 
 
-def _preview_bed_charges_core(admission_id: int, from_date: date,
-                              to_date: date, db: Session,
-                              user: User) -> BedChargePreviewOut:
+def _preview_bed_charges_core(
+    admission_id: int,
+    from_date: date,
+    to_date: date,
+    db: Session,
+    user: User,
+) -> BedChargePreviewOut:
     if not has_perm(user, "ipd.view"):
         raise HTTPException(403, "Not permitted")
     if to_date < from_date:
@@ -907,9 +1133,12 @@ def _preview_bed_charges_core(admission_id: int, from_date: date,
     if not adm:
         raise HTTPException(404, "Admission not found")
 
-    assigns = (db.query(IpdBedAssignment).filter(
-        IpdBedAssignment.admission_id == admission_id).order_by(
-            IpdBedAssignment.from_ts.asc()).all())
+    assigns = (
+        db.query(IpdBedAssignment)
+        .filter(IpdBedAssignment.admission_id == admission_id)
+        .order_by(IpdBedAssignment.from_ts.asc())
+        .all()
+    )
 
     days: List[BedChargeDay] = []
     missing = 0
@@ -919,8 +1148,9 @@ def _preview_bed_charges_core(admission_id: int, from_date: date,
         active = None
         for a in assigns:
             start_ok = a.from_ts <= eod
-            end_ok = (a.to_ts is None) or (a.to_ts >= datetime.combine(
-                cursor, time.min))
+            end_ok = (a.to_ts is None) or (
+                a.to_ts >= datetime.combine(cursor, time.min)
+            )
             if start_ok and end_ok:
                 active = a
         if not active:
@@ -939,44 +1169,59 @@ def _preview_bed_charges_core(admission_id: int, from_date: date,
             rate_val = float(rate)
 
         days.append(
-            BedChargeDay(date=cursor,
-                         bed_id=bed.id if bed else None,
-                         room_type=room_type,
-                         rate=rate_val,
-                         assignment_id=active.id))
+            BedChargeDay(
+                date=cursor,
+                bed_id=bed.id if bed else None,
+                room_type=room_type,
+                rate=rate_val,
+                assignment_id=active.id,
+            )
+        )
         cursor += timedelta(days=1)
 
     total = round(sum(d.rate for d in days), 2)
-    return BedChargePreviewOut(admission_id=admission_id,
-                               from_date=from_date,
-                               to_date=to_date,
-                               days=days,
-                               total_amount=total,
-                               missing_rate_days=missing)
+    return BedChargePreviewOut(
+        admission_id=admission_id,
+        from_date=from_date,
+        to_date=to_date,
+        days=days,
+        total_amount=total,
+        missing_rate_days=missing,
+    )
 
 
-@router.get("/admissions/{admission_id}/ot-cases",
-            response_model=List[OtCaseOut])
-def list_ot_cases_for_admission(admission_id: int,
-                                db: Session = Depends(get_db),
-                                user: User = Depends(auth_current_user)):
+@router.get(
+    "/admissions/{admission_id}/ot-cases",
+    response_model=List[OtCaseOut],
+)
+def list_ot_cases_for_admission(
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
     if not has_perm(user, "ipd.view"):
         raise HTTPException(403, "Not permitted")
-    # ensure admission exists
     adm = db.query(IpdAdmission).get(admission_id)
     if not adm:
         raise HTTPException(404, "Admission not found")
-    return db.query(IpdOtCase)\
-             .filter(IpdOtCase.admission_id == admission_id)\
-             .order_by(IpdOtCase.id.desc())\
-             .all()
+    return (
+        db.query(IpdOtCase)
+        .filter(IpdOtCase.admission_id == admission_id)
+        .order_by(IpdOtCase.id.desc())
+        .all()
+    )
 
 
-@router.post("/admissions/{admission_id}/ot-cases", response_model=OtCaseOut)
-def create_ot_case_for_admission(admission_id: int,
-                                 payload: OtCaseForAdmissionIn,
-                                 db: Session = Depends(get_db),
-                                 user: User = Depends(auth_current_user)):
+@router.post(
+    "/admissions/{admission_id}/ot-cases",
+    response_model=OtCaseOut,
+)
+def create_ot_case_for_admission(
+    admission_id: int,
+    payload: OtCaseForAdmissionIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
     if not has_perm(user, "ipd.manage"):
         raise HTTPException(403, "Not permitted")
     adm = db.query(IpdAdmission).get(admission_id)
@@ -998,3 +1243,1001 @@ def create_ot_case_for_admission(admission_id: int,
     db.commit()
     db.refresh(c)
     return c
+
+
+# =====================================================================
+# NEW: Risk / Clinical Assessments
+# =====================================================================
+@router.post(
+    "/admissions/{admission_id}/assessments/pain",
+    response_model=PainAssessmentOut,
+)
+def create_pain_assessment(
+    admission_id: int,
+    payload: PainAssessmentIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    if not has_perm(user, "ipd.nursing"):
+        raise HTTPException(403, "Not permitted")
+    adm = db.query(IpdAdmission).get(admission_id)
+    if not adm:
+        raise HTTPException(404, "Admission not found")
+
+    rec = IpdPainAssessment(
+        admission_id=admission_id,
+        recorded_at=payload.recorded_at or datetime.utcnow(),
+        scale_type=payload.scale_type or "",
+        score=payload.score,
+        location=payload.location or "",
+        character=payload.character or "",
+        intervention=payload.intervention or "",
+        post_intervention_score=payload.post_intervention_score,
+        recorded_by=user.id,
+    )
+    db.add(rec)
+    db.commit()
+    db.refresh(rec)
+    return rec
+
+
+@router.get(
+    "/admissions/{admission_id}/assessments/pain",
+    response_model=List[PainAssessmentOut],
+)
+def list_pain_assessments(
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    if not has_perm(user, "ipd.view"):
+        raise HTTPException(403, "Not permitted")
+    return (
+        db.query(IpdPainAssessment)
+        .filter(IpdPainAssessment.admission_id == admission_id)
+        .order_by(IpdPainAssessment.recorded_at.desc())
+        .all()
+    )
+
+
+@router.post(
+    "/admissions/{admission_id}/assessments/fall-risk",
+    response_model=FallRiskAssessmentOut,
+)
+def create_fall_risk_assessment(
+    admission_id: int,
+    payload: FallRiskAssessmentIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    if not has_perm(user, "ipd.nursing"):
+        raise HTTPException(403, "Not permitted")
+    adm = db.query(IpdAdmission).get(admission_id)
+    if not adm:
+        raise HTTPException(404, "Admission not found")
+
+    rec = IpdFallRiskAssessment(
+        admission_id=admission_id,
+        recorded_at=payload.recorded_at or datetime.utcnow(),
+        tool=payload.tool or "",
+        score=payload.score,
+        risk_level=payload.risk_level or "",
+        precautions=payload.precautions or "",
+        recorded_by=user.id,
+    )
+    db.add(rec)
+    db.commit()
+    db.refresh(rec)
+    return rec
+
+
+@router.get(
+    "/admissions/{admission_id}/assessments/fall-risk",
+    response_model=List[FallRiskAssessmentOut],
+)
+def list_fall_risk_assessments(
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    if not has_perm(user, "ipd.view"):
+        raise HTTPException(403, "Not permitted")
+    return (
+        db.query(IpdFallRiskAssessment)
+        .filter(IpdFallRiskAssessment.admission_id == admission_id)
+        .order_by(IpdFallRiskAssessment.recorded_at.desc())
+        .all()
+    )
+
+
+@router.post(
+    "/admissions/{admission_id}/assessments/pressure-ulcer",
+    response_model=PressureUlcerAssessmentOut,
+)
+def create_pressure_ulcer_assessment(
+    admission_id: int,
+    payload: PressureUlcerAssessmentIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    if not has_perm(user, "ipd.nursing"):
+        raise HTTPException(403, "Not permitted")
+    adm = db.query(IpdAdmission).get(admission_id)
+    if not adm:
+        raise HTTPException(404, "Admission not found")
+
+    rec = IpdPressureUlcerAssessment(
+        admission_id=admission_id,
+        recorded_at=payload.recorded_at or datetime.utcnow(),
+        tool=payload.tool or "",
+        score=payload.score,
+        risk_level=payload.risk_level or "",
+        existing_ulcer=payload.existing_ulcer,
+        site=payload.site or "",
+        stage=payload.stage or "",
+        management_plan=payload.management_plan or "",
+        recorded_by=user.id,
+    )
+    db.add(rec)
+    db.commit()
+    db.refresh(rec)
+    return rec
+
+
+@router.get(
+    "/admissions/{admission_id}/assessments/pressure-ulcer",
+    response_model=List[PressureUlcerAssessmentOut],
+)
+def list_pressure_ulcer_assessments(
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    if not has_perm(user, "ipd.view"):
+        raise HTTPException(403, "Not permitted")
+    return (
+        db.query(IpdPressureUlcerAssessment)
+        .filter(IpdPressureUlcerAssessment.admission_id == admission_id)
+        .order_by(IpdPressureUlcerAssessment.recorded_at.desc())
+        .all()
+    )
+
+
+@router.post(
+    "/admissions/{admission_id}/assessments/nutrition",
+    response_model=NutritionAssessmentOut,
+)
+def create_nutrition_assessment(
+    admission_id: int,
+    payload: NutritionAssessmentIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    if not has_perm(user, "ipd.nursing"):
+        raise HTTPException(403, "Not permitted")
+    adm = db.query(IpdAdmission).get(admission_id)
+    if not adm:
+        raise HTTPException(404, "Admission not found")
+
+    rec = IpdNutritionAssessment(
+        admission_id=admission_id,
+        recorded_at=payload.recorded_at or datetime.utcnow(),
+        bmi=payload.bmi,
+        weight_kg=payload.weight_kg,
+        height_cm=payload.height_cm,
+        screening_tool=payload.screening_tool or "",
+        score=payload.score,
+        risk_level=payload.risk_level or "",
+        dietician_referral=payload.dietician_referral,
+        recorded_by=user.id,
+    )
+    db.add(rec)
+    db.commit()
+    db.refresh(rec)
+    return rec
+
+
+@router.get(
+    "/admissions/{admission_id}/assessments/nutrition",
+    response_model=List[NutritionAssessmentOut],
+)
+def list_nutrition_assessments(
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    if not has_perm(user, "ipd.view"):
+        raise HTTPException(403, "Not permitted")
+    return (
+        db.query(IpdNutritionAssessment)
+        .filter(IpdNutritionAssessment.admission_id == admission_id)
+        .order_by(IpdNutritionAssessment.recorded_at.desc())
+        .all()
+    )
+
+
+# =====================================================================
+# NEW: Generic IPD Orders
+# =====================================================================
+@router.post(
+    "/admissions/{admission_id}/orders",
+    response_model=OrderOut,
+)
+def create_order(
+    admission_id: int,
+    payload: OrderIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    if not has_perm(user, "ipd.doctor"):
+        raise HTTPException(403, "Not permitted")
+    adm = db.query(IpdAdmission).get(admission_id)
+    if not adm:
+        raise HTTPException(404, "Admission not found")
+
+    rec = IpdOrder(
+        admission_id=admission_id,
+        order_type=payload.order_type,
+        linked_order_id=payload.linked_order_id,
+        order_text=payload.order_text or "",
+        order_status=payload.order_status,
+        ordered_at=payload.ordered_at or datetime.utcnow(),
+        ordered_by=user.id,
+        performed_at=payload.performed_at,
+    )
+    db.add(rec)
+    db.commit()
+    db.refresh(rec)
+    return rec
+
+
+@router.get(
+    "/admissions/{admission_id}/orders",
+    response_model=List[OrderOut],
+)
+def list_orders(
+    admission_id: int,
+    order_type: Optional[str] = None,
+    status: Optional[str] = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    if not has_perm(user, "ipd.view"):
+        raise HTTPException(403, "Not permitted")
+    q = db.query(IpdOrder).filter(IpdOrder.admission_id == admission_id)
+    if order_type:
+        q = q.filter(IpdOrder.order_type == order_type)
+    if status:
+        q = q.filter(IpdOrder.order_status == status)
+    return q.order_by(IpdOrder.ordered_at.desc(), IpdOrder.id.desc()).all()
+
+
+# =====================================================================
+# NEW: Dressing, Transfusion, Restraint, Isolation, ICU
+# =====================================================================
+@router.post(
+    "/admissions/{admission_id}/dressing-records",
+    response_model=DressingRecordOut,
+)
+def create_dressing_record(
+    admission_id: int,
+    payload: DressingRecordIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    if not has_perm(user, "ipd.nursing"):
+        raise HTTPException(403, "Not permitted")
+    adm = db.query(IpdAdmission).get(admission_id)
+    if not adm:
+        raise HTTPException(404, "Admission not found")
+
+    rec = IpdDressingRecord(
+        admission_id=admission_id,
+        wound_site=payload.wound_site or "",
+        dressing_type=payload.dressing_type or "",
+        indication=payload.indication or "",
+        date_time=payload.date_time or datetime.utcnow(),
+        findings=payload.findings or "",
+        next_dressing_due=payload.next_dressing_due,
+        done_by=user.id,
+    )
+    db.add(rec)
+    db.commit()
+    db.refresh(rec)
+    return rec
+
+
+@router.get(
+    "/admissions/{admission_id}/dressing-records",
+    response_model=List[DressingRecordOut],
+)
+def list_dressing_records(
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    if not has_perm(user, "ipd.view"):
+        raise HTTPException(403, "Not permitted")
+    return (
+        db.query(IpdDressingRecord)
+        .filter(IpdDressingRecord.admission_id == admission_id)
+        .order_by(IpdDressingRecord.date_time.desc())
+        .all()
+    )
+
+
+@router.post(
+    "/admissions/{admission_id}/transfusions",
+    response_model=BloodTransfusionOut,
+)
+def create_transfusion(
+    admission_id: int,
+    payload: BloodTransfusionIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    if not has_perm(user, "ipd.nursing"):
+        raise HTTPException(403, "Not permitted")
+    adm = db.query(IpdAdmission).get(admission_id)
+    if not adm:
+        raise HTTPException(404, "Admission not found")
+
+    rec = IpdBloodTransfusion(
+        admission_id=admission_id,
+        component_type=payload.component_type or "",
+        bag_number=payload.bag_number or "",
+        start_time=payload.start_time,
+        end_time=payload.end_time,
+        pre_vitals=payload.pre_vitals or "",
+        post_vitals=payload.post_vitals or "",
+        reaction_occurred=payload.reaction_occurred,
+        reaction_notes=payload.reaction_notes or "",
+        notified_to=user.id if payload.reaction_occurred else None,
+    )
+    db.add(rec)
+    db.commit()
+    db.refresh(rec)
+    return rec
+
+
+@router.get(
+    "/admissions/{admission_id}/transfusions",
+    response_model=List[BloodTransfusionOut],
+)
+def list_transfusions(
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    if not has_perm(user, "ipd.view"):
+        raise HTTPException(403, "Not permitted")
+    return (
+        db.query(IpdBloodTransfusion)
+        .filter(IpdBloodTransfusion.admission_id == admission_id)
+        .order_by(IpdBloodTransfusion.start_time.desc())
+        .all()
+    )
+
+
+@router.post(
+    "/admissions/{admission_id}/restraints",
+    response_model=RestraintRecordOut,
+)
+def create_restraint(
+    admission_id: int,
+    payload: RestraintRecordIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    if not (
+        has_perm(user, "ipd.doctor") or has_perm(user, "ipd.manage")
+    ):
+        raise HTTPException(403, "Not permitted")
+    adm = db.query(IpdAdmission).get(admission_id)
+    if not adm:
+        raise HTTPException(404, "Admission not found")
+
+    rec = IpdRestraintRecord(
+        admission_id=admission_id,
+        type=payload.type or "",
+        reason=payload.reason or "",
+        start_time=payload.start_time,
+        end_time=payload.end_time,
+        monitoring_notes=payload.monitoring_notes or "",
+        doctor_order_id=user.id,
+    )
+    db.add(rec)
+    db.commit()
+    db.refresh(rec)
+    return rec
+
+
+@router.get(
+    "/admissions/{admission_id}/restraints",
+    response_model=List[RestraintRecordOut],
+)
+def list_restraints(
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    if not has_perm(user, "ipd.view"):
+        raise HTTPException(403, "Not permitted")
+    return (
+        db.query(IpdRestraintRecord)
+        .filter(IpdRestraintRecord.admission_id == admission_id)
+        .order_by(IpdRestraintRecord.start_time.desc())
+        .all()
+    )
+
+
+@router.post(
+    "/admissions/{admission_id}/isolation",
+    response_model=IsolationPrecautionOut,
+)
+def create_isolation(
+    admission_id: int,
+    payload: IsolationPrecautionIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    if not (
+        has_perm(user, "ipd.doctor") or has_perm(user, "ipd.manage")
+    ):
+        raise HTTPException(403, "Not permitted")
+    adm = db.query(IpdAdmission).get(admission_id)
+    if not adm:
+        raise HTTPException(404, "Admission not found")
+
+    rec = IpdIsolationPrecaution(
+        admission_id=admission_id,
+        indication=payload.indication or "",
+        start_date=payload.start_date,
+        end_date=payload.end_date,
+        measures=payload.measures or "",
+        status=payload.status,
+    )
+    db.add(rec)
+    db.commit()
+    db.refresh(rec)
+    return rec
+
+
+@router.get(
+    "/admissions/{admission_id}/isolation",
+    response_model=List[IsolationPrecautionOut],
+)
+def list_isolation(
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    if not has_perm(user, "ipd.view"):
+        raise HTTPException(403, "Not permitted")
+    return (
+        db.query(IpdIsolationPrecaution)
+        .filter(IpdIsolationPrecaution.admission_id == admission_id)
+        .order_by(IpdIsolationPrecaution.start_date.desc())
+        .all()
+    )
+
+
+@router.post(
+    "/admissions/{admission_id}/icu-flow",
+    response_model=IcuFlowSheetOut,
+)
+def create_icu_flow(
+    admission_id: int,
+    payload: IcuFlowSheetIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    if not (
+        has_perm(user, "ipd.nursing") or has_perm(user, "ipd.doctor")
+    ):
+        raise HTTPException(403, "Not permitted")
+    adm = db.query(IpdAdmission).get(admission_id)
+    if not adm:
+        raise HTTPException(404, "Admission not found")
+
+    rec = IcuFlowSheet(
+        admission_id=admission_id,
+        recorded_at=payload.recorded_at or datetime.utcnow(),
+        vital_data=payload.vital_data or "",
+        ventilator_settings=payload.ventilator_settings or "",
+        infusions=payload.infusions or "",
+        gcs_score=payload.gcs_score,
+        urine_output_ml=payload.urine_output_ml,
+        notes=payload.notes or "",
+        recorded_by=user.id,
+    )
+    db.add(rec)
+    db.commit()
+    db.refresh(rec)
+    return rec
+
+
+@router.get(
+    "/admissions/{admission_id}/icu-flow",
+    response_model=List[IcuFlowSheetOut],
+)
+def list_icu_flow(
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    if not has_perm(user, "ipd.view"):
+        raise HTTPException(403, "Not permitted")
+    return (
+        db.query(IcuFlowSheet)
+        .filter(IcuFlowSheet.admission_id == admission_id)
+        .order_by(IcuFlowSheet.recorded_at.desc())
+        .all()
+    )
+
+
+# =====================================================================
+# NEW: Discharge Medications (structured)
+# =====================================================================
+@router.post(
+    "/admissions/{admission_id}/discharge-medications",
+    response_model=DischargeMedicationOut,
+)
+def create_discharge_medication(
+    admission_id: int,
+    payload: DischargeMedicationIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    if not has_perm(user, "ipd.doctor"):
+        raise HTTPException(403, "Not permitted")
+    adm = db.query(IpdAdmission).get(admission_id)
+    if not adm:
+        raise HTTPException(404, "Admission not found")
+
+    rec = IpdDischargeMedication(
+        admission_id=admission_id,
+        drug_name=payload.drug_name,
+        dose=payload.dose,
+        dose_unit=payload.dose_unit or "",
+        route=payload.route or "",
+        frequency=payload.frequency or "",
+        duration_days=payload.duration_days,
+        advice_text=payload.advice_text or "",
+    )
+    db.add(rec)
+    db.commit()
+    db.refresh(rec)
+    return rec
+
+
+@router.get(
+    "/admissions/{admission_id}/discharge-medications",
+    response_model=List[DischargeMedicationOut],
+)
+def list_discharge_medications(
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    if not has_perm(user, "ipd.view"):
+        raise HTTPException(403, "Not permitted")
+    return (
+        db.query(IpdDischargeMedication)
+        .filter(IpdDischargeMedication.admission_id == admission_id)
+        .order_by(IpdDischargeMedication.id.asc())
+        .all()
+    )
+
+
+# =====================================================================
+# NEW: IPD Feedback
+# =====================================================================
+@router.post(
+    "/admissions/{admission_id}/feedback",
+    response_model=IpdFeedbackOut,
+)
+def create_ipd_feedback(
+    admission_id: int,
+    payload: IpdFeedbackIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    # Feedback can be collected by IPD manager / registration / nursing
+    if not (
+        has_perm(user, "ipd.manage")
+        or has_perm(user, "ipd.nursing")
+        or has_perm(user, "ipd.view")
+    ):
+        raise HTTPException(403, "Not permitted")
+
+    adm = db.query(IpdAdmission).get(admission_id)
+    if not adm:
+        raise HTTPException(404, "Admission not found")
+
+    rec = IpdFeedback(
+        admission_id=admission_id,
+        patient_id=adm.patient_id,
+        rating_overall=payload.rating_overall,
+        rating_nursing=payload.rating_nursing,
+        rating_doctor=payload.rating_doctor,
+        rating_cleanliness=payload.rating_cleanliness,
+        comments=payload.comments or "",
+        collected_at=datetime.utcnow(),
+        collected_by=user.id,
+    )
+    db.add(rec)
+    db.commit()
+    db.refresh(rec)
+    return rec
+
+
+@router.get(
+    "/admissions/{admission_id}/feedback",
+    response_model=List[IpdFeedbackOut],
+)
+def list_ipd_feedback_for_admission(
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    if not has_perm(user, "ipd.view"):
+        raise HTTPException(403, "Not permitted")
+
+    return (
+        db.query(IpdFeedback)
+        .filter(IpdFeedback.admission_id == admission_id)
+        .order_by(IpdFeedback.collected_at.desc())
+        .all()
+    )
+
+# ------------------------------
+# Assessments
+# ------------------------------
+@router.get(
+    "/admissions/{admission_id}/assessments",
+    response_model=list[IpdAssessmentOut],
+)
+def list_ipd_assessments(
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user=Depends(auth_current_user),
+):
+    _need_any(user, ["ipd.view", "ipd.nursing", "ipd.doctor", "ipd.manage"])
+    _get_admission_or_404(db, admission_id)
+    rows = (
+        db.query(IpdAssessment)
+        .filter(IpdAssessment.admission_id == admission_id)
+        .order_by(IpdAssessment.assessed_at.desc())
+        .all()
+    )
+    return rows
+
+
+@router.post(
+    "/admissions/{admission_id}/assessments",
+    response_model=IpdAssessmentOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_ipd_assessment(
+    admission_id: int,
+    payload: IpdAssessmentCreate,
+    db: Session = Depends(get_db),
+    user=Depends(auth_current_user),
+):
+    _need_any(user, ["ipd.nursing", "ipd.doctor", "ipd.manage"])
+    _get_admission_or_404(db, admission_id)
+
+    obj = IpdAssessment(
+        admission_id=admission_id,
+        assessment_type=payload.assessment_type or "nursing",
+        assessed_at=payload.assessed_at or datetime.utcnow(),
+        summary=payload.summary,
+        plan=payload.plan,
+        created_by_id=user.id if getattr(user, "id", None) else None,
+    )
+    db.add(obj)
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+# ------------------------------
+# Medications (Drug chart)
+# ------------------------------
+@router.get(
+    "/admissions/{admission_id}/medications",
+    response_model=List[IpdMedicationOut],
+)
+def list_ipd_medications(
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user=Depends(auth_current_user),
+):
+    """
+    List all IPD medications (drug chart master list) for a given admission.
+    - Requires any of: ipd.view / ipd.doctor / ipd.manage
+    - Returns [] if no medications.
+    - Logs DB-level errors instead of crashing with raw 500 tracebacks.
+    """
+    # 1) Basic param sanity
+    if admission_id <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid admission id",
+        )
+
+    # 2) Permission check
+    _need_any(user, ["ipd.view", "ipd.doctor", "ipd.manage"])
+
+    # 3) Guard against invalid admission
+    _get_admission_or_404(db, admission_id)
+
+    # 4) Safe DB access
+    try:
+        rows = (
+            db.query(IpdMedication)
+            .filter(IpdMedication.admission_id == admission_id)
+            .order_by(IpdMedication.id.desc())
+            .all()
+        )
+        # Always return a list (never None)
+        return rows or []
+    except SQLAlchemyError as e:
+        logger.exception(
+            "Failed to list medications for admission_id=%s", admission_id
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load medications. Please try again.",
+        ) from e
+
+
+@router.post(
+    "/admissions/{admission_id}/medications",
+    response_model=IpdMedicationOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_ipd_medication(
+    admission_id: int,
+    payload: IpdMedicationCreate,
+    db: Session = Depends(get_db),
+    user=Depends(auth_current_user),
+):
+    _need_any(user, ["ipd.doctor", "ipd.manage"])
+    _get_admission_or_404(db, admission_id)
+
+    obj = IpdMedication(
+        admission_id=admission_id,
+        drug_name=payload.drug_name,
+        route=payload.route or "oral",
+        frequency=payload.frequency or "od",
+        dose=payload.dose,
+        start_date=payload.start_date,
+        end_date=payload.end_date,
+        instructions=payload.instructions,
+        status=payload.status or "active",
+        created_by_id=user.id if getattr(user, "id", None) else None,
+    )
+    db.add(obj)
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+
+@router.put(
+    "/admissions/{admission_id}/medications/{med_id}",
+    response_model=IpdMedicationOut,
+)
+def update_ipd_medication(
+    admission_id: int,
+    med_id: int,
+    payload: IpdMedicationUpdate,
+    db: Session = Depends(get_db),
+    user=Depends(auth_current_user),
+):
+    _need_any(user, ["ipd.doctor", "ipd.manage"])
+    _get_admission_or_404(db, admission_id)
+
+    obj = (
+        db.query(IpdMedication)
+        .filter(
+            IpdMedication.id == med_id,
+            IpdMedication.admission_id == admission_id,
+        )
+        .first()
+    )
+    if not obj:
+        raise HTTPException(status_code=404, detail="Medication not found")
+
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        setattr(obj, field, value)
+
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+# ------------------------------
+# Dressing / Transfusion
+# ------------------------------
+@router.get(
+    "/admissions/{admission_id}/dressing-transfusion",
+    response_model=list[IpdDressingTransfusionOut],
+)
+def list_ipd_dressing_transfusion(
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user=Depends(auth_current_user),
+):
+    _need_any(user, ["ipd.view", "ipd.nursing", "ipd.manage"])
+    _get_admission_or_404(db, admission_id)
+
+    try:
+        rows = (
+            db.query(IpdDressingTransfusion)
+            .filter(IpdDressingTransfusion.admission_id == admission_id)
+            .order_by(IpdDressingTransfusion.done_at.desc())
+            .all()
+        )
+        return rows or []
+    except SQLAlchemyError as e:
+        logger.exception(
+            "Failed to list dressing/transfusion entries for admission_id=%s",
+            admission_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load dressing/transfusion entries.",
+        ) from e
+
+
+@router.post(
+    "/admissions/{admission_id}/dressing-transfusion",
+    response_model=IpdDressingTransfusionOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_ipd_dressing_transfusion(
+    admission_id: int,
+    payload: IpdDressingTransfusionCreate,
+    db: Session = Depends(get_db),
+    user=Depends(auth_current_user),
+):
+    _need_any(user, ["ipd.nursing", "ipd.manage"])
+    _get_admission_or_404(db, admission_id)
+
+    try:
+        obj = IpdDressingTransfusion(
+            admission_id=admission_id,
+            entry_type=(payload.entry_type or "dressing").lower(),
+            done_at=payload.done_at or datetime.utcnow(),
+            site=payload.site or "",
+            product=payload.product or "",
+            volume=payload.volume or "",
+            notes=payload.notes or "",
+            created_by_id=getattr(user, "id", None),
+        )
+        db.add(obj)
+        db.commit()
+        db.refresh(obj)
+        return obj
+    except SQLAlchemyError as e:
+        logger.exception(
+            "Failed to create dressing/transfusion entry for admission_id=%s",
+            admission_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to save dressing/transfusion entry.",
+        ) from e
+
+
+# ------------------------------
+# Discharge Medications
+# ------------------------------
+@router.get(
+    "/admissions/{admission_id}/discharge-meds",
+    response_model=list[IpdDischargeMedicationOut],
+)
+def list_ipd_discharge_meds(
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user=Depends(auth_current_user),
+):
+    _need_any(user, ["ipd.view", "ipd.doctor", "ipd.manage"])
+    _get_admission_or_404(db, admission_id)
+
+    rows = (
+        db.query(IpdDischargeMedication)
+        .filter(IpdDischargeMedication.admission_id == admission_id)
+        .order_by(IpdDischargeMedication.id.asc())
+        .all()
+    )
+    return rows
+
+
+@router.post(
+    "/admissions/{admission_id}/discharge-meds",
+    response_model=IpdDischargeMedicationOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_ipd_discharge_med(
+    admission_id: int,
+    payload: IpdDischargeMedicationCreate,
+    db: Session = Depends(get_db),
+    user=Depends(auth_current_user),
+):
+    _need_any(user, ["ipd.doctor", "ipd.manage"])
+    _get_admission_or_404(db, admission_id)
+
+    obj = IpdDischargeMedication(
+        admission_id=admission_id,
+        drug_name=payload.drug_name,
+        dose=payload.dose,
+        dose_unit=payload.dose_unit or "",
+        route=payload.route or "",
+        frequency=payload.frequency or "",
+        duration_days=payload.duration_days,
+        advice_text=payload.advice_text or "",
+        created_by_id=user.id if getattr(user, "id", None) else None,
+    )
+    db.add(obj)
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+
+# ------------------------------
+# Admission Feedback (upsert)
+# ------------------------------
+@router.get(
+    "/admissions/{admission_id}/feedback",
+    response_model=IpdAdmissionFeedbackOut,
+)
+def get_ipd_feedback(
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user=Depends(auth_current_user),
+):
+    _need_any(user, ["ipd.view", "ipd.manage"])
+    _get_admission_or_404(db, admission_id)
+
+    obj = (
+        db.query(IpdAdmissionFeedback)
+        .filter(IpdAdmissionFeedback.admission_id == admission_id)
+        .first()
+    )
+    if not obj:
+        raise HTTPException(status_code=404, detail="Feedback not found")
+    return obj
+
+
+@router.post(
+    "/admissions/{admission_id}/feedback",
+    response_model=IpdAdmissionFeedbackOut,
+)
+def save_ipd_feedback(
+    admission_id: int,
+    payload: IpdAdmissionFeedbackCreate,
+    db: Session = Depends(get_db),
+    user=Depends(auth_current_user),
+):
+    _need_any(user, ["ipd.manage"])
+    _get_admission_or_404(db, admission_id)
+
+    obj = (
+        db.query(IpdAdmissionFeedback)
+        .filter(IpdAdmissionFeedback.admission_id == admission_id)
+        .first()
+    )
+    if obj is None:
+        obj = IpdAdmissionFeedback(
+            admission_id=admission_id,
+            created_by_id=user.id if getattr(user, "id", None) else None,
+        )
+        db.add(obj)
+
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        setattr(obj, field, value)
+
+    db.commit()
+    db.refresh(obj)
+    return obj

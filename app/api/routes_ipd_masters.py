@@ -1,10 +1,11 @@
+# FILE: app/api/routes_ipd_master.py
 from __future__ import annotations
 from datetime import datetime, date
 from typing import List, Optional, Dict, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Body
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, current_user as auth_current_user
 from app.models.user import User
@@ -43,9 +44,9 @@ def has_perm(user: User, code: str) -> bool:
 # ---------------------------------------------------------------------
 @router.post("/wards", response_model=WardOut)
 def create_ward(
-        payload: WardIn,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
+    payload: WardIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
 ):
     if not has_perm(user, "ipd.masters.manage"):
         raise HTTPException(403, "Not permitted")
@@ -62,13 +63,17 @@ def create_ward(
 
 @router.get("/wards", response_model=List[WardOut])
 def list_wards(
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
 ):
     if not has_perm(user, "ipd.view"):
         raise HTTPException(403, "Not permitted")
-    return (db.query(IpdWard).filter(IpdWard.is_active.is_(True)).order_by(
-        IpdWard.name.asc()).all())
+    return (
+        db.query(IpdWard)
+        .filter(IpdWard.is_active.is_(True))
+        .order_by(IpdWard.name.asc())
+        .all()
+    )
 
 
 # ---------------------------------------------------------------------
@@ -76,9 +81,9 @@ def list_wards(
 # ---------------------------------------------------------------------
 @router.post("/rooms", response_model=RoomOut)
 def create_room(
-        payload: RoomIn,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
+    payload: RoomIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
 ):
     if not has_perm(user, "ipd.masters.manage"):
         raise HTTPException(403, "Not permitted")
@@ -95,16 +100,15 @@ def create_room(
 
 @router.get("/rooms", response_model=List[RoomOut])
 def list_rooms(
-        ward_id: Optional[int] = None,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
+    ward_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
 ):
     if not has_perm(user, "ipd.view"):
         raise HTTPException(403, "Not permitted")
     q = db.query(IpdRoom).filter(IpdRoom.is_active.is_(True))
     if ward_id:
         q = q.filter(IpdRoom.ward_id == ward_id)
-    # Friendlier ordering for pickers
     return q.order_by(IpdRoom.number.asc()).all()
 
 
@@ -113,9 +117,9 @@ def list_rooms(
 # ---------------------------------------------------------------------
 @router.post("/beds", response_model=BedOut)
 def create_bed(
-        payload: BedIn,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
+    payload: BedIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
 ):
     if not has_perm(user, "ipd.masters.manage"):
         raise HTTPException(403, "Not permitted")
@@ -132,10 +136,10 @@ def create_bed(
 
 @router.get("/beds", response_model=List[BedOut])
 def list_beds(
-        room_id: Optional[int] = None,
-        ward_id: Optional[int] = None,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
+    room_id: Optional[int] = None,
+    ward_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
 ):
     if not has_perm(user, "ipd.view"):
         raise HTTPException(403, "Not permitted")
@@ -144,25 +148,23 @@ def list_beds(
         q = q.filter(IpdRoom.ward_id == ward_id)
     if room_id:
         q = q.filter(IpdBed.room_id == room_id)
-    # Friendlier ordering for pickers
     return q.order_by(IpdBed.code.asc()).all()
 
 
-# NEW: single endpoint to mutate bed state (reserve / preoccupy / occupy / vacate)
 class BedStateIn(BaseModel):
-    state: str  # vacant / occupied / reserved / preoccupied
+    state: str  # vacant / reserved / preoccupied
     reserved_until: Optional[datetime] = None
     note: Optional[str] = None
 
 
-# in masters router
 @router.patch("/beds/{bed_id}/state")
-def set_bed_state(bed_id: int,
-                  state: str = Query(...,
-                                     regex="^(vacant|reserved|preoccupied)$"),
-                  reserved_until: Optional[datetime] = Query(None),
-                  db: Session = Depends(get_db),
-                  user: User = Depends(auth_current_user)):
+def set_bed_state(
+    bed_id: int,
+    state: str = Query(..., regex="^(vacant|reserved|preoccupied)$"),
+    reserved_until: Optional[datetime] = Query(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
     """
     Set bed state quickly from the board.
     NOTE: 'occupied' is intentionally blocked — use admission/transfer to occupy.
@@ -181,18 +183,18 @@ def set_bed_state(bed_id: int,
         "message": "Updated",
         "bed_id": b.id,
         "state": b.state,
-        "reserved_until": b.reserved_until
+        "reserved_until": b.reserved_until,
     }
 
 
-# Backward-compat: keep simple reserve/release for existing callers
 @router.post("/beds/{bed_id}/reserve")
 def reserve_bed(
-        bed_id: int,
-        until_ts: Optional[datetime] = Query(
-            None, description="Optional reservation expiry"),
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
+    bed_id: int,
+    until_ts: Optional[datetime] = Query(
+        None, description="Optional reservation expiry"
+    ),
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
 ):
     if not has_perm(user, "ipd.masters.manage"):
         raise HTTPException(403, "Not permitted")
@@ -207,15 +209,15 @@ def reserve_bed(
     return {
         "message": "Reserved",
         "bed_id": b.id,
-        "reserved_until": b.reserved_until
+        "reserved_until": b.reserved_until,
     }
 
 
 @router.post("/beds/{bed_id}/release")
 def release_bed(
-        bed_id: int,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
+    bed_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
 ):
     if not has_perm(user, "ipd.masters.manage"):
         raise HTTPException(403, "Not permitted")
@@ -224,7 +226,8 @@ def release_bed(
         raise HTTPException(404, "Bed not found")
     if b.state not in ("reserved", "preoccupied"):
         raise HTTPException(
-            400, "Only reserved/preoccupied beds can be released to vacant")
+            400, "Only reserved/preoccupied beds can be released to vacant"
+        )
     b.state = "vacant"
     b.reserved_until = None
     db.commit()
@@ -236,9 +239,9 @@ def release_bed(
 # ---------------------------------------------------------------------
 @router.get("/bedboard")
 def bedboard_snapshot(
-        ward_id: Optional[int] = None,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
+    ward_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
 ):
     """
     Lightweight board with enriched labels for UI cards.
@@ -246,37 +249,42 @@ def bedboard_snapshot(
     if not has_perm(user, "ipd.view"):
         raise HTTPException(403, "Not permitted")
 
-    q = (db.query(IpdBed).join(IpdRoom, IpdRoom.id == IpdBed.room_id).join(
-        IpdWard, IpdWard.id == IpdRoom.ward_id))
+    q = (
+        db.query(IpdBed)
+        .join(IpdRoom, IpdRoom.id == IpdBed.room_id)
+        .join(IpdWard, IpdWard.id == IpdRoom.ward_id)
+    )
     if ward_id:
         q = q.filter(IpdWard.id == ward_id)
 
     rows = q.add_columns(IpdRoom.number, IpdRoom.type, IpdWard.name).all()
-    counts = {"vacant": 0, "occupied": 0, "reserved": 0, "preoccupied": 0}
+    counts: Dict[str, int] = {"vacant": 0, "occupied": 0, "reserved": 0, "preoccupied": 0}
 
     beds: List[Dict[str, Any]] = []
     for b, room_number, room_type, ward_name in rows:
         counts[b.state] = counts.get(b.state, 0) + 1
-        beds.append({
-            "id": b.id,
-            "code": b.code,
-            "state": b.state,
-            "room_id": b.room_id,
-            "room_number": room_number,
-            "room_type": room_type,
-            "ward_name": ward_name,
-            "reserved_until": b.reserved_until,
-            "note": b.note,
-        })
+        beds.append(
+            {
+                "id": b.id,
+                "code": b.code,
+                "state": b.state,
+                "room_id": b.room_id,
+                "room_number": room_number,
+                "room_type": room_type,
+                "ward_name": ward_name,
+                "reserved_until": b.reserved_until,
+                "note": b.note,
+            }
+        )
 
     return {"beds": beds, "counts": counts}
 
 
 @router.get("/tree")
 def ward_room_bed_tree(
-        only_active: bool = True,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
+    only_active: bool = True,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
 ):
     """
     Convenience endpoint for cascading pickers:
@@ -290,7 +298,6 @@ def ward_room_bed_tree(
         wq = wq.filter(IpdWard.is_active.is_(True))
     wards = wq.order_by(IpdWard.name.asc()).all()
 
-    # preload rooms and beds
     room_map: Dict[int, List[IpdRoom]] = {}
     bed_map: Dict[int, List[IpdBed]] = {}
 
@@ -310,28 +317,32 @@ def ward_room_bed_tree(
     for w in wards:
         r_nodes = []
         for r in room_map.get(w.id, []):
-            r_nodes.append({
-                "id":
-                r.id,
-                "number":
-                r.number,
-                "type":
-                r.type,
-                "beds": [{
-                    "id": b.id,
-                    "code": b.code,
-                    "state": b.state,
-                    "reserved_until": b.reserved_until,
-                    "note": b.note,
-                } for b in bed_map.get(r.id, [])],
-            })
-        tree.append({
-            "id": w.id,
-            "name": w.name,
-            "code": w.code,
-            "floor": w.floor,
-            "rooms": r_nodes,
-        })
+            r_nodes.append(
+                {
+                    "id": r.id,
+                    "number": r.number,
+                    "type": r.type,
+                    "beds": [
+                        {
+                            "id": b.id,
+                            "code": b.code,
+                            "state": b.state,
+                            "reserved_until": b.reserved_until,
+                            "note": b.note,
+                        }
+                        for b in bed_map.get(r.id, [])
+                    ],
+                }
+            )
+        tree.append(
+            {
+                "id": w.id,
+                "name": w.name,
+                "code": w.code,
+                "floor": w.floor,
+                "rooms": r_nodes,
+            }
+        )
 
     return {"wards": tree}
 
@@ -341,9 +352,9 @@ def ward_room_bed_tree(
 # ---------------------------------------------------------------------
 @router.post("/packages", response_model=PackageOut)
 def create_package(
-        payload: PackageIn,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
+    payload: PackageIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
 ):
     if not has_perm(user, "ipd.packages.manage"):
         raise HTTPException(403, "Not permitted")
@@ -356,8 +367,8 @@ def create_package(
 
 @router.get("/packages", response_model=List[PackageOut])
 def list_packages(
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
 ):
     if not has_perm(user, "ipd.view"):
         raise HTTPException(403, "Not permitted")
@@ -369,9 +380,9 @@ def list_packages(
 # ---------------------------------------------------------------------
 @router.post("/bed-rates", response_model=BedRateOut)
 def create_bed_rate(
-        payload: BedRateIn,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
+    payload: BedRateIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
 ):
     if not has_perm(user, "ipd.masters.manage"):
         raise HTTPException(403, "Not permitted")
@@ -384,39 +395,46 @@ def create_bed_rate(
 
 @router.get("/bed-rates", response_model=List[BedRateOut])
 def list_bed_rates(
-        room_type: Optional[str] = None,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
+    room_type: Optional[str] = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
 ):
     if not has_perm(user, "ipd.view"):
         raise HTTPException(403, "Not permitted")
     q = db.query(IpdBedRate).filter(IpdBedRate.is_active.is_(True))
     if room_type:
         q = q.filter(IpdBedRate.room_type == room_type)
-    return (q.order_by(IpdBedRate.room_type.asc(),
-                       IpdBedRate.effective_from.desc()).all())
+    return (
+        q.order_by(IpdBedRate.room_type.asc(), IpdBedRate.effective_from.desc())
+        .all()
+    )
 
 
 @router.get("/bed-rates/resolve")
 def resolve_bed_rate(
-        room_type: str = Query(...),
-        on_date: date = Query(...),
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
+    room_type: str = Query(...),
+    on_date: date = Query(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
 ):
     if not has_perm(user, "ipd.view"):
         raise HTTPException(403, "Not permitted")
     r = (
-        db.query(IpdBedRate).filter(IpdBedRate.is_active.is_(True)).filter(
-            IpdBedRate.room_type == room_type).filter(
-                IpdBedRate.effective_from <= on_date).filter(
-                    (IpdBedRate.effective_to == None)  # noqa: E711
-                    | (IpdBedRate.effective_to >= on_date)).order_by(
-                        IpdBedRate.effective_from.desc()).first())
+        db.query(IpdBedRate)
+        .filter(IpdBedRate.is_active.is_(True))
+        .filter(IpdBedRate.room_type == room_type)
+        .filter(IpdBedRate.effective_from <= on_date)
+        .filter(
+            (IpdBedRate.effective_to == None)  # noqa: E711
+            | (IpdBedRate.effective_to >= on_date)
+        )
+        .order_by(IpdBedRate.effective_from.desc())
+        .first()
+    )
     if not r:
         return {"room_type": room_type, "on_date": on_date, "daily_rate": None}
     return {
         "room_type": room_type,
         "on_date": on_date,
-        "daily_rate": float(r.daily_rate)
+        "daily_rate": float(r.daily_rate),
     }
