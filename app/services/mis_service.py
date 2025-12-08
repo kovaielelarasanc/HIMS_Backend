@@ -16,7 +16,7 @@ from app.models.ipd import IpdAdmission
 from app.models.pharmacy_prescription import PharmacySale, PharmacySaleItem
 from app.models.lis import LisOrder
 from app.models.ris import RisOrder
-from app.models.ot import OtSchedule  # noqa: F401
+from app.models.ot import OtSchedule, OtCase  # noqa: F401
 from app.models.billing import Invoice, InvoiceItem, Payment  # noqa: F401
 
 from app.schemas.mis import (
@@ -622,6 +622,138 @@ def _report_ris_orders_summary(db: Session, user: User,
 
 
 # ---------- Definition registry ----------
+def _report_ot_schedule_summary(db: Session, user: User,
+                                filters: MISFilter) -> MISRawReportResult:
+    """
+    OT Schedule / Case summary for the selected period.
+
+    - Uses NEW OtSchedule (bed-based) + OtCase
+    - Filters:
+        * date_from / date_to  → OtSchedule.date
+        * doctor_id           → OtSchedule.surgeon_user_id
+        * unit_id             → OtSchedule.bed_id (treat 'unit/ward id' as bed id)
+    """
+    start_dt, end_dt = _date_range(filters)
+    start_date = start_dt.date()
+    end_date = (end_dt - timedelta(days=1)).date()  # inclusive end date
+
+    q = db.query(OtSchedule).filter(
+        OtSchedule.date >= start_date,
+        OtSchedule.date <= end_date,
+    )
+
+    # Map doctor_id filter → surgeon_user_id
+    if filters.doctor_id:
+        q = q.filter(OtSchedule.surgeon_user_id == filters.doctor_id)
+
+    # Map unit_id filter → bed_id (you can later expand to ward/room)
+    if filters.unit_id:
+        q = q.filter(OtSchedule.bed_id == filters.unit_id)
+
+    schedules: List[OtSchedule] = q.all()
+
+    # ---- Daily aggregation (Python-side for simplicity) ----
+    daily: Dict[str, Dict[str, Any]] = {}
+
+    total_completed = 0
+    total_cancelled = 0
+
+    for s in schedules:
+        if not s.date:
+            continue
+        day_key = s.date.isoformat()
+        row = daily.setdefault(
+            day_key,
+            {
+                "day": day_key,
+                "scheduled": 0,
+                "completed": 0,
+                "cancelled": 0,
+            },
+        )
+        row["scheduled"] += 1
+        if s.status == "completed":
+            row["completed"] += 1
+            total_completed += 1
+        elif s.status == "cancelled":
+            row["cancelled"] += 1
+            total_cancelled += 1
+
+    data_rows = sorted(daily.values(), key=lambda r: r["day"])
+
+    total_cases = len(schedules)
+
+    # ---- OT utilization hours from OtCase.actual_start_time / actual_end_time ----
+    total_minutes = 0
+    for s in schedules:
+        case = s.case  # relationship from OtSchedule → OtCase
+        if not case or not case.actual_start_time or not case.actual_end_time:
+            continue
+        delta = case.actual_end_time - case.actual_start_time
+        mins = int(delta.total_seconds() // 60)
+        if mins > 0:
+            total_minutes += mins
+
+    total_hours = round(total_minutes / 60.0, 1) if total_minutes > 0 else 0.0
+
+    # ---- MIS columns & chart config ----
+    columns = [
+        MISColumn(key="day", label="Date", type="date", align="left"),
+        MISColumn(
+            key="scheduled",
+            label="Scheduled Cases",
+            type="number",
+            align="right",
+        ),
+        MISColumn(
+            key="completed",
+            label="Completed Cases",
+            type="number",
+            align="right",
+        ),
+        MISColumn(
+            key="cancelled",
+            label="Cancelled Cases",
+            type="number",
+            align="right",
+        ),
+    ]
+
+    # For now, primary chart = Scheduled cases per day
+    chart = MISChartConfig(
+        chart_type="column",
+        x_key="day",
+        series=[
+            {
+                "key": "scheduled",
+                "label": "Scheduled OT Cases",
+            },
+        ],
+    )
+
+    return MISRawReportResult(
+        code="ot.schedule_summary",
+        name="OT Schedule Summary",
+        group="OT",
+        description=
+        ("Daily OT scheduled / completed / cancelled cases in the selected period "
+         "based on the new bed-based OT Schedule + OT Case model."),
+        filters_applied=filters,
+        summary={
+            "total_cases": total_cases,
+            "total_completed": total_completed,
+            "total_cancelled": total_cancelled,
+            "total_ot_hours": total_hours,
+        },
+        columns=columns,
+        rows=data_rows,
+        chart=chart,
+        meta={
+            "note":
+            "Uses OtSchedule.date and OtCase.actual_start_time / actual_end_time."
+        },
+    )
+
 
 MIS_DEFINITIONS: Dict[str, MISDefinition] = {
     "patient.registration_summary":
@@ -703,6 +835,17 @@ MIS_DEFINITIONS: Dict[str, MISDefinition] = {
         required_perm_prefixes=["radiology.orders", "radiology.report"],
         allowed_filters=["date_from", "date_to"],
         run_fn=_report_ris_orders_summary,
+    ),
+    "ot.schedule_summary":
+    MISDefinition(
+        code="ot.schedule_summary",
+        name="OT Schedule Summary",
+        group="OT",
+        description=
+        "Daily OT scheduled / completed / cancelled cases and utilization hours.",
+        required_perm_prefixes=["ot."],
+        allowed_filters=["date_from", "date_to", "doctor_id", "unit_id"],
+        run_fn=_report_ot_schedule_summary,
     ),
 }
 

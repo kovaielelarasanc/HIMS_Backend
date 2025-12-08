@@ -43,7 +43,7 @@ from app.models.ipd import (
     IpdBed,
     IpdBedAssignment,
 )
-from app.models.ot import OtSchedule
+from app.models.ot import OtSchedule, OtCase
 from app.models.billing import Invoice, InvoiceItem, Payment
 
 # Pharmacy (optional, NEW models)
@@ -472,7 +472,8 @@ def _build_timeline(
         sales = (
             db.query(PharmacySale).filter(
                 PharmacySale.patient_id == patient_id,
-                PharmacySale.invoice_status != "CANCELLED",  # skip cancelled bills
+                PharmacySale.invoice_status
+                != "CANCELLED",  # skip cancelled bills
             ).order_by(PharmacySale.id.desc()).limit(250).all())
 
         sale_ids = [s.id for s in sales]
@@ -662,49 +663,121 @@ def _build_timeline(
                 ))
 
     # --- OT Case ---
+    # --- OT (Schedule + Case) ---
     if _want("ot", allow):
-        ot = (db.query(OtSchedule)(
-                OtSchedule.patient_id == patient_id).order_by(
-                    OtSchedule.id.desc()).limit(200).all())
-        for oc in ot:
-            ts = oc.actual_end or oc.actual_start or oc.scheduled_start or oc.created_at
-            ts = _safe_dt(ts)
+        # New OT is bed-based; we use schedules and join to case
+        ot_schedules = (db.query(OtSchedule).options(
+            joinedload(OtSchedule.case),
+            joinedload(OtSchedule.surgeon),
+            joinedload(OtSchedule.anaesthetist),
+            joinedload(OtSchedule.bed),
+        ).filter(OtSchedule.patient_id == patient_id).order_by(
+            OtSchedule.date.desc(),
+            OtSchedule.planned_start_time.desc(),
+        ).limit(200).all())
+
+        for oc in ot_schedules:
+            case = oc.case
+
+            # planned datetime (combine date + time)
+            planned_dt = None
+            if oc.date and oc.planned_start_time:
+                planned_dt = datetime(
+                    oc.date.year,
+                    oc.date.month,
+                    oc.date.day,
+                    oc.planned_start_time.hour,
+                    oc.planned_start_time.minute,
+                    oc.planned_start_time.second if hasattr(
+                        oc.planned_start_time, "second") else 0,
+                )
+
+            ts_raw = ((case.actual_end_time if case else None)
+                      or (case.actual_start_time if case else None)
+                      or planned_dt or oc.created_at)
+            ts = _safe_dt(ts_raw)
             if not _in_window(ts, dfrom, dto):
                 continue
-            atts = [
-                AttachmentOut(
-                    label=a.note or "Attachment",
-                    url=a.file_url,
-                    content_type=None,
-                    note=a.note or None,
-                    size_bytes=None,
-                ) for a in (oc.attachments or [])
-            ]
+
+            # Procedure name preference: final_procedure_name > schedule.procedure_name
+            proc_name = (case.final_procedure_name if case
+                         and case.final_procedure_name else oc.procedure_name)
+            subtitle = proc_name or "OT Case"
+
+            # Surgeon name (supports full_name hybrid if present)
+            surgeon_name = None
+            if oc.surgeon is not None:
+                surgeon_name = (getattr(oc.surgeon, "full_name", None)
+                                or getattr(oc.surgeon, "name", None)
+                                or getattr(oc.surgeon, "first_name", None))
+
+            bed_code = oc.bed.code if oc.bed is not None else None
+
             out.append(
                 TimelineItemOut(
                     type="ot",
                     ts=ts,
                     title=_title_for("ot"),
-                    subtitle=oc.surgery_name or "OT Case",
+                    subtitle=subtitle,
                     status=_map_ui_status(oc.status),
+                    doctor_name=surgeon_name,
                     ref_kind="ot_case",
-                    ref_display=oc.surgery_name or "OT Case",
-                    attachments=atts,
+                    ref_display=subtitle,
+                    attachments=[],  # no dedicated OT attachments model yet
                     data={
-                        "context_type": oc.context_type,
-                        "context_id": oc.context_id,
-                        "surgery_code": oc.surgery_code,
-                        "surgery_name": oc.surgery_name,
-                        "estimated_cost": _as_float(oc.estimated_cost),
-                        "scheduled_start": oc.scheduled_start,
-                        "scheduled_end": oc.scheduled_end,
-                        "actual_start": oc.actual_start,
-                        "actual_end": oc.actual_end,
-                        "status": oc.status,
-                        "surgeon_id": oc.surgeon_id,
-                        "anaesthetist_id": oc.anaesthetist_id,
-                        "preop_notes": oc.preop_notes,
-                        "postop_notes": oc.postop_notes,
+                        # identifiers
+                        "schedule_id":
+                        oc.id,
+                        "case_id":
+                        case.id if case else None,
+                        "patient_id":
+                        oc.patient_id,
+                        "admission_id":
+                        oc.admission_id,
+
+                        # location
+                        "bed_id":
+                        oc.bed_id,
+                        "bed_code":
+                        bed_code,
+
+                        # timing
+                        "date":
+                        oc.date,
+                        "planned_start_time":
+                        oc.planned_start_time,
+                        "planned_end_time":
+                        oc.planned_end_time,
+                        "actual_start_time":
+                        case.actual_start_time if case else None,
+                        "actual_end_time":
+                        case.actual_end_time if case else None,
+
+                        # status / priority
+                        "status":
+                        oc.status,
+                        "priority":
+                        oc.priority,
+
+                        # clinical summary
+                        "procedure_name":
+                        proc_name,
+                        "final_procedure_name":
+                        case.final_procedure_name if case else None,
+                        "preop_diagnosis":
+                        case.preop_diagnosis if case else None,
+                        "postop_diagnosis":
+                        case.postop_diagnosis if case else None,
+                        "outcome":
+                        case.outcome if case else None,
+                        "icu_required":
+                        case.icu_required if case else None,
+
+                        # surgeon / anaesthetist ids
+                        "surgeon_user_id":
+                        oc.surgeon_user_id,
+                        "anaesthetist_user_id":
+                        oc.anaesthetist_user_id,
                     },
                 ))
 
