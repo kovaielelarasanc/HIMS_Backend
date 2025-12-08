@@ -32,7 +32,9 @@ from app.schemas.ot import (
     OtPreopInvestigations,
     OtPreopVitals,
     OtPreopChecklistOut,
+    OtCaseCloseBody,
 )
+from app.services.billing_ot import create_ot_invoice_items_for_case
 from app.models.user import User
 
 router = APIRouter(prefix="/ot", tags=["OT - Schedule & Cases"])
@@ -829,64 +831,6 @@ def open_ot_case_for_schedule(
     db.refresh(case)
     return case
 
-
-@router.post(
-    "/cases/{case_id}/close",
-    response_model=OtCaseOut,
-)
-def close_ot_case(
-        case_id: int,
-        payload: OtCaseClosePayload,
-        db: Session = Depends(get_db),
-        user: User = Depends(current_user),
-):
-    """
-    Close an OT case:
-    - Sets outcome & actual_end_time.
-    - Updates schedule.status appropriately.
-    """
-    _need_any(
-        user,
-        ["ot.cases.close", "ot.cases.update", "ot.schedule.update"],
-    )
-
-    case = db.query(OtCase).get(case_id)
-    if not case:
-        raise HTTPException(status_code=404, detail="OT Case not found")
-
-    if not case.actual_start_time:
-        raise HTTPException(
-            status_code=400,
-            detail=("Cannot close a case that has not been started "
-                    "(no actual_start_time)"),
-        )
-
-    now = datetime.utcnow()
-
-    case.outcome = payload.outcome
-    case.actual_end_time = payload.actual_end_time or now
-
-    if payload.icu_required is not None:
-        case.icu_required = payload.icu_required
-    if payload.immediate_postop_condition is not None:
-        case.immediate_postop_condition = payload.immediate_postop_condition
-
-    schedule = case.schedule
-    if schedule:
-        outcome_lower = (payload.outcome or "").lower()
-        if outcome_lower in ("completed", "converted"):
-            schedule.status = "completed"
-        elif outcome_lower in ("abandoned", "cancelled"):
-            schedule.status = "cancelled"
-        else:
-            if schedule.status != "completed":
-                schedule.status = "completed"
-        db.add(schedule)
-
-    db.add(case)
-    db.commit()
-    db.refresh(case)
-    return case
 
 
 # ============================================================

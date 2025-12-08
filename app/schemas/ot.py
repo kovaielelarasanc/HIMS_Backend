@@ -708,6 +708,28 @@ class OtAnaesthesiaRecordIn(BaseModel):
     notes: Optional[str] = None
 
 
+class OtCaseCloseBody(BaseModel):
+    """
+    Payload used when closing an OT case from UI.
+
+    Currently your frontend sends:
+        { "outcome": "Completed" }
+
+    You can also optionally send an explicit actual_end_time.
+    """
+    outcome: Optional[str] = Field(
+        default="Completed",
+        max_length=50,
+        description=
+        "Final outcome of OT case (Completed / Abandoned / Converted etc.)",
+    )
+    actual_end_time: Optional[datetime] = Field(
+        default=None,
+        description=
+        "If sent, will override or set the actual end time of the surgery.",
+    )
+
+
 class OtAnaesthesiaRecordOut(OtAnaesthesiaRecordIn):
     model_config = ConfigDict(from_attributes=True)
 

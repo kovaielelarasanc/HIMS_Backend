@@ -8,7 +8,23 @@ from decimal import Decimal
 
 # ---------- Provider (credit / TPA) ----------
 
+class AutoBedChargesIn(BaseModel):
+    admission_id: int
+    # "daily" -> charge by day
+    # "hourly" -> charge by hour (derived from daily_rate / 24)
+    # "mixed" -> <= 6h hourly, > 6h daily
+    mode: Literal["daily", "hourly", "mixed"] = "daily"
 
+    # For open-ended stays (to_ts is NULL), we cut at upto_ts (default: now)
+    upto_ts: Optional[datetime] = None
+
+    # If True, skip bed-assignments that are already billed in this invoice
+    skip_if_already_billed: bool = True
+
+
+class AutoOtChargesIn(BaseModel):
+    # OT Case for which we auto-bill procedures
+    case_id: int
 class ProviderBase(BaseModel):
     name: str
     code: Optional[str] = None

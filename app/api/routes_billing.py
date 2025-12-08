@@ -6,7 +6,7 @@ from typing import List, Optional, Dict, Any
 from pydantic import ValidationError
 from fastapi import APIRouter, Depends, HTTPException, Body
 from fastapi.responses import StreamingResponse
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func
 
 from app.api.deps import get_db, current_user as auth_current_user
@@ -19,6 +19,7 @@ from app.models.billing import (
     Advance,
     BillingProvider,
 )
+
 from app.schemas.billing import (
     InvoiceCreate,
     AddServiceIn,
@@ -30,10 +31,18 @@ from app.schemas.billing import (
     InvoiceOut,
     InvoiceItemOut,
     PaymentOut,
+    AutoBedChargesIn,  # 👈 add
+    AutoOtChargesIn,
 )
+from math import ceil
 import logging
 import io
-from app.models.ipd import IpdPackage
+from app.models.ipd import (
+    IpdPackage,
+    IpdBed,
+    IpdBedRate,
+    IpdBedAssignment,
+)
 from app.models.payer import Payer, Tpa, CreditPlan
 from app.models.payer import CreditProvider  # optional / legacy
 
@@ -153,6 +162,60 @@ def _manual_ref_for_invoice(invoice_id: int, seq: int) -> int:
     is always unique globally.
     """
     return invoice_id * 1_000_000 + seq
+
+
+def _get_bed_rate_for_date(
+    db: Session,
+    room_type: str,
+    dt: datetime,
+) -> IpdBedRate:
+    """
+    Pick latest active bed rate for room_type on the given date.
+    Mirrors /ipd/bed-rates/resolve logic.
+    """
+    day = dt.date()
+    r = (
+        db.query(IpdBedRate).filter(IpdBedRate.is_active.is_(True)).filter(
+            IpdBedRate.room_type == room_type).filter(
+                IpdBedRate.effective_from <= day).filter(
+                    (IpdBedRate.effective_to == None)  # noqa: E711
+                    | (IpdBedRate.effective_to >= day)).order_by(
+                        IpdBedRate.effective_from.desc()).first())
+    if not r:
+        raise HTTPException(
+            status_code=400,
+            detail=
+            f"No active bed rate for room type '{room_type}' on {day.isoformat()}",
+        )
+    return r
+
+
+def _compute_stay_units(
+    start: datetime,
+    end: datetime,
+    mode: str,
+) -> int:
+    """
+    Convert stay duration to billable units.
+
+    daily  -> ceil(hours / 24), min 1
+    hourly -> ceil(hours), min 1
+    mixed  -> <= 6h = hourly, > 6h = daily
+    """
+    if end <= start:
+        return 0
+
+    hours = (end - start).total_seconds() / 3600.0
+
+    if mode == "daily":
+        return max(1, ceil(hours / 24.0))
+    if mode == "hourly":
+        return max(1, ceil(hours))
+
+    # mixed
+    if hours <= 6:
+        return max(1, ceil(hours))
+    return max(1, ceil(hours / 24.0))
 
 
 def _generate_invoice_number(db: Session) -> str:
@@ -650,6 +713,300 @@ def bulk_add_from_unbilled_alias(
     Alias for FE: POST /billing/invoices/{id}/unbilled/bulk-add
     """
     return _apply_unbilled_services(invoice_id, payload, db, user)
+
+
+@router.post(
+    "/invoices/{invoice_id}/items/ipd-bed-auto",
+    response_model=InvoiceOut,
+)
+def auto_add_ipd_bed_charges(
+        invoice_id: int,
+        payload: AutoBedChargesIn,
+        db: Session = Depends(get_db),
+        user: User = Depends(auth_current_user),
+):
+    """
+    Auto-generate IPD bed charges from IpdBedAssignment for an admission.
+
+    Use-cases:
+      - IPD billing after discharge
+      - Re-run safely (skip_if_already_billed prevents duplicates)
+
+    Logic:
+      - Read IpdBedAssignment for given admission_id
+      - Resolve room_type from IpdBed -> IpdRoom.type
+      - Resolve daily_rate via IpdBedRate (no model change)
+      - For hourly: derived_hour_rate = daily_rate / 24
+      - For mixed: <=6h = hourly, >6h = daily
+      - Create InvoiceItems with service_type='ipd_bed' and
+        service_ref_id = bed_assignment.id
+    """
+    if not has_perm(user, "billing.items.add"):
+        raise HTTPException(status_code=403, detail="Not permitted")
+
+    inv = db.query(Invoice).get(invoice_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+
+    upto_ts = payload.upto_ts or datetime.utcnow()
+
+    # All bed assignments for this admission
+    assignments: list[IpdBedAssignment] = (db.query(IpdBedAssignment).filter(
+        IpdBedAssignment.admission_id == payload.admission_id).order_by(
+            IpdBedAssignment.from_ts.asc()).all())
+    if not assignments:
+        raise HTTPException(
+            status_code=404,
+            detail="No bed assignments found for this admission",
+        )
+
+    # Already billed IPD bed lines for this invoice (to avoid duplicates)
+    existing_map: dict[int, InvoiceItem] = {}
+    existing_items: list[InvoiceItem] = (db.query(InvoiceItem).filter(
+        InvoiceItem.invoice_id == invoice_id,
+        InvoiceItem.service_type == "ipd_bed",
+        InvoiceItem.is_voided.is_(False),
+    ).all())
+    for it in existing_items:
+        if it.service_ref_id:
+            existing_map[int(it.service_ref_id)] = it
+
+    created_any = False
+
+    for ba in assignments:
+        # Skip already billed assignment if requested
+        if payload.skip_if_already_billed and ba.id in existing_map:
+            continue
+
+        start = ba.from_ts
+        end = ba.to_ts or upto_ts
+        if not start or end <= start:
+            continue
+
+        bed: IpdBed | None = ba.bed
+        if not bed or not bed.room:
+            continue
+
+        room_type = bed.room.type or "General"
+        bed_code = bed.code
+
+        # Resolve rate using same logic as /ipd/bed-rates/resolve
+        rate_row = _get_bed_rate_for_date(db, room_type, start)
+        daily_rate = float(rate_row.daily_rate or 0)
+        if daily_rate <= 0:
+            # no sensible rate -> skip silently
+            continue
+
+        duration_hours = (end - start).total_seconds() / 3600.0
+        units = _compute_stay_units(start, end, payload.mode)
+        if units <= 0:
+            continue
+
+        # Decide price per unit
+        if payload.mode == "hourly":
+            unit_price = daily_rate / 24.0
+        elif payload.mode == "mixed":
+            if duration_hours <= 6:
+                unit_price = daily_rate / 24.0
+            else:
+                unit_price = daily_rate
+        else:  # daily
+            unit_price = daily_rate
+
+        if unit_price <= 0:
+            continue
+
+        line_total = round(units * unit_price, 2)
+
+        desc = (
+            f"Bed charges - {room_type} ({bed_code}) "
+            f"{start.strftime('%d-%m-%Y %H:%M')} to {end.strftime('%d-%m-%Y %H:%M')} "
+            f"({units} {'day' if payload.mode == 'daily' else 'hour'}"
+            f"{'s' if units != 1 else ''})")
+
+        seq = _next_seq_for_invoice(db, invoice_id)
+
+        item = InvoiceItem(
+            invoice_id=invoice_id,
+            seq=seq,
+            service_type="ipd_bed",
+            service_ref_id=ba.id,  # link back to bed-assignment
+            description=desc,
+            quantity=units,
+            unit_price=unit_price,
+            tax_rate=0.0,
+            discount_percent=0.0,
+            discount_amount=0.0,
+            tax_amount=0.0,
+            line_total=line_total,
+            is_voided=False,
+            created_by=user.id,
+        )
+        db.add(item)
+        created_any = True
+
+    db.flush()
+    db.refresh(inv)
+    recalc_totals(inv)
+    inv.updated_by = user.id
+    db.commit()
+    db.refresh(inv)
+
+    if not created_any:
+        logger.info(
+            "No new IPD bed charges generated for invoice %s / admission %s",
+            invoice_id,
+            payload.admission_id,
+        )
+
+    # ✅ Invoice status is still 'draft'
+    return serialize_invoice(inv)
+
+
+@router.post(
+    "/invoices/{invoice_id}/items/ot-auto",
+    response_model=InvoiceOut,
+)
+def auto_add_ot_charges(
+        invoice_id: int,
+        payload: AutoOtChargesIn,
+        db: Session = Depends(get_db),
+        user: User = Depends(auth_current_user),
+):
+    """
+    Auto-generate OT procedure charges for a given OT Case.
+
+    Rules:
+      - Only if operation is 'successful/completed'
+      - Uses OtProcedure.rate_per_hour
+      - Duration from actual_start_time to actual_end_time (in hours)
+      - One line per linked procedure (OtScheduleProcedure)
+      - Does NOT finalize invoice (status remains 'draft')
+    """
+    if not has_perm(user, "billing.items.add"):
+        raise HTTPException(status_code=403, detail="Not permitted")
+
+    inv = db.query(Invoice).get(invoice_id)
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+
+    # Load case with schedule + procedures
+    case: OtCase | None = (db.query(OtCase).options(
+        joinedload(OtCase.schedule).joinedload(
+            OtCase.schedule.procedures).joinedload(
+                OtScheduleProcedure.procedure)).get(payload.case_id))
+    if not case:
+        raise HTTPException(status_code=404, detail="OT case not found")
+
+    # ✅ Only when operation status is success/completed
+    outcome = (case.outcome or "").lower()
+    if outcome not in ("completed", "converted", "success", "successful"):
+        raise HTTPException(
+            status_code=400,
+            detail="OT case is not completed/successful; cannot auto-bill.",
+        )
+
+    start = case.actual_start_time
+    end = case.actual_end_time
+    if not start or not end or end <= start:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid OT timings (start/end); cannot auto-bill.",
+        )
+
+    total_hours = (end - start).total_seconds() / 3600.0
+    if total_hours <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="OT duration is zero; cannot auto-bill.",
+        )
+
+    schedule = case.schedule
+    if not schedule:
+        raise HTTPException(
+            status_code=400,
+            detail="OT case is not linked to a schedule.",
+        )
+
+    links: list[OtScheduleProcedure] = list(schedule.procedures or [])
+    if not links:
+        # Fallback: use primary_procedure if no schedule links are present
+        raise HTTPException(
+            status_code=400,
+            detail="No OT procedures linked to this schedule.",
+        )
+
+    # Avoid double-billing: check existing InvoiceItems
+    existing_map: dict[int, InvoiceItem] = {}
+    existing_items: list[InvoiceItem] = (db.query(InvoiceItem).filter(
+        InvoiceItem.invoice_id == invoice_id,
+        InvoiceItem.service_type == "ot_procedure",
+        InvoiceItem.is_voided.is_(False),
+    ).all())
+    for it in existing_items:
+        if it.service_ref_id:
+            existing_map[int(it.service_ref_id)] = it
+
+    created_any = False
+    qty_hours = round(total_hours, 2)
+
+    for link in links:
+        if link.id in existing_map:
+            # already billed this schedule-procedure link
+            continue
+        proc: OtProcedure | None = link.procedure
+        if not proc or proc.rate_per_hour is None:
+            # no configured rate, skip
+            continue
+
+        rate_per_hour = float(proc.rate_per_hour or 0)
+        if rate_per_hour <= 0:
+            continue
+
+        line_total = round(qty_hours * rate_per_hour, 2)
+        if line_total <= 0:
+            continue
+
+        seq = _next_seq_for_invoice(db, invoice_id)
+
+        desc = (f"OT charges - {proc.name} "
+                f"({qty_hours:.2f} hr, Case #{case.id})")
+
+        item = InvoiceItem(
+            invoice_id=invoice_id,
+            seq=seq,
+            service_type="ot_procedure",
+            service_ref_id=link.id,  # schedule-procedure link as ref
+            description=desc,
+            quantity=qty_hours,  # duration in hours
+            unit_price=rate_per_hour,  # rate per hour
+            tax_rate=0.0,
+            discount_percent=0.0,
+            discount_amount=0.0,
+            tax_amount=0.0,
+            line_total=line_total,
+            is_voided=False,
+            created_by=user.id,
+        )
+        db.add(item)
+        created_any = True
+
+    db.flush()
+    db.refresh(inv)
+    recalc_totals(inv)
+    inv.updated_by = user.id
+    db.commit()
+    db.refresh(inv)
+
+    if not created_any:
+        logger.info(
+            "No OT charges generated for invoice %s / case %s",
+            invoice_id,
+            payload.case_id,
+        )
+
+    # ✅ Invoice status remains 'draft'
+    return serialize_invoice(inv)
 
 
 # ---------------------------------------------------------------------------

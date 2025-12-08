@@ -28,6 +28,11 @@ from app.db.base import Base
 
 class IpdWard(Base):
     __tablename__ = "ipd_wards"
+    __table_args__ = {
+        "mysql_engine": "InnoDB",
+        "mysql_charset": "utf8mb4",
+        "mysql_collate": "utf8mb4_unicode_ci",
+    }
 
     id = Column(Integer, primary_key=True)
     name = Column(String(100), unique=True, nullable=False)
@@ -44,6 +49,11 @@ class IpdWard(Base):
 
 class IpdRoom(Base):
     __tablename__ = "ipd_rooms"
+    __table_args__ = {
+    "mysql_engine": "InnoDB",
+        "mysql_charset": "utf8mb4",
+        "mysql_collate": "utf8mb4_unicode_ci",
+    }
 
     id = Column(Integer, primary_key=True)
     ward_id = Column(
@@ -72,6 +82,11 @@ class IpdRoom(Base):
 
 class IpdBed(Base):
     __tablename__ = "ipd_beds"
+    __table_args__ = {
+        "mysql_engine": "InnoDB",
+        "mysql_charset": "utf8mb4",
+        "mysql_collate": "utf8mb4_unicode_ci",
+    }
 
     id = Column(Integer, primary_key=True)
     room_id = Column(
@@ -111,6 +126,11 @@ class IpdBed(Base):
 
 class IpdBedRate(Base):
     __tablename__ = "ipd_bed_rates"
+    __table_args__ = {
+        "mysql_engine": "InnoDB",
+        "mysql_charset": "utf8mb4",
+        "mysql_collate": "utf8mb4_unicode_ci",
+    }
 
     id = Column(Integer, primary_key=True)
     room_type = Column(String(30), nullable=False, index=True)
@@ -132,6 +152,11 @@ class IpdBedRate(Base):
 
 class IpdBedAssignment(Base):
     __tablename__ = "ipd_bed_assignments"
+    __table_args__ = {
+        "mysql_engine": "InnoDB",
+        "mysql_charset": "utf8mb4",
+        "mysql_collate": "utf8mb4_unicode_ci",
+    }
 
     id = Column(Integer, primary_key=True)
     admission_id = Column(Integer, ForeignKey("ipd_admissions.id"), index=True)
@@ -151,6 +176,11 @@ class IpdBedAssignment(Base):
 
 class IpdPackage(Base):
     __tablename__ = "ipd_packages"
+    __table_args__ = {
+        "mysql_engine": "InnoDB",
+        "mysql_charset": "utf8mb4",
+        "mysql_collate": "utf8mb4_unicode_ci",
+    }
 
     id = Column(Integer, primary_key=True)
     name = Column(String(120), unique=True, nullable=False)
@@ -166,6 +196,11 @@ class IpdPackage(Base):
 
 class IpdAdmission(Base):
     __tablename__ = "ipd_admissions"
+    __table_args__ = {
+        "mysql_engine": "InnoDB",
+        "mysql_charset": "utf8mb4",
+        "mysql_collate": "utf8mb4_unicode_ci",
+    }
 
     id = Column(Integer, primary_key=True)
 
@@ -416,6 +451,11 @@ class IpdAdmission(Base):
 
 class IpdTransfer(Base):
     __tablename__ = "ipd_transfers"
+    __table_args__ = {
+        "mysql_engine": "InnoDB",
+        "mysql_charset": "utf8mb4",
+        "mysql_collate": "utf8mb4_unicode_ci",
+    }
 
     id = Column(Integer, primary_key=True)
     admission_id = Column(Integer, ForeignKey("ipd_admissions.id"), index=True)
@@ -434,6 +474,11 @@ class IpdTransfer(Base):
 
 class IpdNursingNote(Base):
     __tablename__ = "ipd_nursing_notes"
+    __table_args__ = {
+        "mysql_engine": "InnoDB",
+        "mysql_charset": "utf8mb4",
+        "mysql_collate": "utf8mb4_unicode_ci",
+    }
 
     id = Column(Integer, primary_key=True, index=True)
 
@@ -553,6 +598,11 @@ class IpdNursingNote(Base):
 
 class IpdShiftHandover(Base):
     __tablename__ = "ipd_shift_handovers"
+    __table_args__ = {
+        "mysql_engine": "InnoDB",
+        "mysql_charset": "utf8mb4",
+        "mysql_collate": "utf8mb4_unicode_ci",
+    }
 
     id = Column(Integer, primary_key=True)
     admission_id = Column(Integer, ForeignKey("ipd_admissions.id"), index=True)
