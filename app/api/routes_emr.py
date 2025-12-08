@@ -48,7 +48,7 @@ from app.models.billing import Invoice, InvoiceItem, Payment
 
 HAS_PHARMACY = False
 try:
-    # ✅ use new pharmacy_prescription models
+   
     from app.models.pharmacy_prescription import PharmacySale, PharmacySaleItem
 
     HAS_PHARMACY = True

@@ -16,7 +16,7 @@ from app.models.ipd import IpdAdmission
 from app.models.pharmacy_prescription import PharmacySale, PharmacySaleItem
 from app.models.lis import LisOrder
 from app.models.ris import RisOrder
-from app.models.ot import OtSchedule, OtCase  # noqa: F401
+from app.models.ot import OtSchedule, OtCase  
 from app.models.billing import Invoice, InvoiceItem, Payment  # noqa: F401
 
 from app.schemas.mis import (
