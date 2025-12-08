@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select, func
 
 from app.models.billing import Invoice, InvoiceItem
-from app.models.ot import OtCase, OtSchedule, OtProcedure  # adjust imports
+from app.models.ot import OtCase, OtSchedule, OtProcedure  
 
 OT_SERVICE_TYPE = "ot"
 

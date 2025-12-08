@@ -46,7 +46,6 @@ from app.models.ipd import (
 from app.models.ot import OtSchedule, OtCase
 from app.models.billing import Invoice, InvoiceItem, Payment
 
-# Pharmacy (optional, NEW models)
 HAS_PHARMACY = False
 try:
     # ✅ use new pharmacy_prescription models
