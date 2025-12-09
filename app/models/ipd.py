@@ -3,20 +3,9 @@ from __future__ import annotations
 
 from datetime import datetime, date
 
-from sqlalchemy import (
-    Column,
-    Integer,
-    String,
-    DateTime,
-    Date,
-    Text,
-    ForeignKey,
-    Boolean,
-    Numeric,
-    UniqueConstraint,
-    Index,
-    func
-)
+from sqlalchemy import (Column, Integer, String, DateTime, Date, Text,
+                        ForeignKey, Boolean, Numeric, UniqueConstraint, Index,
+                        func)
 from sqlalchemy.orm import relationship
 
 from app.db.base import Base
@@ -49,67 +38,56 @@ class IpdWard(Base):
 
 class IpdRoom(Base):
     __tablename__ = "ipd_rooms"
-    __table_args__ = {
-    "mysql_engine": "InnoDB",
-        "mysql_charset": "utf8mb4",
-        "mysql_collate": "utf8mb4_unicode_ci",
-    }
+    __table_args__ = (
+        UniqueConstraint("ward_id",
+                         "number",
+                         name="uq_ipd_room_number_per_ward"),
+        Index("ix_ipd_rooms_ward_active", "ward_id", "is_active"),
+        {
+            "mysql_engine": "InnoDB",
+            "mysql_charset": "utf8mb4",
+            "mysql_collate": "utf8mb4_unicode_ci",
+        },
+    )
 
     id = Column(Integer, primary_key=True)
-    ward_id = Column(
-        Integer,
-        ForeignKey("ipd_wards.id"),
-        nullable=False,
-        index=True,
-    )
+    ward_id = Column(Integer,
+                     ForeignKey("ipd_wards.id"),
+                     nullable=False,
+                     index=True)
     number = Column(String(30), nullable=False)
     type = Column(String(30), default="General")
     is_active = Column(Boolean, default=True)
 
-    __table_args__ = (
-        UniqueConstraint("ward_id", "number", name="uq_ipd_room_number_per_ward"),
-        Index("ix_ipd_rooms_ward_active", "ward_id", "is_active"),
-    )
-
     ward = relationship("IpdWard", back_populates="rooms")
-
-    beds = relationship(
-        "IpdBed",
-        back_populates="room",
-        cascade="all, delete-orphan",
-    )
+    beds = relationship("IpdBed",
+                        back_populates="room",
+                        cascade="all, delete-orphan")
 
 
 class IpdBed(Base):
     __tablename__ = "ipd_beds"
-    __table_args__ = {
-        "mysql_engine": "InnoDB",
-        "mysql_charset": "utf8mb4",
-        "mysql_collate": "utf8mb4_unicode_ci",
-    }
-
-    id = Column(Integer, primary_key=True)
-    room_id = Column(
-        Integer,
-        ForeignKey("ipd_rooms.id"),
-        nullable=False,
-        index=True,
-    )
-    code = Column(String(30), unique=True, nullable=False)
-    state = Column(
-        String(20),
-        default="vacant",  # vacant/occupied/reserved/preoccupied
-    )
-    reserved_until = Column(DateTime, nullable=True)
-    note = Column(String(255), default="")
-
     __table_args__ = (
         Index("ix_ipd_beds_state", "state"),
         Index("ix_ipd_beds_room_state", "room_id", "state"),
+        {
+            "mysql_engine": "InnoDB",
+            "mysql_charset": "utf8mb4",
+            "mysql_collate": "utf8mb4_unicode_ci",
+        },
     )
 
-    room = relationship("IpdRoom", back_populates="beds")
+    id = Column(Integer, primary_key=True)
+    room_id = Column(Integer,
+                     ForeignKey("ipd_rooms.id"),
+                     nullable=False,
+                     index=True)
+    code = Column(String(30), unique=True, nullable=False)
+    state = Column(String(20), default="vacant")
+    reserved_until = Column(DateTime, nullable=True)
+    note = Column(String(255), default="")
 
+    room = relationship("IpdRoom", back_populates="beds")
     bed_assignments = relationship(
         "IpdBedAssignment",
         back_populates="bed",
@@ -124,21 +102,9 @@ class IpdBed(Base):
     def room_name(self) -> str | None:
         return self.room.number if self.room else None
 
+
 class IpdBedRate(Base):
     __tablename__ = "ipd_bed_rates"
-    __table_args__ = {
-        "mysql_engine": "InnoDB",
-        "mysql_charset": "utf8mb4",
-        "mysql_collate": "utf8mb4_unicode_ci",
-    }
-
-    id = Column(Integer, primary_key=True)
-    room_type = Column(String(30), nullable=False, index=True)
-    daily_rate = Column(Numeric(12, 2), nullable=False)
-    effective_from = Column(Date, nullable=False)
-    effective_to = Column(Date, nullable=True)
-    is_active = Column(Boolean, default=True)
-
     __table_args__ = (
         Index(
             "ix_ipd_bed_rates_lookup",
@@ -147,16 +113,32 @@ class IpdBedRate(Base):
             "effective_to",
             "is_active",
         ),
+        {
+            "mysql_engine": "InnoDB",
+            "mysql_charset": "utf8mb4",
+            "mysql_collate": "utf8mb4_unicode_ci",
+        },
     )
+
+    id = Column(Integer, primary_key=True)
+    room_type = Column(String(30), nullable=False, index=True)
+    daily_rate = Column(Numeric(12, 2), nullable=False)
+    effective_from = Column(Date, nullable=False)
+    effective_to = Column(Date, nullable=True)
+    is_active = Column(Boolean, default=True)
 
 
 class IpdBedAssignment(Base):
     __tablename__ = "ipd_bed_assignments"
-    __table_args__ = {
-        "mysql_engine": "InnoDB",
-        "mysql_charset": "utf8mb4",
-        "mysql_collate": "utf8mb4_unicode_ci",
-    }
+    __table_args__ = (
+        Index("ix_ipd_bed_assignments_adm_from", "admission_id", "from_ts"),
+        Index("ix_ipd_bed_assignments_adm_to", "admission_id", "to_ts"),
+        {
+            "mysql_engine": "InnoDB",
+            "mysql_charset": "utf8mb4",
+            "mysql_collate": "utf8mb4_unicode_ci",
+        },
+    )
 
     id = Column(Integer, primary_key=True)
     admission_id = Column(Integer, ForeignKey("ipd_admissions.id"), index=True)
@@ -164,11 +146,6 @@ class IpdBedAssignment(Base):
     from_ts = Column(DateTime, default=datetime.utcnow)
     to_ts = Column(DateTime, nullable=True)
     reason = Column(String(120), default="admission")
-
-    __table_args__ = (
-        Index("ix_ipd_bed_assignments_adm_from", "admission_id", "from_ts"),
-        Index("ix_ipd_bed_assignments_adm_to", "admission_id", "to_ts"),
-    )
 
     admission = relationship("IpdAdmission", back_populates="bed_assignments")
     bed = relationship("IpdBed", back_populates="bed_assignments")
@@ -544,14 +521,13 @@ class IpdNursingNote(Base):
         nullable=False,
         default="routine",
     )
-     # 🔹 Shift handover specific fields
+    # 🔹 Shift handover specific fields
     vital_signs_summary = Column(Text, nullable=False, default="")
     todays_procedures = Column(Text, nullable=False, default="")
     current_condition = Column(Text, nullable=False, default="")
     recent_changes = Column(Text, nullable=False, default="")
     ongoing_treatment = Column(Text, nullable=False, default="")
     watch_next_shift = Column(Text, nullable=False, default="")
-
 
     # Core NABH text fields (as before)
     entry_time = Column(
@@ -585,7 +561,7 @@ class IpdNursingNote(Base):
         onupdate=func.now(),
     )
     is_locked = Column(Boolean, nullable=False, default=False)
-       # 👇 NEW: relationship NAME MUST BE "vitals"
+    # 👇 NEW: relationship NAME MUST BE "vitals"
     vitals = relationship(
         "IpdVital",
         foreign_keys=[linked_vital_id],
@@ -719,7 +695,8 @@ class IpdFallRiskAssessment(Base):
 
     recorded_by = Column(Integer, ForeignKey("users.id"), nullable=True)
 
-    admission = relationship("IpdAdmission", back_populates="fall_risk_assessments")
+    admission = relationship("IpdAdmission",
+                             back_populates="fall_risk_assessments")
 
 
 class IpdPressureUlcerAssessment(Base):
@@ -740,9 +717,8 @@ class IpdPressureUlcerAssessment(Base):
 
     recorded_by = Column(Integer, ForeignKey("users.id"), nullable=True)
 
-    admission = relationship(
-        "IpdAdmission", back_populates="pressure_ulcer_assessments"
-    )
+    admission = relationship("IpdAdmission",
+                             back_populates="pressure_ulcer_assessments")
 
 
 class IpdNutritionAssessment(Base):
@@ -764,9 +740,8 @@ class IpdNutritionAssessment(Base):
 
     recorded_by = Column(Integer, ForeignKey("users.id"), nullable=True)
 
-    admission = relationship(
-        "IpdAdmission", back_populates="nutrition_assessments"
-    )
+    admission = relationship("IpdAdmission",
+                             back_populates="nutrition_assessments")
 
 
 # ---------------------------------------------------------------------
@@ -797,12 +772,14 @@ class IpdOrder(Base):
     performed_by = Column(Integer, ForeignKey("users.id"), nullable=True)
 
     admission = relationship("IpdAdmission", back_populates="orders")
-    ordered_by_user = relationship(
-        "User", foreign_keys=[ordered_by], lazy="joined", uselist=False
-    )
-    performed_by_user = relationship(
-        "User", foreign_keys=[performed_by], lazy="joined", uselist=False
-    )
+    ordered_by_user = relationship("User",
+                                   foreign_keys=[ordered_by],
+                                   lazy="joined",
+                                   uselist=False)
+    performed_by_user = relationship("User",
+                                     foreign_keys=[performed_by],
+                                     lazy="joined",
+                                     uselist=False)
 
 
 class IpdMedicationOrder(Base):
@@ -840,15 +817,18 @@ class IpdMedicationOrder(Base):
 
     ordered_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
 
-    admission = relationship("IpdAdmission", back_populates="medication_orders")
+    admission = relationship("IpdAdmission",
+                             back_populates="medication_orders")
     administrations = relationship(
         "IpdMedicationAdministration",
         back_populates="order",
         cascade="all, delete-orphan",
     )
-    ordered_by_user = relationship(
-        "User", foreign_keys=[ordered_by_id], lazy="joined", uselist=False
-    )
+    ordered_by_user = relationship("User",
+                                   foreign_keys=[ordered_by_id],
+                                   lazy="joined",
+                                   uselist=False)
+
 
 class IpdDrugChartMeta(Base):
     """
@@ -886,9 +866,9 @@ class IpdDrugChartMeta(Base):
     diet_remarks = Column(Text, default="")
 
     created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
-    )
+    updated_at = Column(DateTime,
+                        default=datetime.utcnow,
+                        onupdate=datetime.utcnow)
 
     admission = relationship("IpdAdmission", back_populates="drug_chart_meta")
 
@@ -934,13 +914,11 @@ class IpdMedicationAdministration(Base):
     )
     given_by_user = relationship("User", foreign_keys=[given_by])
 
-    __table_args__ = (
-        Index(
-            "ix_ipd_med_admin_by_adm_sched",
-            "admission_id",
-            "scheduled_datetime",
-        ),
-    )
+    __table_args__ = (Index(
+        "ix_ipd_med_admin_by_adm_sched",
+        "admission_id",
+        "scheduled_datetime",
+    ), )
 
 
 # ---------------------------------------------------------------------
@@ -986,7 +964,8 @@ class IpdBloodTransfusion(Base):
     reaction_notes = Column(Text, default="")
     notified_to = Column(Integer, ForeignKey("users.id"), nullable=True)
 
-    admission = relationship("IpdAdmission", back_populates="blood_transfusions")
+    admission = relationship("IpdAdmission",
+                             back_populates="blood_transfusions")
 
 
 class IpdRestraintRecord(Base):
@@ -1066,11 +1045,12 @@ class IpdDischargeSummary(Base):
     )
 
     # Core existing fields
-    demographics = Column(Text, default="")          # will be auto-filled from admission/patient
+    demographics = Column(
+        Text, default="")  # will be auto-filled from admission/patient
     medical_history = Column(Text, default="")
     treatment_summary = Column(Text, default="")
     medications = Column(Text, default="")
-    follow_up = Column(Text, default="")             # can be enriched from opd_followups
+    follow_up = Column(Text, default="")  # can be enriched from opd_followups
     icd10_codes = Column(Text, default="")
 
     # A. MUST-HAVE
@@ -1119,7 +1099,6 @@ class IpdDischargeSummary(Base):
     finalized_by_user = relationship("User", foreign_keys=[finalized_by])
 
 
-
 class IpdDischargeChecklist(Base):
     __tablename__ = "ipd_discharge_checklists"
 
@@ -1133,10 +1112,14 @@ class IpdDischargeChecklist(Base):
     )
 
     financial_clearance = Column(Boolean, default=False)
-    financial_cleared_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    financial_cleared_by = Column(Integer,
+                                  ForeignKey("users.id"),
+                                  nullable=True)
 
     clinical_clearance = Column(Boolean, default=False)
-    clinical_cleared_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    clinical_cleared_by = Column(Integer,
+                                 ForeignKey("users.id"),
+                                 nullable=True)
 
     delay_reason = Column(Text, default="")
     submitted = Column(Boolean, default=False)
@@ -1148,7 +1131,6 @@ class IpdDischargeChecklist(Base):
     )
     financial_user = relationship("User", foreign_keys=[financial_cleared_by])
     clinical_user = relationship("User", foreign_keys=[clinical_cleared_by])
-
 
 
 class IpdDischargeMedication(Base):
@@ -1173,7 +1155,8 @@ class IpdDischargeMedication(Base):
     created_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
-    admission = relationship("IpdAdmission", back_populates="discharge_medications")
+    admission = relationship("IpdAdmission",
+                             back_populates="discharge_medications")
     created_by = relationship("User")
 
 
@@ -1329,9 +1312,8 @@ class IpdAssessment(Base):
     assessed_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     summary = Column(Text, nullable=True)
     plan = Column(Text, nullable=True)
-    type = Column(
-        String(50), nullable=False
-    )  # 'pain' / 'fall' / 'pressure' / 'nutrition'
+    type = Column(String(50),
+                  nullable=False)  # 'pain' / 'fall' / 'pressure' / 'nutrition'
     score = Column(Integer, nullable=True)
     risk_level = Column(String(50), nullable=True)
     details = Column(Text, nullable=True)
@@ -1396,9 +1378,8 @@ class IpdDressingTransfusion(Base):
         index=True,
     )
 
-    entry_type = Column(
-        String(20), nullable=False, default="dressing"
-    )  # dressing | transfusion
+    entry_type = Column(String(20), nullable=False,
+                        default="dressing")  # dressing | transfusion
     done_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     site = Column(String(255), nullable=True)
     product = Column(String(255), nullable=True)
@@ -1408,10 +1389,10 @@ class IpdDressingTransfusion(Base):
     created_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
-    admission = relationship(
-        "IpdAdmission", back_populates="dressing_transfusion_entries"
-    )
+    admission = relationship("IpdAdmission",
+                             back_populates="dressing_transfusion_entries")
     created_by = relationship("User")
+
 
 class IpdIvFluidOrder(Base):
     """
@@ -1431,9 +1412,9 @@ class IpdIvFluidOrder(Base):
 
     # Order details
     ordered_datetime = Column(DateTime, default=datetime.utcnow)
-    fluid = Column(String(255), nullable=False)              # e.g. DNS 500 ml
-    additive = Column(String(255), default="")               # e.g. KCl 20 mEq
-    dose_ml = Column(Numeric(10, 2), nullable=True)          # total volume
+    fluid = Column(String(255), nullable=False)  # e.g. DNS 500 ml
+    additive = Column(String(255), default="")  # e.g. KCl 20 mEq
+    dose_ml = Column(Numeric(10, 2), nullable=True)  # total volume
     rate_ml_per_hr = Column(Numeric(10, 2), nullable=True)
 
     doctor_name = Column(String(255), default="")
@@ -1454,6 +1435,7 @@ class IpdIvFluidOrder(Base):
     doctor = relationship("User", foreign_keys=[doctor_id])
     start_nurse = relationship("User", foreign_keys=[start_nurse_id])
     stop_nurse = relationship("User", foreign_keys=[stop_nurse_id])
+
 
 class IpdDrugChartNurseRow(Base):
     """
@@ -1477,8 +1459,10 @@ class IpdDrugChartNurseRow(Base):
     specimen_sign = Column(String(255), default="")  # simple text / initials
     emp_no = Column(String(50), default="")
 
-    admission = relationship("IpdAdmission", back_populates="drug_chart_nurse_rows")
+    admission = relationship("IpdAdmission",
+                             back_populates="drug_chart_nurse_rows")
     nurse = relationship("User", foreign_keys=[nurse_id])
+
 
 class IpdDrugChartDoctorAuth(Base):
     """

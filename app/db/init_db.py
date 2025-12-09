@@ -10,7 +10,7 @@ from sqlalchemy import text
 from app.db.base_master import MasterBase
 from app.db.base import Base
 from app.db.session import master_engine, get_or_create_tenant_engine
-from app.models import tenant as Tenant
+
 
 
 def print_tables(conn):

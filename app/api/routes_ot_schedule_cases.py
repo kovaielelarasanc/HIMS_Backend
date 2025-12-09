@@ -60,6 +60,49 @@ def _need_any(user: User, codes: list[str]) -> None:
     )
 
 
+# ---------------------------------------------------------------------
+# OT bed helpers – mark occupied / vacant based on OT schedules
+# ---------------------------------------------------------------------
+
+
+def _mark_ot_bed_occupied(db: Session, bed_id: int | None) -> None:
+    """Mark a bed as occupied for OT use."""
+    if not bed_id:
+        return
+    bed = db.query(IpdBed).filter(IpdBed.id == bed_id).first()
+    if not bed:
+        return
+    bed.state = "occupied"  # or "ot_occupied" / "reserved" as per your UI
+    bed.reserved_until = None
+    db.add(bed)
+
+
+def _release_ot_bed_if_free(db: Session, bed_id: int | None) -> None:
+    """
+    Release bed back to vacant if there are no other active OT schedules
+    (planned / in_progress) for this bed.
+    """
+    if not bed_id:
+        return
+
+    # any other OT schedules still using this bed?
+    active_count = (db.query(OtSchedule).filter(
+        OtSchedule.bed_id == bed_id,
+        OtSchedule.status.in_(["planned", "in_progress"]),
+    ).count())
+    if active_count > 0:
+        # still some OT cases booked on this bed – don't release it
+        return
+
+    bed = db.query(IpdBed).filter(IpdBed.id == bed_id).first()
+    if not bed:
+        return
+
+    bed.state = "vacant"
+    bed.reserved_until = None
+    db.add(bed)
+
+
 def _validate_time_order(start: time, end: Optional[time]) -> None:
     """
     Ensure end time is after start time when provided.
@@ -328,9 +371,11 @@ def create_ot_schedule(
         )
 
         db.add(schedule)
-        db.flush()
+        db.flush()  # get schedule.id
 
-        # ... add OtScheduleProcedure links ...
+        # 🔴 Mark OT bed as occupied when we book it
+        if payload.bed_id:
+            _mark_ot_bed_occupied(db, payload.bed_id)
 
         db.commit()
         db.refresh(schedule)
@@ -362,6 +407,10 @@ def update_ot_schedule(
 
     data = payload.model_dump(exclude_unset=True)
 
+    # Keep copies for bed / status logic
+    old_bed_id = schedule.bed_id
+    old_status = schedule.status
+
     # Pre-calculate potential new values for conflict check
     new_date = data.get("date", schedule.date)
     new_start = data.get("planned_start_time", schedule.planned_start_time)
@@ -382,7 +431,7 @@ def update_ot_schedule(
             exclude_id=schedule.id,
         )
 
-    # handle simple fields
+    # handle simple fields (➕ also allow status update)
     for field in [
             "date",
             "planned_start_time",
@@ -396,6 +445,7 @@ def update_ot_schedule(
             "side",
             "priority",
             "notes",
+            "status",
     ]:
         if field in data:
             setattr(schedule, field, data[field])
@@ -432,6 +482,21 @@ def update_ot_schedule(
                     is_primary=False,
                 ))
             seen_ids.add(pid)
+
+    # 🔁 BED STATE LOGIC ------------------------------------------
+
+    # 1) If bed changed, mark new bed occupied and try to free old bed
+    new_bed_final = schedule.bed_id
+    if "bed_id" in data and new_bed_final != old_bed_id:
+        if new_bed_final:
+            _mark_ot_bed_occupied(db, new_bed_final)
+        if old_bed_id:
+            _release_ot_bed_if_free(db, old_bed_id)
+
+    # 2) If status changed to cancelled via this endpoint, free the bed if no other active OT
+    new_status = schedule.status
+    if old_status != "cancelled" and new_status == "cancelled" and schedule.bed_id:
+        _release_ot_bed_if_free(db, schedule.bed_id)
 
     db.commit()
     db.refresh(schedule)
@@ -475,6 +540,12 @@ def cancel_ot_schedule(
             schedule.notes = f"[CANCELLED]: {reason}"
 
     db.add(schedule)
+    db.flush()
+
+    # 🟢 Try to free the bed (if no other active OT schedules for it)
+    if schedule.bed_id:
+        _release_ot_bed_if_free(db, schedule.bed_id)
+
     db.commit()
     db.refresh(schedule)
     return schedule
@@ -508,7 +579,14 @@ def delete_ot_schedule(
             detail="Cannot delete schedule with an attached OT case",
         )
 
+    bed_id = schedule.bed_id
+
     db.delete(schedule)
+    db.flush()  # row removed; other schedules (if any) remain
+
+    if bed_id:
+        _release_ot_bed_if_free(db, bed_id)
+
     db.commit()
     return None
 
@@ -827,10 +905,67 @@ def open_ot_case_for_schedule(
     schedule.status = "in_progress"
     db.add(schedule)
 
+    # 🔴 Ensure OT bed is occupied when surgery actually starts
+    if schedule.bed_id:
+        _mark_ot_bed_occupied(db, schedule.bed_id)
+
     db.commit()
     db.refresh(case)
     return case
 
+
+@router.post("/cases/{case_id}/close", response_model=OtCaseOut)
+def close_ot_case(
+        case_id: int,
+        payload: OtCaseClosePayload,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    _need_any(user, ["ot.cases.update", "ot.cases.close"])
+
+    case = (db.query(OtCase).options(joinedload(
+        OtCase.schedule)).filter(OtCase.id == case_id).first())
+    if not case:
+        raise HTTPException(status_code=404, detail="OT Case not found")
+
+    schedule = case.schedule
+    now = datetime.utcnow()
+
+    # ---- Update case clinical fields ----
+    case.outcome = payload.outcome
+    case.actual_end_time = (payload.actual_end_time or case.actual_end_time
+                            or now)
+
+    if payload.icu_required is not None:
+        case.icu_required = payload.icu_required
+    if payload.immediate_postop_condition is not None:
+        case.immediate_postop_condition = payload.immediate_postop_condition
+
+    db.add(case)
+
+    # ---- Update schedule status + free bed ----
+    if schedule:
+        schedule.status = "completed"
+        db.add(schedule)
+
+        if schedule.bed_id:
+            _release_ot_bed_if_free(db, schedule.bed_id)
+
+    db.commit()
+    db.refresh(case)
+
+    # ---- Try to create OT billing items (do not break close if it fails) ----
+    try:
+        create_ot_invoice_items_for_case(
+            db=db,
+            case_id=case.id,
+            user_id=user.id,
+        )
+    except Exception as e:
+        # You can swap to proper logging
+        print("Failed to create OT invoice items for case", case.id, ":", e)
+
+    return case
 
 
 # ============================================================
