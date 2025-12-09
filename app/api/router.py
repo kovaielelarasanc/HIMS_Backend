@@ -57,7 +57,8 @@ from app.api import (
     routes_ui_branding,
     routes_inventory,
     routes_audit_logs,
-    routes_lis_masters
+    routes_lis_masters,
+    routes_lis_device
     )
 
 api_router = APIRouter()
@@ -122,7 +123,7 @@ api_router.include_router(routes_masters.router,
 # ---- LIS / RIS / OT / Billing
 api_router.include_router(routes_lis.router,  prefix="/lab", tags=["LIS Orders"])
 api_router.include_router(routes_lis_masters.router)
-
+api_router.include_router(routes_lis_device.router)
 
 api_router.include_router(routes_ris.router)
 

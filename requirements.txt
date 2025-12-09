@@ -22,3 +22,5 @@ pillow
 jinja2
 qrcode
 openpyxl
+pyserial
+requests
