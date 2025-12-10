@@ -12,7 +12,6 @@ from app.db.base import Base
 from app.db.session import master_engine, get_or_create_tenant_engine
 
 
-
 def print_tables(conn):
     rows = conn.exec_driver_sql("SHOW TABLES").fetchall()
     names = [r[0] for r in rows]
@@ -62,49 +61,43 @@ def seed_permissions(db: Session) -> None:
         # -------------------------------------------------------------------
         # IPD – Core
         # -------------------------------------------------------------------
-        ("ipd",["view","manage","doctor"]),
+        ("ipd", ["view", "manage", "doctor"]),
 
         # -------------------------------------------------------------------
         # IPD Masters (Ward / Room / Bed / Bed-rates)
         # Used in: routes_ipd_master.py  → ipd.masters.manage, ipd.view
         # -------------------------------------------------------------------
-        ("ipd.masters",["manage"]),
+        ("ipd.masters", ["manage"]),
 
         # Specific helpers for UI (optional but nice)
-        ("ipd.beds",["view","manage","reserve","release"]),
-        ("ipd.bedrates",["view","manage"]),
-
-        
-        ("ipd.packages",["view","manage"]),
+        ("ipd.beds", ["view", "manage", "reserve", "release"]),
+        ("ipd.bedrates", ["view", "manage"]),
+        ("ipd.packages", ["view", "manage"]),
 
         # -------------------------------------------------------------------
         # IPD Admissions / Tracking
         # (these are mostly for frontend gating + future-proofing)
         # -------------------------------------------------------------------
-        ("ipd.admissions",["view","create","update","cancel","transfer","discharge"]),
-
-        ("ipd.tracking",["view"]),
-
-        ("ipd.my",["view"]),
-
-        ("ipd.discharged",["view"]),
-
-        ("ipd.bedboard",["view"]),
+        ("ipd.admissions",
+         ["view", "create", "update", "cancel", "transfer", "discharge"]),
+        ("ipd.tracking", ["view"]),
+        ("ipd.my", ["view"]),
+        ("ipd.discharged", ["view"]),
+        ("ipd.bedboard", ["view"]),
 
         # -------------------------------------------------------------------
         # IPD Clinical – Nursing, Vitals, Intake/Output, Assessments
         # (these codes are mainly for FE; backend mostly uses ipd.view/ipd.nursing)
         # -------------------------------------------------------------------
-        ("ipd.vitals",["view","create","update"]),
-
-        ("ipd.nursing_notes",
+        ("ipd.vitals", ["view", "create", "update"]),
+        (
+            "ipd.nursing_notes",
             [
                 "view",
                 "create",
                 "update",
             ],
         ),
-
         (
             "ipd.io",  # Intake / Output chart
             [
@@ -113,7 +106,6 @@ def seed_permissions(db: Session) -> None:
                 "update",
             ],
         ),
-
         (
             "ipd.assessments",
             [
@@ -131,16 +123,16 @@ def seed_permissions(db: Session) -> None:
         (
             "ipd.meds",
             [
-                "view",         # list med orders, drug chart, IV fluids, etc.
-                "order",        # create medication order
-                "update",       # update medication order
-                "regenerate",   # regenerate admin grid
-                "mark",         # mark given/missed/refused/held in drug chart
-                "meta",         # edit drug chart meta header (allergies, diagnosis, diet)
-                "iv",           # create/update IV fluid rows
-                "nurse_rows",   # manage nurse signature rows
+                "view",  # list med orders, drug chart, IV fluids, etc.
+                "order",  # create medication order
+                "update",  # update medication order
+                "regenerate",  # regenerate admin grid
+                "mark",  # mark given/missed/refused/held in drug chart
+                "meta",  # edit drug chart meta header (allergies, diagnosis, diet)
+                "iv",  # create/update IV fluid rows
+                "nurse_rows",  # manage nurse signature rows
                 "doctor_auth",  # manage doctor daily authorisation rows
-                "pdf",          # download drug chart PDF
+                "pdf",  # download drug chart PDF
             ],
         ),
 
@@ -152,17 +144,16 @@ def seed_permissions(db: Session) -> None:
         (
             "ipd.discharges",
             [
-                "view",         # view discharge tabs / data
-                "summary",      # create/update discharge summary
-                "checklist",    # create/update discharge checklist
+                "view",  # view discharge tabs / data
+                "summary",  # create/update discharge summary
+                "checklist",  # create/update discharge checklist
                 "medications",  # manage discharge medications
-                "queue",        # view "due discharges" queue
+                "queue",  # view "due discharges" queue
                 "mark_status",  # mark LAMA / DAMA / disappeared
-                "push_abha",    # push discharge to ABHA (stubbed now)
-                "pdf",          # download discharge summary PDF
+                "push_abha",  # push discharge to ABHA (stubbed now)
+                "pdf",  # download discharge summary PDF
             ],
         ),
-
 
         # -------- Pharmacy Inventory ----------
         ("pharmacy.inventory.locations", ["view", "manage"]),
@@ -177,21 +168,23 @@ def seed_permissions(db: Session) -> None:
         ("pharmacy.inventory.txns", ["view"]),
 
         # -------- LIS ----------
-        ("lab.masters",         ["view", "manage"]),
-        ("lab.orders",          ["create", "view"]),           # OP/IP lab orders
-        ("lab.samples",         ["collect"]),                  # sample collection
-        ("lab.results",         ["enter", "validate", "report"]),
-        ("lab.attachments",     ["add"]),                      # add report attachments
+        ("lab.masters", ["view", "manage"]),
+        ("lab.orders", ["create", "view"]),  # OP/IP lab orders
+        ("lab.samples", ["collect"]),  # sample collection
+        ("lab.results", ["enter", "validate", "report"]),
+        ("lab.attachments", ["add"]),  # add report attachments
 
         # NEW: Analyzer / Device management
         # Used in routes_lis_device.py & AnalyzerDeviceMapping.jsx
-        ("lab.devices",         ["view", "manage"]),           # list/create/update/delete devices & channels
-        ("lab.device_results",  ["review", "import"]),         # review staging, import to LIS
-        ("lab.device_logs",     ["view"]),                     # view raw message logs
+        ("lab.devices", ["view", "manage"]
+         ),  # list/create/update/delete devices & channels
+        ("lab.device_results", ["review",
+                                "import"]),  # review staging, import to LIS
+        ("lab.device_logs", ["view"]),  # view raw message logs
 
         # LIS masters (new LIS service master screens)
         ("lis.masters.departments", ["view", "create", "update", "delete"]),
-        ("lis.masters.services",    ["view", "create", "update", "delete"]),
+        ("lis.masters.services", ["view", "create", "update", "delete"]),
 
         # -------- RIS ----------
         ("radiology.masters", ["view", "manage"]),
