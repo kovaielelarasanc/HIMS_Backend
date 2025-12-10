@@ -59,14 +59,110 @@ def seed_permissions(db: Session) -> None:
         ("opd.queue", ["view", "manage"]),
         ("opd.followups", ["view", "manage"]),
 
-        # -------- IPD ----------
-        ("ipd", ["view", "manage", "nursing", "doctor"]),
-        ("ipd.masters", ["manage"]),
-        ("ipd.packages", ["manage"]),
-        ("ipd.tracking", ["view"]),
-        ("ipd.my", ["view"]),
-        ("ipd.discharged", ["view"]),
-        ("ipd.bedboard", ["view"]),
+        # -------------------------------------------------------------------
+        # IPD – Core
+        # -------------------------------------------------------------------
+        ("ipd",["view","manage","doctor"]),
+
+        # -------------------------------------------------------------------
+        # IPD Masters (Ward / Room / Bed / Bed-rates)
+        # Used in: routes_ipd_master.py  → ipd.masters.manage, ipd.view
+        # -------------------------------------------------------------------
+        ("ipd.masters",["manage"]),
+
+        # Specific helpers for UI (optional but nice)
+        ("ipd.beds",["view","manage","reserve","release"]),
+        ("ipd.bedrates",["view","manage"]),
+
+        
+        ("ipd.packages",["view","manage"]),
+
+        # -------------------------------------------------------------------
+        # IPD Admissions / Tracking
+        # (these are mostly for frontend gating + future-proofing)
+        # -------------------------------------------------------------------
+        ("ipd.admissions",["view","create","update","cancel","transfer","discharge"]),
+
+        ("ipd.tracking",["view"]),
+
+        ("ipd.my",["view"]),
+
+        ("ipd.discharged",["view"]),
+
+        ("ipd.bedboard",["view"]),
+
+        # -------------------------------------------------------------------
+        # IPD Clinical – Nursing, Vitals, Intake/Output, Assessments
+        # (these codes are mainly for FE; backend mostly uses ipd.view/ipd.nursing)
+        # -------------------------------------------------------------------
+        ("ipd.vitals",["view","create","update"]),
+
+        ("ipd.nursing_notes",
+            [
+                "view",
+                "create",
+                "update",
+            ],
+        ),
+
+        (
+            "ipd.io",  # Intake / Output chart
+            [
+                "view",
+                "create",
+                "update",
+            ],
+        ),
+
+        (
+            "ipd.assessments",
+            [
+                "view",
+                "create",
+                "update",
+            ],
+        ),
+
+        # -------------------------------------------------------------------
+        # IPD Medications / Drug Chart
+        # Backend uses: ipd.view, ipd.doctor, ipd.nursing, ipd.manage
+        # (routes_ipd_medications.py)
+        # -------------------------------------------------------------------
+        (
+            "ipd.meds",
+            [
+                "view",         # list med orders, drug chart, IV fluids, etc.
+                "order",        # create medication order
+                "update",       # update medication order
+                "regenerate",   # regenerate admin grid
+                "mark",         # mark given/missed/refused/held in drug chart
+                "meta",         # edit drug chart meta header (allergies, diagnosis, diet)
+                "iv",           # create/update IV fluid rows
+                "nurse_rows",   # manage nurse signature rows
+                "doctor_auth",  # manage doctor daily authorisation rows
+                "pdf",          # download drug chart PDF
+            ],
+        ),
+
+        # -------------------------------------------------------------------
+        # IPD Discharge (Summary, Checklist, Medications, Special Status, ABHA)
+        # Backend uses: ipd.view, ipd.doctor, ipd.nursing, ipd.manage
+        # (routes_ipd_discharge.py)
+        # -------------------------------------------------------------------
+        (
+            "ipd.discharges",
+            [
+                "view",         # view discharge tabs / data
+                "summary",      # create/update discharge summary
+                "checklist",    # create/update discharge checklist
+                "medications",  # manage discharge medications
+                "queue",        # view "due discharges" queue
+                "mark_status",  # mark LAMA / DAMA / disappeared
+                "push_abha",    # push discharge to ABHA (stubbed now)
+                "pdf",          # download discharge summary PDF
+            ],
+        ),
+
 
         # -------- Pharmacy Inventory ----------
         ("pharmacy.inventory.locations", ["view", "manage"]),
