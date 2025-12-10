@@ -1,12 +1,11 @@
 # app/api/deps.py
-from typing import Optional, Tuple
-
-from fastapi import Depends, Header, HTTPException
+from typing import Optional, Tuple, Generator, Dict
+from fastapi import Depends, Header, HTTPException, Request, status
 from jose import jwt, JWTError
-from sqlalchemy.orm import Session, joinedload
-
+from sqlalchemy.orm import Session, joinedload, sessionmaker
+from sqlalchemy import create_engine  
 from app.core.config import settings
-from app.db.session import MasterSessionLocal, create_tenant_session
+from app.db.session import MasterSessionLocal, create_tenant_session, get_or_create_tenant_engine
 from app.models.tenant import Tenant
 from app.models.user import User
 from app.models.role import Role
@@ -125,3 +124,87 @@ def current_user(
     raw = _extract_bearer(authorization)
     user, _ = get_current_user_and_tenant_from_token(raw, master_db)
     return user
+
+
+
+# ---------- CONNECTOR TENANT DB (Analyzer Connector only) ----------
+
+# Cache: tenant_code -> SessionLocal
+_connector_session_cache: Dict[str, sessionmaker] = {}
+# Cache: tenant_code -> Engine (optional, but nice)
+_connector_engine_cache: Dict[str, any] = {}
+
+
+def _build_tenant_db_url(tenant_code: str) -> str:
+    """
+    Build SQLAlchemy URL for tenant DB using env/settings.
+
+    Pattern: nabh_hims_<tenant_code>
+    Example: smc001 -> nabh_hims_smc001
+    """
+    driver = getattr(settings, "DB_DRIVER", "pymysql")          # e.g. "pymysql"
+    host = getattr(settings, "MYSQL_HOST", "localhost")
+    port = getattr(settings, "MYSQL_PORT", 3306)
+    user = getattr(settings, "MYSQL_USER", "root")
+    password = getattr(settings, "MYSQL_PASSWORD", "")
+    # base_db = getattr(settings, "MYSQL_DB", "nabh_hims_emr")  # not used here
+
+    db_name = f"nabh_hims_{tenant_code}"  # 👈 your pattern
+
+    if password:
+        auth = f"{user}:{password}"
+    else:
+        auth = user
+
+    return f"mysql+{driver}://{auth}@{host}:{port}/{db_name}?charset=utf8mb4"
+
+
+def get_connector_tenant_db(request: Request) -> Generator[Session, None, None]:
+    """
+    Dependency for /api/connector/... routes.
+
+    - Reads X-Tenant-Code header (e.g. 'smc001')
+    - Builds DB URL: mysql+pymysql://.../nabh_hims_smc001
+    - Returns a Session bound to that tenant DB
+    """
+    tenant_code = request.headers.get("X-Tenant-Code")
+
+    if not tenant_code:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing X-Tenant-Code header",
+        )
+
+    # Get or build engine
+    engine = _connector_engine_cache.get(tenant_code)
+    if engine is None:
+        url = _build_tenant_db_url(tenant_code)
+        try:
+            engine = create_engine(
+                url,
+                pool_pre_ping=True,
+                pool_recycle=3600,
+            )
+        except Exception as e:
+            # If URL is bad or DB unreachable, fail clearly
+            raise HTTPException(
+                status_code=500,
+                detail=f"Could not open tenant database for tenant '{tenant_code}': {e}",
+            )
+        _connector_engine_cache[tenant_code] = engine
+
+    # Get or build SessionLocal for this tenant
+    SessionLocal = _connector_session_cache.get(tenant_code)
+    if SessionLocal is None:
+        SessionLocal = sessionmaker(
+            autocommit=False,
+            autoflush=False,
+            bind=engine,
+        )
+        _connector_session_cache[tenant_code] = SessionLocal
+
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()

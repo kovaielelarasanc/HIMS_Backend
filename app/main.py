@@ -14,7 +14,7 @@ from starlette.status import HTTP_500_INTERNAL_SERVER_ERROR
 from app.db.session import MasterSessionLocal
 from app.services.error_logger import log_error, format_exception
 from app.utils.jwt import extract_tenant_from_request
-
+# from app.api.routes_lis_device import public_router as lis_public_router
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -151,7 +151,7 @@ async def cors_preflight_handler(rest_of_path: str, request: Request):
         headers=headers,
     )
 
-
+# app.include_router(lis_public_router, prefix=settings.API_V1_STR)
 app.include_router(api_router, prefix=settings.API_V1_STR)
 
 # Media mount

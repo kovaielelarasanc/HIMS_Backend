@@ -3,15 +3,33 @@ from __future__ import annotations
 
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Request,
+    status,
+    Header,
+)
 from sqlalchemy.orm import Session
+from passlib.context import CryptContext
 
-from app.api.deps import get_db, current_user as auth_current_user 
+from app.api.deps import (
+    get_db,                    # normal tenant DB (JWT)
+    current_user as auth_current_user,
+    get_connector_tenant_db,   # header-based tenant DB for connector
+)
+from app.models.user import User
+from app.models.lis_device import (
+    LabDevice,
+    LabDeviceChannel,
+    LabDeviceMessageLog,
+    LabDeviceResult,
+)
 from app.schemas.lis_device import (
     LabDeviceCreate,
     LabDeviceUpdate,
     LabDeviceOut,
-    LabDeviceChannelBase,
     LabDeviceChannelCreate,
     LabDeviceChannelUpdate,
     LabDeviceChannelOut,
@@ -20,15 +38,13 @@ from app.schemas.lis_device import (
     DeviceResultBatchIn,
 )
 from app.services import lis_device as svc
-from app.models.lis_device import LabDevice, LabDeviceMessageLog, LabDeviceResult
-from app.core.device_auth import get_lab_device_by_api_key
 
-from app.models.user import User
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-router = APIRouter(prefix="/api/lis", tags=["LIS - Devices"])
+# =====================================================
+#  Helper functions
+# =====================================================
 
-
-# --------- Admin Device Management (UI) ---------
 def has_perm(user: User, code: str) -> bool:
     if user.is_admin:
         return True
@@ -38,11 +54,27 @@ def has_perm(user: User, code: str) -> bool:
                 return True
     return False
 
-@router.get(
-    "/devices",
-    response_model=List[LabDeviceOut],
-)
-async def list_lab_devices(
+
+def verify_api_key(plain: str, hashed: str) -> bool:
+    """
+    Safe wrapper around passlib verify for device API keys.
+    """
+    try:
+        return pwd_context.verify(plain, hashed)
+    except Exception:
+        return False
+
+
+# =====================================================
+#  A. DEVICE MANAGEMENT (UI – secured by JWT + perms)
+# =====================================================
+
+# UI router (uses JWT + get_db / tenant middleware)
+router = APIRouter(prefix="/lis", tags=["LIS - Devices"])
+
+
+@router.get("/devices", response_model=List[LabDeviceOut])
+def list_lab_devices(
     db: Session = Depends(get_db),
     user: User = Depends(auth_current_user),
 ):
@@ -56,7 +88,7 @@ async def list_lab_devices(
     response_model=LabDeviceOut,
     status_code=status.HTTP_201_CREATED,
 )
-async def create_lab_device(
+def create_lab_device(
     payload: LabDeviceCreate,
     db: Session = Depends(get_db),
     user: User = Depends(auth_current_user),
@@ -64,7 +96,6 @@ async def create_lab_device(
     if not has_perm(user, "lab.devices.manage"):
         raise HTTPException(status_code=403, detail="Not permitted")
 
-    # ensure unique code
     existing = svc.get_device_by_code(db, payload.code)
     if existing:
         raise HTTPException(
@@ -78,7 +109,7 @@ async def create_lab_device(
     "/devices/{device_id}",
     response_model=LabDeviceOut,
 )
-async def update_lab_device(
+def update_lab_device(
     device_id: int,
     payload: LabDeviceUpdate,
     db: Session = Depends(get_db),
@@ -97,7 +128,7 @@ async def update_lab_device(
     "/devices/{device_id}",
     status_code=status.HTTP_204_NO_CONTENT,
 )
-async def delete_lab_device(
+def delete_lab_device(
     device_id: int,
     db: Session = Depends(get_db),
     user: User = Depends(auth_current_user),
@@ -112,14 +143,14 @@ async def delete_lab_device(
     return None
 
 
-# --------- Device Channel Mapping ---------
+# ----- Channels -----
 
 
 @router.get(
     "/devices/{device_id}/channels",
     response_model=List[LabDeviceChannelOut],
 )
-async def list_device_channels(
+def list_device_channels(
     device_id: int,
     db: Session = Depends(get_db),
     user: User = Depends(auth_current_user),
@@ -127,44 +158,41 @@ async def list_device_channels(
     if not has_perm(user, "lab.devices.view"):
         raise HTTPException(status_code=403, detail="Not permitted")
 
-    # validate device
     device = svc.get_device_by_id(db, device_id)
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
+
     return svc.list_channels_for_device(db, device_id)
 
 
 @router.post(
     "/devices/{device_id}/channels",
     response_model=LabDeviceChannelOut,
+    status_code=status.HTTP_201_CREATED,
 )
-async def create_device_channel(
+def create_device_channel(
     device_id: int,
-    payload: LabDeviceChannelBase,
+    payload: LabDeviceChannelCreate,
     db: Session = Depends(get_db),
     user: User = Depends(auth_current_user),
 ):
     if not has_perm(user, "lab.devices.manage"):
         raise HTTPException(status_code=403, detail="Not permitted")
 
-    # ensure device exists
+    payload.device_id = device_id  # avoid spoof from body
+
     device = svc.get_device_by_id(db, device_id)
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
 
-    # build full create DTO with device_id from path
-    dto = LabDeviceChannelCreate(
-        device_id=device_id,
-        **payload.model_dump(),
-    )
-    return svc.create_channel(db, dto)
+    return svc.create_channel(db, payload)
 
 
 @router.put(
     "/channels/{channel_id}",
     response_model=LabDeviceChannelOut,
 )
-async def update_device_channel(
+def update_device_channel(
     channel_id: int,
     payload: LabDeviceChannelUpdate,
     db: Session = Depends(get_db),
@@ -183,7 +211,7 @@ async def update_device_channel(
     "/channels/{channel_id}",
     status_code=status.HTTP_204_NO_CONTENT,
 )
-async def delete_device_channel(
+def delete_device_channel(
     channel_id: int,
     db: Session = Depends(get_db),
     user: User = Depends(auth_current_user),
@@ -198,14 +226,14 @@ async def delete_device_channel(
     return None
 
 
-# --------- Logs & Staging Results (UI read) ---------
+# ----- Logs & staging -----
 
 
 @router.get(
     "/devices/{device_id}/logs",
     response_model=List[LabDeviceMessageLogOut],
 )
-async def list_device_logs(
+def list_device_logs(
     device_id: int,
     limit: int = 100,
     db: Session = Depends(get_db),
@@ -215,21 +243,20 @@ async def list_device_logs(
         raise HTTPException(status_code=403, detail="Not permitted")
 
     limit = max(1, min(limit, 500))
-    logs = (
+    return (
         db.query(LabDeviceMessageLog)
         .filter(LabDeviceMessageLog.device_id == device_id)
-        .order_by(LabDeviceMessageLog.created_at.desc())  # updated: created_at
+        .order_by(LabDeviceMessageLog.created_at.desc())
         .limit(limit)
         .all()
     )
-    return logs
 
 
 @router.get(
     "/devices/{device_id}/results/staging",
     response_model=List[LabDeviceResultOut],
 )
-async def list_staging_results_for_device(
+def list_staging_results_for_device(
     device_id: int,
     limit: int = 200,
     db: Session = Depends(get_db),
@@ -239,60 +266,99 @@ async def list_staging_results_for_device(
         raise HTTPException(status_code=403, detail="Not permitted")
 
     limit = max(1, min(limit, 500))
-    rows = (
+    return (
         db.query(LabDeviceResult)
         .filter(LabDeviceResult.device_id == device_id)
         .order_by(LabDeviceResult.received_at.desc())
         .limit(limit)
         .all()
     )
-    return rows
 
 
-# --------- Connector Endpoint (Machine → HIMS) ---------
+# =====================================================
+#  B. (Optional) CONNECTOR AUTH helper (not used now)
+# =====================================================
+
+def get_lab_device_by_api_key_public(
+    request: Request,
+    db: Session = Depends(get_connector_tenant_db),
+) -> LabDevice:
+    """
+    Authenticate connector using X-Device-Api-Key header
+    against lab_devices.api_key_hash in the tenant DB.
+
+    (Kept for future use; current connector endpoint does
+    explicit lookup using payload.device_code.)
+    """
+    api_key = request.headers.get("X-Device-Api-Key")
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing X-Device-Api-Key header",
+        )
+
+    devices = (
+        db.query(LabDevice)
+        .filter(LabDevice.is_active.is_(True))
+        .all()
+    )
+    for dev in devices:
+        if verify_api_key(api_key, dev.api_key_hash):
+            return dev
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid device API key",
+    )
 
 
-@router.post(
+# =====================================================
+#  C. CONNECTOR ENDPOINT  (device -> HIMS, no JWT)
+# =====================================================
+
+connector_router = APIRouter(prefix="/connector/lis", tags=["LIS Connector"])
+
+
+@connector_router.post(
     "/device-results",
     response_model=List[LabDeviceResultOut],
     status_code=status.HTTP_201_CREATED,
 )
-async def receive_device_results(
+def receive_device_results_public(
     payload: DeviceResultBatchIn,
-    db: Session = Depends(get_db),
-    # Device auth: X-Device-Api-Key header
-    device: LabDevice = Depends(get_lab_device_by_api_key),
+    db: Session = Depends(get_connector_tenant_db),
+    x_device_api_key: str = Header(..., alias="X-Device-Api-Key"),
 ):
     """
-    Connector on local PC calls this endpoint.
+    Analyzer connector entrypoint (multi-tenant):
 
-    Headers:
-      X-Device-Api-Key: <device secret key>
-
-    Body:
-    {
-      "device_code": "CBC1",
-      "results": [
-        {
-          "sample_id": "SMP-00123",
-          "external_test_code": "WBC",
-          "external_test_name": "White Blood Cell Count",
-          "result_value": "5.6",
-          "unit": "10^3/uL",
-          "flag": "",
-          "reference_range": "4.0-11.0",
-          "measured_at": "2025-12-08T12:30:00Z"
-        }
-      ],
-      "raw_payload": "optional raw ASTM/HL7 string..."
-    }
+    - Tenant chosen by X-Tenant-Code header  (smc001 -> nabh_hims_smc001)
+    - Device authenticated by X-Device-Api-Key (bcrypt hash in lab_devices.api_key_hash)
+    - No JWT token used here
     """
-    # Safety: check that payload.device_code matches authenticated device
-    if payload.device_code != device.code:
+
+    # 1) Find device by code in this tenant DB
+    device = (
+        db.query(LabDevice)
+        .filter(
+            LabDevice.code == payload.device_code,
+            LabDevice.is_active.is_(True),
+        )
+        .first()
+    )
+    if not device:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Device code mismatch for provided API key",
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Device not found for this tenant",
         )
 
+    # 2) Verify API key using bcrypt
+    if not verify_api_key(x_device_api_key, device.api_key_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid device API key",
+        )
+
+    # 3) Save results into staging table (uses svc from services)
     results = svc.save_device_results_batch(db, device=device, batch=payload)
     return results

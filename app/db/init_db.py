@@ -81,13 +81,21 @@ def seed_permissions(db: Session) -> None:
         ("pharmacy.inventory.txns", ["view"]),
 
         # -------- LIS ----------
-        ("lab.masters", ["view", "manage"]),
-        ("lab.orders", ["create", "view"]),
-        ("lab.samples", ["collect"]),
-        ("lab.results", ["enter", "validate", "report"]),
-        ("lab.attachments", ["add"]),
+        ("lab.masters",         ["view", "manage"]),
+        ("lab.orders",          ["create", "view"]),           # OP/IP lab orders
+        ("lab.samples",         ["collect"]),                  # sample collection
+        ("lab.results",         ["enter", "validate", "report"]),
+        ("lab.attachments",     ["add"]),                      # add report attachments
+
+        # NEW: Analyzer / Device management
+        # Used in routes_lis_device.py & AnalyzerDeviceMapping.jsx
+        ("lab.devices",         ["view", "manage"]),           # list/create/update/delete devices & channels
+        ("lab.device_results",  ["review", "import"]),         # review staging, import to LIS
+        ("lab.device_logs",     ["view"]),                     # view raw message logs
+
+        # LIS masters (new LIS service master screens)
         ("lis.masters.departments", ["view", "create", "update", "delete"]),
-        ("lis.masters.services", ["view", "create", "update", "delete"]),
+        ("lis.masters.services",    ["view", "create", "update", "delete"]),
 
         # -------- RIS ----------
         ("radiology.masters", ["view", "manage"]),

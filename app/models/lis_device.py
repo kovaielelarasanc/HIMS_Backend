@@ -20,8 +20,7 @@ from sqlalchemy.orm import relationship
 from app.db.base import Base
 
 
-# ----------------- Python Enums (correct) -----------------
-
+# ------------ Python Enums ------------
 
 class DeviceConnectionType(str, PyEnum):
     RS232 = "rs232"
@@ -45,13 +44,11 @@ class DeviceResultStatus(str, PyEnum):
     ERROR = "error"
 
 
-# ----------------- Models -----------------
-
+# ------------ LabDevice ------------
 
 class LabDevice(Base):
     __tablename__ = "lab_devices"
     __table_args__ = (
-        
         {
             "mysql_engine": "InnoDB",
             "mysql_charset": "utf8mb4",
@@ -63,13 +60,10 @@ class LabDevice(Base):
     code = Column(String(50), nullable=False, unique=True, index=True)
     name = Column(String(255), nullable=False)
 
-    # rs232 / tcp_ip / file_drop / manual
     connection_type = Column(
         SAEnum(DeviceConnectionType),
         nullable=False,
     )
-
-    # astm / hl7 / csv / json / proprietary
     protocol = Column(
         SAEnum(DeviceProtocolType),
         nullable=False,
@@ -78,7 +72,7 @@ class LabDevice(Base):
     # For securing connector -> backend
     api_key_hash = Column(String(255), nullable=False)
 
-    # Optional extra fields (for reference / UI)
+    # Optional reference fields
     location = Column(String(255), nullable=True)
     manufacturer = Column(String(255), nullable=True)
     model = Column(String(255), nullable=True)
@@ -109,6 +103,8 @@ class LabDevice(Base):
         cascade="all, delete-orphan",
     )
 
+
+# ------------ Channel Mapping ------------
 
 class LabDeviceChannel(Base):
     """
@@ -155,6 +151,8 @@ class LabDeviceChannel(Base):
 
     device = relationship("LabDevice", back_populates="channels")
 
+
+# ------------ Staging Results ------------
 
 class LabDeviceResult(Base):
     """
@@ -217,6 +215,8 @@ class LabDeviceResult(Base):
 
     device = relationship("LabDevice", back_populates="results")
 
+
+# ------------ Raw Message Logs ------------
 
 class LabDeviceMessageLog(Base):
     """

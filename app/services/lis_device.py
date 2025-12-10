@@ -37,20 +37,10 @@ def create_device(db: Session, data: LabDeviceCreate) -> LabDevice:
         name=data.name,
         model=data.model,
         manufacturer=data.manufacturer,
+        location=data.location,
         connection_type=data.connection_type,
         protocol=data.protocol,
-        # the following are optional config hints; only keep if you added
-        # matching columns in LabDevice model. If not, remove them here.
-        ip_address=data.ip_address,
-        port=data.port,
-        serial_port=data.serial_port,
-        baudrate=data.baudrate,
-        data_bits=data.data_bits,
-        stop_bits=data.stop_bits,
-        parity=data.parity,
-        file_drop_path=data.file_drop_path,
         is_active=data.is_active,
-        allow_unmapped_tests=data.allow_unmapped_tests,
         api_key_hash=hashed,
     )
     db.add(obj)
@@ -60,11 +50,22 @@ def create_device(db: Session, data: LabDeviceCreate) -> LabDevice:
 
 
 def update_device(db: Session, device: LabDevice, data: LabDeviceUpdate) -> LabDevice:
+    allowed_fields = {
+        "name",
+        "model",
+        "manufacturer",
+        "location",
+        "connection_type",
+        "protocol",
+        "is_active",
+    }
+
     for field, value in data.model_dump(exclude_unset=True).items():
         if field == "api_key" and value:
             setattr(device, "api_key_hash", hash_api_key(value))
-        else:
+        elif field in allowed_fields:
             setattr(device, field, value)
+
     db.add(device)
     db.commit()
     db.refresh(device)
@@ -184,7 +185,7 @@ def save_device_results_batch(
 
     for idx, item in enumerate(batch.results):
         try:
-            # Basic sanity checks (pydantic already validates, but extra layer is ok)
+            # Basic sanity checks
             if not item.sample_id or not item.external_test_code or not item.result_value:
                 raise ValueError("Missing required fields (sample_id, external_test_code, result_value).")
 
@@ -225,3 +226,12 @@ def save_device_results_batch(
         db.refresh(r)
 
     return results
+
+def verify_api_key(plain: str, hashed: str) -> bool:
+    """
+    Safe wrapper around passlib verify for device API keys.
+    """
+    try:
+        return pwd_context.verify(plain, hashed)
+    except Exception:
+        return False

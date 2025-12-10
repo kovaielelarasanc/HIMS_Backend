@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional, Any
+from typing import Optional
 
 from pydantic import BaseModel, Field, ConfigDict
 
@@ -13,34 +13,19 @@ from app.models.lis_device import (
 )
 
 
-# ----------------- Devices -----------------
-
+# ------------ Devices ------------
 
 class LabDeviceBase(BaseModel):
     name: str = Field(..., max_length=255)
     code: str = Field(..., max_length=50)
     model: Optional[str] = Field(None, max_length=255)
     manufacturer: Optional[str] = Field(None, max_length=255)
+    location: Optional[str] = Field(None, max_length=255)
 
     connection_type: DeviceConnectionType
     protocol: DeviceProtocolType = DeviceProtocolType.ASTM
 
-    # These are fine to keep in schema even if model doesn't
-    # yet have columns; they will be None in output and used
-    # as config hints for connector.
-    ip_address: Optional[str] = Field(None, max_length=64)
-    port: Optional[int] = None
-
-    serial_port: Optional[str] = Field(None, max_length=64)
-    baudrate: Optional[int] = None
-    data_bits: Optional[int] = None
-    stop_bits: Optional[int] = None
-    parity: Optional[str] = Field(None, max_length=8)
-
-    file_drop_path: Optional[str] = Field(None, max_length=512)
-
     is_active: bool = True
-    allow_unmapped_tests: bool = False
 
 
 class LabDeviceCreate(LabDeviceBase):
@@ -52,23 +37,11 @@ class LabDeviceUpdate(BaseModel):
     name: Optional[str] = None
     model: Optional[str] = None
     manufacturer: Optional[str] = None
+    location: Optional[str] = None
 
     connection_type: Optional[DeviceConnectionType] = None
     protocol: Optional[DeviceProtocolType] = None
-
-    ip_address: Optional[str] = None
-    port: Optional[int] = None
-
-    serial_port: Optional[str] = None
-    baudrate: Optional[int] = None
-    data_bits: Optional[int] = None
-    stop_bits: Optional[int] = None
-    parity: Optional[str] = None
-
-    file_drop_path: Optional[str] = None
-
     is_active: Optional[bool] = None
-    allow_unmapped_tests: Optional[bool] = None
 
     # optional API key rotate
     api_key: Optional[str] = Field(None, min_length=16, max_length=128)
@@ -82,14 +55,13 @@ class LabDeviceOut(LabDeviceBase):
     updated_at: datetime
 
 
-# ----------------- Channels -----------------
-
+# ------------ Channels ------------
 
 class LabDeviceChannelBase(BaseModel):
     external_test_code: str = Field(..., max_length=64)
     external_test_name: Optional[str] = Field(None, max_length=255)
     lis_test_id: Optional[int] = None
-    default_unit: Optional[str] = Field(None, max_length=32)
+    default_unit: Optional[str] = Field(None, max_length=64)
     reference_range: Optional[str] = Field(None, max_length=255)
     is_active: bool = True
 
@@ -115,19 +87,17 @@ class LabDeviceChannelOut(LabDeviceChannelBase):
     updated_at: datetime
 
 
-# ----------------- Logs / Results (read only to UI) -----------------
-
+# ------------ Logs & Results (UI read) ------------
 
 class LabDeviceMessageLogOut(BaseModel):
     """
-    Matches LabDeviceMessageLog model:
-      id, device_id, direction, raw_payload, created_at
+    Matches LabDeviceMessageLog model.
     """
     model_config = ConfigDict(from_attributes=True)
 
     id: int
     device_id: Optional[int]
-    direction: str              # "in" | "out"
+    direction: str  # "in" | "out"
     raw_payload: str
     created_at: datetime
 
@@ -151,23 +121,23 @@ class LabDeviceResultOut(BaseModel):
     error_message: Optional[str]
     measured_at: Optional[datetime]
     received_at: datetime
+    created_at: datetime
+    updated_at: datetime
 
 
-# ----------------- Incoming payload from connector -----------------
-
+# ------------ Incoming payload from connector ------------
 
 class DeviceResultItemIn(BaseModel):
     """
-    Payload format to be sent from the local connector
-    reading device output.
+    Payload format from local connector (per test/parameter).
     """
 
     sample_id: str = Field(..., max_length=64)
     external_test_code: str = Field(..., max_length=64)
     external_test_name: Optional[str] = Field(None, max_length=255)
-    result_value: str = Field(..., max_length=64)
-    unit: Optional[str] = Field(None, max_length=32)
-    flag: Optional[str] = Field(None, max_length=32)
+    result_value: str = Field(..., max_length=255)
+    unit: Optional[str] = Field(None, max_length=64)
+    flag: Optional[str] = Field(None, max_length=16)
     reference_range: Optional[str] = Field(None, max_length=255)
     measured_at: Optional[datetime] = None
 

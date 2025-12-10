@@ -1,54 +1,66 @@
 # FILE: app/core/device_auth.py
 from __future__ import annotations
 
-from fastapi import Depends, HTTPException, status
-from fastapi.security import APIKeyHeader
+from fastapi import Depends, Header, HTTPException, status
 from sqlalchemy.orm import Session
 from passlib.context import CryptContext
-from app.api.deps import get_db, current_user
 
+from app.api.deps import get_db
 from app.models.lis_device import LabDevice
 
+# Same bcrypt setup as lis_device service
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-device_api_key_header = APIKeyHeader(name="X-Device-Api-Key", auto_error=False)
 
-
-def verify_api_key(api_key_plain: str, api_key_hash: str) -> bool:
-    return pwd_context.verify(api_key_plain, api_key_hash)
+def verify_api_key(plain_key: str, hashed_key: str | None) -> bool:
+    """
+    Safe bcrypt verify for device API keys.
+    """
+    if not plain_key or not hashed_key:
+        return False
+    try:
+        return pwd_context.verify(plain_key, hashed_key)
+    except Exception:
+        return False
 
 
 async def get_lab_device_by_api_key(
-    api_key: str | None = Depends(device_api_key_header),
+    x_device_api_key: str | None = Header(default=None, alias="X-Device-Api-Key"),
     db: Session = Depends(get_db),
 ) -> LabDevice:
     """
-    Used by connector-facing endpoints.
-    Devices send X-Device-Api-Key header.
+    Public-device auth ONLY.
+
+    - NO JWT
+    - NO 'Authorization' header
+    - NO 'Missing token' messages
+
+    Logic:
+    1) Read X-Device-Api-Key from header
+    2) Try to match against LabDevice.api_key_hash (bcrypt)
+    3) If match → return that LabDevice
+    4) Else → 401
     """
-    if not api_key:
+    # 1) Explicit error if header missing
+    if not x_device_api_key:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing device API key",
+            detail="Device API key missing",
         )
 
-    # Simple lookup: we don't store plain key, only hash.
-    device: LabDevice | None = db.query(LabDevice).filter(
-        LabDevice.is_active.is_(True)
-    ).first()
+    # 2) Check all active devices for a match
+    devices = (
+        db.query(LabDevice)
+        .filter(LabDevice.is_active.is_(True))
+        .all()
+    )
 
-    # You can optimize by storing API key hash index or a separate mapping.
-    # Here we just iterate active devices and verify.
-    matched_device: LabDevice | None = None
-    for dev in db.query(LabDevice).filter(LabDevice.is_active.is_(True)).all():
-        if verify_api_key(api_key, dev.api_key_hash):
-            matched_device = dev
-            break
+    for dev in devices:
+        if verify_api_key(x_device_api_key, dev.api_key_hash):
+            return dev
 
-    if not matched_device:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid device API key",
-        )
-
-    return matched_device
+    # 3) No match -> invalid
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid device API key",
+    )

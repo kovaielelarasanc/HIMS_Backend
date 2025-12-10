@@ -1,7 +1,6 @@
-# backend/app/api/router.py
+# FILE: app/api/router.py
 from fastapi import APIRouter
 from app.api import (
-    # Core
     routes_auth,
     routes_admin,
     routes_users,
@@ -10,42 +9,34 @@ from app.api import (
     routes_permissions,
     routes_masters,
 
-    # Patients / ABHA
     routes_patients,
     routes_abha,
     routes_patient_types,
 
-    # OPD
     routes_opd_common,
     routes_opd_schedules,
     routes_opd,
     routes_opd_clinical,
 
-    # IPD
     routes_ipd_masters,
     routes_ipd,
     routes_ipd_medications,
     routes_ipd_discharge,
     routes_pharmacy,
- 
     routes_pharmacy_rx_list,
-  
+
     routes_lis,
     routes_ris,
-    
     routes_billing,
-    
+
     routes_ot_masters,
     routes_ot_schedule_cases,
     routes_ot_clinical,
     routes_ot_admin_logs,
-    
-    
+
     routes_system,
-   
     routes_files,
     routes_lis_history,
-
     routes_ris_history,
     routes_emr,
     routes_templates,
@@ -58,8 +49,9 @@ from app.api import (
     routes_inventory,
     routes_audit_logs,
     routes_lis_masters,
-    routes_lis_device
-    )
+    routes_lis_device,
+)
+from app.api.routes_lis_device import connector_router as lis_connector_router
 
 api_router = APIRouter()
 
@@ -89,13 +81,13 @@ api_router.include_router(
 )
 api_router.include_router(routes_audit_logs.router,
                           prefix="/audit-logs",
-                          tags=["audit-logs"])  # 👈 this gives /api/audit-logs
+                          tags=["audit-logs"])
 api_router.include_router(routes_masters_credit.router,
                           prefix="/masters",
                           tags=["masters"])
 api_router.include_router(routes_abha.router, prefix="/abha", tags=["abha"])
 
-# ---- OPD (Avoid path collisions: see notes in each module)
+# ---- OPD
 api_router.include_router(routes_opd_common.router,
                           prefix="/opd",
                           tags=["opd"])
@@ -121,9 +113,10 @@ api_router.include_router(routes_masters.router,
                           tags=["masters"])
 
 # ---- LIS / RIS / OT / Billing
-api_router.include_router(routes_lis.router,  prefix="/lab", tags=["LIS Orders"])
+api_router.include_router(routes_lis.router, prefix="/lab", tags=["LIS Orders"])
 api_router.include_router(routes_lis_masters.router)
-api_router.include_router(routes_lis_device.router)
+api_router.include_router(routes_lis_device.router)  # UI routes only
+api_router.include_router(lis_connector_router) 
 
 api_router.include_router(routes_ris.router)
 
@@ -131,22 +124,17 @@ api_router.include_router(routes_billing.router,
                           prefix="/billing",
                           tags=["billing"])
 
-
-
 api_router.include_router(routes_ot_masters.router)
 api_router.include_router(routes_ot_schedule_cases.router)
 api_router.include_router(routes_ot_clinical.router)
 api_router.include_router(routes_ot_admin_logs.router)
-
 
 # ---- Files & History
 api_router.include_router(routes_files.router, prefix="/files", tags=["Files"])
 api_router.include_router(routes_lis_history.router)
 api_router.include_router(routes_ris_history.router)
 
-
 api_router.include_router(routes_emr.router, prefix="/emr", tags=["EMR"])
-
 api_router.include_router(routes_templates.router,
                           prefix="/templates",
                           tags=["Templates & Consents"])
@@ -160,7 +148,6 @@ api_router.include_router(routes_dashboard.router,
 api_router.include_router(routes_mis.router, prefix="/mis", tags=["MIS"])
 
 api_router.include_router(routes_ui_branding.router)
-
 api_router.include_router(routes_inventory.router)
 api_router.include_router(routes_pharmacy.router)
 
@@ -169,6 +156,5 @@ api_router.include_router(
     prefix="/pharmacy",
     tags=["Pharmacy Rx"],
 )
-
 
 api_router.include_router(routes_system.router, tags=["system"])
