@@ -2,7 +2,7 @@
 import random
 from datetime import datetime, timedelta
 from typing import Optional
-
+import traceback
 from fastapi import (
     APIRouter,
     Depends,
@@ -104,67 +104,52 @@ def _load_tenant_from_refresh_payload(payload: dict,
 
 @router.post("/register-admin")
 def register_admin(
-        payload: RegisterAdminIn,
-        master_db: Session = Depends(get_master_db),
+    payload: RegisterAdminIn,
+    master_db: Session = Depends(get_master_db),
 ):
-    """
-    FIRST STEP: Register tenant + first admin.
-    - Create Tenant in MASTER DB
-    - Create tenant DB & tables
-    - Create Admin user inside tenant DB
-
-    Also:
-    - Auto-compute license_start_date (now)
-    - Auto-compute license_end_date based on plan
-    - Auto-compute amc_next_due = license_end_date + 10 days
-    """
     if payload.password != payload.confirm_password:
         raise HTTPException(status_code=400, detail="Passwords do not match")
 
-    tenant_code = (payload.tenant_code
-                   or payload.tenant_name.replace(" ", "").upper())
+    tenant_code = (payload.tenant_code or payload.tenant_name.replace(" ", "").upper()).strip()
+    if not tenant_code:
+        raise HTTPException(status_code=400, detail="Tenant code is required")
 
     try:
-        # Create tenant + tenant DB + admin user
         tenant = provision_tenant_with_admin(
             master_db,
             tenant_name=payload.tenant_name,
             tenant_code=tenant_code,
-            hospital_address=payload.hospital_address,
+            hospital_address=getattr(payload, "hospital_address", None),
             contact_person=payload.contact_person,
             contact_phone=payload.contact_phone,
             subscription_plan=payload.subscription_plan,
-            amc_percent=payload.
-            amc_percent,  # ⚠ can later be overridden only by NDH admin
+            amc_percent=payload.amc_percent,
             admin_name=payload.admin_name,
             admin_email=payload.email,
             admin_password=payload.password,
         )
 
-        # 🔐 Commercial logic (master side, not visible to hospital client)
-        # Auto-calc license dates based on plan
-        lic_start, lic_end, amc_next_due = _compute_license_dates(
-            payload.subscription_plan)
-
+        lic_start, lic_end, amc_next_due = _compute_license_dates(payload.subscription_plan)
         tenant.license_start_date = lic_start
         tenant.license_end_date = lic_end
         tenant.amc_next_due = amc_next_due
 
-        # NOTE: subscription_amount, amc_percent etc. SHOULD be updated
-        # later from an internal NDH Admin panel / API, not by the hospital.
-        # Here we only set dates; amounts stay null or default.
         master_db.commit()
         master_db.refresh(tenant)
 
+        return {
+            "message": "Tenant created and Admin user provisioned. Proceed to login.",
+            "tenant_id": tenant.id,
+            "tenant_code": tenant.code,
+        }
+
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-
-    return {
-        "message":
-        "Tenant created and Admin user provisioned. Proceed to login.",
-        "tenant_id": tenant.id,
-        "tenant_code": tenant.code,
-    }
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        traceback.print_exc()  # ✅ prints full error to terminal
+        raise HTTPException(status_code=500, detail=f"Registration failed: {repr(e)}")
 
 
 # ---------------------------------------------------------------------

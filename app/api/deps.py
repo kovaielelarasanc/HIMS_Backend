@@ -12,7 +12,7 @@ from app.models.role import Role
 from app.models.permission import Permission
 
 
-def get_master_db():
+def get_master_db() -> Generator[Session, None, None]:
     """
     Session for MASTER (tenant management) DB.
     """

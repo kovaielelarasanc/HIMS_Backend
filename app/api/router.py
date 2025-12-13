@@ -28,7 +28,7 @@ from app.api import (
     routes_lis,
     routes_ris,
     routes_billing,
-
+    routes_pharmacy_accounts,
     routes_ot_masters,
     routes_ot_schedule_cases,
     routes_ot_clinical,
@@ -150,6 +150,7 @@ api_router.include_router(routes_mis.router, prefix="/mis", tags=["MIS"])
 api_router.include_router(routes_ui_branding.router)
 api_router.include_router(routes_inventory.router)
 api_router.include_router(routes_pharmacy.router)
+api_router.include_router(routes_pharmacy_accounts.router)
 
 api_router.include_router(
     routes_pharmacy_rx_list.router,

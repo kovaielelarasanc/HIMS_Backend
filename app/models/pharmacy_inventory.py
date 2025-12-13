@@ -1,6 +1,6 @@
 # FILE: app/models/pharmacy_inventory.py
 from __future__ import annotations
-
+import enum
 from datetime import datetime, date
 from decimal import Decimal
 
@@ -15,12 +15,21 @@ from sqlalchemy import (
     ForeignKey,
     Text,
     Enum,
+    CheckConstraint,
+    Index
 )
 from sqlalchemy.orm import relationship
 
 from app.db.base import Base
 
+Money = Numeric(14, 2)  # for invoice/totals
+Qty = Numeric(14, 4)    # for quantities/rates
 
+class GRNStatus(str, enum.Enum):
+    DRAFT = "DRAFT"
+    POSTED = "POSTED"
+    CANCELLED = "CANCELLED"
+    
 class InventoryLocation(Base):
     """
     Pharmacy / Store location
@@ -270,43 +279,70 @@ class GRN(Base):
     id = Column(Integer, primary_key=True, index=True)
     grn_number = Column(String(50), unique=True, nullable=False, index=True)
 
-    po_id = Column(Integer,
-                   ForeignKey("inv_purchase_orders.id"),
-                   nullable=True)
-    supplier_id = Column(Integer,
-                         ForeignKey("inv_suppliers.id"),
-                         nullable=False)
-    location_id = Column(Integer,
-                         ForeignKey("inv_locations.id"),
-                         nullable=False)
+    po_id = Column(Integer, ForeignKey("inv_purchase_orders.id"), nullable=True, index=True)
+    supplier_id = Column(Integer, ForeignKey("inv_suppliers.id"), nullable=False, index=True)
+    location_id = Column(Integer, ForeignKey("inv_locations.id"), nullable=False, index=True)
 
     received_date = Column(Date, nullable=False, default=date.today)
 
-    invoice_number = Column(String(100), default="")
+    # Supplier Invoice
+    invoice_number = Column(String(100), nullable=False, default="")
     invoice_date = Column(Date, nullable=True)
 
-    status = Column(String(20), nullable=False,
-                    default="DRAFT")  # DRAFT/POSTED/CANCELLED
+    # ✅ Supplier Net Payable (what supplier bill says)
+    supplier_invoice_amount = Column(Money, nullable=False, default=0)
 
-    notes = Column(String(1000), default="")
+    # ✅ System calculated breakup (good for audit & mismatch warning)
+    taxable_amount = Column(Money, nullable=False, default=0)
+    cgst_amount = Column(Money, nullable=False, default=0)
+    sgst_amount = Column(Money, nullable=False, default=0)
+    igst_amount = Column(Money, nullable=False, default=0)
 
-    created_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    discount_amount = Column(Money, nullable=False, default=0)   # total discount
+    freight_amount = Column(Money, nullable=False, default=0)    # transport
+    other_charges = Column(Money, nullable=False, default=0)     # packing/handling/etc
+    round_off = Column(Money, nullable=False, default=0)
+
+    calculated_grn_amount = Column(Money, nullable=False, default=0)
+    amount_difference = Column(Money, nullable=False, default=0)
+    difference_reason = Column(String(255), nullable=False, default="")
+
+    status = Column(String(20), nullable=False, default=GRNStatus.DRAFT.value)  # DRAFT/POSTED/CANCELLED
+
+    notes = Column(String(1000), nullable=False, default="")
+
+    created_by_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    posted_by_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    posted_at = Column(DateTime, nullable=True)
+    cancelled_by_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    cancelled_at = Column(DateTime, nullable=True)
+    cancel_reason = Column(String(255), nullable=False, default="")
+
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(
-        DateTime,
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
-        nullable=False,
-    )
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
+    # relationships
     purchase_order = relationship("PurchaseOrder", back_populates="grns")
     supplier = relationship("Supplier", back_populates="grns")
     location = relationship("InventoryLocation", back_populates="grns")
-    created_by = relationship("User", backref="inventory_grns")
+    created_by = relationship("User", foreign_keys=[created_by_id], backref="inventory_grns_created")
+    posted_by = relationship("User", foreign_keys=[posted_by_id], backref="inventory_grns_posted")
+    cancelled_by = relationship("User", foreign_keys=[cancelled_by_id], backref="inventory_grns_cancelled")
 
-    items = relationship("GRNItem",
-                         back_populates="grn",
-                         cascade="all, delete-orphan")
+    items = relationship("GRNItem", back_populates="grn", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        # basic sanity checks
+        CheckConstraint("supplier_invoice_amount >= 0", name="ck_grn_supplier_invoice_amount_nonneg"),
+        CheckConstraint("taxable_amount >= 0", name="ck_grn_taxable_amount_nonneg"),
+        CheckConstraint("cgst_amount >= 0", name="ck_grn_cgst_nonneg"),
+        CheckConstraint("sgst_amount >= 0", name="ck_grn_sgst_nonneg"),
+        CheckConstraint("igst_amount >= 0", name="ck_grn_igst_nonneg"),
+        CheckConstraint("discount_amount >= 0", name="ck_grn_discount_nonneg"),
+        CheckConstraint("freight_amount >= 0", name="ck_grn_freight_nonneg"),
+        CheckConstraint("other_charges >= 0", name="ck_grn_other_charges_nonneg"),
+        Index("ix_inv_grns_supplier_invoice", "supplier_id", "invoice_number"),
+    )
 
 
 class GRNItem(Base):
@@ -316,38 +352,58 @@ class GRNItem(Base):
     __tablename__ = "inv_grn_items"
 
     id = Column(Integer, primary_key=True, index=True)
-    grn_id = Column(Integer,
-                    ForeignKey("inv_grns.id"),
-                    nullable=False,
-                    index=True)
-    po_item_id = Column(Integer,
-                        ForeignKey("inv_purchase_order_items.id"),
-                        nullable=True)
-    item_id = Column(Integer,
-                     ForeignKey("inv_items.id"),
-                     nullable=False,
-                     index=True)
+    grn_id = Column(Integer, ForeignKey("inv_grns.id"), nullable=False, index=True)
 
-    batch_no = Column(String(100), nullable=False)
-    expiry_date = Column(Date, nullable=True)
+    po_item_id = Column(Integer, ForeignKey("inv_purchase_order_items.id"), nullable=True, index=True)
+    item_id = Column(Integer, ForeignKey("inv_items.id"), nullable=False, index=True)
 
-    quantity = Column(Numeric(14, 4), nullable=False, default=0)
-    free_quantity = Column(Numeric(14, 4), nullable=False, default=0)
+    batch_no = Column(String(100), nullable=False, index=True)
+    expiry_date = Column(Date, nullable=True, index=True)
 
-    unit_cost = Column(Numeric(14, 4), default=0)
-    tax_percent = Column(Numeric(5, 2), default=0)
-    mrp = Column(Numeric(14, 4), default=0)
+    quantity = Column(Qty, nullable=False, default=0)
+    free_quantity = Column(Qty, nullable=False, default=0)
 
-    line_total = Column(Numeric(14, 4), default=0)
+    unit_cost = Column(Qty, nullable=False, default=0)  # purchase rate
+    mrp = Column(Qty, nullable=False, default=0)
 
-    batch_id = Column(Integer,
-                      ForeignKey("inv_item_batches.id"),
-                      nullable=True)
+    # ✅ Discount support (common in pharmacy invoices)
+    discount_percent = Column(Numeric(5, 2), nullable=False, default=0)
+    discount_amount = Column(Money, nullable=False, default=0)
+
+    # ✅ Tax split
+    tax_percent = Column(Numeric(5, 2), nullable=False, default=0)
+    cgst_percent = Column(Numeric(5, 2), nullable=False, default=0)
+    sgst_percent = Column(Numeric(5, 2), nullable=False, default=0)
+    igst_percent = Column(Numeric(5, 2), nullable=False, default=0)
+
+    taxable_amount = Column(Money, nullable=False, default=0)
+    cgst_amount = Column(Money, nullable=False, default=0)
+    sgst_amount = Column(Money, nullable=False, default=0)
+    igst_amount = Column(Money, nullable=False, default=0)
+
+    line_total = Column(Money, nullable=False, default=0)  # final line total
+
+    # optional: allow per-item notes / scheme refs
+    scheme = Column(String(100), nullable=False, default="")   # e.g., "10+1"
+    remarks = Column(String(255), nullable=False, default="")
+
+    batch_id = Column(Integer, ForeignKey("inv_item_batches.id"), nullable=True, index=True)
 
     grn = relationship("GRN", back_populates="items")
     po_item = relationship("PurchaseOrderItem")
     item = relationship("InventoryItem", back_populates="grn_items")
     batch = relationship("ItemBatch")
+
+    __table_args__ = (
+        CheckConstraint("quantity >= 0", name="ck_grn_item_qty_nonneg"),
+        CheckConstraint("free_quantity >= 0", name="ck_grn_item_free_qty_nonneg"),
+        CheckConstraint("unit_cost >= 0", name="ck_grn_item_unit_cost_nonneg"),
+        CheckConstraint("mrp >= 0", name="ck_grn_item_mrp_nonneg"),
+        CheckConstraint("discount_percent >= 0", name="ck_grn_item_disc_pct_nonneg"),
+        CheckConstraint("discount_amount >= 0", name="ck_grn_item_disc_amt_nonneg"),
+        CheckConstraint("taxable_amount >= 0", name="ck_grn_item_taxable_nonneg"),
+        Index("ix_inv_grn_items_grn_item_batch", "grn_id", "item_id", "batch_no"),
+    )
 
 
 class ReturnNote(Base):

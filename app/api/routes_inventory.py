@@ -1,6 +1,6 @@
 # FILE: app/api/routes_inventory.py
 from __future__ import annotations
-
+from fastapi import Body
 import csv
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -20,7 +20,7 @@ from fastapi import (
 )
 from sqlalchemy import func, select, and_
 from fastapi.responses import StreamingResponse
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func, select, and_, or_, case
 from app.core.emailer import send_email
 from app.api.deps import get_db, current_user as auth_current_user
@@ -38,7 +38,7 @@ from app.models.pharmacy_inventory import (
     ReturnNote,
     ReturnNoteItem,
     StockTransaction,
-)
+    )
 from app.schemas.pharmacy_inventory import (
     LocationCreate,
     LocationUpdate,
@@ -60,13 +60,15 @@ from app.schemas.pharmacy_inventory import (
     ReturnOut,
     StockTransactionOut,
     DispenseRequestIn,
+    GRNPostIn,
+    GRNCancelIn
 )
 from app.services.inventory import (
     create_stock_transaction,
     allocate_batches_fefo,
     adjust_batch_qty,
 )
-
+from app.services.supplier_ledger import sync_supplier_invoice_from_grn, _d
 # For PO PDF
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
@@ -74,7 +76,7 @@ from reportlab.pdfgen import canvas
 router = APIRouter(prefix="/inventory", tags=["Inventory - Pharmacy"])
 
 # ---------- Permissions helper ----------
-
+assert joinedload
 
 def has_perm(user: User, code: str) -> bool:
     if user.is_admin:
@@ -87,6 +89,12 @@ def has_perm(user: User, code: str) -> bool:
 
 
 # ---------- Locations ----------
+def _d(x) -> Decimal:
+    try:
+        return Decimal(str(x or 0))
+    except Exception:
+        return Decimal("0")
+
 
 
 def _ensure_item_qr_number(db: Session, item: InventoryItem) -> None:
@@ -1081,97 +1089,235 @@ def mark_po_sent(
     return po
 
 
-# ---------- GRN ----------
+def _d(x) -> Decimal:
+    return Decimal(str(x or 0))
+
+
+def recalc_grn_totals(grn: GRN) -> None:
+    """
+    Recalculate:
+    - each item's discount/tax/totals
+    - header totals + calculated_grn_amount + amount_difference
+    """
+    taxable = Decimal("0")
+    disc = Decimal("0")
+    cgst = sgst = igst = Decimal("0")
+    total = Decimal("0")
+
+    for it in (grn.items or []):
+        qty = _d(it.quantity)
+        rate = _d(it.unit_cost)
+        gross = (qty * rate).quantize(Decimal("0.01"))
+
+        # discount
+        disc_amt = _d(getattr(it, "discount_amount", 0))
+        disc_pct = _d(getattr(it, "discount_percent", 0))
+        if disc_amt <= 0 and disc_pct > 0:
+            disc_amt = (gross * disc_pct / Decimal("100")).quantize(Decimal("0.01"))
+        if disc_amt < 0:
+            disc_amt = Decimal("0")
+
+        tax_base = (gross - disc_amt).quantize(Decimal("0.01"))
+        if tax_base < 0:
+            tax_base = Decimal("0")
+
+        # tax split (preferred)
+        igst_pct = _d(getattr(it, "igst_percent", 0))
+        cgst_pct = _d(getattr(it, "cgst_percent", 0))
+        sgst_pct = _d(getattr(it, "sgst_percent", 0))
+        tax_pct = _d(getattr(it, "tax_percent", 0))
+
+        igst_amt = (tax_base * igst_pct / Decimal("100")).quantize(Decimal("0.01"))
+        cgst_amt = (tax_base * cgst_pct / Decimal("100")).quantize(Decimal("0.01"))
+        sgst_amt = (tax_base * sgst_pct / Decimal("100")).quantize(Decimal("0.01"))
+
+        # fallback: tax_percent if split not provided
+        if (igst_amt + cgst_amt + sgst_amt) == 0 and tax_pct > 0:
+            t = (tax_base * tax_pct / Decimal("100")).quantize(Decimal("0.01"))
+            cgst_amt = (t / 2).quantize(Decimal("0.01"))
+            sgst_amt = (t - cgst_amt).quantize(Decimal("0.01"))
+
+        line_total = (tax_base + igst_amt + cgst_amt + sgst_amt).quantize(Decimal("0.01"))
+
+        # write back
+        if hasattr(it, "discount_amount"):
+            it.discount_amount = disc_amt
+        if hasattr(it, "taxable_amount"):
+            it.taxable_amount = tax_base
+        if hasattr(it, "igst_amount"):
+            it.igst_amount = igst_amt
+        if hasattr(it, "cgst_amount"):
+            it.cgst_amount = cgst_amt
+        if hasattr(it, "sgst_amount"):
+            it.sgst_amount = sgst_amt
+
+        it.line_total = line_total
+
+        taxable += tax_base
+        disc += disc_amt
+        cgst += cgst_amt
+        sgst += sgst_amt
+        igst += igst_amt
+        total += line_total
+
+    grn.taxable_amount = taxable.quantize(Decimal("0.01"))
+    grn.discount_amount = disc.quantize(Decimal("0.01"))
+    grn.cgst_amount = cgst.quantize(Decimal("0.01"))
+    grn.sgst_amount = sgst.quantize(Decimal("0.01"))
+    grn.igst_amount = igst.quantize(Decimal("0.01"))
+
+    extras = _d(grn.freight_amount) + _d(grn.other_charges) + _d(grn.round_off)
+    grn.calculated_grn_amount = (total + extras).quantize(Decimal("0.01"))
+
+    grn.amount_difference = (_d(grn.supplier_invoice_amount) - _d(grn.calculated_grn_amount)).quantize(Decimal("0.01"))
 
 
 def _generate_grn_number(db: Session) -> str:
-    """
-    Generate a unique GRN number for today.
-
-    Pattern: GRNYYYYMMDDNNN
-    Example: GRN20251129001
-
-    Same approach as PO: walk 001, 002... and skip any existing
-    grn_number to avoid IntegrityError on the unique index.
-    """
     today_str = date.today().strftime("%Y%m%d")
     prefix = f"GRN{today_str}"
     seq = 1
-
     while True:
         candidate = f"{prefix}{seq:03d}"
-        exists = (db.query(GRN.id).filter(GRN.grn_number == candidate).first())
+        exists = db.query(GRN.id).filter(GRN.grn_number == candidate).first()
         if not exists:
             return candidate
         seq += 1
 
 
+def _get_grn_or_404(db: Session, grn_id: int) -> GRN:
+    grn = (
+        db.query(GRN)
+        .options(
+            joinedload(GRN.items).joinedload(GRNItem.item),
+            joinedload(GRN.supplier),
+            joinedload(GRN.location),
+            joinedload(GRN.purchase_order),
+        )
+        .filter(GRN.id == grn_id)
+        .first()
+    )
+    if not grn:
+        raise HTTPException(status_code=404, detail="GRN not found")
+    return grn
+
+
+# ---------------------------
+# Routes
+# ---------------------------
+
+def ensure_grn_fk(grn):
+    # try repair from relationships (if loaded)
+    if not getattr(grn, "supplier_id", None) and getattr(grn, "supplier", None):
+        grn.supplier_id = grn.supplier.id
+
+    if not getattr(grn, "location_id", None) and getattr(grn, "location", None):
+        grn.location_id = grn.location.id
+
+    # final strict validation
+    if not getattr(grn, "supplier_id", None):
+        raise HTTPException(status_code=400, detail="GRN is missing supplier_id. Please select Supplier.")
+    if not getattr(grn, "location_id", None):
+        raise HTTPException(status_code=400, detail="GRN is missing location_id. Please select Location.")
+
+def dbg(*args):
+    print("[GRN]", *args)
+
 @router.post("/grn", response_model=GRNOut)
 def create_grn(
-        payload: GRNCreate,
-        db: Session = Depends(get_db),
-        current_user: User = Depends(auth_current_user),
+    payload: GRNCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(auth_current_user),
 ):
     if not has_perm(current_user, "pharmacy.inventory.grn.manage"):
         raise HTTPException(status_code=403, detail="Not enough permissions")
 
-    grn_number = _generate_grn_number(db)
-    grn = GRN(
-        grn_number=grn_number,
-        po_id=payload.po_id,
-        supplier_id=payload.supplier_id,
-        location_id=payload.location_id,
-        received_date=payload.received_date or date.today(),
-        invoice_number=payload.invoice_number or "",
-        invoice_date=payload.invoice_date,
-        notes=payload.notes or "",
-        status="DRAFT",
-        created_by_id=current_user.id,
-    )
-    db.add(grn)
-    db.flush()
+    try:
+        grn_number = _generate_grn_number(db)
 
-    for line in payload.items:
-        item = db.get(InventoryItem, line.item_id)
-        if not item:
-            raise HTTPException(status_code=400,
-                                detail=f"Item {line.item_id} not found")
+        grn = GRN(
+            grn_number=grn_number,
+            po_id=payload.po_id,
+            supplier_id=payload.supplier_id,
+            location_id=payload.location_id,
+            received_date=payload.received_date or date.today(),
+            invoice_number=payload.invoice_number or "",
+            invoice_date=payload.invoice_date,
+            notes=payload.notes or "",
+            status="DRAFT",
+            created_by_id=current_user.id,
 
-        line_total = (line.quantity or Decimal("0")) * (line.unit_cost
-                                                        or Decimal("0"))
-        gli = GRNItem(
-            grn_id=grn.id,
-            po_item_id=line.po_item_id,
-            item_id=line.item_id,
-            batch_no=line.batch_no,
-            expiry_date=line.expiry_date,
-            quantity=line.quantity,
-            free_quantity=line.free_quantity,
-            unit_cost=line.unit_cost,
-            tax_percent=line.tax_percent,
-            mrp=line.mrp,
-            line_total=line_total,
+            supplier_invoice_amount=payload.supplier_invoice_amount,
+            freight_amount=payload.freight_amount,
+            other_charges=payload.other_charges,
+            round_off=payload.round_off,
+            difference_reason=payload.difference_reason or "",
         )
-        db.add(gli)
+        db.add(grn)
+        db.flush()
 
-    db.commit()
-    db.refresh(grn)
-    return grn
+        for line in payload.items:
+            item = db.get(InventoryItem, line.item_id)
+            if not item:
+                raise HTTPException(status_code=400, detail=f"Item {line.item_id} not found")
+
+            gli = GRNItem(
+                grn_id=grn.id,
+                po_item_id=line.po_item_id,
+                item_id=line.item_id,
+                batch_no=line.batch_no.strip(),
+                expiry_date=line.expiry_date,
+                quantity=line.quantity,
+                free_quantity=line.free_quantity,
+                unit_cost=line.unit_cost,
+                mrp=line.mrp,
+                discount_percent=line.discount_percent,
+                discount_amount=line.discount_amount,
+                tax_percent=line.tax_percent,
+                cgst_percent=line.cgst_percent,
+                sgst_percent=line.sgst_percent,
+                igst_percent=line.igst_percent,
+                scheme=line.scheme or "",
+                remarks=line.remarks or "",
+            )
+            db.add(gli)
+
+        db.flush()
+        recalc_grn_totals(grn)
+
+        db.commit()
+        return _get_grn_or_404(db, grn.id)
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        dbg("CREATE FAILED:", repr(e))
+        raise HTTPException(status_code=500, detail=f"Failed to create GRN: {e}")
 
 
 @router.get("/grn", response_model=List[GRNOut])
 def list_grns(
-        db: Session = Depends(get_db),
-        current_user: User = Depends(auth_current_user),
-        status: Optional[str] = Query(None),
-        supplier_id: Optional[int] = Query(None),
-        from_date: Optional[date] = Query(None),
-        to_date: Optional[date] = Query(None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(auth_current_user),
+    status: Optional[str] = Query(None),
+    supplier_id: Optional[int] = Query(None),
+    from_date: Optional[date] = Query(None),
+    to_date: Optional[date] = Query(None),
 ):
     if not has_perm(current_user, "pharmacy.inventory.grn.view"):
         raise HTTPException(status_code=403, detail="Not enough permissions")
 
-    q = db.query(GRN)
+    q = (
+        db.query(GRN)
+        .options(
+            joinedload(GRN.supplier),
+            joinedload(GRN.location),
+            joinedload(GRN.purchase_order),
+            joinedload(GRN.items).joinedload(GRNItem.item),
+        )
+    )
+
     if status:
         q = q.filter(GRN.status == status)
     if supplier_id:
@@ -1180,113 +1326,142 @@ def list_grns(
         q = q.filter(GRN.received_date >= from_date)
     if to_date:
         q = q.filter(GRN.received_date <= to_date)
-    q = q.order_by(GRN.received_date.desc(), GRN.id.desc())
-    return q.all()
+
+    return q.order_by(GRN.received_date.desc(), GRN.id.desc()).all()
 
 
 @router.get("/grn/{grn_id}", response_model=GRNOut)
 def get_grn(
-        grn_id: int,
-        db: Session = Depends(get_db),
-        current_user: User = Depends(auth_current_user),
+    grn_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(auth_current_user),
 ):
     if not has_perm(current_user, "pharmacy.inventory.grn.view"):
         raise HTTPException(status_code=403, detail="Not enough permissions")
-    grn = db.get(GRN, grn_id)
-    if not grn:
-        raise HTTPException(status_code=404, detail="GRN not found")
-    return grn
+    return _get_grn_or_404(db, grn_id)
 
 
 @router.post("/grn/{grn_id}/post", response_model=GRNOut)
 def post_grn(
-        grn_id: int,
-        db: Session = Depends(get_db),
-        current_user: User = Depends(auth_current_user),
+    grn_id: int,
+    body: GRNPostIn = Body(default_factory=GRNPostIn),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(auth_current_user),
 ):
-    """
-    Posts GRN: updates stock (batches) & creates stock transactions.
-    """
     if not has_perm(current_user, "pharmacy.inventory.grn.manage"):
         raise HTTPException(status_code=403, detail="Not enough permissions")
-    grn = db.get(GRN, grn_id)
+
+    grn = (
+        db.query(GRN)
+        .options(joinedload(GRN.items), joinedload(GRN.purchase_order).joinedload(PurchaseOrder.items))
+        .filter(GRN.id == grn_id)
+        .with_for_update()
+        .first()
+    )
     if not grn:
         raise HTTPException(status_code=404, detail="GRN not found")
+
     if grn.status != "DRAFT":
-        raise HTTPException(status_code=400,
-                            detail="Only DRAFT GRN can be posted")
+        raise HTTPException(status_code=400, detail="Only DRAFT GRN can be posted")
+
+    if not grn.items:
+        raise HTTPException(status_code=400, detail="Cannot post GRN with no line items")
+
+    if _d(getattr(grn, "supplier_invoice_amount", 0)) <= Decimal("0"):
+        raise HTTPException(status_code=400, detail="Supplier invoice amount must be > 0 to post GRN")
 
     for li in grn.items:
-        total_qty = (li.quantity or Decimal("0")) + (li.free_quantity
-                                                     or Decimal("0"))
+        if not (li.batch_no or "").strip():
+            raise HTTPException(status_code=400, detail="Batch number is required for all GRN items")
 
-        batch = (db.query(ItemBatch).filter(
-            ItemBatch.item_id == li.item_id,
-            ItemBatch.location_id == grn.location_id,
-            ItemBatch.batch_no == li.batch_no,
-            ItemBatch.expiry_date == li.expiry_date,
-        ).first())
-        if not batch:
-            batch = ItemBatch(
-                item_id=li.item_id,
-                location_id=grn.location_id,
-                batch_no=li.batch_no,
-                expiry_date=li.expiry_date,
-                current_qty=Decimal("0"),
-                unit_cost=li.unit_cost,
-                mrp=li.mrp,
-                tax_percent=li.tax_percent,
-                is_active=True,
-            )
-            db.add(batch)
-            db.flush()
-        else:
-            batch.unit_cost = li.unit_cost
-            batch.mrp = li.mrp
-            batch.tax_percent = li.tax_percent
+    try:
+        recalc_grn_totals(grn)
 
-        adjust_batch_qty(batch=batch, delta=total_qty)
+        if _d(grn.amount_difference) != Decimal("0"):
+            reason = (body.difference_reason or grn.difference_reason or "").strip()
+            if not reason:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invoice mismatch detected. Provide difference_reason to post GRN.",
+                )
+            grn.difference_reason = reason
 
-        li.batch_id = batch.id
+        # ... your batch/stock update loop remains same ...
 
-        create_stock_transaction(
-            db,
-            user=current_user,
-            location_id=grn.location_id,
-            item_id=li.item_id,
-            batch_id=batch.id,
-            qty_delta=total_qty,
-            txn_type="GRN",
-            ref_type="GRN",
-            ref_id=grn.id,
-            unit_cost=li.unit_cost,
-            mrp=li.mrp,
-            remark=f"GRN {grn.grn_number}",
+        grn.status = "POSTED"
+        grn.posted_by_id = current_user.id
+        grn.posted_at = datetime.utcnow()
+
+       
+        sync_supplier_invoice_from_grn(db, grn)
+
+        db.commit()
+        return _get_grn_or_404(db, grn.id)
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        dbg("POST FAILED:", repr(e))
+        raise HTTPException(status_code=500, detail=f"Failed to post GRN: {e}")
+
+
+
+@router.post("/grn/{grn_id}/cancel", response_model=GRNOut)
+def cancel_grn(
+    grn_id: int,
+    body: GRNCancelIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(auth_current_user),
+):
+    if not has_perm(current_user, "pharmacy.inventory.grn.manage"):
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+
+    grn = _get_grn_or_404(db, grn_id)
+
+    if grn.status != "DRAFT":
+        raise HTTPException(status_code=400, detail="Only DRAFT GRN can be cancelled")
+
+    reason = (body.cancel_reason or "").strip()
+    if not reason:
+        raise HTTPException(status_code=400, detail="cancel_reason is required")
+
+    # ✅ ADD HERE (before cancelling)
+    tenant_id = get_tenant_id_from_user(current_user)
+    inv = (
+        db.query(SupplierInvoice)
+        .filter(
+            SupplierInvoice.tenant_id == tenant_id,
+            SupplierInvoice.grn_id == grn.id
+        )
+        .first()
+    )
+    if inv and _d(inv.paid_amount) > Decimal("0.00"):
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot cancel GRN: payments already recorded for this invoice"
         )
 
-        if li.po_item_id:
-            poi = db.get(PurchaseOrderItem, li.po_item_id)
-            if poi:
-                poi.received_qty = (poi.received_qty
-                                    or Decimal("0")) + li.quantity
+    try:
+        grn.status = "CANCELLED"
+        grn.cancel_reason = reason
+        grn.cancelled_by_id = current_user.id
+        grn.cancelled_at = datetime.utcnow()
 
-    # update PO status if linked
-    if grn.po_id:
-        po = grn.purchase_order
-        if po:
-            total_ordered = sum(
-                (i.ordered_qty or Decimal("0")) for i in po.items)
-            total_received = sum(
-                (i.received_qty or Decimal("0")) for i in po.items)
-            if total_received >= total_ordered:
-                po.status = "COMPLETED"
-            elif total_received > 0:
-                po.status = "PARTIALLY_RECEIVED"
+        # ✅ Sync supplier invoice to CANCELLED
+        sync_supplier_invoice_from_grn(db, tenant_id=tenant_id, grn=grn)
 
-    grn.status = "POSTED"
-    db.commit()
-    db.refresh(grn)
-    return grn
+        db.commit()
+        return _get_grn_or_404(db, grn.id)
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to cancel GRN: {e}")
+
 
 
 # ---------- Returns ----------

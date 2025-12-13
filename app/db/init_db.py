@@ -166,7 +166,10 @@ def seed_permissions(db: Session) -> None:
         ("pharmacy.inventory.returns", ["view", "manage"]),
         ("pharmacy.inventory", ["dispense"]),
         ("pharmacy.inventory.txns", ["view"]),
-
+        ("pharmacy.accounts.supplier_ledger", ["view", "manage", "export"]),
+        ("pharmacy.accounts.supplier_payments", ["view", "manage", "export"]),
+        ("pharmacy.accounts.supplier_invoices", ["view", "manage", "export"]),
+        
         # -------- LIS ----------
         ("lab.masters", ["view", "manage"]),
         ("lab.orders", ["create", "view"]),  # OP/IP lab orders
@@ -240,7 +243,7 @@ def seed_permissions(db: Session) -> None:
         ("mis.stock", ["view"]),
         ("mis.lab", ["view"]),
         ("mis.radiology", ["view"]),
-
+ 
         # -------- Pharmacy Rx & Billing ----------
         ("pharmacy.rx", ["view", "dispense", "override", "cancel"]),
         ("pharmacy.sales", ["view", "create", "return"]),
