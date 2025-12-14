@@ -285,7 +285,7 @@ def get_rx_queue(
         limit: int = Query(100, ge=1, le=500),
         current_user: User = Depends(auth_current_user),
 ):
-    """
+    """_rx_base_options
     Queue for pharmacy dispense.
 
     Frontend status mapping:

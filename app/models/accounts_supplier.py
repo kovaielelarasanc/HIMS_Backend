@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, date
 from decimal import Decimal
-
+import enum  # ✅ REQUIRED
 from sqlalchemy import (
     Column, Integer, String, Date, DateTime, ForeignKey,
     Numeric, Boolean, UniqueConstraint, Index, Text
@@ -11,6 +11,11 @@ from sqlalchemy import (
 from sqlalchemy.orm import relationship
 from app.db.base import Base
 
+class SupplierInvoiceStatus(str, enum.Enum):
+    UNPAID = "UNPAID"
+    PARTIAL = "PARTIAL"
+    PAID = "PAID"
+    CANCELLED = "CANCELLED"
 
 class SupplierInvoice(Base):
     __tablename__ = "acc_supplier_invoices"

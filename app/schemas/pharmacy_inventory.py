@@ -6,7 +6,7 @@ from decimal import Decimal
 from typing import List, Optional, Literal
 
 from pydantic import BaseModel, Field, ConfigDict, condecimal, field_validator
-
+from app.models.pharmacy_inventory import GRNStatus  # ✅ import your model Enum
 # ---------- Locations ----------
 
 
@@ -252,7 +252,7 @@ class PurchaseOrderOut(BaseModel):
 
 
 # ---------- GRN ----------
-GRNStatus = Literal["DRAFT", "POSTED", "CANCELLED"]
+# GRNStatus = Literal["DRAFT", "POSTED", "CANCELLED"]
 
 # ---------------------------
 # GRN Items
@@ -524,20 +524,20 @@ class ReturnOut(BaseModel):
 
 class StockTransactionOut(BaseModel):
     id: int
-    location_id: int
-    item_id: int
-    batch_id: int | None
-    txn_time: datetime
-    txn_type: str
-    ref_type: str
-    ref_id: int | None
-    quantity_change: Quantity
-    unit_cost: Money
-    mrp: Money
+    location_id: Optional[int] = None
+    item_id: Optional[int] = None
+    batch_id: Optional[int] = None
+    txn_time: Optional[datetime] = None
+    txn_type: Optional[str] = None
+    ref_type: Optional[str] = None
+    ref_id: Optional[int] = None
+    quantity_change: Optional[Decimal] = None
+    unit_cost: Optional[Decimal] = None
+    mrp: Optional[Decimal] = None
     remark: Optional[str] = None
-    user_id: int | None
-    patient_id: int | None
-    visit_id: int | None
+    user_id: Optional[int] = None
+    patient_id: Optional[int] = None
+    visit_id: Optional[int] = None
     
     item_name: Optional[str] = None
     item_code: Optional[str] = None
@@ -547,6 +547,7 @@ class StockTransactionOut(BaseModel):
     ref_display: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
+
 
 
 # ---------- Dispense (stock OUT) ----------

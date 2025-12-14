@@ -17,6 +17,8 @@ from app.models.pharmacy_prescription import (
     PharmacySaleItem,
     PharmacyPayment,
 )
+from app.services.inventory import create_stock_transaction
+
 from app.models.pharmacy_inventory import (
     InventoryItem,
     ItemBatch,
@@ -205,22 +207,25 @@ def _allocate_stock_fefo(
         tax_percent = Decimal(batch.tax_percent or item.default_tax_percent
                               or 0)
         unit_cost = Decimal(batch.unit_cost or 0)
-
-        stock_txn = StockTransaction(
+        
+        
+        stock_txn = create_stock_transaction(
+            db=db,
+            user=user,
             location_id=location_id,
             item_id=item.id,
             batch_id=batch.id,
+            qty_delta=-use_qty,
             txn_type="DISPENSE",
             ref_type=ref_type,
             ref_id=ref_id,
-            quantity_change=-use_qty,
             unit_cost=unit_cost,
             mrp=mrp,
             remark=f"Dispense from {ref_type} {ref_id}",
-            user_id=user.id,
-            patient_id=patient_id,
-            visit_id=visit_id,
+            patient_id=patient_id,  # will be ignored if column not present
+            visit_id=visit_id,      # will be ignored if column not present
         )
+        db.flush()
         db.add(stock_txn)
 
         allocations.append(
