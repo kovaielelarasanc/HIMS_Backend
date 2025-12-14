@@ -48,6 +48,8 @@ class RisOrder(Base):
                                   ForeignKey("users.id"),
                                   nullable=True)
     approved_at = Column(DateTime, nullable=True)
+    billing_invoice_id = Column(Integer, nullable=True, index=True)
+    billing_status = Column(String(20), default="not_billed")
 
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     updated_by = Column(Integer, ForeignKey("users.id"), nullable=True)

@@ -50,6 +50,9 @@ from app.api import (
     routes_audit_logs,
     routes_lis_masters,
     routes_lis_device,
+    routes_billing_advances,
+    routes_billing_invoice_wallet,
+    routes_billing_wallet
 )
 from app.api.routes_lis_device import connector_router as lis_connector_router
 
@@ -123,6 +126,9 @@ api_router.include_router(routes_ris.router)
 api_router.include_router(routes_billing.router,
                           prefix="/billing",
                           tags=["billing"])
+api_router.include_router(routes_billing_advances.router)
+api_router.include_router(routes_billing_wallet.router )
+api_router.include_router(routes_billing_invoice_wallet.router)
 
 api_router.include_router(routes_ot_masters.router)
 api_router.include_router(routes_ot_schedule_cases.router)

@@ -198,12 +198,9 @@ def seed_permissions(db: Session) -> None:
         ("radiology.attachments", ["add"]),
 
         # -------- OT ----------
-        ("ot.masters", ["view", "create", "update", "delete"]),
+        ("ot.masters", ["view", "create", "update", "delete","manage"]),
         ("ot.specialities", ["view", "create", "update", "delete"]),
-        ("ot.theatres", ["view", "create", "update", "delete"]),
-        ("ot.equipment", ["view", "create", "update", "delete"]),
-        ("ot.environment", ["view", "create", "update", "delete"]),
-        ("ot.schedule", ["view", "create", "update", "delete", "cancel"]),
+        ("ot.schedule", ["view", "create", "update", "delete", "cancel", "manage"]),
         ("ot.cases", ["view", "create", "update", "delete", "close"]),
         ("ot.pre_anaesthesia", ["view", "create", "update"]),
         ("ot.preop_checklist", ["view", "create", "update"]),

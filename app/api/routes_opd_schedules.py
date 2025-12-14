@@ -49,6 +49,8 @@ def ensure_can_mutate_schedule(user: User, sch: OpdSchedule):
     raise HTTPException(status_code=403, detail="Not permitted")
 
 
+
+
 @router.get("/schedules", response_model=List[OpdScheduleOut])
 def list_schedules(
         doctor_user_id: Optional[int] = Query(None),

@@ -232,7 +232,10 @@ class IpdAdmission(Base):
     )  # admitted/transferred/discharged/lama/dama/disappeared
 
     abha_shared_at = Column(DateTime, nullable=True)
-
+    billing_locked = Column(Boolean, default=False, nullable=False)
+    billing_locked_at = Column(DateTime, nullable=True)
+    billing_locked_by = Column(Integer, nullable=True)
+    discharge_at = Column(DateTime, nullable=True)
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -447,8 +450,6 @@ class IpdTransfer(Base):
 # ---------------------------------------------------------------------
 # Nursing / Clinical
 # ---------------------------------------------------------------------
-
-
 class IpdNursingNote(Base):
     __tablename__ = "ipd_nursing_notes"
     __table_args__ = {
@@ -472,7 +473,7 @@ class IpdNursingNote(Base):
         nullable=False,
     )
 
-    # 🔗 DIRECT LINK TO VITALS ROW (optional)
+    # ✅ DIRECT LINK TO ONE VITALS ROW (optional)
     linked_vital_id = Column(
         Integer,
         ForeignKey("ipd_vitals.id"),
@@ -480,48 +481,16 @@ class IpdNursingNote(Base):
         index=True,
     )
 
-    wound_status = Column(
-        String(255),
-        nullable=False,
-        default="",
-        comment="e.g. Clean, dry, soaked, oozing, dressing intact",
-    )
-    oxygen_support = Column(
-        String(255),
-        nullable=False,
-        default="",
-        comment="e.g. Room air / NC 2L / NRBM 10L / Ventilator",
-    )
-    urine_output = Column(
-        String(255),
-        nullable=False,
-        default="",
-        comment="e.g. 200 ml clear in last 4 hrs, catheter in situ",
-    )
-    drains_tubes = Column(
-        String(255),
-        nullable=False,
-        default="",
-        comment="e.g. ICD, Ryle’s tube, drains – status",
-    )
-    pain_score = Column(
-        String(50),
-        nullable=False,
-        default="",
-        comment="e.g. Pain score 3/10 on VAS",
-    )
-    other_findings = Column(
-        Text,
-        nullable=False,
-        default="",
-        comment="Any other observations not covered above.",
-    )
-    note_type = Column(
-        String(20),
-        nullable=False,
-        default="routine",
-    )
-    # 🔹 Shift handover specific fields
+    wound_status = Column(String(255), nullable=False, default="")
+    oxygen_support = Column(String(255), nullable=False, default="")
+    urine_output = Column(String(255), nullable=False, default="")
+    drains_tubes = Column(String(255), nullable=False, default="")
+    pain_score = Column(String(50), nullable=False, default="")
+    other_findings = Column(Text, nullable=False, default="")
+
+    note_type = Column(String(20), nullable=False, default="routine")
+
+    # Shift handover fields
     vital_signs_summary = Column(Text, nullable=False, default="")
     todays_procedures = Column(Text, nullable=False, default="")
     current_condition = Column(Text, nullable=False, default="")
@@ -529,7 +498,7 @@ class IpdNursingNote(Base):
     ongoing_treatment = Column(Text, nullable=False, default="")
     watch_next_shift = Column(Text, nullable=False, default="")
 
-    # Core NABH text fields (as before)
+    # NABH core text fields
     entry_time = Column(
         DateTime(timezone=True),
         nullable=False,
@@ -543,7 +512,7 @@ class IpdNursingNote(Base):
     response_progress = Column(Text, nullable=False, default="")
     handover_note = Column(Text, nullable=False, default="")
 
-    # Extra: shift, ICU, audit fields
+    # Extra audit/flags
     shift = Column(String(20), nullable=True, index=True)
     is_icu = Column(Boolean, nullable=False, default=False)
 
@@ -561,15 +530,20 @@ class IpdNursingNote(Base):
         onupdate=func.now(),
     )
     is_locked = Column(Boolean, nullable=False, default=False)
-    # 👇 NEW: relationship NAME MUST BE "vitals"
+
+    # ---------------- Relationships ----------------
+    admission = relationship("IpdAdmission", back_populates="nursing_notes")
+    nurse = relationship("User")
+
+    # ✅ IMPORTANT:
+    # Keep ONLY ONE relationship that uses linked_vital_id.
+    # Name it "vitals" to match your Pydantic NursingNoteOut.vitals
     vitals = relationship(
         "IpdVital",
         foreign_keys=[linked_vital_id],
         uselist=False,
+        lazy="joined",
     )
-    admission = relationship("IpdAdmission", back_populates="nursing_notes")
-    nurse = relationship("User")
-    linked_vital = relationship("IpdVital")
 
 
 class IpdShiftHandover(Base):
@@ -599,11 +573,25 @@ class IpdShiftHandover(Base):
 
 class IpdVital(Base):
     __tablename__ = "ipd_vitals"
+    __table_args__ = {
+        "mysql_engine": "InnoDB",
+        "mysql_charset": "utf8mb4",
+        "mysql_collate": "utf8mb4_unicode_ci",
+    }
 
     id = Column(Integer, primary_key=True)
-    admission_id = Column(Integer, ForeignKey("ipd_admissions.id"), index=True)
-    recorded_at = Column(DateTime, default=datetime.utcnow)
-    recorded_by = Column(Integer, ForeignKey("users.id"))
+
+    admission_id = Column(
+        Integer,
+        ForeignKey("ipd_admissions.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+
+    recorded_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    recorded_by = Column(Integer,
+                         ForeignKey("users.id", ondelete="RESTRICT"),
+                         nullable=False)
 
     bp_systolic = Column(Integer, nullable=True)
     bp_diastolic = Column(Integer, nullable=True)
@@ -613,6 +601,13 @@ class IpdVital(Base):
     pulse = Column(Integer, nullable=True)
 
     admission = relationship("IpdAdmission", back_populates="vitals")
+    recorder = relationship("User", foreign_keys=[recorded_by])
+    nursing_note = relationship(
+        "IpdNursingNote",
+        uselist=False,
+        primaryjoin="IpdVital.id==IpdNursingNote.linked_vital_id",
+        viewonly=True,
+    )
 
 
 class IpdIntakeOutput(Base):

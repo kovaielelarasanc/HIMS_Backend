@@ -15,10 +15,18 @@ from sqlalchemy import (
     Text,
     Numeric,
     JSON,
+    UniqueConstraint,
+    Index,
 )
 from sqlalchemy.orm import relationship
 
 from app.db.base import Base
+
+MYSQL_ARGS = {
+    "mysql_engine": "InnoDB",
+    "mysql_charset": "utf8mb4",
+    "mysql_collate": "utf8mb4_unicode_ci",
+}
 
 # ============================================================
 #  OT MASTERS
@@ -30,10 +38,10 @@ class OtSpeciality(Base):
     Master for OT Specialities / Types (General, Ortho, Neuro, Cardiac, etc.)
     """
     __tablename__ = "ot_specialities"
-    __table_args__ = {
-        "mysql_engine": "InnoDB",
-        "mysql_charset": "utf8mb4",
-    }
+    __table_args__ = (
+        Index("ix_ot_specialities_active", "is_active"),
+        MYSQL_ARGS,
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     code = Column(String(50), unique=True, nullable=False, index=True)
@@ -42,14 +50,11 @@ class OtSpeciality(Base):
     is_active = Column(Boolean, default=True, nullable=False)
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(
-        DateTime,
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
-        nullable=False,
-    )
+    updated_at = Column(DateTime,
+                        default=datetime.utcnow,
+                        onupdate=datetime.utcnow,
+                        nullable=False)
 
-    # ✅ Only procedures now – NO theatres
     procedures = relationship(
         "OtProcedure",
         back_populates="speciality",
@@ -64,29 +69,22 @@ class OtProcedure(Base):
     - rate is defined per hour (can be used to auto-calculate billing)
     """
     __tablename__ = "ot_procedures"
-    __table_args__ = {
-        "mysql_engine": "InnoDB",
-        "mysql_charset": "utf8mb4",
-    }
-
-    id = Column(Integer, primary_key=True)
-    code = Column(String(50), unique=True, nullable=False)
-    name = Column(String(255), nullable=False)
-
-    # Optional mapping to speciality (for reports & filtering)
-    speciality_id = Column(
-        Integer,
-        ForeignKey("ot_specialities.id"),
-        nullable=True,
+    __table_args__ = (
+        Index("ix_ot_procedures_active", "is_active"),
+        Index("ix_ot_procedures_speciality", "speciality_id"),
+        MYSQL_ARGS,
     )
 
-    # Default estimated duration for scheduling (in minutes)
+    id = Column(Integer, primary_key=True)
+    code = Column(String(50), unique=True, nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+
+    speciality_id = Column(Integer,
+                           ForeignKey("ot_specialities.id"),
+                           nullable=True)
+
     default_duration_min = Column(Integer, nullable=True)
-
-    # Amount per hour for billing (e.g., surgery charges)
     rate_per_hour = Column(Numeric(10, 2), nullable=True)
-
-    # Extra description or notes (e.g., “Includes surgeon + anaesthetist”)
     description = Column(Text, nullable=True)
 
     is_active = Column(Boolean, default=True, nullable=False)
@@ -94,7 +92,6 @@ class OtProcedure(Base):
 
     speciality = relationship("OtSpeciality", back_populates="procedures")
 
-    # Link to schedules via junction table
     schedule_links = relationship(
         "OtScheduleProcedure",
         back_populates="procedure",
@@ -108,10 +105,11 @@ class OtEquipmentMaster(Base):
     Example: Anaesthesia Machine, Defibrillator, Suction, OT Table, Cautery.
     """
     __tablename__ = "ot_equipment_master"
-    __table_args__ = {
-        "mysql_engine": "InnoDB",
-        "mysql_charset": "utf8mb4",
-    }
+    __table_args__ = (
+        Index("ix_ot_equipment_active", "is_active"),
+        Index("ix_ot_equipment_category", "category"),
+        MYSQL_ARGS,
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     code = Column(String(50), unique=True, nullable=False, index=True)
@@ -123,12 +121,10 @@ class OtEquipmentMaster(Base):
     is_active = Column(Boolean, default=True, nullable=False)
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(
-        DateTime,
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
-        nullable=False,
-    )
+    updated_at = Column(DateTime,
+                        default=datetime.utcnow,
+                        onupdate=datetime.utcnow,
+                        nullable=False)
 
 
 # ============================================================
@@ -142,22 +138,23 @@ class OtScheduleProcedure(Base):
     We still keep primary_procedure_id on OtSchedule for quick access.
     """
     __tablename__ = "ot_schedule_procedures"
-    __table_args__ = {
-        "mysql_engine": "InnoDB",
-        "mysql_charset": "utf8mb4",
-    }
+    __table_args__ = (
+        UniqueConstraint("schedule_id",
+                         "procedure_id",
+                         name="uq_ot_sched_proc"),
+        Index("ix_ot_sched_proc_schedule", "schedule_id"),
+        Index("ix_ot_sched_proc_procedure", "procedure_id"),
+        MYSQL_ARGS,
+    )
 
     id = Column(Integer, primary_key=True)
-    schedule_id = Column(
-        Integer,
-        ForeignKey("ot_schedules.id"),
-        nullable=False,
-    )
-    procedure_id = Column(
-        Integer,
-        ForeignKey("ot_procedures.id"),
-        nullable=False,
-    )
+
+    schedule_id = Column(Integer,
+                         ForeignKey("ot_schedules.id", ondelete="CASCADE"),
+                         nullable=False)
+    procedure_id = Column(Integer,
+                          ForeignKey("ot_procedures.id", ondelete="RESTRICT"),
+                          nullable=False)
     is_primary = Column(Boolean, default=False, nullable=False)
 
     schedule = relationship("OtSchedule", back_populates="procedures")
@@ -166,35 +163,52 @@ class OtScheduleProcedure(Base):
 
 class OtSchedule(Base):
     """
-    OT Schedule – now uses IPD bed (ward/room/bed) instead of OT theatre master.
+    OT Schedule – uses IPD bed master as OT location (OT theatre/room).
+    NOTE:
+      - ot_bed_id means OT LOCATION bed (your replacement for OT theatre master)
+      - patient's actual IPD bed comes from IpdAdmission.current_bed_id / assignments
     """
     __tablename__ = "ot_schedules"
-    __table_args__ = {
-        "mysql_engine": "InnoDB",
-        "mysql_charset": "utf8mb4",
-    }
+    __table_args__ = (
+        # ✅ Enforce true 1:1 schedule <-> case when case_id is set
+        UniqueConstraint("case_id", name="uq_ot_schedules_case_id"),
+        Index("ix_ot_schedules_date", "date"),
+        Index("ix_ot_schedules_status", "status"),
+        Index("ix_ot_schedules_ot_bed_date", "ot_bed_id", "date"),
+        Index("ix_ot_schedules_admission", "admission_id"),
+        Index("ix_ot_schedules_patient", "patient_id"),
+        MYSQL_ARGS,
+    )
 
     id = Column(Integer, primary_key=True)
 
-    # 🔁 Date & planned timing
+    # Planned date & time
     date = Column(Date, nullable=False)
     planned_start_time = Column(Time, nullable=False)
     planned_end_time = Column(Time, nullable=True)
 
-    # 🔁 Patient / IPD link
-    patient_id = Column(Integer, ForeignKey("patients.id"), nullable=True)
+    # Patient / Admission context
+    patient_id = Column(Integer,
+                        ForeignKey("patients.id", ondelete="SET NULL"),
+                        nullable=True)
     admission_id = Column(Integer,
-                          ForeignKey("ipd_admissions.id"),
+                          ForeignKey("ipd_admissions.id", ondelete="SET NULL"),
                           nullable=True)
-    bed_id = Column(Integer, ForeignKey("ipd_beds.id"), nullable=True)
 
-    # 🔁 Surgeon / Anaesthetist
-    surgeon_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    # ✅ OT Location (shared bed master)
+    ot_bed_id = Column(Integer,
+                       ForeignKey("ipd_beds.id", ondelete="SET NULL"),
+                       nullable=True)
+
+    # Staff
+    surgeon_user_id = Column(Integer,
+                             ForeignKey("users.id", ondelete="SET NULL"),
+                             nullable=True)
     anaesthetist_user_id = Column(Integer,
-                                  ForeignKey("users.id"),
+                                  ForeignKey("users.id", ondelete="SET NULL"),
                                   nullable=True)
 
-    # 🔁 Procedure details
+    # Procedure details
     procedure_name = Column(String(255),
                             nullable=True)  # free-text display name
     side = Column(String(50), nullable=True)
@@ -204,39 +218,34 @@ class OtSchedule(Base):
     status = Column(String(50), default="planned", nullable=False)
 
     # Link to OT Case (central surgery record)
-    case_id = Column(
-        Integer,
-        ForeignKey("ot_cases.id", ondelete="SET NULL"),
-        nullable=True,
-    )
+    case_id = Column(Integer,
+                     ForeignKey("ot_cases.id", ondelete="SET NULL"),
+                     nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(
-        DateTime,
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
-        nullable=False,
-    )
+    updated_at = Column(DateTime,
+                        default=datetime.utcnow,
+                        onupdate=datetime.utcnow,
+                        nullable=False)
 
-    # Primary procedure from master (for quick access)
-    primary_procedure_id = Column(
-        Integer,
-        ForeignKey("ot_procedures.id"),
-        nullable=True,
-    )
+    # Primary procedure from master (quick access)
+    primary_procedure_id = Column(Integer,
+                                  ForeignKey("ot_procedures.id",
+                                             ondelete="SET NULL"),
+                                  nullable=True)
 
     # Relationships
     patient = relationship("Patient")
     admission = relationship("IpdAdmission")
-    bed = relationship("IpdBed", lazy="joined")
+
+    # ✅ OT location bed
+    ot_bed = relationship("IpdBed", foreign_keys=[ot_bed_id], lazy="joined")
 
     surgeon = relationship("User", foreign_keys=[surgeon_user_id])
     anaesthetist = relationship("User", foreign_keys=[anaesthetist_user_id])
 
-    primary_procedure = relationship(
-        "OtProcedure",
-        foreign_keys=[primary_procedure_id],
-    )
+    primary_procedure = relationship("OtProcedure",
+                                     foreign_keys=[primary_procedure_id])
 
     procedures = relationship(
         "OtScheduleProcedure",
@@ -244,6 +253,7 @@ class OtSchedule(Base):
         cascade="all, delete-orphan",
     )
 
+    # ✅ schedule -> case is 1:1 (because case_id is UNIQUE)
     case = relationship(
         "OtCase",
         back_populates="schedule",
@@ -258,10 +268,11 @@ class OtCase(Base):
     All checklists, notes, anaesthesia, etc. attach to this.
     """
     __tablename__ = "ot_cases"
-    __table_args__ = {
-        "mysql_engine": "InnoDB",
-        "mysql_charset": "utf8mb4",
-    }
+    __table_args__ = (
+        Index("ix_ot_cases_created_at", "created_at"),
+        Index("ix_ot_cases_speciality", "speciality_id"),
+        MYSQL_ARGS,
+    )
 
     id = Column(Integer, primary_key=True, index=True)
 
@@ -270,11 +281,10 @@ class OtCase(Base):
     postop_diagnosis = Column(Text, nullable=True)
     final_procedure_name = Column(String(255), nullable=True)
 
-    speciality_id = Column(
-        Integer,
-        ForeignKey("ot_specialities.id"),
-        nullable=True,
-    )
+    speciality_id = Column(Integer,
+                           ForeignKey("ot_specialities.id",
+                                      ondelete="SET NULL"),
+                           nullable=True)
 
     # Actual timings
     actual_start_time = Column(DateTime, nullable=True)
@@ -286,19 +296,14 @@ class OtCase(Base):
     immediate_postop_condition = Column(String(255), nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(
-        DateTime,
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
-        nullable=False,
-    )
+    updated_at = Column(DateTime,
+                        default=datetime.utcnow,
+                        onupdate=datetime.utcnow,
+                        nullable=False)
 
-    schedule = relationship(
-        "OtSchedule",
-        back_populates="case",
-        foreign_keys="OtSchedule.case_id",
-        uselist=False,
-    )
+    # ✅ case -> schedule (1:1)
+    schedule = relationship("OtSchedule", back_populates="case", uselist=False)
+
     speciality = relationship("OtSpeciality")
 
     # Clinical linked records (one-to-one or one-to-many)
@@ -363,6 +368,7 @@ class OtCase(Base):
     cleaning_logs = relationship(
         "OtCleaningLog",
         back_populates="case",
+        cascade="all, delete-orphan",
     )
 
     @property
@@ -380,23 +386,20 @@ class PreAnaesthesiaEvaluation(Base):
     Pre-Anaesthetic Evaluation (PAE) form.
     """
     __tablename__ = "ot_pre_anaesthesia_evaluations"
-    __table_args__ = {
-        "mysql_engine": "InnoDB",
-        "mysql_charset": "utf8mb4",
-    }
+    __table_args__ = (
+        UniqueConstraint("case_id", name="uq_ot_pae_case"),
+        Index("ix_ot_pae_anaesthetist", "anaesthetist_user_id"),
+        MYSQL_ARGS,
+    )
 
     id = Column(Integer, primary_key=True)
-    case_id = Column(
-        Integer,
-        ForeignKey("ot_cases.id"),
-        nullable=False,
-        unique=True,
-    )
-    anaesthetist_user_id = Column(
-        Integer,
-        ForeignKey("users.id"),
-        nullable=False,
-    )
+    case_id = Column(Integer,
+                     ForeignKey("ot_cases.id", ondelete="CASCADE"),
+                     nullable=False,
+                     unique=True)
+    anaesthetist_user_id = Column(Integer,
+                                  ForeignKey("users.id", ondelete="RESTRICT"),
+                                  nullable=False)
 
     asa_grade = Column(String(10), nullable=False)  # ASA I–V
     comorbidities = Column(Text, nullable=True)
@@ -418,19 +421,20 @@ class PreOpChecklist(Base):
     JSON holds all checkbox items, remarks etc.
     """
     __tablename__ = "ot_preop_checklists"
-    __table_args__ = {
-        "mysql_engine": "InnoDB",
-        "mysql_charset": "utf8mb4",
-    }
+    __table_args__ = (
+        UniqueConstraint("case_id", name="uq_ot_preop_case"),
+        Index("ix_ot_preop_nurse", "nurse_user_id"),
+        MYSQL_ARGS,
+    )
 
     id = Column(Integer, primary_key=True)
-    case_id = Column(
-        Integer,
-        ForeignKey("ot_cases.id"),
-        nullable=False,
-        unique=True,
-    )
-    nurse_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    case_id = Column(Integer,
+                     ForeignKey("ot_cases.id", ondelete="CASCADE"),
+                     nullable=False,
+                     unique=True)
+    nurse_user_id = Column(Integer,
+                           ForeignKey("users.id", ondelete="RESTRICT"),
+                           nullable=False)
 
     data = Column(JSON, nullable=False)  # {field: {value, remark}}
     completed = Column(Boolean, default=False, nullable=False)
@@ -448,32 +452,35 @@ class SurgicalSafetyChecklist(Base):
     Each phase stored as JSON.
     """
     __tablename__ = "ot_safety_checklists"
-    __table_args__ = {
-        "mysql_engine": "InnoDB",
-        "mysql_charset": "utf8mb4",
-    }
-
-    id = Column(Integer, primary_key=True)
-    case_id = Column(
-        Integer,
-        ForeignKey("ot_cases.id"),
-        nullable=False,
-        unique=True,
+    __table_args__ = (
+        UniqueConstraint("case_id", name="uq_ot_safety_case"),
+        Index("ix_ot_safety_signin_by", "sign_in_done_by_id"),
+        Index("ix_ot_safety_timeout_by", "time_out_done_by_id"),
+        Index("ix_ot_safety_signout_by", "sign_out_done_by_id"),
+        MYSQL_ARGS,
     )
 
+    id = Column(Integer, primary_key=True)
+    case_id = Column(Integer,
+                     ForeignKey("ot_cases.id", ondelete="CASCADE"),
+                     nullable=False,
+                     unique=True)
+
     sign_in_data = Column(JSON, nullable=True)
-    sign_in_done_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    sign_in_done_by_id = Column(Integer,
+                                ForeignKey("users.id", ondelete="SET NULL"),
+                                nullable=True)
     sign_in_time = Column(DateTime, nullable=True)
 
     time_out_data = Column(JSON, nullable=True)
     time_out_done_by_id = Column(Integer,
-                                 ForeignKey("users.id"),
+                                 ForeignKey("users.id", ondelete="SET NULL"),
                                  nullable=True)
     time_out_time = Column(DateTime, nullable=True)
 
     sign_out_data = Column(JSON, nullable=True)
     sign_out_done_by_id = Column(Integer,
-                                 ForeignKey("users.id"),
+                                 ForeignKey("users.id", ondelete="SET NULL"),
                                  nullable=True)
     sign_out_time = Column(DateTime, nullable=True)
 
@@ -491,23 +498,20 @@ class AnaesthesiaRecord(Base):
     Real-time vitals and drug logs are in child tables.
     """
     __tablename__ = "ot_anaesthesia_records"
-    __table_args__ = {
-        "mysql_engine": "InnoDB",
-        "mysql_charset": "utf8mb4",
-    }
+    __table_args__ = (
+        UniqueConstraint("case_id", name="uq_ot_anaesthesia_case"),
+        Index("ix_ot_anaesthesia_anaesthetist", "anaesthetist_user_id"),
+        MYSQL_ARGS,
+    )
 
     id = Column(Integer, primary_key=True)
-    case_id = Column(
-        Integer,
-        ForeignKey("ot_cases.id"),
-        nullable=False,
-        unique=True,
-    )
-    anaesthetist_user_id = Column(
-        Integer,
-        ForeignKey("users.id"),
-        nullable=False,
-    )
+    case_id = Column(Integer,
+                     ForeignKey("ot_cases.id", ondelete="CASCADE"),
+                     nullable=False,
+                     unique=True)
+    anaesthetist_user_id = Column(Integer,
+                                  ForeignKey("users.id", ondelete="RESTRICT"),
+                                  nullable=False)
 
     preop_vitals = Column(JSON, nullable=True)  # baseline vitals snapshot
     plan = Column(Text, nullable=True)  # GA/Spinal/Epidural etc.
@@ -519,6 +523,7 @@ class AnaesthesiaRecord(Base):
 
     case = relationship("OtCase", back_populates="anaesthesia_record")
     anaesthetist = relationship("User")
+
     vitals = relationship(
         "AnaesthesiaVitalLog",
         back_populates="record",
@@ -536,21 +541,20 @@ class AnaesthesiaVitalLog(Base):
     Time-series vitals during anaesthesia.
     """
     __tablename__ = "ot_anaesthesia_vitals"
-    __table_args__ = {
-        "mysql_engine": "InnoDB",
-        "mysql_charset": "utf8mb4",
-    }
+    __table_args__ = (
+        Index("ix_ot_an_vitals_record_time", "record_id", "time"),
+        MYSQL_ARGS,
+    )
 
     id = Column(Integer, primary_key=True)
-    record_id = Column(
-        Integer,
-        ForeignKey("ot_anaesthesia_records.id"),
-        nullable=False,
-    )
+    record_id = Column(Integer,
+                       ForeignKey("ot_anaesthesia_records.id",
+                                  ondelete="CASCADE"),
+                       nullable=False,
+                       index=True)
 
     time = Column(DateTime, nullable=False)
 
-    # EXISTING
     bp_systolic = Column(Integer, nullable=True)
     bp_diastolic = Column(Integer, nullable=True)
     pulse = Column(Integer, nullable=True)
@@ -560,15 +564,11 @@ class AnaesthesiaVitalLog(Base):
     temperature = Column(Numeric(4, 1), nullable=True)
     comments = Column(String(255), nullable=True)
 
-    # 🔸 NEW – rows from the sheet
     ventilation_mode = Column(
-        String(20),
-        nullable=True)  # 'Spont', 'Assist', 'Control', 'Manual', 'Ventilator'
-
+        String(20), nullable=True)  # Spont/Assist/Control/Manual/Ventilator
     peak_airway_pressure = Column(Numeric(5, 2), nullable=True)  # cmH2O
     cvp_pcwp = Column(Numeric(5, 2), nullable=True)  # CVP / PCWP
-    st_segment = Column(String(20),
-                        nullable=True)  # 'Normal', 'Depression', etc.
+    st_segment = Column(String(20), nullable=True)  # Normal/Depression/...
     urine_output_ml = Column(Integer, nullable=True)
     blood_loss_ml = Column(Integer, nullable=True)
 
@@ -580,17 +580,17 @@ class AnaesthesiaDrugLog(Base):
     Intra-op drug administration log.
     """
     __tablename__ = "ot_anaesthesia_drugs"
-    __table_args__ = {
-        "mysql_engine": "InnoDB",
-        "mysql_charset": "utf8mb4",
-    }
+    __table_args__ = (
+        Index("ix_ot_an_drugs_record_time", "record_id", "time"),
+        MYSQL_ARGS,
+    )
 
     id = Column(Integer, primary_key=True)
-    record_id = Column(
-        Integer,
-        ForeignKey("ot_anaesthesia_records.id"),
-        nullable=False,
-    )
+    record_id = Column(Integer,
+                       ForeignKey("ot_anaesthesia_records.id",
+                                  ondelete="CASCADE"),
+                       nullable=False,
+                       index=True)
 
     time = Column(DateTime, nullable=False)
     drug_name = Column(String(255), nullable=False)
@@ -606,21 +606,21 @@ class OtNursingRecord(Base):
     Intra-operative nursing care record – aligned with UI NursingTab.
     """
     __tablename__ = "ot_nursing_records"
-    __table_args__ = {
-        "mysql_engine": "InnoDB",
-        "mysql_charset": "utf8mb4",
-    }
+    __table_args__ = (
+        UniqueConstraint("case_id", name="uq_ot_nursing_case"),
+        Index("ix_ot_nursing_primary_nurse", "primary_nurse_id"),
+        MYSQL_ARGS,
+    )
 
     id = Column(Integer, primary_key=True)
 
-    case_id = Column(
-        Integer,
-        ForeignKey("ot_cases.id"),
-        nullable=False,
-        unique=True,
-    )
-
-    primary_nurse_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    case_id = Column(Integer,
+                     ForeignKey("ot_cases.id", ondelete="CASCADE"),
+                     nullable=False,
+                     unique=True)
+    primary_nurse_id = Column(Integer,
+                              ForeignKey("users.id", ondelete="SET NULL"),
+                              nullable=True)
 
     scrub_nurse_name = Column(String(255), nullable=True)
     circulating_nurse_name = Column(String(255), nullable=True)
@@ -639,12 +639,10 @@ class OtNursingRecord(Base):
     notes = Column(Text, nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(
-        DateTime,
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
-        nullable=False,
-    )
+    updated_at = Column(DateTime,
+                        default=datetime.utcnow,
+                        onupdate=datetime.utcnow,
+                        nullable=False)
 
     case = relationship("OtCase", back_populates="nursing_record")
     primary_nurse = relationship("User")
@@ -655,18 +653,16 @@ class OtSpongeInstrumentCount(Base):
     Sponge & instrument count record.
     """
     __tablename__ = "ot_sponge_instrument_counts"
-    __table_args__ = {
-        "mysql_engine": "InnoDB",
-        "mysql_charset": "utf8mb4",
-    }
+    __table_args__ = (
+        UniqueConstraint("case_id", name="uq_ot_counts_case"),
+        MYSQL_ARGS,
+    )
 
     id = Column(Integer, primary_key=True)
-    case_id = Column(
-        Integer,
-        ForeignKey("ot_cases.id"),
-        nullable=False,
-        unique=True,
-    )
+    case_id = Column(Integer,
+                     ForeignKey("ot_cases.id", ondelete="CASCADE"),
+                     nullable=False,
+                     unique=True)
 
     initial_count_data = Column(JSON, nullable=True)
     final_count_data = Column(JSON, nullable=True)
@@ -674,12 +670,10 @@ class OtSpongeInstrumentCount(Base):
     discrepancy_notes = Column(Text, nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(
-        DateTime,
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
-        nullable=True,
-    )
+    updated_at = Column(DateTime,
+                        default=datetime.utcnow,
+                        onupdate=datetime.utcnow,
+                        nullable=True)
 
     case = relationship("OtCase", back_populates="counts_record")
 
@@ -689,13 +683,16 @@ class OtImplantRecord(Base):
     Implants / prosthesis used in surgery.
     """
     __tablename__ = "ot_implant_records"
-    __table_args__ = {
-        "mysql_engine": "InnoDB",
-        "mysql_charset": "utf8mb4",
-    }
+    __table_args__ = (
+        Index("ix_ot_implants_case", "case_id"),
+        MYSQL_ARGS,
+    )
 
     id = Column(Integer, primary_key=True)
-    case_id = Column(Integer, ForeignKey("ot_cases.id"), nullable=False)
+    case_id = Column(Integer,
+                     ForeignKey("ot_cases.id", ondelete="CASCADE"),
+                     nullable=False,
+                     index=True)
 
     implant_name = Column(String(255), nullable=False)
     size = Column(String(50), nullable=True)
@@ -715,19 +712,20 @@ class OperationNote(Base):
     Surgeon’s Operation Notes.
     """
     __tablename__ = "ot_operation_notes"
-    __table_args__ = {
-        "mysql_engine": "InnoDB",
-        "mysql_charset": "utf8mb4",
-    }
+    __table_args__ = (
+        UniqueConstraint("case_id", name="uq_ot_opnote_case"),
+        Index("ix_ot_opnote_surgeon", "surgeon_user_id"),
+        MYSQL_ARGS,
+    )
 
     id = Column(Integer, primary_key=True)
-    case_id = Column(
-        Integer,
-        ForeignKey("ot_cases.id"),
-        nullable=False,
-        unique=True,
-    )
-    surgeon_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    case_id = Column(Integer,
+                     ForeignKey("ot_cases.id", ondelete="CASCADE"),
+                     nullable=False,
+                     unique=True)
+    surgeon_user_id = Column(Integer,
+                             ForeignKey("users.id", ondelete="RESTRICT"),
+                             nullable=False)
 
     preop_diagnosis = Column(Text, nullable=True)
     postop_diagnosis = Column(Text, nullable=True)
@@ -740,12 +738,10 @@ class OperationNote(Base):
     postop_instructions = Column(Text, nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(
-        DateTime,
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
-        nullable=False,
-    )
+    updated_at = Column(DateTime,
+                        default=datetime.utcnow,
+                        onupdate=datetime.utcnow,
+                        nullable=False)
 
     case = relationship("OtCase", back_populates="operation_note")
     surgeon = relationship("User")
@@ -756,13 +752,16 @@ class OtBloodTransfusionRecord(Base):
     OT-side blood / blood component transfusion details.
     """
     __tablename__ = "ot_blood_transfusion_records"
-    __table_args__ = {
-        "mysql_engine": "InnoDB",
-        "mysql_charset": "utf8mb4",
-    }
+    __table_args__ = (
+        Index("ix_ot_blood_case", "case_id"),
+        MYSQL_ARGS,
+    )
 
     id = Column(Integer, primary_key=True)
-    case_id = Column(Integer, ForeignKey("ot_cases.id"), nullable=False)
+    case_id = Column(Integer,
+                     ForeignKey("ot_cases.id", ondelete="CASCADE"),
+                     nullable=False,
+                     index=True)
 
     component = Column(String(50),
                        nullable=False)  # PRBC / FFP / Platelet / etc.
@@ -782,19 +781,20 @@ class PacuRecord(Base):
     Post-Anaesthesia Care Unit (Recovery) record.
     """
     __tablename__ = "ot_pacu_records"
-    __table_args__ = {
-        "mysql_engine": "InnoDB",
-        "mysql_charset": "utf8mb4",
-    }
+    __table_args__ = (
+        UniqueConstraint("case_id", name="uq_ot_pacu_case"),
+        Index("ix_ot_pacu_nurse", "nurse_user_id"),
+        MYSQL_ARGS,
+    )
 
     id = Column(Integer, primary_key=True)
-    case_id = Column(
-        Integer,
-        ForeignKey("ot_cases.id"),
-        nullable=False,
-        unique=True,
-    )
-    nurse_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    case_id = Column(Integer,
+                     ForeignKey("ot_cases.id", ondelete="CASCADE"),
+                     nullable=False,
+                     unique=True)
+    nurse_user_id = Column(Integer,
+                           ForeignKey("users.id", ondelete="RESTRICT"),
+                           nullable=False)
 
     admission_time = Column(DateTime, nullable=True)
     discharge_time = Column(DateTime, nullable=True)
@@ -817,64 +817,78 @@ class PacuRecord(Base):
 
 class OtEquipmentDailyChecklist(Base):
     """
-    Daily equipment checklist per OT location (now tied to IPD bed).
+    Daily equipment checklist per OT location (tied to IPD bed master).
     `data` holds checklist items mapped from OtEquipmentMaster.
     """
     __tablename__ = "ot_equipment_checklists"
-    __table_args__ = {
-        "mysql_engine": "InnoDB",
-        "mysql_charset": "utf8mb4",
-    }
+    __table_args__ = (
+        Index("ix_ot_eq_chk_ot_bed_date", "ot_bed_id", "date"),
+        Index("ix_ot_eq_chk_checked_by", "checked_by_user_id"),
+        MYSQL_ARGS,
+    )
 
     id = Column(Integer, primary_key=True)
 
-    # 🔁 use bed_id instead of theatre
-    bed_id = Column(Integer, ForeignKey("ipd_beds.id"), nullable=True)
+    # ✅ OT location bed
+    ot_bed_id = Column(Integer,
+                       ForeignKey("ipd_beds.id", ondelete="SET NULL"),
+                       nullable=True,
+                       index=True)
+
     date = Column(Date, nullable=False)
     shift = Column(String(50),
                    nullable=True)  # Morning / Evening / Night, etc.
 
     checked_by_user_id = Column(Integer,
-                                ForeignKey("users.id"),
+                                ForeignKey("users.id", ondelete="RESTRICT"),
                                 nullable=False)
     data = Column(
-        JSON,
-        nullable=False,
-    )  # {equipment_id or code: {ok: bool, remark: str}}
+        JSON, nullable=False)  # {equipment_id/code: {ok: bool, remark: str}}
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
-    bed = relationship("IpdBed")
+    ot_bed = relationship("IpdBed", foreign_keys=[ot_bed_id], lazy="joined")
     checked_by = relationship("User")
 
 
 class OtCleaningLog(Base):
     """
     OT cleaning / sterility log (between cases and daily).
-    Now optionally tied to bed instead of theatre.
+    Tied to OT location bed (shared master) and optionally a case.
     """
     __tablename__ = "ot_cleaning_logs"
-    __table_args__ = {
-        "mysql_engine": "InnoDB",
-        "mysql_charset": "utf8mb4",
-    }
+    __table_args__ = (
+        Index("ix_ot_clean_ot_bed_date", "ot_bed_id", "date"),
+        Index("ix_ot_clean_case", "case_id"),
+        Index("ix_ot_clean_done_by", "done_by_user_id"),
+        MYSQL_ARGS,
+    )
 
     id = Column(Integer, primary_key=True)
 
-    bed_id = Column(Integer, ForeignKey("ipd_beds.id"), nullable=True)
+    ot_bed_id = Column(Integer,
+                       ForeignKey("ipd_beds.id", ondelete="SET NULL"),
+                       nullable=True,
+                       index=True)
     date = Column(Date, nullable=False)
     session = Column(String(50),
                      nullable=True)  # pre-list / between-cases / EOD
-    case_id = Column(Integer, ForeignKey("ot_cases.id"), nullable=True)
+
+    case_id = Column(Integer,
+                     ForeignKey("ot_cases.id", ondelete="SET NULL"),
+                     nullable=True,
+                     index=True)
 
     method = Column(String(255),
                     nullable=True)  # mopping, fumigation, UV, etc.
-    done_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    done_by_user_id = Column(Integer,
+                             ForeignKey("users.id", ondelete="RESTRICT"),
+                             nullable=False)
     remarks = Column(Text, nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
-    bed = relationship("IpdBed")
+    ot_bed = relationship("IpdBed", foreign_keys=[ot_bed_id], lazy="joined")
     case = relationship("OtCase", back_populates="cleaning_logs")
     done_by = relationship("User")
 
@@ -882,17 +896,20 @@ class OtCleaningLog(Base):
 class OtEnvironmentLog(Base):
     """
     Temperature, humidity, and pressure differential logs per OT location.
-    Now tied to IPD bed.
     """
     __tablename__ = "ot_environment_logs"
-    __table_args__ = {
-        "mysql_engine": "InnoDB",
-        "mysql_charset": "utf8mb4",
-    }
+    __table_args__ = (
+        Index("ix_ot_env_ot_bed_date_time", "ot_bed_id", "date", "time"),
+        Index("ix_ot_env_logged_by", "logged_by_user_id"),
+        MYSQL_ARGS,
+    )
 
     id = Column(Integer, primary_key=True)
 
-    bed_id = Column(Integer, ForeignKey("ipd_beds.id"), nullable=True)
+    ot_bed_id = Column(Integer,
+                       ForeignKey("ipd_beds.id", ondelete="SET NULL"),
+                       nullable=True,
+                       index=True)
     date = Column(Date, nullable=False)
     time = Column(Time, nullable=False)
 
@@ -900,8 +917,10 @@ class OtEnvironmentLog(Base):
     humidity_percent = Column(Numeric(4, 1), nullable=True)
     pressure_diff_pa = Column(Numeric(6, 2), nullable=True)
 
-    logged_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    logged_by_user_id = Column(Integer,
+                               ForeignKey("users.id", ondelete="RESTRICT"),
+                               nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
-    bed = relationship("IpdBed")
+    ot_bed = relationship("IpdBed", foreign_keys=[ot_bed_id], lazy="joined")
     logged_by = relationship("User")

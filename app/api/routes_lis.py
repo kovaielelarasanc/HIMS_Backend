@@ -16,7 +16,7 @@ from fastapi import (
 )
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-
+from app.services.lis_billing import bill_lis_order
 from app.api.deps import get_db, current_user
 from app.models.user import User
 from app.models.opd import LabTest
@@ -51,8 +51,10 @@ from reportlab.lib.units import mm
 from reportlab.lib import colors
 from reportlab.lib.utils import ImageReader
 from pathlib import Path
+from app.models.opd import Visit
+from app.models.ipd import IpdAdmission
 import logging
-
+from app.services.billing_bridge import create_or_get_invoice_for_lis_order
 from app.core.config import settings
 from app.services.ui_branding import get_ui_branding
 
@@ -79,6 +81,27 @@ def _need_any(user: User, codes: list[str]):
             if p.code in codes:
                 return
     raise HTTPException(status_code=403, detail="Not permitted")
+
+
+def _infer_context_type(db: Session, context_id: int | None) -> str | None:
+    """
+    If context_id exists but context_type not provided:
+      - if Visit exists => opd
+      - else if Admission exists => ipd
+      - else None
+    """
+    if not context_id:
+        return None
+
+    v = db.query(Visit.id).filter(Visit.id == context_id).first()
+    if v:
+        return "opd"
+
+    a = db.query(IpdAdmission.id).filter(IpdAdmission.id == context_id).first()
+    if a:
+        return "ipd"
+
+    return None
 
 
 # ---------------- Real-time (WebSocket) ----------------
@@ -110,7 +133,7 @@ _ws = _WSManager()
 
 @router.websocket("/ws")
 async def lab_ws(websocket: WebSocket):
-    await _WSManager().connect(websocket)
+    await _ws.connect(websocket)  # ✅ correct (global instance)
     try:
         while True:
             await websocket.receive_text()
@@ -211,23 +234,28 @@ def list_lab_masters(
 
 # ------------------- Create Order -------------------
 @router.post("/orders")
-def create_order(
-        payload: LisOrderCreate,
-        db: Session = Depends(get_db),
-        user: User = Depends(current_user),
-):
+def create_order(payload: LisOrderCreate,
+                 db: Session = Depends(get_db),
+                 user: User = Depends(current_user)):
     _need_any(user, ["orders.lab.create", "lab.orders.create"])
+
     if not payload.items:
         raise HTTPException(422, "At least one test is required")
 
+    # ✅ auto infer context_type
+    ctx_type = payload.context_type
+    if not ctx_type and payload.context_id:
+        ctx_type = _infer_context_type(db, payload.context_id)
+
     order = LisOrder(
         patient_id=payload.patient_id,
-        context_type=payload.context_type,
+        context_type=ctx_type,
         context_id=payload.context_id,
         ordering_user_id=payload.ordering_user_id or user.id,
         priority=payload.priority or "routine",
         status="ordered",
         created_by=user.id,
+        billing_status="not_billed",
     )
     db.add(order)
     db.flush()
@@ -236,18 +264,23 @@ def create_order(
         m = db.query(LabTest).get(it.test_id)
         if not m:
             raise HTTPException(404, f"LabTest not found: {it.test_id}")
+
         db.add(
             LisOrderItem(
                 order_id=order.id,
                 test_id=m.id,
-                test_name=getattr(m, "name", f"Test {m.id}"),
-                test_code=getattr(m, "code", ""),
+                test_name=m.name,
+                test_code=m.code,
                 status="ordered",
                 created_by=user.id,
             ))
 
     db.commit()
-    return {"id": order.id, "message": "LIS order created"}
+    return {
+        "id": order.id,
+        "context_type": order.context_type,
+        "message": "LIS order created"
+    }
 
 
 # ---------------- LIST ORDERS ----------------
@@ -1173,16 +1206,43 @@ def validate_item(
 
 
 # ---------------- FINALIZE ORDER ----------------
+
+
 @router.post("/orders/{order_id}/finalize")
-def finalize(order_id: int, db: Session = Depends(get_db)):
+async def finalize(order_id: int,
+                   db: Session = Depends(get_db),
+                   user: User = Depends(current_user)):
+    # optional permission gate
+    _need_any(user,
+              ["lab.results.report", "lab.orders.update", "orders.lab.update"])
+
     o = db.query(LisOrder).get(order_id)
     if not o:
         raise HTTPException(404, "Order not found")
 
+    # ✅ LIS finalize
+    now = datetime.utcnow()
     o.status = "reported"
-    o.reported_at = datetime.now()
+    o.reported_at = now
+    o.updated_by = user.id
+    o.updated_at = now
+
+    # ✅ Auto-create billing invoice once (idempotent)
+    if (getattr(o, "billing_status", None) or "not_billed") != "billed":
+        inv = bill_lis_order(db, order=o, created_by=user.id)
+        o.billing_invoice_id = inv.id
+        o.billing_status = "billed"
+
     db.commit()
-    return {"message": "Finalized"}
+
+    await _notify("finalized",
+                  order_id=o.id,
+                  billing_invoice_id=o.billing_invoice_id)
+    return {
+        "message": "Finalized",
+        "billing_invoice_id": o.billing_invoice_id,
+        "billing_status": o.billing_status,
+    }
 
 
 # ------------------- Attachments -------------------

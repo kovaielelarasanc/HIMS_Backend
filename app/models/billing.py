@@ -13,9 +13,10 @@ from sqlalchemy import (
     ForeignKey,
     UniqueConstraint,
     Text,
+    BigInteger,
 )
 from sqlalchemy.orm import relationship
-
+from decimal import Decimal, ROUND_HALF_UP
 from app.db.base import Base
 
 
@@ -62,7 +63,8 @@ class Invoice(Base):
     id = Column(Integer, primary_key=True, index=True)
 
     # Optional invoice number visible in print (INV-000001 etc.)
-    invoice_number = Column(String(30), unique=True, index=True, nullable=True)
+    invoice_uid = Column(String(36), unique=True, index=True, nullable=True)
+    invoice_number = Column(String(32), unique=True, index=True, nullable=True)
 
     patient_id = Column(
         Integer,
@@ -121,7 +123,7 @@ class Invoice(Base):
     balance_due = Column(Numeric(12, 2), default=0)
 
     # Header-level discount applied on total
-    header_discount_percent = Column(Numeric(5, 2), default=0)
+    header_discount_percent = Column(Numeric(10, 2), default=0)
     header_discount_amount = Column(Numeric(12, 2), default=0)
 
     discount_remarks = Column(String(255), nullable=True)
@@ -147,6 +149,7 @@ class Invoice(Base):
         default=datetime.utcnow,
         onupdate=datetime.utcnow,
     )
+    patient = relationship("Patient")
 
     items = relationship(
         "InvoiceItem",
@@ -170,24 +173,141 @@ class Invoice(Base):
         back_populates="billing_invoice",
         lazy="selectin",
     )
+    # FILE: app/models/billing.py
+    # put this INSIDE class Invoice (indentation must match other methods in class)
+
+    # ---------- Billing math helpers ----------
+    @staticmethod
+    def _d(v) -> Decimal:
+        if v is None:
+            return Decimal("0")
+        return Decimal(str(v))
+
+    @staticmethod
+    def _q2(v: Decimal) -> Decimal:
+        return v.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    def recalc(self) -> None:
+        """
+        Recalculate invoice totals from items.
+
+        Counts only items where is_voided=False.
+
+        Item math:
+          base = qty * unit_price
+          line_discount = discount_amount (if >0) else base * discount_percent/100
+          taxable = max(base - line_discount, 0)
+          tax = taxable * tax_rate/100
+          line_total = taxable + tax
+
+        Header discount:
+          - if header_discount_amount > 0 -> use it
+          - else if header_discount_percent > 0 -> apply on (gross - line_discounts)
+          - capped so net_total never goes negative
+
+        Updates:
+          gross_total, discount_total, tax_total, net_total, balance_due
+        """
+        _d = self._d
+        _q2 = self._q2
+
+        gross = Decimal("0")
+        line_disc_total = Decimal("0")
+        tax_total = Decimal("0")
+        net_before_header = Decimal("0")
+
+        items = [
+            it for it in (self.items or [])
+            if not getattr(it, "is_voided", False)
+        ]
+
+        for it in items:
+            qty = _d(it.quantity)
+            price = _d(it.unit_price)
+            base = _q2(qty * price)
+
+            disc_amt = _d(it.discount_amount)
+            disc_pct = _d(it.discount_percent)
+
+            # if amount not set but % set, compute
+            if disc_amt <= 0 and disc_pct > 0:
+                disc_amt = _q2(base * disc_pct / Decimal("100"))
+
+            # cap discount to base
+            if disc_amt > base:
+                disc_amt = base
+
+            taxable = base - disc_amt
+            if taxable < 0:
+                taxable = Decimal("0")
+
+            tr = _d(it.tax_rate)
+            tax_amt = _q2(taxable * tr / Decimal("100"))
+            line_total = _q2(taxable + tax_amt)
+
+            # write back computed values
+            it.discount_amount = disc_amt
+            it.tax_amount = tax_amt
+            it.line_total = line_total
+
+            gross += base
+            line_disc_total += disc_amt
+            tax_total += tax_amt
+            net_before_header += line_total
+
+        gross = _q2(gross)
+        line_disc_total = _q2(line_disc_total)
+        tax_total = _q2(tax_total)
+        net_before_header = _q2(net_before_header)
+
+        # Header discount
+        hdr_pct = _d(self.header_discount_percent)
+        hdr_amt = _d(self.header_discount_amount)
+
+        gross_after_line_discounts = gross - line_disc_total
+        if gross_after_line_discounts < 0:
+            gross_after_line_discounts = Decimal("0")
+
+        computed_hdr = Decimal("0")
+        if hdr_amt > 0:
+            computed_hdr = hdr_amt
+        elif hdr_pct > 0:
+            computed_hdr = _q2(gross_after_line_discounts * hdr_pct /
+                               Decimal("100"))
+
+        # cap header discount so net doesn't go negative
+        if computed_hdr > net_before_header:
+            computed_hdr = net_before_header
+
+        self.header_discount_amount = _q2(computed_hdr)
+
+        discount_total = _q2(line_disc_total + computed_hdr)
+        net_total = _q2(net_before_header - computed_hdr)
+
+        self.gross_total = gross
+        self.discount_total = discount_total
+        self.tax_total = tax_total
+        self.net_total = net_total
+
+        # Balance due = net_total - (amount_paid + advance_adjusted)
+        paid = _d(self.amount_paid)
+        adv = _d(self.advance_adjusted)
+        due = net_total - paid - adv
+        if due < 0:
+            due = Decimal("0")
+        self.balance_due = _q2(due)
 
 
 class InvoiceItem(Base):
-    """
-    Per line item in invoice.
-    Supports:
-    - Service-type items (OP consult, IP, Lab, Radiology, Pharmacy, OT, etc.)
-    - Manual lines (e.g., "Dressing charges")
-    """
-
     __tablename__ = "billing_invoice_items"
     __table_args__ = (
-        # Global dedupe (optional): prevent same external line twice if not voided
+        # ✅ Dedupe per-invoice (safe)
         UniqueConstraint(
+            "invoice_id",
             "service_type",
             "service_ref_id",
             "is_voided",
-            name="uq_billing_service_unique",
+            name="uq_billing_item_dedupe_per_invoice",
         ),
         Index("ix_billing_items_invoice", "invoice_id"),
         Index("ix_billing_items_service", "service_type", "service_ref_id"),
@@ -205,17 +325,18 @@ class InvoiceItem(Base):
 
     # lab | radiology | ot | pharmacy | opd_consult | ipd | manual | other
     service_type = Column(String(32), nullable=False)
-    service_ref_id = Column(Integer, nullable=False, default=0)
+    service_ref_id = Column(BigInteger, nullable=True)
+
     description = Column(String(300), nullable=False)
 
-    quantity = Column(Integer, default=1)
+    quantity = Column(Numeric(10, 2), default=1)
     unit_price = Column(Numeric(12, 2), default=0)
 
     # GST / tax in %
-    tax_rate = Column(Numeric(5, 2), default=0)
+    tax_rate = Column(Numeric(10, 2), default=0)
 
     # Discount % and amount at line level
-    discount_percent = Column(Numeric(5, 2), default=0)
+    discount_percent = Column(Numeric(10, 2), default=0)
     discount_amount = Column(Numeric(12, 2), default=0)
 
     # Calculated tax amount in currency
@@ -310,6 +431,10 @@ class Advance(Base):
     remarks = Column(String(255), nullable=True)
 
     received_at = Column(DateTime, default=datetime.utcnow)
+    is_voided = Column(Boolean, default=False, nullable=False)
+    void_reason = Column(String(255), nullable=True)
+    voided_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    voided_at = Column(DateTime, nullable=True)
 
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)

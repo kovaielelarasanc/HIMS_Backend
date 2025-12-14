@@ -87,6 +87,7 @@ from app.schemas.ot import (
     OtEnvironmentLogOut,
 )
 from app.models.user import User
+from app.services.ot_billing import ensure_ot_invoice_and_items
 
 router = APIRouter(prefix="/ot", tags=["OT - Clinical Records"])
 

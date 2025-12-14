@@ -138,6 +138,8 @@ class OtEquipmentMasterOut(OtEquipmentMasterBase):
 
 # ---------- OtSchedule ----------
 
+# ---------- OtSchedule ----------
+
 
 class OtScheduleBedOut(BaseModel):
     id: int
@@ -151,10 +153,9 @@ class OtScheduleBedOut(BaseModel):
 class OtScheduleAdmissionOut(BaseModel):
     id: int
     admission_code: Optional[str] = None
-    display_code: str  # from IpdAdmission.display_code
+    display_code: str
     admitted_at: Optional[datetime] = None
 
-    # Ward/room/bed if you want to show *ward bed* instead of OT bed
     current_bed: Optional[OtScheduleBedOut] = None
 
     model_config = ConfigDict(from_attributes=True)
@@ -170,22 +171,23 @@ class OtScheduleProcedureLinkOut(BaseModel):
 
 
 class OtScheduleBase(BaseModel):
-    # OT is now *bed-based*, not theatre-based
+    # 🗓️ Timing
     date: date
     planned_start_time: time
     planned_end_time: Optional[time] = None
 
+    # 👤 Patient context
     patient_id: Optional[int] = None
     admission_id: Optional[int] = None
 
-    # Location
-    bed_id: Optional[int] = None  # OT location via Ward/Room/Bed
+    # ✅ FIXED: OT LOCATION (NOT bed_id)
+    ot_bed_id: Optional[int] = None
 
-    # Surgeon / anaesthetist
+    # 👨‍⚕️ Staff
     surgeon_user_id: int
     anaesthetist_user_id: Optional[int] = None
 
-    # Clinical details
+    # 🧠 Clinical
     procedure_name: str
     side: Optional[str] = None
     priority: str = "Elective"
@@ -193,7 +195,6 @@ class OtScheduleBase(BaseModel):
 
 
 class OtScheduleCreate(OtScheduleBase):
-    # 🔹 master procedure ids (write-only)
     primary_procedure_id: Optional[int] = None
     additional_procedure_ids: List[int] = []
 
@@ -206,7 +207,8 @@ class OtScheduleUpdate(BaseModel):
     patient_id: Optional[int] = None
     admission_id: Optional[int] = None
 
-    bed_id: Optional[int] = None
+    # ✅ FIXED
+    ot_bed_id: Optional[int] = None
 
     surgeon_user_id: Optional[int] = None
     anaesthetist_user_id: Optional[int] = None
@@ -222,7 +224,7 @@ class OtScheduleUpdate(BaseModel):
 
 class OtScheduleOut(OtScheduleBase):
     """
-    Main DTO for listing / viewing OT schedules (bed-based).
+    Main DTO for OT schedule listing / detail.
     """
     id: int
     status: str
@@ -230,16 +232,17 @@ class OtScheduleOut(OtScheduleBase):
 
     primary_procedure_id: Optional[int] = None
 
-    # Nested objects
+    # 🔗 Relations
     patient: Optional["PatientOut"] = None
     surgeon: Optional["UserMiniOut"] = None
     anaesthetist: Optional["UserMiniOut"] = None
 
-    # NEW 🔹 admission + OT bed
-    admission: Optional["OtScheduleAdmissionOut"] = None
-    bed: Optional["OtScheduleBedOut"] = None
+    admission: Optional[OtScheduleAdmissionOut] = None
 
-    # NEW 🔹 latest OP number (filled in route)
+    # ✅ FIXED: name must match ORM relationship
+    ot_bed: Optional[OtScheduleBedOut] = None
+
+    # UI helper
     op_no: Optional[str] = None
 
     primary_procedure: Optional[OtProcedureOut] = None
@@ -309,8 +312,17 @@ class OtCaseUpdate(BaseModel):
 
 class OtCaseOut(OtCaseBase):
     model_config = ConfigDict(from_attributes=True)
-
+    schedule: Optional[OtScheduleOut] = None
     id: int
+    
+    patient_id: Optional[int] = None
+    patient_name: Optional[str] = None
+    uhid: Optional[str] = None
+    age: Optional[int] = None
+    sex: Optional[str] = None
+    
+    op_no: Optional[str] = None
+    
     created_at: datetime
     updated_at: datetime
     schedule_id: Optional[int] = None

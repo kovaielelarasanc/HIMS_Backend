@@ -10,6 +10,7 @@ from app.api.deps import get_db, current_user
 from app.models.user import User
 from app.models.patient import Patient
 from app.models.opd import Appointment, Vitals, Visit
+from sqlalchemy import func
 
 router = APIRouter()
 
@@ -105,6 +106,109 @@ def record_vitals(
     }
 
 
+# ----- VITALS (GET latest) -----
+
+
+def _vitals_out(v: Vitals):
+    return {
+        "id": v.id,
+        "created_at": v.created_at,
+        "appointment_id": getattr(v, "appointment_id", None),
+        "patient_id": v.patient_id,
+        "height_cm": v.height_cm,
+        "weight_kg": v.weight_kg,
+        "temp_c": v.temp_c,
+        "pulse": v.pulse,
+        "resp_rate": getattr(v, "rr", None),
+        "spo2": v.spo2,
+        "bp_sys": getattr(v, "bp_systolic", None),
+        "bp_dia": getattr(v, "bp_diastolic", None),
+        "notes": v.notes or "",
+    }
+
+
+@router.get("/vitals/latest")
+def get_latest_vitals(
+        appointment_id: Optional[int] = Query(None),
+        patient_id: Optional[int] = Query(None),
+        for_date: Optional[date] = Query(None),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    if not (has_perm(user, "vitals.create")
+            or has_perm(user, "appointments.view") or user.is_admin):
+        raise HTTPException(status_code=403, detail="Not permitted")
+
+    if not appointment_id and not patient_id:
+        raise HTTPException(status_code=400,
+                            detail="appointment_id or patient_id required")
+
+    q = db.query(Vitals)
+
+    if appointment_id and hasattr(Vitals, "appointment_id"):
+        q = q.filter(Vitals.appointment_id == appointment_id)
+    else:
+        # resolve patient_id from appointment if needed
+        if not patient_id and appointment_id:
+            appt = db.query(Appointment).get(appointment_id)
+            if not appt:
+                raise HTTPException(status_code=404,
+                                    detail="Appointment not found")
+            patient_id = appt.patient_id
+        q = q.filter(Vitals.patient_id == patient_id)
+
+    if for_date:
+        start = datetime(for_date.year, for_date.month, for_date.day, 0, 0, 0)
+        end = datetime(for_date.year, for_date.month, for_date.day, 23, 59, 59)
+        q = q.filter(Vitals.created_at >= start, Vitals.created_at <= end)
+
+    v = q.order_by(Vitals.created_at.desc()).first()
+    if not v:
+        raise HTTPException(status_code=404, detail="Vitals not found")
+
+    return _vitals_out(v)
+
+
+@router.get("/vitals/history")
+def get_vitals_history(
+        appointment_id: Optional[int] = Query(None),
+        patient_id: Optional[int] = Query(None),
+        for_date: Optional[date] = Query(None),
+        limit: int = Query(3, ge=1, le=20),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    if not (has_perm(user, "vitals.create")
+            or has_perm(user, "appointments.view") or user.is_admin):
+        raise HTTPException(status_code=403, detail="Not permitted")
+
+    if not appointment_id and not patient_id:
+        raise HTTPException(status_code=400,
+                            detail="appointment_id or patient_id required")
+
+    q = db.query(Vitals)
+
+    if appointment_id and hasattr(Vitals, "appointment_id"):
+        q = q.filter(Vitals.appointment_id == appointment_id)
+    else:
+        if not patient_id and appointment_id:
+            appt = db.query(Appointment).get(appointment_id)
+            if not appt:
+                raise HTTPException(status_code=404,
+                                    detail="Appointment not found")
+            patient_id = appt.patient_id
+        q = q.filter(Vitals.patient_id == patient_id)
+
+    if for_date:
+        start = datetime(for_date.year, for_date.month, for_date.day, 0, 0, 0)
+        end = datetime(for_date.year, for_date.month, for_date.day, 23, 59, 59)
+        q = q.filter(Vitals.created_at >= start, Vitals.created_at <= end)
+
+    rows = q.order_by(Vitals.created_at.desc()).limit(limit).all()
+    return [_vitals_out(v) for v in rows]
+
+
+# ----- QUEUE -----
 # ----- QUEUE -----
 @router.get("/queue")
 def get_queue(
@@ -114,6 +218,12 @@ def get_queue(
             "If omitted and current user is a doctor, uses current user's id",
         ),
         for_date: date = Query(default_factory=date.today),
+
+        # ✅ NEW: force current doctor queue
+        my_only: bool = Query(
+            False,
+            description=
+            "If true, returns ONLY current logged-in doctor's appointments"),
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
 ):
@@ -121,22 +231,29 @@ def get_queue(
             user, "visits.view") or user.is_admin or user.is_doctor):
         raise HTTPException(status_code=403, detail="Not permitted")
 
-    target_doctor_id = doctor_user_id
-    if target_doctor_id is None:
-        if user.is_doctor:
-            target_doctor_id = user.id
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail="doctor_user_id is required for non-doctor users",
-            )
+    # ✅ If my_only ON → only doctors allowed and FORCE target doctor = current user
+    if my_only:
+        if not user.is_doctor:
+            raise HTTPException(status_code=403,
+                                detail="My appointments is only for doctors")
+        target_doctor_id = user.id
     else:
-        if (user.is_doctor and target_doctor_id != user.id
-                and not has_perm(user, "appointments.view")):
-            raise HTTPException(
-                status_code=403,
-                detail="Not permitted to view other doctor's queue",
-            )
+        target_doctor_id = doctor_user_id
+        if target_doctor_id is None:
+            if user.is_doctor:
+                target_doctor_id = user.id
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail="doctor_user_id is required for non-doctor users",
+                )
+        else:
+            if user.is_doctor and target_doctor_id != user.id and not has_perm(
+                    user, "appointments.view"):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Not permitted to view other doctor's queue",
+                )
 
     appts = (db.query(Appointment).options(joinedload(
         Appointment.patient)).filter(
@@ -144,30 +261,27 @@ def get_queue(
             Appointment.date == for_date,
         ).order_by(Appointment.slot_start.asc()).all())
 
-    vis_map = {
-        v.appointment_id: v.id
-        for v in db.query(Visit).filter(
-            Visit.appointment_id.in_([a.id for a in appts]))
-    }
+    appt_ids = [a.id for a in appts]
+
+    vis_map = {}
+    if appt_ids:
+        vis_map = {
+            v.appointment_id: v.id
+            for v in db.query(Visit).filter(Visit.appointment_id.in_(
+                appt_ids)).all()
+        }
 
     vitals_map = {}
-    if hasattr(Vitals, "appointment_id"):
-        rows = (db.query(Vitals.appointment_id).filter(
-            Vitals.appointment_id.in_([a.id for a in appts])).distinct().all())
-        for (aid, ) in rows:
+    vitals_last_at_map = {}
+
+    if appt_ids:
+        rows = (db.query(Vitals.appointment_id,
+                         func.max(Vitals.created_at)).filter(
+                             Vitals.appointment_id.in_(appt_ids)).group_by(
+                                 Vitals.appointment_id).all())
+        for aid, last_at in rows:
             vitals_map[aid] = True
-    else:
-        start = datetime(for_date.year, for_date.month, for_date.day, 0, 0, 0)
-        end = datetime(for_date.year, for_date.month, for_date.day, 23, 59, 59)
-        patient_ids = list({a.patient_id for a in appts})
-        rows = (db.query(Vitals.patient_id).filter(
-            Vitals.patient_id.in_(patient_ids)).filter(
-                Vitals.created_at >= start, Vitals.created_at
-                <= end).distinct().all())
-        patients_with_vitals = {pid for (pid, ) in rows}
-        for a in appts:
-            if a.patient_id in patients_with_vitals:
-                vitals_map[a.id] = True
+            vitals_last_at_map[aid] = last_at
 
     resp = []
     for a in appts:
@@ -178,8 +292,7 @@ def get_queue(
             "status": a.status,
             "visit_id": vis_map.get(a.id),
             "doctor_user_id": a.doctor_user_id,
-            "department_id":
-            a.department_id,  # NEW: for default department in UI
+            "department_id": a.department_id,
             "booked_by": getattr(a, "booked_by", None),
             "patient": {
                 "id": p.id,
@@ -188,6 +301,8 @@ def get_queue(
                 "phone": p.phone,
             },
             "has_vitals": bool(vitals_map.get(a.id, False)),
+            "vitals_last_at": vitals_last_at_map.get(a.id),
             "visit_purpose": a.purpose or "",
         })
+
     return resp

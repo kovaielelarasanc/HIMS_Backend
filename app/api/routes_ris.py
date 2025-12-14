@@ -1,7 +1,8 @@
 from __future__ import annotations
 from datetime import datetime
 from typing import Optional, List, Dict, Any
-
+# add near imports
+from fastapi import Request
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, UploadFile, File, Form
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
@@ -13,6 +14,10 @@ from app.models.ris import RisOrder, RisAttachment
 from app.schemas.ris import (RisOrderCreate, RisScheduleIn, RisReportIn,
                              RisAttachmentIn, RisOrderOut, RadiologyTestIn,
                              RadiologyTestOut)
+from app.models.opd import Visit
+from app.models.ipd import IpdAdmission
+from app.services.ris_billing import bill_ris_order
+
 from app.utils.files import save_upload
 
 router = APIRouter(prefix="/ris", tags=["RIS"])
@@ -37,6 +42,16 @@ def require_any(user: User, codes: list[str]):
             if p.code in codes:
                 return
     raise HTTPException(status_code=403, detail="Not permitted")
+
+
+def _infer_context_type(db: Session, context_id: int | None) -> str | None:
+    if not context_id:
+        return None
+    if db.query(Visit.id).filter(Visit.id == context_id).first():
+        return "opd"
+    if db.query(IpdAdmission.id).filter(IpdAdmission.id == context_id).first():
+        return "ipd"
+    return None
 
 
 # ---------- realtime (WebSocket) ----------
@@ -68,8 +83,7 @@ _ws = _WSManager()
 
 @router.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket):
-    await _WSManager.connect(
-        _ws, websocket) if False else await _ws.connect(websocket)
+    await _ws.connect(websocket)
     try:
         while True:
             await websocket.receive_text()
@@ -221,9 +235,13 @@ async def create_order(
     m = db.query(RadiologyTest).get(payload.test_id)
     if not m:
         raise HTTPException(404, "Radiology test not found")
+    ctx_type = payload.context_type
+    if not ctx_type and payload.context_id:
+        ctx_type = _infer_context_type(db, payload.context_id)
+
     o = RisOrder(
         patient_id=payload.patient_id,
-        context_type=payload.context_type,
+        context_type=ctx_type,
         context_id=payload.context_id,
         ordering_user_id=payload.ordering_user_id or user.id,
         test_id=m.id,
@@ -233,7 +251,9 @@ async def create_order(
         if hasattr(m, "modality") else None,
         status="ordered",
         created_by=user.id,
+        billing_status="not_billed",
     )
+
     db.add(o)
     db.commit()
     await _notify("ordered", order_id=o.id)
@@ -384,6 +404,10 @@ async def add_report(
     o = db.query(RisOrder).get(order_id)
     if not o:
         raise HTTPException(404, "Order not found")
+    if (getattr(o, "billing_status", None) or "not_billed") != "billed":
+        inv = bill_ris_order(db, order=o, created_by=user.id)
+        o.billing_invoice_id = inv.id
+        o.billing_status = "billed"
     o.report_text = payload.report_text
     o.status = "reported"
     o.reported_at = datetime.utcnow()
@@ -445,6 +469,11 @@ async def approve_report(
         raise HTTPException(404, "Order not found")
     if o.status != "reported":
         raise HTTPException(400, "Report not ready for approval")
+        # ✅ Billing: on approve (idempotent)
+    if (getattr(o, "billing_status", None) or "not_billed") != "billed":
+        inv = bill_ris_order(db, order=o, created_by=user.id)
+        o.billing_invoice_id = inv.id
+        o.billing_status = "billed"
     o.status = "approved"
     o.secondary_signoff_by = user.id
     o.approved_at = datetime.utcnow()
@@ -475,6 +504,7 @@ async def approve_report(
 def add_attachment(
         order_id: int,
         payload: RisAttachmentIn,
+        request: Request,
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
 ):
@@ -482,44 +512,68 @@ def add_attachment(
     o = db.query(RisOrder).get(order_id)
     if not o:
         raise HTTPException(404, "Order not found")
-    att = RisAttachment(order_id=o.id,
-                        file_url=payload.file_url,
-                        note=payload.note or "",
-                        created_by=user.id)
+
+    att = RisAttachment(
+        order_id=o.id,
+        file_url=payload.file_url,
+        note=payload.note or "",
+        created_by=user.id,
+    )
     db.add(att)
     db.commit()
+
     return {
         "id": att.id,
         "message": "Attachment added",
-        "file_url": att.file_url
+        "file_url": _abs_url(request, att.file_url),  # ✅ absolute
     }
 
 
 @router.post("/orders/{order_id}/upload")
 def upload_attachment(
         order_id: int,
+        request: Request,
         file: UploadFile = File(...),
         note: Optional[str] = Form(None),
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
 ):
-    """Saves into uploads/ris/YYYY/MM/DD/ and links as RisAttachment."""
     require_any(user, ["radiology.attachments.add"])
     o = db.query(RisOrder).get(order_id)
     if not o:
         raise HTTPException(404, "Order not found")
-    meta = save_upload(file, "ris")
-    att = RisAttachment(order_id=o.id,
-                        file_url=meta["public_url"],
-                        note=note or "",
-                        created_by=user.id)
+
+    meta = save_upload(file, "ris")  # must return "/files/ris/...."
+    att = RisAttachment(
+        order_id=o.id,
+        file_url=meta["public_url"],
+        note=note or "",
+        created_by=user.id,
+    )
     db.add(att)
     db.commit()
+
     return {
         "id": att.id,
-        "file_url": meta["public_url"],
-        "message": "Uploaded"
+        "file_url": _abs_url(request, att.file_url),  # ✅ absolute
+        "message": "Uploaded",
     }
+
+
+def _abs_url(request: Request, u: str) -> str:
+    if not u:
+        return u
+    if u.startswith("http://") or u.startswith("https://"):
+        return u
+
+    proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+    host = request.headers.get("x-forwarded-host") or request.headers.get(
+        "host") or request.url.netloc
+    base = f"{proto}://{host}"
+
+    if u.startswith("/"):
+        return base + u
+    return base + "/" + u
 
 
 # ---------- Queue (dashboard) ----------
@@ -548,3 +602,149 @@ def ris_queue(
         "approved_at": r.approved_at,
         "updated_at": r.updated_at,
     } for r in rows]
+
+
+# ADD in your routes file (same file you shared)
+from pydantic import BaseModel
+
+
+class RisAttachmentOut(BaseModel):
+    id: int
+    order_id: int
+    file_url: str
+    note: str | None = None
+    created_at: str | None = None
+    created_by: int | None = None
+
+
+class RisNotesIn(BaseModel):
+    notes: str | None = None
+
+
+@router.get("/orders/{order_id}/attachments",
+            response_model=List[RisAttachmentOut])
+def list_attachments(
+        order_id: int,
+        request: Request,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    require_any(user, ["radiology.orders.view", "orders.ris.view"])
+    o = db.query(RisOrder).get(order_id)
+    if not o:
+        raise HTTPException(404, "Order not found")
+
+    rows = (db.query(RisAttachment).filter(
+        RisAttachment.order_id == order_id).order_by(
+            RisAttachment.id.desc()).all())
+
+    return [
+        RisAttachmentOut(
+            id=r.id,
+            order_id=r.order_id,
+            file_url=_abs_url(request, r.file_url),  # ✅ absolute
+            note=getattr(r, "note", None),
+            created_by=getattr(r, "created_by", None),
+            created_at=r.created_at.isoformat() if getattr(
+                r, "created_at", None) else None,
+        ) for r in rows
+    ]
+
+
+@router.delete("/attachments/{attachment_id}")
+def delete_attachment(
+        attachment_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    require_any(user, ["radiology.attachments.add"])
+    att = db.query(RisAttachment).get(attachment_id)
+    if not att:
+        raise HTTPException(404, "Attachment not found")
+
+    # allow admin OR creator
+    if not getattr(user, "is_admin", False):
+        if getattr(att, "created_by", None) != user.id:
+            raise HTTPException(403, "Not permitted")
+
+    db.delete(att)
+    db.commit()
+    return {"message": "Deleted"}
+
+
+@router.put("/orders/{order_id}/notes")
+def update_order_notes(
+        order_id: int,
+        payload: RisNotesIn,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    require_any(user, [
+        "radiology.report.create", "radiology.orders.update",
+        "orders.ris.update"
+    ])
+    o = db.query(RisOrder).get(order_id)
+    if not o:
+        raise HTTPException(404, "Order not found")
+
+    # ✅ IMPORTANT: do NOT change status/workflow
+    txt = (payload.notes or "").strip()
+
+    # prefer a dedicated "notes" column if you add later; else fallback safely
+    if hasattr(o, "notes"):
+        o.notes = txt
+    else:
+        o.report_text = txt  # fallback storage
+
+    o.updated_by = user.id
+    o.updated_at = datetime.utcnow()
+    db.commit()
+    return {"message": "Saved", "notes": txt}
+
+
+@router.post("/orders/{order_id}/finalize")
+def finalize_order(
+        order_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    # ✅ permission
+    require_any(user, [
+        "orders.ris.finalize", "radiology.orders.finalize",
+        "billing.invoices.create"
+    ])
+
+    o = db.query(RisOrder).get(order_id)
+    if not o:
+        raise HTTPException(404, "Order not found")
+
+    # ✅ idempotent
+    if (o.status or "").lower() == "finalized":
+        return {
+            "message": "Already finalized",
+            "status": o.status,
+            "billing_status": getattr(o, "billing_status", None),
+            "invoice_id": getattr(o, "billing_invoice_id", None),
+        }
+
+    # ✅ auto billing if not billed
+    if (getattr(o, "billing_status", None) or "not_billed") != "billed":
+        inv = bill_ris_order(db, order=o, created_by=user.id)
+        o.billing_invoice_id = inv.id
+        o.billing_status = "billed"
+
+    # ✅ manual finalize status
+    o.status = "finalized"
+    if hasattr(o, "finalized_at"):
+        o.finalized_at = datetime.utcnow()
+
+    o.updated_by = user.id
+    o.updated_at = datetime.utcnow()
+    db.commit()
+
+    return {
+        "message": "Finalized",
+        "status": o.status,
+        "billing_status": getattr(o, "billing_status", None),
+        "invoice_id": getattr(o, "billing_invoice_id", None),
+    }

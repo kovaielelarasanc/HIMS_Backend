@@ -29,11 +29,14 @@ class LisOrder(Base):
     context_type = Column(String(10), nullable=True)  # opd | ipd
     context_id = Column(Integer, nullable=True)
     ordering_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
-    priority = Column(String(16), default="routine")  # routine | stat
+    priority = Column(String(20), default="routine")  # routine | stat
     status = Column(
         String(20), default="ordered"
     )  # draft/ordered/collected/in_progress/validated/reported/cancelled
-
+    
+    billing_invoice_id = Column(Integer, nullable=True, index=True)
+    billing_status = Column(String(20), default="not_billed")  # not_billed|billed|cancelled
+    
     collected_at = Column(DateTime, nullable=True)
     reported_at = Column(DateTime, nullable=True)
 

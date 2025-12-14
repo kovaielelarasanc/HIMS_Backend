@@ -1,54 +1,150 @@
-# FILE: app/api/routes_billing.pys
+# NEW FILE: app/api/routes_billing.py
 from __future__ import annotations
 
 from datetime import datetime, date
 from typing import List, Optional, Dict, Any
+from decimal import Decimal
+from math import ceil
+import logging
+import io
+import uuid
+from datetime import datetime, date, timedelta
 from pydantic import ValidationError
 from fastapi import APIRouter, Depends, HTTPException, Body
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func
-
+from app.services.room_type import normalize_room_type
 from app.api.deps import get_db, current_user as auth_current_user
 from app.models.user import User
 from app.models.patient import Patient
+from app.services.ipd_billing import compute_ipd_bed_charges_daily, ensure_invoice_for_context  # if in same file, remove this line
 from app.models.billing import (
     Invoice,
     InvoiceItem,
     Payment,
     Advance,
+    AdvanceAdjustment,
     BillingProvider,
 )
 
+# ✅ OT imports (this was missing in your file)
+from app.models.ot import OtCase, OtScheduleProcedure, OtProcedure, OtSchedule  # IMPORTANT
+
 from app.schemas.billing import (
     InvoiceCreate,
-    AddServiceIn,
     ManualItemIn,
+    AddServiceIn,
     UpdateItemIn,
     VoidItemIn,
     PaymentIn,
-    BulkAddFromUnbilledIn,
     InvoiceOut,
     InvoiceItemOut,
     PaymentOut,
-    AutoBedChargesIn,  # 👈 add
+    AutoBedChargesIn,
     AutoOtChargesIn,
+    AutoOtInvoiceIn,
+    AdvanceCreate,
+    ApplyAdvanceIn,
 )
-from math import ceil
-import logging
-import io
-from app.models.ipd import (
-    IpdPackage,
-    IpdBed,
-    IpdBedRate,
-    IpdBedAssignment,
-)
+from app.models.ipd import IpdAdmission
+import zlib
+from app.models.ipd import IpdPackage, IpdBed, IpdBedRate, IpdBedAssignment, IpdRoom
 from app.models.payer import Payer, Tpa, CreditPlan
-from app.models.payer import CreditProvider  # optional / legacy
 
 router = APIRouter()
-
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# IPD Billing lock helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_ipd_admission_for_invoice(db: Session,
+                                   inv: Invoice) -> IpdAdmission | None:
+    """
+    If invoice context is IPD admission, return the admission row, else None.
+    """
+    if (inv.context_type or "").lower() != "ipd":
+        return None
+    if not inv.context_id:
+        return None
+    return db.query(IpdAdmission).get(int(inv.context_id))
+
+
+def _ensure_ipd_not_locked_for_item_mutation(db: Session,
+                                             inv: Invoice) -> None:
+    """
+    Block item edits if admission is discharged/locked.
+    Payments are handled separately (allowed).
+    """
+    adm = _get_ipd_admission_for_invoice(db, inv)
+    if adm and getattr(adm, "billing_locked", False):
+        raise HTTPException(
+            400,
+            "Billing is locked for this IPD admission (discharged). Items cannot be edited."
+        )
+
+
+def _ensure_ipd_not_locked_for_invoice_update(db: Session,
+                                              inv: Invoice) -> None:
+    """
+    Block invoice header edits/cancel when locked (optional but recommended).
+    """
+    adm = _get_ipd_admission_for_invoice(db, inv)
+    if adm and getattr(adm, "billing_locked", False):
+        raise HTTPException(
+            400,
+            "Billing is locked for this IPD admission (discharged). Invoice cannot be edited."
+        )
+
+
+def _service_ref_id(key: str) -> int:
+    """
+    Global-safe service_ref_id for your UNIQUE(service_type, service_ref_id, is_voided).
+    Uses crc32 -> int (stable and safe).
+    """
+    return int(zlib.crc32(key.encode("utf-8")))
+
+
+def ensure_invoice_for_context(
+    db: Session,
+    *,
+    patient_id: int,
+    billing_type: str,
+    context_type: str,
+    context_id: int,
+    created_by: int | None,
+) -> Invoice:
+    inv = (db.query(Invoice).filter(
+        Invoice.patient_id == patient_id,
+        Invoice.billing_type == billing_type,
+        Invoice.context_type == context_type,
+        Invoice.context_id == context_id,
+        Invoice.status != "cancelled",
+    ).order_by(Invoice.id.desc()).first())
+    if inv:
+        # backfill ids
+        if not inv.invoice_uid:
+            inv.invoice_uid = _new_invoice_uid()
+        if not inv.invoice_number:
+            inv.invoice_number = _new_invoice_number()
+        db.flush()
+        return inv
+
+    inv = Invoice(
+        invoice_uid=_new_invoice_uid(),
+        invoice_number=_new_invoice_number(),
+        patient_id=patient_id,
+        context_type=context_type,
+        context_id=context_id,
+        billing_type=billing_type,
+        status="draft",
+        created_by=created_by,
+    )
+    db.add(inv)
+    db.flush()
+    return inv
 
 
 # ---------------------------------------------------------------------------
@@ -65,79 +161,25 @@ def has_perm(user: User, code: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Invoice identity helpers
 # ---------------------------------------------------------------------------
-def recalc_totals(inv: Invoice) -> None:
-    """Recalculate invoice totals based on non-voided items & payments."""
-    gross = 0.0
-    tax_total = 0.0
-    discount_total = 0.0
-
-    for it in inv.items:
-        if it.is_voided:
-            continue
-        # line_total is after discount + tax
-        gross += float(it.line_total or 0)
-        tax_total += float(it.tax_amount or 0)
-        discount_total += float(it.discount_amount or 0)
-
-    inv.gross_total = gross
-    inv.tax_total = tax_total
-    inv.discount_total = discount_total
-
-    # header net_total = sum of item net
-    inv.net_total = gross
-
-    paid = 0.0
-    for pay in inv.payments:
-        paid += float(pay.amount or 0)
-    inv.amount_paid = paid
-    inv.balance_due = float(inv.net_total or 0) - paid
+def _new_invoice_uid() -> str:
+    return str(uuid.uuid4())
 
 
-def serialize_invoice(inv: Invoice) -> InvoiceOut:
-    """Convert ORM invoice to Pydantic InvoiceOut, including items & payments."""
-    items_out: List[InvoiceItemOut] = [
-        InvoiceItemOut.model_validate(it, from_attributes=True)
-        for it in inv.items
-    ]
-    pays_out: List[PaymentOut] = [
-        PaymentOut.model_validate(pay, from_attributes=True)
-        for pay in inv.payments
-    ]
-
-    data = InvoiceOut.model_validate(inv, from_attributes=True)
-    data.items = items_out
-    data.payments = pays_out
-    return data
+def _new_invoice_number() -> str:
+    # UUID based, short, realtime, no raw id exposure
+    return f"INV-{uuid.uuid4().hex[:8].upper()}"
 
 
-def _apply_unbilled_services(
-    invoice_id: int,
-    payload: Optional[BulkAddFromUnbilledIn],
-    db: Session,
-    user: User,
-) -> InvoiceOut:
-    """
-    Shared logic for adding unbilled services to an invoice.
-    Currently placeholder so FE doesn't break.
-    """
-    if not has_perm(user, "billing.items.add"):
-        raise HTTPException(status_code=403, detail="Not permitted")
-
-    inv = db.query(Invoice).get(invoice_id)
-    if not inv:
-        raise HTTPException(status_code=404, detail="Invoice not found")
-
-    # TODO: Implement actual fetch using payload.uids from OPD/LIS/RIS modules
-    _ = (payload.uids if payload else None) or []
-
-    db.refresh(inv)
-    recalc_totals(inv)
-    inv.updated_by = user.id
-    db.commit()
-    db.refresh(inv)
-    return serialize_invoice(inv)
+# ---------------------------------------------------------------------------
+# Money helpers
+# ---------------------------------------------------------------------------
+def _d(x: Any) -> Decimal:
+    try:
+        return Decimal(str(x or "0"))
+    except Exception:
+        return Decimal("0")
 
 
 def _money(x: Any) -> str:
@@ -145,175 +187,580 @@ def _money(x: Any) -> str:
 
 
 def _next_seq_for_invoice(db: Session, invoice_id: int) -> int:
-    """
-    Next line sequence number for given invoice.
-    Uses MAX(seq) + 1, scoped per invoice_id.
-    """
-    max_seq = (db.query(func.max(InvoiceItem.seq)).filter(
-        InvoiceItem.invoice_id == invoice_id).scalar())
+    max_seq = db.query(func.max(InvoiceItem.seq)).filter(
+        InvoiceItem.invoice_id == invoice_id).scalar()
     return (max_seq or 0) + 1
 
 
 def _manual_ref_for_invoice(invoice_id: int, seq: int) -> int:
-    """
-    Generate a synthetic unique service_ref_id for manual items.
-
-    This ensures (service_type='manual', service_ref_id, is_voided=0)
-    is always unique globally.
-    """
     return invoice_id * 1_000_000 + seq
 
 
-def _get_bed_rate_for_date(
-    db: Session,
-    room_type: str,
-    dt: datetime,
-) -> IpdBedRate:
-    """
-    Pick latest active bed rate for room_type on the given date.
-    Mirrors /ipd/bed-rates/resolve logic.
-    """
-    day = dt.date()
-    r = (
-        db.query(IpdBedRate).filter(IpdBedRate.is_active.is_(True)).filter(
-            IpdBedRate.room_type == room_type).filter(
-                IpdBedRate.effective_from <= day).filter(
-                    (IpdBedRate.effective_to == None)  # noqa: E711
-                    | (IpdBedRate.effective_to >= day)).order_by(
-                        IpdBedRate.effective_from.desc()).first())
-    if not r:
-        raise HTTPException(
-            status_code=400,
-            detail=
-            f"No active bed rate for room type '{room_type}' on {day.isoformat()}",
-        )
-    return r
-
-
-def _compute_stay_units(
-    start: datetime,
-    end: datetime,
-    mode: str,
-) -> int:
-    """
-    Convert stay duration to billable units.
-
-    daily  -> ceil(hours / 24), min 1
-    hourly -> ceil(hours), min 1
-    mixed  -> <= 6h = hourly, > 6h = daily
-    """
-    if end <= start:
-        return 0
-
-    hours = (end - start).total_seconds() / 3600.0
-
-    if mode == "daily":
-        return max(1, ceil(hours / 24.0))
-    if mode == "hourly":
-        return max(1, ceil(hours))
-
-    # mixed
-    if hours <= 6:
-        return max(1, ceil(hours))
-    return max(1, ceil(hours / 24.0))
-
-
-def _generate_invoice_number(db: Session) -> str:
-    """
-    Optional helper: generate invoice_number if Invoice model has that column.
-
-    Format: INV-YYYYMMDD-XXXX
-    """
-    today_str = datetime.utcnow().strftime("%Y%m%d")
-    prefix = f"INV-{today_str}"
-    last = (db.query(Invoice.invoice_number).filter(
-        Invoice.invoice_number.like(f"{prefix}-%")).order_by(
-            Invoice.invoice_number.desc()).first())
-    seq = 1
-    if last and last[0]:
-        try:
-            seq = int(last[0].split("-")[-1]) + 1
-        except Exception:
-            seq = 1
-    return f"{prefix}-{seq:04d}"
-
-
 # ---------------------------------------------------------------------------
-# Core Invoices
+# Totals (FIXED)
 # ---------------------------------------------------------------------------
-@router.post("/invoices", response_model=InvoiceOut)
-def create_invoice(
-        payload: InvoiceCreate,
+def recalc_totals(inv: Invoice, db: Session) -> None:
+    """
+    ✅ Correct totals:
+      - gross_total = sum(qty*price) for active items
+      - discount_total = sum(line_discount) + header_discount_amount
+      - tax_total = sum(line_tax)
+      - net_total = (gross - line_discounts - header_discount) + tax
+      - amount_paid = sum(payments)
+      - advance_adjusted = sum(advance_adjustments)
+      - balance_due = net_total - amount_paid - advance_adjusted
+    """
+    gross_subtotal = Decimal("0")
+    line_discount = Decimal("0")
+    tax_total = Decimal("0")
+
+    for it in inv.items:
+        if it.is_voided:
+            continue
+        qty = _d(it.quantity)
+        price = _d(it.unit_price)
+        base = qty * price
+
+        disc_amt = _d(it.discount_amount)
+        tax_amt = _d(it.tax_amount)
+
+        gross_subtotal += base
+        line_discount += disc_amt
+        tax_total += tax_amt
+
+    # header discount
+    header_disc_amt = _d(inv.header_discount_amount)
+    header_disc_pct = _d(inv.header_discount_percent)
+
+    # if percent provided but amount empty -> derive
+    if header_disc_pct and (not header_disc_amt or header_disc_amt == 0):
+        header_disc_amt = (gross_subtotal -
+                           line_discount) * header_disc_pct / Decimal("100")
+        header_disc_amt = header_disc_amt.quantize(Decimal("0.01"))
+        inv.header_discount_amount = header_disc_amt
+
+    total_discount = (line_discount + header_disc_amt).quantize(
+        Decimal("0.01"))
+    net = (gross_subtotal - line_discount - header_disc_amt +
+           tax_total).quantize(Decimal("0.01"))
+
+    inv.gross_total = gross_subtotal.quantize(Decimal("0.01"))
+    inv.tax_total = tax_total.quantize(Decimal("0.01"))
+    inv.discount_total = total_discount
+    inv.net_total = net
+
+    paid = Decimal("0")
+    for pay in inv.payments:
+        paid += _d(pay.amount)
+    inv.amount_paid = paid.quantize(Decimal("0.01"))
+
+    adv_used = Decimal("0")
+    for adj in inv.advance_adjustments:
+        adv_used += _d(adj.amount_applied)
+    inv.advance_adjusted = adv_used.quantize(Decimal("0.01"))
+
+    inv.balance_due = (net - paid - adv_used).quantize(Decimal("0.01"))
+
+
+from app.schemas.billing import PatientMiniOut  # ✅ import
+
+
+def serialize_invoice(inv: Invoice) -> InvoiceOut:
+    if not getattr(inv, "invoice_uid", None):
+        inv.invoice_uid = _new_invoice_uid()
+    if not getattr(inv, "invoice_number", None):
+        inv.invoice_number = _new_invoice_number()
+
+    items_out = [
+        InvoiceItemOut.model_validate(it, from_attributes=True)
+        for it in inv.items
+    ]
+    pays_out = [
+        PaymentOut.model_validate(p, from_attributes=True)
+        for p in inv.payments
+    ]
+
+    data = InvoiceOut.model_validate(inv, from_attributes=True)
+    data.items = items_out
+    data.payments = pays_out
+
+    # ✅ ADD patient object
+    if getattr(inv, "patient", None):
+        p = inv.patient
+        full = (f"{p.first_name or ''} {p.last_name or ''}").strip() or None
+        data.patient = PatientMiniOut.model_validate(p, from_attributes=True)
+        data.patient.full_name = full
+
+    return data
+
+
+@router.post("/ipd/admissions/{admission_id}/ensure-invoices",
+             response_model=dict)
+def ensure_ipd_invoices(
+        admission_id: int,
         db: Session = Depends(get_db),
         user: User = Depends(auth_current_user),
 ):
-    """
-    Create a billing invoice (OP/IP/Pharmacy/Lab/Radiology/General).
-    Always starts in 'draft' status.
-    """
-    if not has_perm(user, "billing.create"):
-        raise HTTPException(status_code=403, detail="Not permitted")
+    if not has_perm(user, "billing.view"):
+        raise HTTPException(403, "Not permitted")
 
-    inv = Invoice(
-        patient_id=payload.patient_id,
-        context_type=payload.context_type,
-        context_id=payload.context_id,
+    adm = db.query(IpdAdmission).get(admission_id)
+    if not adm:
+        raise HTTPException(404, "Admission not found")
+
+    ip_inv = ensure_invoice_for_context(
+        db,
+        patient_id=adm.patient_id,
+        billing_type="ip_billing",
+        context_type="ipd",
+        context_id=adm.id,
+        created_by=user.id,
     )
 
-    payload_data = payload.model_dump(exclude_unset=True)
+    pharm_inv = ensure_invoice_for_context(
+        db,
+        patient_id=adm.patient_id,
+        billing_type="pharmacy",
+        context_type="ipd",
+        context_id=adm.id,
+        created_by=user.id,
+    )
 
-    # Direct fields present on Invoice model
-    for key in (
-            "billing_type",
-            "consultant_id",
-            "remarks",
-            "provider_id",
-            "visit_no",
-    ):
-        if hasattr(inv, key) and key in payload_data:
-            setattr(inv, key, payload_data[key])
+    ot_inv = ensure_invoice_for_context(
+        db,
+        patient_id=adm.patient_id,
+        billing_type="ot",
+        context_type="ipd",
+        context_id=adm.id,
+        created_by=user.id,
+    )
+    ris_inv = ensure_invoice_for_context(
+        db,
+        patient_id=adm.patient_id,
+        billing_type="radiology",  # ✅ ADD THIS
+        context_type="ipd",
+        context_id=adm.id,
+        created_by=user.id,
+    )
 
-    # Optional mapping: visit_id -> visit_no (string) if FE sends visit_id
-    if "visit_id" in payload_data and hasattr(inv, "visit_no"):
-        inv.visit_no = str(payload_data["visit_id"])
+    db.commit()
+    return {
+        "ip_invoice_id": ip_inv.id,
+        "pharmacy_invoice_id": pharm_inv.id,
+        "ot_invoice_id": ot_inv.id,
+        "radiology_invoice_id": ris_inv.id,  # ✅ ADD
+    }
 
-    # Always draft by default – finalized only via explicit API
-    inv.status = "draft"
-    inv.gross_total = 0
-    inv.tax_total = 0
-    inv.discount_total = 0
-    inv.net_total = 0
-    inv.amount_paid = 0
-    inv.balance_due = 0
-    inv.created_by = user.id
 
-    # Optional invoice_number auto-generate if model has that column
-    if hasattr(inv,
-               "invoice_number") and not getattr(inv, "invoice_number", None):
-        try:
-            inv.invoice_number = _generate_invoice_number(db)
-        except Exception:
-            # if anything fails, keep it None / default
-            pass
+def _resolve_bed_daily_rate(db: Session, room_type: str,
+                            on_date: date) -> Decimal:
+    rt = normalize_room_type(room_type)
+    r = (
+        db.query(IpdBedRate).filter(IpdBedRate.is_active.is_(True)).filter(
+            IpdBedRate.room_type == rt).filter(
+                IpdBedRate.effective_from <= on_date).filter(
+                    (IpdBedRate.effective_to == None) |
+                    (IpdBedRate.effective_to >= on_date))  # noqa
+        .order_by(IpdBedRate.effective_from.desc()).first())
+    return _d(getattr(r, "daily_rate", 0))
 
-    db.add(inv)
+
+@router.post("/ipd/admissions/{admission_id}/auto-bed-charges",
+             response_model=InvoiceOut)
+def auto_ipd_bed_charges(
+        admission_id: int,
+        payload: AutoBedChargesIn,
+        db: Session = Depends(get_db),
+        user: User = Depends(auth_current_user),
+):
+    if not has_perm(user, "billing.items.add"):
+        raise HTTPException(403, "Not permitted")
+
+    adm = db.query(IpdAdmission).get(admission_id)
+    if not adm:
+        raise HTTPException(404, "Admission not found")
+
+    inv = ensure_invoice_for_context(
+        db,
+        patient_id=adm.patient_id,
+        billing_type="ip_billing",
+        context_type="ipd",
+        context_id=adm.id,
+        created_by=user.id,
+    )
+
+    # decide date range
+    start_date = payload.from_date or (adm.admitted_at.date()
+                                       if adm.admitted_at else
+                                       datetime.utcnow().date())
+    end_date = payload.to_date or datetime.utcnow().date()
+
+    assigns = (db.query(IpdBedAssignment).filter(
+        IpdBedAssignment.admission_id == adm.id).order_by(
+            IpdBedAssignment.from_ts.asc()).all())
+
+    d = start_date
+    while d <= end_date:
+        # pick active assignment for day (simple daily)
+        active = None
+        day_start = datetime.combine(d, datetime.min.time())
+        day_end = datetime.combine(d, datetime.max.time())
+        for a in assigns:
+            if a.from_ts <= day_end and ((a.to_ts is None) or
+                                         (a.to_ts >= day_start)):
+                active = a
+
+        if active:
+            bed = db.get(IpdBed, active.bed_id)
+            room = db.get(IpdRoom, bed.room_id) if bed and getattr(
+                bed, "room_id", None) else None
+
+            room_type = normalize_room_type(getattr(room, "type", None))
+            rate = _resolve_bed_daily_rate(db, room_type, d)
+
+            # ✅ global-safe item
+            ref_key = f"ipd:{adm.id}:bed:{active.id}:{d.isoformat()}"
+            safe_ref = _service_ref_id(ref_key)
+
+            exists = db.query(InvoiceItem).filter(
+                InvoiceItem.service_type == "ipd_bed",
+                InvoiceItem.service_ref_id == safe_ref,
+                InvoiceItem.is_voided.is_(False),
+            ).first()
+
+            if not exists and rate > 0:
+                seq = _next_seq_for_invoice(db, inv.id)
+                qty, price, disc_pct, disc_amt, tax_rate, tax_amt, line_total = _compute_line(
+                    Decimal("1"), rate, Decimal("0"), Decimal("0"),
+                    payload.tax_rate or Decimal("0"))
+                db.add(
+                    InvoiceItem(
+                        invoice_id=inv.id,
+                        seq=seq,
+                        service_type="ipd_bed",
+                        service_ref_id=safe_ref,
+                        description=
+                        f"Bed charge — {d.strftime('%d-%m-%Y')} — {room_type}",
+                        quantity=qty,
+                        unit_price=price,
+                        tax_rate=tax_rate,
+                        discount_percent=disc_pct,
+                        discount_amount=disc_amt,
+                        tax_amount=tax_amt,
+                        line_total=line_total,
+                        created_by=user.id,
+                    ))
+
+        d = (d + timedelta(days=1))
+
+    db.flush()
+    inv = db.query(Invoice).options(
+        joinedload(Invoice.items),
+        joinedload(Invoice.payments),
+        joinedload(Invoice.advance_adjustments),
+    ).get(inv.id)
+
+    recalc_totals(inv, db)
+    inv.updated_by = user.id
     db.commit()
     db.refresh(inv)
     return serialize_invoice(inv)
 
 
-@router.get("/invoices/{invoice_id}", response_model=InvoiceOut)
-def get_invoice(
-        invoice_id: int,
+@router.get("/masters", response_model=dict)
+def billing_masters(
         db: Session = Depends(get_db),
         user: User = Depends(auth_current_user),
 ):
     if not has_perm(user, "billing.view"):
         raise HTTPException(status_code=403, detail="Not permitted")
 
-    inv = db.query(Invoice).get(invoice_id)
+    from app.models.user import User as UserModel
+
+    doctors_q = db.query(UserModel).filter(UserModel.is_active.is_(True))
+    if hasattr(UserModel, "is_doctor"):
+        doctors_q = doctors_q.filter(UserModel.is_doctor.is_(True))
+    doctors = [{
+        "id": d.id,
+        "name": d.name,
+        "email": d.email
+    } for d in doctors_q.order_by(UserModel.name.asc()).all()]
+
+    providers = [{
+        "id": p.id,
+        "name": p.name,
+        "code": p.code,
+        "provider_type": p.provider_type
+    } for p in db.query(BillingProvider).filter(
+        BillingProvider.is_active.is_(True)).order_by(
+            BillingProvider.name.asc()).all()]
+
+    payers = [{
+        "id": p.id,
+        "code": p.code,
+        "name": p.name,
+        "payer_type": p.payer_type
+    } for p in db.query(Payer).order_by(Payer.name.asc()).all()]
+
+    tpas = [{
+        "id": t.id,
+        "code": t.code,
+        "name": t.name,
+        "payer_id": t.payer_id
+    } for t in db.query(Tpa).order_by(Tpa.name.asc()).all()]
+
+    credit_plans = [{
+        "id": c.id,
+        "code": c.code,
+        "name": c.name,
+        "payer_id": c.payer_id,
+        "tpa_id": c.tpa_id
+    } for c in db.query(CreditPlan).order_by(CreditPlan.name.asc()).all()]
+
+    packages = [{
+        "id": pkg.id,
+        "name": pkg.name,
+        "charges": float(pkg.charges or 0)
+    } for pkg in db.query(IpdPackage).order_by(IpdPackage.name.asc()).all()]
+
+    return {
+        "doctors": doctors,
+        "credit_providers": providers,
+        "payers": payers,
+        "tpas": tpas,
+        "credit_plans": credit_plans,
+        "packages": packages,
+    }
+
+
+def apply_ipd_bed_charges_to_invoice(
+    db: Session,
+    admission_id: int,
+    upto_date: date,
+    user_id: int | None = None,
+    tax_rate: float = 0.0,
+) -> Invoice:
+    adm = db.query(IpdAdmission).get(admission_id)
+    if not adm:
+        raise ValueError("Admission not found")
+
+    from_date = (adm.admitted_at.date() if adm.admitted_at else upto_date)
+
+    inv = ensure_invoice_for_context(
+        db=db,
+        patient_id=adm.patient_id,
+        billing_type="ip_billing",
+        context_type="ipd",
+        context_id=adm.id,
+    )
+
+    # Daily breakdown from your existing calculator
+    preview = compute_ipd_bed_charges_daily(db, admission_id, from_date,
+                                            upto_date)
+
+    for d in preview.days:
+        # unique per day + assignment
+        safe_ref = f"{d.assignment_id}:{d.date.isoformat()}"
+
+        exists = (
+            db.query(InvoiceItem).filter(
+                InvoiceItem.invoice_id == inv.id,  # ✅ IMPORTANT
+                InvoiceItem.service_type == "ipd_bed",
+                InvoiceItem.service_ref_id == safe_ref,
+                InvoiceItem.is_voided.is_(False),
+            ).first())
+
+        qty = 1
+        unit_price = float(d.rate or 0.0)
+        amount = round(qty * unit_price, 2)
+
+        if exists:
+            # update if rate changed
+            exists.qty = qty
+            exists.unit_price = unit_price
+            exists.amount = amount
+            exists.tax_rate = tax_rate
+            exists.tax_amount = round(amount * (tax_rate / 100.0), 2)
+            exists.total_amount = round(amount + exists.tax_amount, 2)
+        else:
+            item = InvoiceItem(
+                invoice_id=inv.id,
+                name=
+                f"Bed Charges ({d.room_type}) - {d.date.strftime('%d-%m-%Y')}",
+                qty=qty,
+                unit_price=unit_price,
+                amount=amount,
+                tax_rate=tax_rate,
+                tax_amount=round(amount * (tax_rate / 100.0), 2),
+                total_amount=round(
+                    amount + round(amount * (tax_rate / 100.0), 2), 2),
+                service_type="ipd_bed",
+                service_ref_id=safe_ref,
+                created_by=user_id,
+            )
+            db.add(item)
+
+    # make totals correct
+    inv.recalc()
+    db.add(inv)
+    return inv
+
+
+# ---------------------------------------------------------------------------
+# Core Invoices
+# ---------------------------------------------------------------------------
+
+
+@router.get("/patients/{patient_id}/summary", response_model=dict)
+def patient_billing_summary(
+        patient_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(auth_current_user),
+):
+    if not has_perm(user, "billing.view"):
+        raise HTTPException(status_code=403, detail="Not permitted")
+
+    patient = db.query(Patient).get(patient_id)
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
+    invs = (db.query(Invoice).filter(
+        Invoice.patient_id == patient_id).order_by(
+            Invoice.created_at.asc()).all())
+
+    invoices_out = []
+    total_net = total_paid = total_balance = 0.0
+
+    for inv in invs:
+        inv = db.query(Invoice).options(
+            joinedload(Invoice.items),
+            joinedload(Invoice.payments),
+            joinedload(Invoice.advance_adjustments),
+        ).get(inv.id)
+
+        recalc_totals(inv, db)
+
+        net = float(inv.net_total or 0)
+        paid = float(inv.amount_paid or 0)
+        bal = float(inv.balance_due or 0)
+
+        total_net += net
+        total_paid += paid
+        total_balance += bal
+
+        invoices_out.append({
+            "id":
+            inv.id,
+            "invoice_number":
+            getattr(inv, "invoice_number", None) or str(inv.id),
+            "billing_type":
+            getattr(inv, "billing_type", None) or "general",
+            "context_type":
+            inv.context_type,
+            "context_id":
+            inv.context_id,
+            "status":
+            inv.status,
+            "net_total":
+            net,
+            "amount_paid":
+            paid,
+            "balance_due":
+            bal,
+            "created_at":
+            inv.created_at.isoformat() if inv.created_at else None,
+            "finalized_at":
+            inv.finalized_at.isoformat() if inv.finalized_at else None,
+        })
+
+    db.commit()
+
+    return {
+        "patient": {
+            "id": patient.id,
+            "uhid": getattr(patient, "uhid", None),
+            "name":
+            f"{patient.first_name or ''} {patient.last_name or ''}".strip(),
+            "phone": patient.phone,
+        },
+        "invoices": invoices_out,
+        "totals": {
+            "net_total": total_net,
+            "amount_paid": total_paid,
+            "balance_due": total_balance,
+        },
+    }
+
+
+@router.get("/patient/{patient_id}/summary", response_model=dict)
+def patient_billing_summary_alias(
+        patient_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(auth_current_user),
+):
+    return patient_billing_summary(patient_id=patient_id, db=db, user=user)
+
+
+@router.get("/invoices/{invoice_id}/unbilled", response_model=List[dict])
+def fetch_unbilled_services(
+        invoice_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(auth_current_user),
+):
+    if not has_perm(user, "billing.items.add"):
+        raise HTTPException(status_code=403, detail="Not permitted")
+
+    # TODO: later fetch OPD/LIS/RIS/Pharmacy unbilled items for this invoice context
+    return []
+
+
+@router.post("/invoices", response_model=InvoiceOut)
+def create_invoice(
+        payload: InvoiceCreate,
+        db: Session = Depends(get_db),
+        user: User = Depends(auth_current_user),
+):
+    if not has_perm(user, "billing.create"):
+        raise HTTPException(status_code=403, detail="Not permitted")
+
+    inv = Invoice(
+        invoice_uid=_new_invoice_uid(),
+        invoice_number=_new_invoice_number(),
+        patient_id=payload.patient_id,
+        context_type=payload.context_type,
+        context_id=payload.context_id,
+        billing_type=payload.billing_type,
+        provider_id=payload.provider_id,
+        consultant_id=payload.consultant_id,
+        visit_no=payload.visit_no,
+        remarks=payload.remarks,
+        status="draft",
+        created_by=user.id,
+    )
+
+    db.add(inv)
+    db.commit()
+    db.refresh(inv)
+    recalc_totals(inv, db)
+    db.commit()
+    db.refresh(inv)
+    return serialize_invoice(inv)
+
+
+@router.get("/invoices/{invoice_id}", response_model=InvoiceOut)
+def get_invoice(invoice_id: int,
+                db: Session = Depends(get_db),
+                user: User = Depends(auth_current_user)):
+    if not has_perm(user, "billing.view"):
+        raise HTTPException(status_code=403, detail="Not permitted")
+    inv = db.query(Invoice).options(
+        joinedload(Invoice.items), joinedload(Invoice.payments),
+        joinedload(Invoice.advance_adjustments)).get(invoice_id)
     if not inv:
         raise HTTPException(status_code=404, detail="Not found")
+    recalc_totals(inv, db)
+    db.commit()
+    db.refresh(inv)
     return serialize_invoice(inv)
 
 
@@ -328,20 +775,11 @@ def list_invoices(
         db: Session = Depends(get_db),
         user: User = Depends(auth_current_user),
 ):
-    """
-    List invoices with optional filters.
-    Supports: patient_id, patient_uhid, billing_type, status, date range.
-
-    NOTE:
-      - If patient_uhid is passed, it takes precedence over patient_id.
-      - This allows FE to avoid exposing raw numeric patient IDs.
-    """
     if not has_perm(user, "billing.view"):
         raise HTTPException(status_code=403, detail="Not permitted")
 
     q = db.query(Invoice)
 
-    # Prefer UHID if provided
     if patient_uhid:
         patient = db.query(Patient).filter(
             Patient.uhid == patient_uhid).first()
@@ -351,7 +789,7 @@ def list_invoices(
     elif patient_id:
         q = q.filter(Invoice.patient_id == patient_id)
 
-    if billing_type and hasattr(Invoice, "billing_type"):
+    if billing_type:
         q = q.filter(Invoice.billing_type == billing_type)
     if status:
         q = q.filter(Invoice.status == status)
@@ -362,9 +800,21 @@ def list_invoices(
         q = q.filter(Invoice.created_at <= datetime.combine(
             to_date, datetime.max.time()))
 
-    q = q.order_by(Invoice.id.desc()).limit(500)
-    invs = q.all()
-    return [serialize_invoice(inv) for inv in invs]
+    invs = q.order_by(Invoice.id.desc()).limit(500).all()
+
+    # lightweight serialize
+    out = []
+    for inv in invs:
+        inv = db.query(Invoice).options(
+            joinedload(Invoice.patient),
+            joinedload(Invoice.items),
+            joinedload(Invoice.payments),
+            joinedload(Invoice.advance_adjustments),
+        ).get(inv.id)
+        recalc_totals(inv, db)
+        out.append(serialize_invoice(inv))
+    db.commit()
+    return out
 
 
 @router.put("/invoices/{invoice_id}", response_model=InvoiceOut)
@@ -374,16 +824,15 @@ def update_invoice(
         db: Session = Depends(get_db),
         user: User = Depends(auth_current_user),
 ):
-    """
-    Update header fields of invoice (consultant, credit, remarks, etc.).
-    Uses loose dict body so you can send extended fields safely.
-    """
     if not has_perm(user, "billing.create"):
         raise HTTPException(status_code=403, detail="Not permitted")
 
     inv = db.query(Invoice).get(invoice_id)
     if not inv:
         raise HTTPException(status_code=404, detail="Not found")
+
+    if inv.status in ("finalized", "cancelled"):
+        raise HTTPException(status_code=400, detail="Invoice locked")
 
     for k, v in payload.items():
         if hasattr(inv, k):
@@ -392,27 +841,31 @@ def update_invoice(
     inv.updated_by = user.id
     db.commit()
     db.refresh(inv)
+
+    recalc_totals(inv, db)
+    db.commit()
+    db.refresh(inv)
     return serialize_invoice(inv)
 
 
 @router.post("/invoices/{invoice_id}/finalize", response_model=InvoiceOut)
-def finalize_invoice(
-        invoice_id: int,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
-):
-    """
-    Lock invoice; no structural edits allowed after this (only payments).
-    Explicit action: auto-billing logic keeps invoice in 'draft' by default.
-    """
+def finalize_invoice(invoice_id: int,
+                     db: Session = Depends(get_db),
+                     user: User = Depends(auth_current_user)):
     if not has_perm(user, "billing.finalize"):
         raise HTTPException(status_code=403, detail="Not permitted")
 
-    inv = db.query(Invoice).get(invoice_id)
+    inv = db.query(Invoice).options(
+        joinedload(Invoice.items), joinedload(Invoice.payments),
+        joinedload(Invoice.advance_adjustments)).get(invoice_id)
     if not inv:
         raise HTTPException(status_code=404, detail="Invoice not found")
 
-    recalc_totals(inv)
+    if inv.status == "cancelled":
+        raise HTTPException(status_code=400,
+                            detail="Cancelled invoice cannot be finalized")
+
+    recalc_totals(inv, db)
     inv.status = "finalized"
     inv.finalized_at = datetime.utcnow()
     inv.updated_by = user.id
@@ -422,17 +875,16 @@ def finalize_invoice(
 
 
 @router.post("/invoices/{invoice_id}/cancel")
-def cancel_invoice(
-        invoice_id: int,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
-):
+def cancel_invoice(invoice_id: int,
+                   db: Session = Depends(get_db),
+                   user: User = Depends(auth_current_user)):
     if not has_perm(user, "billing.finalize"):
         raise HTTPException(status_code=403, detail="Not permitted")
 
     inv = db.query(Invoice).get(invoice_id)
     if not inv:
         raise HTTPException(status_code=404, detail="Not found")
+
     inv.status = "cancelled"
     inv.cancelled_at = datetime.utcnow()
     inv.updated_by = user.id
@@ -443,59 +895,70 @@ def cancel_invoice(
 # ---------------------------------------------------------------------------
 # Items
 # ---------------------------------------------------------------------------
+def _compute_line(payload_qty, payload_price, payload_disc_pct,
+                  payload_disc_amt, payload_tax_rate):
+    qty = _d(payload_qty)
+    price = _d(payload_price)
+    base = (qty * price)
+
+    disc_pct = _d(payload_disc_pct)
+    disc_amt = _d(payload_disc_amt)
+
+    if disc_pct and (not disc_amt or disc_amt == 0):
+        disc_amt = (base * disc_pct / Decimal("100")).quantize(Decimal("0.01"))
+    elif disc_amt and (not disc_pct or disc_pct == 0) and base:
+        disc_pct = (disc_amt * Decimal("100") / base).quantize(Decimal("0.01"))
+
+    taxable = base - disc_amt
+    tax_rate = _d(payload_tax_rate)
+    tax_amt = (taxable * tax_rate / Decimal("100")).quantize(Decimal("0.01"))
+
+    line_total = (taxable + tax_amt).quantize(Decimal("0.01"))
+    return qty, price, disc_pct, disc_amt, tax_rate, tax_amt, line_total
+
+
 @router.post("/invoices/{invoice_id}/items/manual", response_model=InvoiceOut)
-def add_manual_item(
-        invoice_id: int,
-        payload: ManualItemIn,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
-):
+def add_manual_item(invoice_id: int,
+                    payload: ManualItemIn,
+                    db: Session = Depends(get_db),
+                    user: User = Depends(auth_current_user)):
     if not has_perm(user, "billing.items.add"):
         raise HTTPException(status_code=403, detail="Not permitted")
 
-    inv = db.query(Invoice).get(invoice_id)
+    inv = db.query(Invoice).options(joinedload(Invoice.items)).get(invoice_id)
     if not inv:
         raise HTTPException(status_code=404, detail="Invoice not found")
+    if inv.status in ("finalized", "cancelled"):
+        raise HTTPException(status_code=400, detail="Invoice locked")
 
-    # ---- IMPORTANT: make service_ref_id unique for manual lines ----
+    seq = _next_seq_for_invoice(db, invoice_id)
     service_type = (payload.service_type or "manual").strip() or "manual"
+    service_ref_id = payload.service_ref_id or _manual_ref_for_invoice(
+        invoice_id, seq)
 
-    if payload.service_ref_id and payload.service_ref_id > 0:
-        service_ref_id = payload.service_ref_id
-    else:
-        # For manual items, generate a unique synthetic ref id
-        max_ref = (db.query(func.max(InvoiceItem.service_ref_id)).filter(
-            InvoiceItem.service_type == "manual").scalar()) or 0
-        service_ref_id = int(max_ref) + 1
+    qty, price, disc_pct, disc_amt, tax_rate, tax_amt, line_total = _compute_line(
+        payload.quantity, payload.unit_price, payload.discount_percent,
+        payload.discount_amount, payload.tax_rate)
 
     it = InvoiceItem(
         invoice_id=invoice_id,
+        seq=seq,
         service_type=service_type,
-        service_ref_id=service_ref_id,
+        service_ref_id=int(service_ref_id),
         description=(payload.description or "").strip(),
-        quantity=payload.quantity or 1,
-        unit_price=payload.unit_price,
-        tax_rate=payload.tax_rate or 0,
-        discount_percent=payload.discount_percent or 0,
-        discount_amount=payload.discount_amount or 0,
+        quantity=qty,
+        unit_price=price,
+        tax_rate=tax_rate,
+        discount_percent=disc_pct,
+        discount_amount=disc_amt,
+        tax_amount=tax_amt,
+        line_total=line_total,
         created_by=user.id,
     )
 
-    qty = float(it.quantity or 0)
-    price = float(it.unit_price or 0)
-    discount_amount = float(it.discount_amount or 0)
-    tax_rate = float(it.tax_rate or 0)
-
-    base = (qty * price) - discount_amount
-    tax_amt = base * (tax_rate / 100.0)
-    it.tax_amount = tax_amt
-    it.line_total = base + tax_amt
-
     db.add(it)
-    db.flush()  # service_ref_id uniqueness prevents duplicate constraint
-
-    db.refresh(inv)
-    recalc_totals(inv)
+    db.flush()
+    recalc_totals(inv, db)
     inv.updated_by = user.id
     db.commit()
     db.refresh(inv)
@@ -509,54 +972,55 @@ def add_service_item(
         db: Session = Depends(get_db),
         user: User = Depends(auth_current_user),
 ):
-    """
-    Add service-based item (OPD visit, Lab test, Radiology, OT, etc).
-    Actual price lookup you can hook from other modules.
-    """
     if not has_perm(user, "billing.items.add"):
         raise HTTPException(status_code=403, detail="Not permitted")
 
-    inv = db.query(Invoice).get(invoice_id)
+    inv = db.query(Invoice).options(joinedload(Invoice.items)).get(invoice_id)
     if not inv:
         raise HTTPException(status_code=404, detail="Invoice not found")
+    if inv.status in ("finalized", "cancelled"):
+        raise HTTPException(status_code=400, detail="Invoice locked")
+
+    # ✅ GLOBAL SAFE service_ref_id (critical)
+    # Create a full context key so OP/IP never collide
+    ref_key = f"{inv.context_type}:{inv.context_id}:{payload.service_type}:{payload.service_ref_id}"
+    safe_ref_id = _service_ref_id(ref_key)
+
+    # ✅ Idempotent (avoid duplicate insert + unique constraint crash)
+    existing = db.query(InvoiceItem).filter(
+        InvoiceItem.service_type == payload.service_type,
+        InvoiceItem.service_ref_id == safe_ref_id,
+        InvoiceItem.is_voided.is_(False),
+    ).first()
+    if existing:
+        recalc_totals(inv, db)
+        db.commit()
+        db.refresh(inv)
+        return serialize_invoice(inv)
 
     seq = _next_seq_for_invoice(db, invoice_id)
-
     desc = (payload.description
             or f"{payload.service_type.upper()} #{payload.service_ref_id}")
 
-    qty = float(payload.quantity or 1)
-    if qty <= 0:
-        raise HTTPException(status_code=400, detail="Quantity must be > 0")
-
-    unit_price = float((getattr(payload, "unit_price", None) or 0))
-    tax_rate = float(payload.tax_rate or 0)
-    discount_percent = float(payload.discount_percent or 0)
-    discount_amount = float(payload.discount_amount or 0)
-
-    base = qty * unit_price
-
-    # Same discount handling as manual
-    if discount_percent and not discount_amount:
-        discount_amount = round(base * discount_percent / 100.0, 2)
-    elif discount_amount and not discount_percent and base:
-        discount_percent = round((discount_amount / base) * 100.0, 2)
-
-    taxable = base - discount_amount
-    tax_amt = round(taxable * (tax_rate / 100.0), 2)
-    line_total = round(taxable + tax_amt, 2)
+    qty, price, disc_pct, disc_amt, tax_rate, tax_amt, line_total = _compute_line(
+        payload.quantity,
+        (payload.unit_price or 0),
+        payload.discount_percent,
+        payload.discount_amount,
+        payload.tax_rate,
+    )
 
     it = InvoiceItem(
         invoice_id=invoice_id,
         seq=seq,
         service_type=payload.service_type,
-        service_ref_id=payload.service_ref_id,
+        service_ref_id=safe_ref_id,  # ✅ safe
         description=desc,
-        quantity=int(qty),
-        unit_price=unit_price,
+        quantity=qty,
+        unit_price=price,
         tax_rate=tax_rate,
-        discount_percent=discount_percent,
-        discount_amount=discount_amount,
+        discount_percent=disc_pct,
+        discount_amount=disc_amt,
         tax_amount=tax_amt,
         line_total=line_total,
         is_voided=False,
@@ -565,31 +1029,28 @@ def add_service_item(
 
     db.add(it)
     db.flush()
-    db.refresh(inv)
-    recalc_totals(inv)
+    recalc_totals(inv, db)
     inv.updated_by = user.id
     db.commit()
     db.refresh(inv)
     return serialize_invoice(inv)
 
 
-@router.put(
-    "/invoices/{invoice_id}/items/{item_id}",
-    response_model=InvoiceOut,
-)
-def update_item(
-        invoice_id: int,
-        item_id: int,
-        payload: UpdateItemIn,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
-):
+@router.put("/invoices/{invoice_id}/items/{item_id}",
+            response_model=InvoiceOut)
+def update_item(invoice_id: int,
+                item_id: int,
+                payload: UpdateItemIn,
+                db: Session = Depends(get_db),
+                user: User = Depends(auth_current_user)):
     if not has_perm(user, "billing.items.add"):
         raise HTTPException(status_code=403, detail="Not permitted")
 
-    inv = db.query(Invoice).get(invoice_id)
+    inv = db.query(Invoice).options(joinedload(Invoice.items)).get(invoice_id)
     if not inv:
         raise HTTPException(status_code=404, detail="Invoice not found")
+    if inv.status in ("finalized", "cancelled"):
+        raise HTTPException(status_code=400, detail="Invoice locked")
 
     it = db.query(InvoiceItem).get(item_id)
     if not it or it.invoice_id != invoice_id:
@@ -598,54 +1059,43 @@ def update_item(
     for k, v in payload.model_dump(exclude_unset=True).items():
         setattr(it, k, v)
 
-    qty = float(it.quantity or 0)
-    price = float(it.unit_price or 0)
-    tax_rate = float(it.tax_rate or 0)
-    discount_percent = float(it.discount_percent or 0)
-    discount_amount = float(it.discount_amount or 0)
-
-    base = qty * price
-
-    # Re-sync discount fields if only one changed
-    if discount_percent and not discount_amount:
-        discount_amount = round(base * discount_percent / 100.0, 2)
-        it.discount_amount = discount_amount
-    elif discount_amount and not discount_percent and base:
-        discount_percent = round((discount_amount / base) * 100.0, 2)
-        it.discount_percent = discount_percent
-
-    taxable = base - discount_amount
-    tax_amt = round(taxable * (tax_rate / 100.0), 2)
+    qty, price, disc_pct, disc_amt, tax_rate, tax_amt, line_total = _compute_line(
+        it.quantity, it.unit_price, it.discount_percent, it.discount_amount,
+        it.tax_rate)
+    it.quantity = qty
+    it.unit_price = price
+    it.discount_percent = disc_pct
+    it.discount_amount = disc_amt
+    it.tax_rate = tax_rate
     it.tax_amount = tax_amt
-    it.line_total = taxable + tax_amt
+    it.line_total = line_total
     it.updated_by = user.id
 
     db.commit()
     db.refresh(inv)
-    recalc_totals(inv)
+    recalc_totals(inv, db)
     inv.updated_by = user.id
     db.commit()
     db.refresh(inv)
     return serialize_invoice(inv)
 
 
-@router.post(
-    "/invoices/{invoice_id}/items/{item_id}/void",
-    response_model=InvoiceOut,
-)
-def void_item(
-        invoice_id: int,
-        item_id: int,
-        payload: VoidItemIn,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
-):
+@router.post("/invoices/{invoice_id}/items/{item_id}/void",
+             response_model=InvoiceOut)
+def void_item(invoice_id: int,
+              item_id: int,
+              payload: VoidItemIn,
+              db: Session = Depends(get_db),
+              user: User = Depends(auth_current_user)):
     if not has_perm(user, "billing.items.add"):
         raise HTTPException(status_code=403, detail="Not permitted")
 
-    inv = db.query(Invoice).get(invoice_id)
+    inv = db.query(Invoice).options(joinedload(Invoice.items)).get(invoice_id)
     if not inv:
         raise HTTPException(status_code=404, detail="Invoice not found")
+    if inv.status in ("finalized", ):
+        raise HTTPException(status_code=400,
+                            detail="Finalized invoice cannot be edited")
 
     it = db.query(InvoiceItem).get(item_id)
     if not it or it.invoice_id != invoice_id:
@@ -655,418 +1105,265 @@ def void_item(
     it.void_reason = payload.reason
     it.voided_by = user.id
     it.voided_at = datetime.utcnow()
-
     db.commit()
+
     db.refresh(inv)
-    recalc_totals(inv)
+    recalc_totals(inv, db)
     inv.updated_by = user.id
     db.commit()
     db.refresh(inv)
     return serialize_invoice(inv)
 
 
-# ---- UNBILLED SERVICES ----
-@router.post(
-    "/invoices/{invoice_id}/items/bulk-from-unbilled",
-    response_model=InvoiceOut,
-)
-def bulk_add_from_unbilled(
-        invoice_id: int,
-        payload: BulkAddFromUnbilledIn = Body(default=None),
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
-):
-    """
-    Old path kept for compatibility.
-    """
-    return _apply_unbilled_services(invoice_id, payload, db, user)
+# ---------------------------------------------------------------------------
+# OT Billing: FIX + Auto Create Invoice
+# ---------------------------------------------------------------------------
+def _case_completed(case: OtCase) -> bool:
+    s = (getattr(case, "status", "") or "").lower()
+    o = (getattr(case, "outcome", "") or "").lower()
+    return (s in ("completed", "done",
+                  "closed")) or (o in ("completed", "converted", "success",
+                                       "successful"))
 
 
-@router.get("/invoices/{invoice_id}/unbilled", response_model=List[dict])
-def fetch_unbilled_services(
-        invoice_id: int,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
-):
-    """
-    New FE expects this path. For now, return empty list so screen won't crash.
-    Later you can plug in OPD/LIS/RIS unbilled services.
-    """
-    if not has_perm(user, "billing.items.add"):
-        raise HTTPException(status_code=403, detail="Not permitted")
-
-    # TODO: implement real lookup
-    return []
+from datetime import timedelta  # make sure this exists at top
 
 
-@router.post(
-    "/invoices/{invoice_id}/unbilled/bulk-add",
-    response_model=InvoiceOut,
-)
-def bulk_add_from_unbilled_alias(
-        invoice_id: int,
-        payload: BulkAddFromUnbilledIn = Body(default=None),
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
-):
-    """
-    Alias for FE: POST /billing/invoices/{id}/unbilled/bulk-add
-    """
-    return _apply_unbilled_services(invoice_id, payload, db, user)
-
-
-@router.post(
-    "/invoices/{invoice_id}/items/ipd-bed-auto",
-    response_model=InvoiceOut,
-)
-def auto_add_ipd_bed_charges(
-        invoice_id: int,
-        payload: AutoBedChargesIn,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
-):
-    """
-    Auto-generate IPD bed charges from IpdBedAssignment for an admission.
-
-    Use-cases:
-      - IPD billing after discharge
-      - Re-run safely (skip_if_already_billed prevents duplicates)
-
-    Logic:
-      - Read IpdBedAssignment for given admission_id
-      - Resolve room_type from IpdBed -> IpdRoom.type
-      - Resolve daily_rate via IpdBedRate (no model change)
-      - For hourly: derived_hour_rate = daily_rate / 24
-      - For mixed: <=6h = hourly, >6h = daily
-      - Create InvoiceItems with service_type='ipd_bed' and
-        service_ref_id = bed_assignment.id
-    """
-    if not has_perm(user, "billing.items.add"):
-        raise HTTPException(status_code=403, detail="Not permitted")
-
-    inv = db.query(Invoice).get(invoice_id)
-    if not inv:
-        raise HTTPException(status_code=404, detail="Invoice not found")
-
-    upto_ts = payload.upto_ts or datetime.utcnow()
-
-    # All bed assignments for this admission
-    assignments: list[IpdBedAssignment] = (db.query(IpdBedAssignment).filter(
-        IpdBedAssignment.admission_id == payload.admission_id).order_by(
-            IpdBedAssignment.from_ts.asc()).all())
-    if not assignments:
-        raise HTTPException(
-            status_code=404,
-            detail="No bed assignments found for this admission",
-        )
-
-    # Already billed IPD bed lines for this invoice (to avoid duplicates)
-    existing_map: dict[int, InvoiceItem] = {}
-    existing_items: list[InvoiceItem] = (db.query(InvoiceItem).filter(
-        InvoiceItem.invoice_id == invoice_id,
-        InvoiceItem.service_type == "ipd_bed",
-        InvoiceItem.is_voided.is_(False),
-    ).all())
-    for it in existing_items:
-        if it.service_ref_id:
-            existing_map[int(it.service_ref_id)] = it
-
-    created_any = False
-
-    for ba in assignments:
-        # Skip already billed assignment if requested
-        if payload.skip_if_already_billed and ba.id in existing_map:
-            continue
-
-        start = ba.from_ts
-        end = ba.to_ts or upto_ts
-        if not start or end <= start:
-            continue
-
-        bed: IpdBed | None = ba.bed
-        if not bed or not bed.room:
-            continue
-
-        room_type = bed.room.type or "General"
-        bed_code = bed.code
-
-        # Resolve rate using same logic as /ipd/bed-rates/resolve
-        rate_row = _get_bed_rate_for_date(db, room_type, start)
-        daily_rate = float(rate_row.daily_rate or 0)
-        if daily_rate <= 0:
-            # no sensible rate -> skip silently
-            continue
-
-        duration_hours = (end - start).total_seconds() / 3600.0
-        units = _compute_stay_units(start, end, payload.mode)
-        if units <= 0:
-            continue
-
-        # Decide price per unit
-        if payload.mode == "hourly":
-            unit_price = daily_rate / 24.0
-        elif payload.mode == "mixed":
-            if duration_hours <= 6:
-                unit_price = daily_rate / 24.0
-            else:
-                unit_price = daily_rate
-        else:  # daily
-            unit_price = daily_rate
-
-        if unit_price <= 0:
-            continue
-
-        line_total = round(units * unit_price, 2)
-
-        desc = (
-            f"Bed charges - {room_type} ({bed_code}) "
-            f"{start.strftime('%d-%m-%Y %H:%M')} to {end.strftime('%d-%m-%Y %H:%M')} "
-            f"({units} {'day' if payload.mode == 'daily' else 'hour'}"
-            f"{'s' if units != 1 else ''})")
-
-        seq = _next_seq_for_invoice(db, invoice_id)
-
-        item = InvoiceItem(
-            invoice_id=invoice_id,
-            seq=seq,
-            service_type="ipd_bed",
-            service_ref_id=ba.id,  # link back to bed-assignment
-            description=desc,
-            quantity=units,
-            unit_price=unit_price,
-            tax_rate=0.0,
-            discount_percent=0.0,
-            discount_amount=0.0,
-            tax_amount=0.0,
-            line_total=line_total,
-            is_voided=False,
-            created_by=user.id,
-        )
-        db.add(item)
-        created_any = True
-
-    db.flush()
-    db.refresh(inv)
-    recalc_totals(inv)
-    inv.updated_by = user.id
-    db.commit()
-    db.refresh(inv)
-
-    if not created_any:
-        logger.info(
-            "No new IPD bed charges generated for invoice %s / admission %s",
-            invoice_id,
-            payload.admission_id,
-        )
-
-    # ✅ Invoice status is still 'draft'
-    return serialize_invoice(inv)
-
-
-@router.post(
-    "/invoices/{invoice_id}/items/ot-auto",
-    response_model=InvoiceOut,
-)
+@router.post("/invoices/{invoice_id}/items/ot-auto", response_model=InvoiceOut)
 def auto_add_ot_charges(
         invoice_id: int,
         payload: AutoOtChargesIn,
         db: Session = Depends(get_db),
         user: User = Depends(auth_current_user),
 ):
-    """
-    Auto-generate OT procedure charges for a given OT Case.
-
-    Rules:
-      - Only if operation is 'successful/completed'
-      - Uses OtProcedure.rate_per_hour
-      - Duration from actual_start_time to actual_end_time (in hours)
-      - One line per linked procedure (OtScheduleProcedure)
-      - Does NOT finalize invoice (status remains 'draft')
-    """
     if not has_perm(user, "billing.items.add"):
         raise HTTPException(status_code=403, detail="Not permitted")
 
-    inv = db.query(Invoice).get(invoice_id)
+    inv = db.query(Invoice).options(joinedload(Invoice.items)).get(invoice_id)
     if not inv:
         raise HTTPException(status_code=404, detail="Invoice not found")
+    if inv.status in ("finalized", "cancelled"):
+        raise HTTPException(status_code=400, detail="Invoice locked")
 
-    # Load case with schedule + procedures
-    case: OtCase | None = (db.query(OtCase).options(
+    case = (db.query(OtCase).options(
         joinedload(OtCase.schedule).joinedload(
-            OtCase.schedule.procedures).joinedload(
+            OtSchedule.procedures).joinedload(
                 OtScheduleProcedure.procedure)).get(payload.case_id))
     if not case:
         raise HTTPException(status_code=404, detail="OT case not found")
 
-    # ✅ Only when operation status is success/completed
-    outcome = (case.outcome or "").lower()
-    if outcome not in ("completed", "converted", "success", "successful"):
+    if not _case_completed(case):
         raise HTTPException(
             status_code=400,
-            detail="OT case is not completed/successful; cannot auto-bill.",
+            detail="OT case is not completed; cannot auto-bill.",
         )
 
-    start = case.actual_start_time
-    end = case.actual_end_time
+    start = getattr(case, "actual_start_time", None)
+    end = getattr(case, "actual_end_time", None)
     if not start or not end or end <= start:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid OT timings (start/end); cannot auto-bill.",
-        )
+        raise HTTPException(status_code=400,
+                            detail="Invalid OT timings; cannot auto-bill.")
 
-    total_hours = (end - start).total_seconds() / 3600.0
-    if total_hours <= 0:
-        raise HTTPException(
-            status_code=400,
-            detail="OT duration is zero; cannot auto-bill.",
-        )
+    hours = Decimal(str(
+        (end - start).total_seconds() / 3600.0)).quantize(Decimal("0.01"))
+    if hours <= 0:
+        raise HTTPException(status_code=400,
+                            detail="OT duration is zero; cannot auto-bill.")
 
     schedule = case.schedule
     if not schedule:
-        raise HTTPException(
-            status_code=400,
-            detail="OT case is not linked to a schedule.",
-        )
+        raise HTTPException(status_code=400,
+                            detail="OT case not linked to schedule.")
 
-    links: list[OtScheduleProcedure] = list(schedule.procedures or [])
+    links: list[OtScheduleProcedure] = list(
+        getattr(schedule, "procedures", []) or [])
     if not links:
-        # Fallback: use primary_procedure if no schedule links are present
-        raise HTTPException(
-            status_code=400,
-            detail="No OT procedures linked to this schedule.",
-        )
+        raise HTTPException(status_code=400,
+                            detail="No OT procedures linked to this schedule.")
 
-    # Avoid double-billing: check existing InvoiceItems
-    existing_map: dict[int, InvoiceItem] = {}
-    existing_items: list[InvoiceItem] = (db.query(InvoiceItem).filter(
-        InvoiceItem.invoice_id == invoice_id,
-        InvoiceItem.service_type == "ot_procedure",
-        InvoiceItem.is_voided.is_(False),
-    ).all())
-    for it in existing_items:
-        if it.service_ref_id:
-            existing_map[int(it.service_ref_id)] = it
+    # Existing OT items (service_ref_id values already stored)
+    existing_ids = set(
+        int(x[0]) for x in db.query(InvoiceItem.service_ref_id).filter(
+            InvoiceItem.invoice_id == invoice_id,
+            InvoiceItem.service_type == "ot_procedure",
+            InvoiceItem.is_voided.is_(False),
+            InvoiceItem.service_ref_id.isnot(None),
+        ).all() if x[0] is not None)
 
     created_any = False
-    qty_hours = round(total_hours, 2)
 
     for link in links:
-        if link.id in existing_map:
-            # already billed this schedule-procedure link
-            continue
-        proc: OtProcedure | None = link.procedure
-        if not proc or proc.rate_per_hour is None:
-            # no configured rate, skip
+        proc: OtProcedure | None = getattr(link, "procedure", None)
+        if not proc:
             continue
 
-        rate_per_hour = float(proc.rate_per_hour or 0)
-        if rate_per_hour <= 0:
+        rate = _d(getattr(proc, "rate_per_hour", 0))
+        if rate <= 0:
             continue
 
-        line_total = round(qty_hours * rate_per_hour, 2)
-        if line_total <= 0:
+        # ✅ GLOBAL SAFE ref id for UNIQUE(service_type, service_ref_id, is_voided)
+        ref_key = f"otcase:{payload.case_id}:proc_link:{link.id}"
+        safe_ref_id = _service_ref_id(ref_key)
+
+        # ✅ Idempotent
+        if safe_ref_id in existing_ids:
             continue
 
         seq = _next_seq_for_invoice(db, invoice_id)
+        desc = f"OT charges - {proc.name} ({float(hours):.2f} hr, Case #{case.id})"
 
-        desc = (f"OT charges - {proc.name} "
-                f"({qty_hours:.2f} hr, Case #{case.id})")
+        qty, price, disc_pct, disc_amt, tax_rate, tax_amt, line_total = _compute_line(
+            hours, rate, Decimal("0"), Decimal("0"), Decimal("0"))
 
         item = InvoiceItem(
             invoice_id=invoice_id,
             seq=seq,
             service_type="ot_procedure",
-            service_ref_id=link.id,  # schedule-procedure link as ref
+            service_ref_id=safe_ref_id,  # ✅ correct
             description=desc,
-            quantity=qty_hours,  # duration in hours
-            unit_price=rate_per_hour,  # rate per hour
-            tax_rate=0.0,
-            discount_percent=0.0,
-            discount_amount=0.0,
-            tax_amount=0.0,
+            quantity=qty,
+            unit_price=price,
+            tax_rate=tax_rate,
+            discount_percent=disc_pct,
+            discount_amount=disc_amt,
+            tax_amount=tax_amt,
             line_total=line_total,
             is_voided=False,
             created_by=user.id,
         )
         db.add(item)
         created_any = True
+        existing_ids.add(safe_ref_id)
 
     db.flush()
-    db.refresh(inv)
-    recalc_totals(inv)
+    recalc_totals(inv, db)
     inv.updated_by = user.id
     db.commit()
     db.refresh(inv)
 
     if not created_any:
         logger.info(
-            "No OT charges generated for invoice %s / case %s",
-            invoice_id,
-            payload.case_id,
-        )
+            "No new OT charges created (already billed) invoice=%s case=%s",
+            invoice_id, payload.case_id)
 
-    # ✅ Invoice status remains 'draft'
+    return serialize_invoice(inv)
+
+
+@router.post("/ot/auto-invoice", response_model=InvoiceOut)
+def auto_create_invoice_for_ot_case(
+        payload: AutoOtInvoiceIn,
+        db: Session = Depends(get_db),
+        user: User = Depends(auth_current_user),
+):
+    if not has_perm(user, "billing.create"):
+        raise HTTPException(status_code=403, detail="Not permitted")
+
+    case_id = payload.case_id
+
+    case = (db.query(OtCase).options(
+        joinedload(OtCase.schedule).joinedload(
+            OtSchedule.procedures).joinedload(
+                OtScheduleProcedure.procedure)).get(case_id))
+    if not case:
+        raise HTTPException(status_code=404, detail="OT case not found")
+
+    if not case.schedule or not case.schedule.patient_id:
+        raise HTTPException(status_code=400,
+                            detail="OT case not linked to schedule/patient")
+
+    patient_id = case.schedule.patient_id
+
+    # ✅ keep context_type consistent everywhere
+    ctx_type = "ot_case"
+
+    inv = (db.query(Invoice).filter(
+        Invoice.context_type == ctx_type,
+        Invoice.context_id == case_id,
+        Invoice.billing_type == "ot",
+        Invoice.status != "cancelled",
+    ).order_by(Invoice.id.desc()).first())
+
+    if not inv:
+        inv = Invoice(
+            invoice_uid=_new_invoice_uid(),
+            invoice_number=_new_invoice_number(),
+            patient_id=patient_id,
+            context_type=ctx_type,
+            context_id=case_id,
+            billing_type="ot",
+            status="draft",
+            created_by=user.id,
+        )
+        db.add(inv)
+        db.commit()
+        db.refresh(inv)
+
+    # ✅ idempotent OT item add
+    auto_add_ot_charges(inv.id, AutoOtChargesIn(case_id=case_id), db, user)
+
+    inv = (db.query(Invoice).options(
+        joinedload(Invoice.items),
+        joinedload(Invoice.payments),
+        joinedload(Invoice.advance_adjustments),
+    ).get(inv.id))
+    recalc_totals(inv, db)
+    inv.updated_by = user.id
+    db.commit()
+    db.refresh(inv)
+
+    if payload.finalize:
+        inv.status = "finalized"
+        inv.finalized_at = datetime.utcnow()
+        inv.updated_by = user.id
+        db.commit()
+        db.refresh(inv)
+
     return serialize_invoice(inv)
 
 
 # ---------------------------------------------------------------------------
-# Payments & Advances
+# Payments
 # ---------------------------------------------------------------------------
 @router.post("/invoices/{invoice_id}/payments/bulk", response_model=InvoiceOut)
-def add_payments_bulk(
-        invoice_id: int,
-        payload: dict,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
-):
-    """
-    Add one or more payments to invoice.
-
-    Body (any ONE of these is OK):
-      { "payments": [ {amount, mode, reference_no?}, ... ] }
-      [ {amount, mode, reference_no?}, ... ]    # (just array, no wrapper)
-    """
+def add_payments_bulk(invoice_id: int,
+                      payload: dict,
+                      db: Session = Depends(get_db),
+                      user: User = Depends(auth_current_user)):
     if not has_perm(user, "billing.payments.add"):
         raise HTTPException(status_code=403, detail="Not permitted")
 
-    inv = db.query(Invoice).get(invoice_id)
+    inv = db.query(Invoice).options(
+        joinedload(Invoice.payments), joinedload(Invoice.items),
+        joinedload(Invoice.advance_adjustments)).get(invoice_id)
     if not inv:
         raise HTTPException(status_code=404, detail="Invoice not found")
 
     raw = payload
-    # Allow plain list body also
-    if isinstance(raw, list):
-        raw_payments = raw
-    else:
-        raw_payments = raw.get("payments") or []
-
+    raw_payments = raw if isinstance(raw, list) else (raw.get("payments")
+                                                      or [])
     if not raw_payments:
         raise HTTPException(status_code=400, detail="No payments provided")
 
     parsed: list[PaymentIn] = []
     for p in raw_payments:
-        if isinstance(p, PaymentIn):
-            parsed.append(p)
-        else:
-            try:
-                parsed.append(PaymentIn(**p))
-            except ValidationError as exc:
-                raise HTTPException(status_code=422, detail=exc.errors())
+        try:
+            parsed.append(PaymentIn(**p))
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=exc.errors())
 
     for p in parsed:
-        pay = Payment(
-            invoice_id=invoice_id,
-            amount=p.amount,
-            mode=p.mode,
-            reference_no=p.reference_no,
-            notes=p.notes,
-            created_by=user.id,
-        )
-        db.add(pay)
+        db.add(
+            Payment(
+                invoice_id=invoice_id,
+                amount=p.amount,
+                mode=p.mode,
+                reference_no=p.reference_no,
+                notes=p.notes,
+                created_by=user.id,
+            ))
 
     db.flush()
-    db.refresh(inv)
-    recalc_totals(inv)
+    recalc_totals(inv, db)
     inv.updated_by = user.id
     db.commit()
     db.refresh(inv)
@@ -1074,74 +1371,34 @@ def add_payments_bulk(
 
 
 @router.post("/invoices/{invoice_id}/payments", response_model=InvoiceOut)
-def add_payment(
-        invoice_id: int,
-        payload: dict = Body(...),
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
-):
-    """
-    FE helper: add a single payment.
-
-    Accepts BOTH:
-      - { "amount": 500, "mode": "cash", "reference_no": "REC-001" }
-      - { "payments": [ {amount, mode, reference_no?}, ... ] }  --> forwarded to bulk handler
-
-    For refunds, send NEGATIVE amount:
-      { "amount": -500, "mode": "cash_refund", "reference_no": "REF-001" }
-    """
+def add_payment(invoice_id: int,
+                payload: dict = Body(...),
+                db: Session = Depends(get_db),
+                user: User = Depends(auth_current_user)):
     if not has_perm(user, "billing.payments.add"):
         raise HTTPException(status_code=403, detail="Not permitted")
-
-    # If caller accidentally sends bulk shape to this URL, just forward:
     if isinstance(payload, dict) and "payments" in payload:
         return add_payments_bulk(invoice_id, payload, db, user)
-
-    inv = db.query(Invoice).get(invoice_id)
-    if not inv:
-        raise HTTPException(status_code=404, detail="Invoice not found")
-
     try:
         p = PaymentIn(**payload)
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors())
-
-    pay = Payment(
-        invoice_id=invoice_id,
-        amount=p.amount,
-        mode=p.mode,
-        reference_no=p.reference_no,
-        notes=p.notes,
-        created_by=user.id,
-    )
-
-    db.add(pay)
-    db.flush()
-    db.refresh(inv)
-    recalc_totals(inv)
-    inv.updated_by = user.id
-    db.commit()
-    db.refresh(inv)
-    return serialize_invoice(inv)
+    return add_payments_bulk(invoice_id, {"payments": [p.model_dump()]}, db,
+                             user)
 
 
-@router.delete(
-    "/invoices/{invoice_id}/payments/{payment_id}",
-    response_model=InvoiceOut,
-)
-def delete_payment(
-        invoice_id: int,
-        payment_id: int,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
-):
-    """
-    FE helper: delete a payment row.
-    """
+@router.delete("/invoices/{invoice_id}/payments/{payment_id}",
+               response_model=InvoiceOut)
+def delete_payment(invoice_id: int,
+                   payment_id: int,
+                   db: Session = Depends(get_db),
+                   user: User = Depends(auth_current_user)):
     if not has_perm(user, "billing.payments.add"):
         raise HTTPException(status_code=403, detail="Not permitted")
 
-    inv = db.query(Invoice).get(invoice_id)
+    inv = db.query(Invoice).options(
+        joinedload(Invoice.payments), joinedload(Invoice.items),
+        joinedload(Invoice.advance_adjustments)).get(invoice_id)
     if not inv:
         raise HTTPException(status_code=404, detail="Invoice not found")
 
@@ -1152,40 +1409,35 @@ def delete_payment(
     db.delete(pay)
     db.commit()
 
-    db.refresh(inv)
-    recalc_totals(inv)
+    inv = db.query(Invoice).options(
+        joinedload(Invoice.payments), joinedload(Invoice.items),
+        joinedload(Invoice.advance_adjustments)).get(invoice_id)
+    recalc_totals(inv, db)
     inv.updated_by = user.id
     db.commit()
     db.refresh(inv)
     return serialize_invoice(inv)
 
 
+# ---------------------------------------------------------------------------
+# Advances (FIXED using AdvanceAdjustment table)
+# ---------------------------------------------------------------------------
 @router.post("/advances", response_model=dict)
-def create_advance(
-        payload: dict = Body(...),
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
-):
-    """
-    Create a patient advance (IP/OP advance).
-    Expected keys: patient_id, amount, mode, reference_no?, remarks?
-    """
+def create_advance(payload: AdvanceCreate,
+                   db: Session = Depends(get_db),
+                   user: User = Depends(auth_current_user)):
     if not has_perm(user, "billing.create"):
         raise HTTPException(status_code=403, detail="Not permitted")
 
-    patient_id = payload.get("patient_id")
-    amount = payload.get("amount")
-    mode = payload.get("mode")
-    if not patient_id or not amount or not mode:
-        raise HTTPException(status_code=400, detail="Missing required fields")
-
     adv = Advance(
-        patient_id=patient_id,
-        amount=amount,
-        balance_remaining=amount,
-        mode=mode,
-        reference_no=payload.get("reference_no"),
-        remarks=payload.get("remarks"),
+        patient_id=payload.patient_id,
+        context_type=payload.context_type,
+        context_id=payload.context_id,
+        amount=payload.amount,
+        balance_remaining=payload.amount,
+        mode=payload.mode,
+        reference_no=payload.reference_no,
+        remarks=payload.remarks,
         created_by=user.id,
     )
     db.add(adv)
@@ -1197,6 +1449,8 @@ def create_advance(
         "amount": float(adv.amount or 0),
         "balance_remaining": float(adv.balance_remaining or 0),
         "mode": adv.mode,
+        "reference_no": adv.reference_no,
+        "remarks": adv.remarks,
     }
 
 
@@ -1208,12 +1462,6 @@ def list_advances(
         db: Session = Depends(get_db),
         user: User = Depends(auth_current_user),
 ):
-    """
-    List patient advances.
-
-    - If patient_uhid is provided, it is used to resolve the patient internally.
-    - Otherwise, patient_id can be used.
-    """
     if not has_perm(user, "billing.view"):
         raise HTTPException(status_code=403, detail="Not permitted")
 
@@ -1226,12 +1474,12 @@ def list_advances(
         q = q.filter(Advance.patient_id == patient.id)
     elif patient_id:
         q = q.filter(Advance.patient_id == patient_id)
+
     if only_with_balance:
         q = q.filter(Advance.balance_remaining > 0)
 
-    q = q.order_by(Advance.id.desc())
     res = []
-    for adv in q.all():
+    for adv in q.order_by(Advance.id.desc()).all():
         res.append({
             "id":
             adv.id,
@@ -1258,35 +1506,37 @@ def list_advances(
              response_model=InvoiceOut)
 def apply_advances_to_invoice(
         invoice_id: int,
-        payload: dict = Body(default=None),
+        payload: ApplyAdvanceIn = Body(default=None),
         db: Session = Depends(get_db),
         user: User = Depends(auth_current_user),
 ):
-    """
-    Apply available patient advances to reduce invoice balance.
-    If payload has "advance_ids", use only those; else auto-apply oldest first.
-    """
     if not has_perm(user, "billing.payments.add"):
         raise HTTPException(status_code=403, detail="Not permitted")
 
-    inv = db.query(Invoice).get(invoice_id)
+    inv = db.query(Invoice).options(
+        joinedload(Invoice.items),
+        joinedload(Invoice.payments),
+        joinedload(Invoice.advance_adjustments),
+    ).get(invoice_id)
     if not inv:
         raise HTTPException(status_code=404, detail="Invoice not found")
 
-    if inv.balance_due is None:
-        recalc_totals(inv)
+    if inv.status in ("finalized", "cancelled"):
+        raise HTTPException(status_code=400, detail="Invoice locked")
 
-    remaining = float(inv.balance_due or 0)
+    recalc_totals(inv, db)
+
+    remaining = _d(inv.balance_due)
     if remaining <= 0:
+        db.commit()
         return serialize_invoice(inv)
 
-    patient_id = inv.patient_id
-    advance_ids = (payload or {}).get("advance_ids")
-
     q = db.query(Advance).filter(
-        Advance.patient_id == patient_id,
+        Advance.patient_id == inv.patient_id,
         Advance.balance_remaining > 0,
     )
+
+    advance_ids = (payload.advance_ids if payload else None)
     if advance_ids:
         q = q.filter(Advance.id.in_(advance_ids))
 
@@ -1294,29 +1544,44 @@ def apply_advances_to_invoice(
     if not advances:
         return serialize_invoice(inv)
 
+    max_to_use = _d(payload.max_to_use
+                    ) if payload and payload.max_to_use is not None else None
+    if max_to_use is not None:
+        remaining = min(remaining, max_to_use)
+
     for adv in advances:
         if remaining <= 0:
             break
-        avail = float(adv.balance_remaining or 0)
+
+        avail = _d(adv.balance_remaining)
         if avail <= 0:
             continue
-        use = min(avail, remaining)
 
-        pay = Payment(
-            invoice_id=invoice_id,
-            amount=use,
-            mode="advance",
-            reference_no=f"ADV-{adv.id}",
-            created_by=user.id,
-        )
-        db.add(pay)
+        use = min(avail, remaining).quantize(Decimal("0.01"))
 
-        adv.balance_remaining = avail - use
+        # ✅ AdvanceAdjustment row (real accounting)
+        # One row per (advance, invoice); if already exists, increase it
+        adj = db.query(AdvanceAdjustment).filter(
+            AdvanceAdjustment.advance_id == adv.id,
+            AdvanceAdjustment.invoice_id == inv.id).first()
+
+        if adj:
+            adj.amount_applied = (_d(adj.amount_applied) + use).quantize(
+                Decimal("0.01"))
+            adj.applied_at = datetime.utcnow()
+        else:
+            db.add(
+                AdvanceAdjustment(
+                    advance_id=adv.id,
+                    invoice_id=inv.id,
+                    amount_applied=use,
+                ))
+
+        adv.balance_remaining = (avail - use).quantize(Decimal("0.01"))
         remaining -= use
 
     db.flush()
-    db.refresh(inv)
-    recalc_totals(inv)
+    recalc_totals(inv, db)
     inv.updated_by = user.id
     db.commit()
     db.refresh(inv)
@@ -1324,87 +1589,119 @@ def apply_advances_to_invoice(
 
 
 # ---------------------------------------------------------------------------
-# Billing masters: doctors + credit/TPA providers + packages
+# Single-page Billing Workbench (for your NEW UI)
 # ---------------------------------------------------------------------------
-@router.get("/masters")
-def billing_masters(
+@router.get("/workbench", response_model=dict)
+def billing_workbench(
+        patient_uhid: Optional[str] = None,
+        patient_id: Optional[int] = None,
         db: Session = Depends(get_db),
         user: User = Depends(auth_current_user),
 ):
     """
-    Used by Billing screens:
-      - list of doctors (consultant)
-      - list of credit providers (TPA/Insurance/Corporate)
-      - list of payers, TPAs, credit plans
-      - IP packages (for package billing)
+    ✅ Single API for single-page UI:
+      - patient basic
+      - latest invoices
+      - advances
+      - billing masters
     """
     if not has_perm(user, "billing.view"):
         raise HTTPException(status_code=403, detail="Not permitted")
 
-    # Avoid name clash with the type-hint User
-    from app.models.user import User as UserModel
+    patient = None
+    if patient_uhid:
+        patient = db.query(Patient).filter(
+            Patient.uhid == patient_uhid).first()
+    elif patient_id:
+        patient = db.query(Patient).get(patient_id)
 
-    # ----- Doctors -----
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
+    invs = db.query(Invoice).filter(Invoice.patient_id == patient.id).order_by(
+        Invoice.id.desc()).limit(50).all()
+    invoices = []
+    for inv in invs:
+        inv = db.query(Invoice).options(
+            joinedload(Invoice.items),
+            joinedload(Invoice.payments),
+            joinedload(Invoice.advance_adjustments),
+        ).get(inv.id)
+        recalc_totals(inv, db)
+        invoices.append(serialize_invoice(inv).model_dump())
+
+    advances = list_advances(patient_id=patient.id, db=db, user=user)
+
+    # Masters (same logic you already have)
+    from app.models.user import User as UserModel
     doctors_q = db.query(UserModel).filter(UserModel.is_active.is_(True))
     if hasattr(UserModel, "is_doctor"):
         doctors_q = doctors_q.filter(UserModel.is_doctor.is_(True))
-    doctors_q = doctors_q.order_by(UserModel.name.asc())
-
     doctors = [{
         "id": d.id,
         "name": d.name,
-        "email": d.email,
-    } for d in doctors_q.all()]
+        "email": d.email
+    } for d in doctors_q.order_by(UserModel.name.asc()).all()]
 
-    # ----- Credit providers (legacy BillingProvider) -----
-    providers_q = (db.query(BillingProvider).filter(
-        BillingProvider.is_active.is_(True)).order_by(
-            BillingProvider.name.asc()))
-    credit_providers = [{
+    providers = [{
         "id": p.id,
         "name": p.name,
         "code": p.code,
-        "provider_type": p.provider_type,
-    } for p in providers_q.all()]
+        "provider_type": p.provider_type
+    } for p in db.query(BillingProvider).filter(
+        BillingProvider.is_active.is_(True)).order_by(
+            BillingProvider.name.asc()).all()]
 
-    # ----- Payers, TPAs, Credit Plans -----
     payers = [{
         "id": p.id,
         "code": p.code,
         "name": p.name,
-        "payer_type": p.payer_type,
+        "payer_type": p.payer_type
     } for p in db.query(Payer).order_by(Payer.name.asc()).all()]
-
     tpas = [{
         "id": t.id,
         "code": t.code,
         "name": t.name,
-        "payer_id": t.payer_id,
+        "payer_id": t.payer_id
     } for t in db.query(Tpa).order_by(Tpa.name.asc()).all()]
-
     credit_plans = [{
         "id": c.id,
         "code": c.code,
         "name": c.name,
         "payer_id": c.payer_id,
-        "tpa_id": c.tpa_id,
+        "tpa_id": c.tpa_id
     } for c in db.query(CreditPlan).order_by(CreditPlan.name.asc()).all()]
-
-    # ----- IP Packages (for package billing) -----
     packages = [{
         "id": pkg.id,
         "name": pkg.name,
-        "charges": float(pkg.charges or 0),
+        "charges": float(pkg.charges or 0)
     } for pkg in db.query(IpdPackage).order_by(IpdPackage.name.asc()).all()]
 
+    db.commit()
+
     return {
-        "doctors": doctors,
-        "credit_providers": credit_providers,
-        "payers": payers,
-        "tpas": tpas,
-        "credit_plans": credit_plans,
-        "packages": packages,
+        "patient": {
+            "id": patient.id,
+            "uhid": getattr(patient, "uhid", None),
+            "name":
+            f"{patient.first_name or ''} {patient.last_name or ''}".strip(),
+            "phone": patient.phone,
+        },
+        "invoices": invoices,
+        "advances": advances,
+        "masters": {
+            "doctors": doctors,
+            "credit_providers": providers,
+            "payers": payers,
+            "tpas": tpas,
+            "credit_plans": credit_plans,
+            "packages": packages,
+        }
     }
+
+
+from datetime import datetime
+from uuid import uuid4
 
 
 # ---------------------------------------------------------------------------
@@ -2103,26 +2400,5 @@ def print_patient_billing_summary_alias(
         user: User = Depends(auth_current_user),
 ):
     return print_patient_billing_summary(patient_id=patient_id,
-                                         db=db,
-                                         user=user)
-
-
-# UHID-based printable summary
-@router.get("/patients/by-uhid/{uhid}/print-summary")
-def print_patient_billing_summary_by_uhid(
-        uhid: str,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
-):
-    """
-    Printable patient billing summary resolved via UHID instead of numeric ID.
-    """
-    if not has_perm(user, "billing.view"):
-        raise HTTPException(status_code=403, detail="Not permitted")
-
-    patient = db.query(Patient).filter(Patient.uhid == uhid).first()
-    if not patient:
-        raise HTTPException(status_code=404, detail="Patient not found")
-    return print_patient_billing_summary(patient_id=patient.id,
                                          db=db,
                                          user=user)

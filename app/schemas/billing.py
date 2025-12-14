@@ -1,34 +1,45 @@
 # FILE: app/schemas/billing.py
 from __future__ import annotations
 
-from typing import Optional, Literal, List
+from typing import Optional, Literal, List, Dict, Any
 from datetime import datetime
 from pydantic import BaseModel, ConfigDict, field_validator
 from decimal import Decimal
 
-# ---------- Provider (credit / TPA) ----------
+
+class PatientMiniOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    uhid: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    full_name: Optional[str] = None
+    phone: Optional[str] = None
+    gender: Optional[str] = None
+
 
 class AutoBedChargesIn(BaseModel):
     admission_id: int
-    # "daily" -> charge by day
-    # "hourly" -> charge by hour (derived from daily_rate / 24)
-    # "mixed" -> <= 6h hourly, > 6h daily
     mode: Literal["daily", "hourly", "mixed"] = "daily"
-
-    # For open-ended stays (to_ts is NULL), we cut at upto_ts (default: now)
     upto_ts: Optional[datetime] = None
-
-    # If True, skip bed-assignments that are already billed in this invoice
     skip_if_already_billed: bool = True
 
 
 class AutoOtChargesIn(BaseModel):
-    # OT Case for which we auto-bill procedures
     case_id: int
+
+
+class AutoOtInvoiceIn(BaseModel):
+    """✅ One-shot: find/create invoice + add OT charges"""
+    case_id: int
+    finalize: bool = False
+
+
 class ProviderBase(BaseModel):
     name: str
     code: Optional[str] = None
-    provider_type: Optional[str] = None  # insurance | tpa | corporate | other
+    provider_type: Optional[str] = None
     contact_person: Optional[str] = None
     phone: Optional[str] = None
     email: Optional[str] = None
@@ -56,28 +67,11 @@ class ProviderOut(ProviderBase):
     id: int
 
 
-# ---------- Invoice & Items ----------
-
-
 class InvoiceCreate(BaseModel):
-    """
-    Create invoice for:
-    - OP Billing
-    - IP Billing
-    - Pharmacy / Lab / Radiology / General
-    """
     patient_id: int
-
-    # Context link, optional
-    context_type: Optional[
-        str] = None  # opd | ipd | pharmacy | lab | radiology | other
+    context_type: Optional[str] = None
     context_id: Optional[int] = None
-
-    # Logical bill type for UI
-    billing_type: Optional[
-        str] = None  # op_billing | ip_billing | pharmacy | lab | radiology | general
-
-    # Optional provider / consultant / visit
+    billing_type: Optional[str] = None
     provider_id: Optional[int] = None
     consultant_id: Optional[int] = None
     visit_no: Optional[str] = None
@@ -85,9 +79,6 @@ class InvoiceCreate(BaseModel):
 
 
 class InvoiceUpdate(BaseModel):
-    """
-    Update header details + header-discount.
-    """
     billing_type: Optional[str] = None
     provider_id: Optional[int] = None
     consultant_id: Optional[int] = None
@@ -97,78 +88,47 @@ class InvoiceUpdate(BaseModel):
     header_discount_amount: Optional[float] = None
     discount_remarks: Optional[str] = None
     discount_authorized_by: Optional[int] = None
-    status: Optional[
-        str] = None  # allow status change if needed (e.g., cancel)
+    status: Optional[str] = None
 
 
 class AddServiceIn(BaseModel):
-    """
-    Add item from service master or unbilled events.
-    You can either:
-    - resolve description & price in backend from service_ref_id, or
-    - send description & unit_price from frontend.
-    """
-    service_type: Literal["lab", "radiology", "ot", "pharmacy", "opd", "ipd",
-                          "manual", "other"]
+    service_type: Literal["lab", "radiology", "ot_procedure", "ot_bed",
+                          "pharmacy", "opd", "ipd_bed", "manual", "other"]
     service_ref_id: int = 0
     description: Optional[str] = None
-    quantity: int = 1
-    unit_price: Optional[float] = None
-    tax_rate: float = 0.0
-    discount_percent: float = 0.0
-    discount_amount: float = 0.0
+    quantity: Decimal = Decimal("1")
+    unit_price: Optional[Decimal] = None
+    tax_rate: Decimal = Decimal("0")
+    discount_percent: Decimal = Decimal("0")
+    discount_amount: Decimal = Decimal("0")
 
 
 class ManualItemIn(BaseModel):
-    """
-    Pure manual line item (used for "Add manual item").
-    """
     description: str
-    quantity: int = 1
-    unit_price: float
-    tax_rate: float = 0.0
-    discount_percent: float = 0.0
-    discount_amount: float = 0.0
+    quantity: Decimal = Decimal("1")
+    unit_price: Decimal
+    tax_rate: Decimal = Decimal("0")
+    discount_percent: Decimal = Decimal("0")
+    discount_amount: Decimal = Decimal("0")
     service_type: Optional[str] = "manual"
-    service_ref_id: Optional[int] = 0  # 0 or synthetic id
+    service_ref_id: Optional[int] = 0
 
 
 class UpdateItemIn(BaseModel):
-    quantity: Optional[int] = None
-    unit_price: Optional[float] = None
-    tax_rate: Optional[float] = None
-    discount_percent: Optional[float] = None
-    discount_amount: Optional[float] = None
+    quantity: Optional[Decimal] = None
+    unit_price: Optional[Decimal] = None
+    tax_rate: Optional[Decimal] = None
+    discount_percent: Optional[Decimal] = None
+    discount_amount: Optional[Decimal] = None
     description: Optional[str] = None
 
 
 class VoidItemIn(BaseModel):
-    reason: Optional[str] = None  # audit note
-
-
-class BulkAddFromUnbilledIn(BaseModel):
-    """
-    Optional helper if you pull unbilled lab / radiology etc.
-    Format: ["lab:123", "radiology:55", ...]
-    """
-    uids: Optional[List[str]] = None  # if None => add all unbilled
-
-
-# ---------- Payments ----------
+    reason: Optional[str] = None
 
 
 class PaymentIn(BaseModel):
-    """
-    Input model for a single payment row.
-
-    - Positive amount => payment received
-    - Negative amount => refund to patient
-    - 0 is not allowed (meaningless)
-    """
-    model_config = ConfigDict(
-        from_attributes=True,
-        extra="ignore",  # ignore any extra keys from FE instead of 422
-    )
+    model_config = ConfigDict(from_attributes=True, extra="ignore")
 
     amount: Decimal
     mode: str
@@ -177,43 +137,9 @@ class PaymentIn(BaseModel):
 
     @field_validator("amount")
     def non_zero(cls, v: Decimal) -> Decimal:
-        # allow both positive & negative, only block 0
         if v == 0:
-            raise ValueError(
-                "Amount must be non-zero (positive for payment, negative for refund)."
-            )
+            raise ValueError("Amount must be non-zero.")
         return v
-
-
-class PaymentBulkIn(BaseModel):
-    payments: List[PaymentIn]
-
-
-# ---------- Advances ----------
-
-
-class AdvanceCreate(BaseModel):
-    """
-    Create an advance payment (IP advance, etc.).
-    """
-    patient_id: int
-    context_type: Optional[str] = None  # usually ipd / opd
-    context_id: Optional[int] = None
-    amount: float
-    mode: Literal["cash", "card", "upi", "other"]
-    reference_no: Optional[str] = None
-    remarks: Optional[str] = None
-
-
-class ApplyAdvanceIn(BaseModel):
-    """
-    Auto-adjust advances to invoice.
-    - If max_to_use is None: use up to full outstanding.
-    """
-    max_to_use: Optional[float] = None
-
-
-# ---------- OUT models ----------
 
 
 class InvoiceItemOut(BaseModel):
@@ -223,7 +149,7 @@ class InvoiceItemOut(BaseModel):
     service_type: str
     service_ref_id: int
     description: str
-    quantity: int
+    quantity: float
     unit_price: float
     tax_rate: float
     discount_percent: float
@@ -243,28 +169,20 @@ class PaymentOut(BaseModel):
     paid_at: Optional[datetime] = None
 
 
-class AdvanceOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-    id: int
-    patient_id: int
-    context_type: Optional[str] = None
-    context_id: Optional[int] = None
-    amount: float
-    balance_remaining: float
-    mode: str
-    reference_no: Optional[str] = None
-    remarks: Optional[str] = None
-    received_at: Optional[datetime] = None
-
-
 class InvoiceOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
+
     id: int
+
+    invoice_uid: Optional[str] = None
     invoice_number: Optional[str] = None
+
     patient_id: int
+    patient: Optional[PatientMiniOut] = None   # ✅ ADD THIS
     context_type: Optional[str] = None
     context_id: Optional[int] = None
     billing_type: Optional[str] = None
+
     provider_id: Optional[int] = None
     consultant_id: Optional[int] = None
     visit_no: Optional[str] = None
@@ -274,10 +192,10 @@ class InvoiceOut(BaseModel):
     discount_total: float
     tax_total: float
     net_total: float
+
     amount_paid: float
-    balance_due: float
-    previous_balance_snapshot: float
     advance_adjusted: float
+    balance_due: float
 
     header_discount_percent: float
     header_discount_amount: float
@@ -286,28 +204,21 @@ class InvoiceOut(BaseModel):
     finalized_at: Optional[datetime] = None
     created_at: datetime
 
-    # Nested
-    items: List[InvoiceItemOut]
-    payments: List[PaymentOut]
+    items: List[InvoiceItemOut] = []
+    payments: List[PaymentOut] = []
 
 
-class ProviderWithInvoicesOut(ProviderOut):
-    """
-    Optional, if you ever want provider + invoices.
-    """
-    invoices: List[InvoiceOut] = []
-
-
-class PatientBillingSummaryOut(BaseModel):
-    """
-    For patient-wise billing history & totals.
-    """
+class AdvanceCreate(BaseModel):
     patient_id: int
-    invoices: List[InvoiceOut]
-    total_billed: float
-    total_tax: float
-    total_discount: float
-    total_advance_received: float
-    total_advance_balance: float
-    total_paid: float
-    total_outstanding: float
+    context_type: Optional[str] = None
+    context_id: Optional[int] = None
+    amount: Decimal
+    mode: Literal["cash", "card", "upi", "cheque", "neft", "rtgs", "wallet",
+                  "other"]
+    reference_no: Optional[str] = None
+    remarks: Optional[str] = None
+
+
+class ApplyAdvanceIn(BaseModel):
+    advance_ids: Optional[List[int]] = None
+    max_to_use: Optional[Decimal] = None

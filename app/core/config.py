@@ -75,7 +75,7 @@ class Settings(BaseModel):
 
     # ---------- File storage ----------
     STORAGE_DIR: str = os.getenv("STORAGE_DIR", "./media")
-    MEDIA_URL: str = os.getenv("MEDIA_URL", "/media")
+    MEDIA_URL: str = os.getenv("MEDIA_URL", "/files")
 
     # ---------- Billing flags ----------
     BILLING_AUTOCREATE: bool = os.getenv(
