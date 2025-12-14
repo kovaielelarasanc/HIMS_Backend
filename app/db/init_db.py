@@ -161,7 +161,7 @@ def seed_permissions(db: Session) -> None:
         ("pharmacy.inventory.items", ["view", "manage"]),
         ("pharmacy.inventory.stock", ["view"]),
         ("pharmacy.inventory.alerts", ["view"]),
-        ("pharmacy.inventory.po", ["view", "manage"]),
+        ("pharmacy.inventory.po", ["view", "manage","approve","cancel"]),
         ("pharmacy.inventory.grn", ["view", "manage"]),
         ("pharmacy.inventory.returns", ["view", "manage"]),
         ("pharmacy.inventory", ["dispense"]),

@@ -24,7 +24,10 @@ from app.api import (
     routes_ipd_discharge,
     routes_pharmacy,
     routes_pharmacy_rx_list,
-
+    routes_inventory_po_pending,
+    routes_inventory_grn,
+    routes_inventory_po_suggestions,
+    routes_inventory_po,
     routes_lis,
     routes_ris,
     routes_billing,
@@ -109,6 +112,10 @@ api_router.include_router(routes_ipd_masters.router,
 api_router.include_router(routes_ipd.router, prefix="/ipd", tags=["ipd"])
 api_router.include_router(routes_ipd_medications.router)
 api_router.include_router(routes_ipd_discharge.router)
+api_router.include_router(routes_inventory_po.router)
+api_router.include_router(routes_inventory_grn.router)
+api_router.include_router(routes_inventory_po_suggestions.router)
+api_router.include_router(routes_inventory_po_pending.router)
 
 # ---- Masters
 api_router.include_router(routes_masters.router,
