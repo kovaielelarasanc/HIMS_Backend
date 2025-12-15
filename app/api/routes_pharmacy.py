@@ -29,6 +29,8 @@ from app.schemas.pharmacy_prescription import (
     PaymentCreate,
     PaymentOut,
 )
+import json
+from fastapi.encoders import jsonable_encoder
 from app.services import pharmacy as pharmacy_service
 
 router = APIRouter(prefix="/pharmacy", tags=["pharmacy"])
@@ -331,21 +333,38 @@ def get_rx_queue(
 # Dispense
 # ------------------------------------------------------------------
 
-
-@router.post(
-    "/prescriptions/{rx_id}/dispense",
-    response_model=DispenseFromRxOut,
-)
+@router.post("/prescriptions/{rx_id}/dispense", response_model=DispenseFromRxOut)
 def dispense_from_rx(
-        rx_id: int,
-        payload: DispenseFromRxIn,
-        db: Session = Depends(get_db),
-        current_user: User = Depends(auth_current_user),
+    rx_id: int,
+    payload: DispenseFromRxIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(auth_current_user),
 ):
-    rx, sale = pharmacy_service.dispense_from_rx(db, rx_id, payload,
-                                                 current_user)
-    rx = (_rx_base_options(db.query(PharmacyPrescription)).filter(
-        PharmacyPrescription.id == rx.id).first())
+    print("\n================ DISPENSE DEBUG ================")
+    print("rx_id:", rx_id)
+    print("user_id:", getattr(current_user, "id", None))
+    print("payload:", json.dumps(jsonable_encoder(payload), indent=2))
+    print("================================================\n")
+
+    try:
+        rx, sale = pharmacy_service.dispense_from_rx(db, rx_id, payload, current_user)
+
+    except HTTPException as e:
+        print("\n!!!!!!!! DISPENSE HTTPException !!!!!!!!")
+        print("status_code:", e.status_code)
+        print("detail:", e.detail)
+        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
+        raise
+
+    except Exception as e:
+        import traceback
+        print("\n!!!!!!!! DISPENSE UNKNOWN ERROR !!!!!!!!")
+        traceback.print_exc()
+        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
+        raise
+
+    rx = (_rx_base_options(db.query(PharmacyPrescription))
+          .filter(PharmacyPrescription.id == rx.id).first())
     _attach_display_fields(rx)
     sale_id = sale.id if sale else None
     return DispenseFromRxOut(prescription=rx, sale_id=sale_id)

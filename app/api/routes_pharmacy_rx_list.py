@@ -3,16 +3,18 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import List, Optional
-
+from fastapi.responses import StreamingResponse
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
-
+from sqlalchemy.orm import joinedload
+from io import BytesIO
 from app.api.deps import get_db, current_user as auth_current_user
 from app.models.user import User
 from app.models.patient import Patient
 from app.models.pharmacy_prescription import PharmacyPrescription
+from app.services.pdf_prescription import build_prescription_pdf
 
 router = APIRouter()
 
@@ -132,3 +134,30 @@ def list_pharmacy_rx(
             ))
 
     return out
+
+@router.get("/prescriptions/{rx_id}/pdf")
+def download_prescription_pdf(
+    rx_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    _need_any(user, ["pharmacy.rx.view", "pharmacy.dispense.view"])
+
+    rx: Optional[PharmacyPrescription] = (
+        db.query(PharmacyPrescription)
+        .options(joinedload(PharmacyPrescription.lines))
+        .filter(PharmacyPrescription.id == rx_id)
+        .first()
+    )
+    if not rx:
+        raise HTTPException(status_code=404, detail="Prescription not found")
+
+    patient: Optional[Patient] = db.get(Patient, rx.patient_id) if rx.patient_id else None
+    pdf_bytes = build_prescription_pdf(db, rx, patient)
+
+    filename = f"RX_{rx.prescription_number}.pdf"
+    return StreamingResponse(
+        BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+    )
