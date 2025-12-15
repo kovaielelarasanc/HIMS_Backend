@@ -3,11 +3,13 @@ from __future__ import annotations
 
 from datetime import date, time, datetime
 from typing import List, Optional
-
+import re
+from io import BytesIO
+from typing import Literal
 import logging
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 from sqlalchemy import and_, or_
 from sqlalchemy.exc import IntegrityError
 
@@ -22,7 +24,9 @@ from app.models.ot import (
     PreOpChecklist as PreOpChecklistModel,
     OtScheduleProcedure,
     OtProcedure,
+    AnaesthesiaRecord,
 )
+from fastapi.responses import StreamingResponse
 from app.schemas.ot import (
     OtScheduleCreate,
     OtScheduleUpdate,
@@ -35,6 +39,10 @@ from app.schemas.ot import (
 )
 from app.services.billing_ot import create_ot_invoice_items_for_case
 from app.models.user import User
+
+from fastapi.responses import StreamingResponse
+from app.services.ot_history_pdf import build_patient_ot_history_pdf
+from app.services.ot_case_pdf import build_ot_case_pdf
 
 router = APIRouter(prefix="/ot", tags=["OT - Schedule & Cases"])
 logger = logging.getLogger(__name__)
@@ -891,11 +899,14 @@ def close_ot_case(
     db.refresh(case)
 
     try:
-        inv = create_ot_invoice_items_for_case(db=db, case_id=case.id, user_id=user.id)
+        inv = create_ot_invoice_items_for_case(db=db,
+                                               case_id=case.id,
+                                               user_id=user.id)
         db.commit()
     except Exception as e:
         db.rollback()
-        logger.exception("OT billing failed for case_id=%s: %s", case.id, str(e))
+        logger.exception("OT billing failed for case_id=%s: %s", case.id,
+                         str(e))
 
     return case
 
@@ -1014,3 +1025,157 @@ def update_preop_checklist(
         completed=checklist.completed,
         **data,
     )
+
+
+def has_perm(user: User, code: str) -> bool:
+    if getattr(user, "is_admin", False):
+        return True
+    for r in (user.roles or []):
+        for p in (getattr(r, "permissions", None) or []):
+            if p.code == code:
+                return True
+    return False
+
+
+def _safe_filename(x: str) -> str:
+    x = x or "patient"
+    x = re.sub(r"[^A-Za-z0-9._-]+", "_", x).strip("_")
+    return x[:80] if x else "patient"
+
+
+# ============================================================
+#  1) Single OT Case PDF
+# ============================================================
+@router.get("/cases/{case_id}/pdf")
+def download_ot_case_pdf(
+        case_id: int,
+        disposition: Literal["inline", "attachment"] = Query("attachment"),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    if not (has_perm(user, "ot.cases.view") or has_perm(
+            user, "ot.cases.update") or has_perm(user, "ot.schedules.view")):
+        raise HTTPException(status_code=403,
+                            detail="Not permitted to view OT case PDF.")
+
+    case = (
+        db.query(OtCase).options(
+            # schedule + patient/admission/bed + doctors
+            joinedload(OtCase.schedule).joinedload(OtSchedule.patient),
+            joinedload(OtCase.schedule).joinedload(OtSchedule.admission),
+            joinedload(OtCase.schedule).joinedload(OtSchedule.ot_bed),
+            joinedload(OtCase.schedule).joinedload(OtSchedule.surgeon),
+            joinedload(OtCase.schedule).joinedload(OtSchedule.anaesthetist),
+
+            # linked clinical records
+            joinedload(OtCase.preanaesthesia),
+            joinedload(OtCase.preop_checklist),
+            joinedload(OtCase.safety_checklist),
+
+            # anaesthesia header + child vitals/drugs
+            joinedload(OtCase.anaesthesia_record
+                       ).selectinload(AnaesthesiaRecord.vitals),
+            joinedload(OtCase.anaesthesia_record).selectinload(
+                AnaesthesiaRecord.drugs),
+            joinedload(OtCase.nursing_record),
+            joinedload(OtCase.counts_record),
+            selectinload(OtCase.implant_records),
+            selectinload(OtCase.blood_records),
+            joinedload(OtCase.operation_note),
+            joinedload(OtCase.pacu_record),
+        ).filter(OtCase.id == case_id).first())
+
+    if not case:
+        raise HTTPException(status_code=404, detail="OT case not found.")
+
+    schedule = case.schedule
+    patient = schedule.patient if schedule else None
+
+    uhid = getattr(patient, "uhid", None) or getattr(patient, "uhid_number",
+                                                     None) or f"case_{case_id}"
+    dt = getattr(schedule, "date", None)
+    dt_part = dt.strftime("%Y%m%d") if dt else "date"
+    filename = f"OT_Case_{_safe_filename(str(uhid))}_{dt_part}.pdf"
+
+    pdf_bytes = build_ot_case_pdf(
+        case=case,
+        org_name="NUTRYAH HIMS",
+        generated_by=getattr(user, "full_name", None)
+        or getattr(user, "email", None),
+    )
+
+    headers = {"Content-Disposition": f'{disposition}; filename="{filename}"'}
+    return StreamingResponse(BytesIO(pdf_bytes),
+                             media_type="application/pdf",
+                             headers=headers)
+
+
+# ============================================================
+#  2) Patient OT History PDF (All cases)
+# ============================================================
+@router.get("/patients/{patient_id}/history.pdf")
+def download_patient_ot_history_pdf(
+        patient_id: int,
+        disposition: Literal["inline", "attachment"] = Query("attachment"),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    if not (has_perm(user, "ot.cases.view")
+            or has_perm(user, "ot.schedules.view")):
+        raise HTTPException(status_code=403,
+                            detail="Not permitted to view OT history PDF.")
+
+    patient = db.query(Patient).filter(Patient.id == patient_id).first()
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found.")
+
+    schedules = (db.query(OtSchedule).options(
+        joinedload(OtSchedule.case),
+        joinedload(OtSchedule.surgeon),
+        joinedload(OtSchedule.anaesthetist),
+        joinedload(OtSchedule.ot_bed),
+    ).filter(OtSchedule.patient_id == patient_id).order_by(
+        OtSchedule.date.desc(), OtSchedule.planned_start_time.desc()).all())
+
+    uhid = getattr(patient, "uhid", None) or getattr(patient, "uhid_number",
+                                                     None) or str(patient_id)
+    filename = f"OT_History_{_safe_filename(str(uhid))}.pdf"
+
+    pdf_bytes = build_patient_ot_history_pdf(
+        patient=patient,
+        schedules=schedules,
+        org_name="NUTRYAH HIMS",
+        generated_by=getattr(user, "full_name", None)
+        or getattr(user, "email", None),
+    )
+
+    headers = {"Content-Disposition": f'{disposition}; filename="{filename}"'}
+    return StreamingResponse(BytesIO(pdf_bytes),
+                             media_type="application/pdf",
+                             headers=headers)
+
+
+@router.get("/ot/cases/{case_id}/pdf")
+def get_ot_case_pdf(
+        case_id: int,
+        disposition: str = Query("attachment",
+                                 pattern="^(inline|attachment)$"),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    case = db.query(OtCase).filter(OtCase.id == case_id).first()
+    if not case:
+        raise HTTPException(status_code=404, detail="OT case not found")
+
+    pdf_bytes = build_ot_case_pdf(
+        case,
+        org_name="NUTRYAH HIMS",
+        generated_by=getattr(user, "full_name", None)
+        or getattr(user, "email", None),
+    )
+
+    filename = f"OT_Case_{case_id}.pdf"
+    headers = {"Content-Disposition": f'{disposition}; filename="{filename}"'}
+    return StreamingResponse(BytesIO(pdf_bytes),
+                             media_type="application/pdf",
+                             headers=headers)

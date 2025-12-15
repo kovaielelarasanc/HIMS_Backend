@@ -96,7 +96,7 @@ class PatientCreate(BaseModel):
     dob: date
     marital_status: str
     phone: str
-    email: EmailStr
+    email: Optional [EmailStr] = None
     patient_type: str  # value should come from Patient Type master
 
     # optional
@@ -187,6 +187,25 @@ class PatientCreate(BaseModel):
             raise ValueError("DOB cannot be in the future")
         if today.year - v.year > 120:
             raise ValueError("DOB is too far in the past")
+        return v
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalize_email_update(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, str):
+            v = v.strip()
+            return v or None
+        return v
+
+    @field_validator("ref_source", "ref_details", mode="before")
+    @classmethod
+    def normalize_reference_fields_update(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, str):
+            v = v.strip()
+            return v or None
         return v
 
 

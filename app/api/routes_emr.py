@@ -4,8 +4,9 @@ from __future__ import annotations
 from datetime import datetime, date, timedelta
 from decimal import Decimal
 from io import BytesIO
-from typing import List, Optional, Set, Dict
-
+from typing import List, Optional, Set, Dict, Any, Tuple
+import importlib
+import inspect as pyinspect
 from fastapi import (
     APIRouter,
     Depends,
@@ -17,12 +18,15 @@ from fastapi import (
     Body,
 )
 from fastapi.responses import StreamingResponse, JSONResponse
-from sqlalchemy.orm import Session, joinedload
+from fastapi.encoders import jsonable_encoder
+
+from sqlalchemy.orm import Session, joinedload, selectinload
 from sqlalchemy import or_, func
+from sqlalchemy.inspection import inspect as sa_inspect
 
 from app.api.deps import get_db, current_user
 from app.models.user import User
-from app.models.patient import Patient, PatientConsent
+from app.models.patient import Patient, PatientConsent, PatientAddress, PatientDocument
 from app.models.common import FileAttachment
 from app.models.department import Department
 from app.models.opd import (
@@ -33,27 +37,115 @@ from app.models.opd import (
     Appointment,
     LabOrder,
     RadiologyOrder,
+    FollowUp,
 )
-from app.models.lis import LisOrder, LisOrderItem, LisAttachment
+
+from app.models.lis import (
+    LisOrder,
+    LisOrderItem,
+    LisAttachment,
+    LisResultLine,
+)
 from app.models.ris import RisOrder, RisAttachment
+
 from app.models.ipd import (
     IpdAdmission,
     IpdTransfer,
     IpdDischargeSummary,
+    IpdDischargeChecklist,
+    IpdDischargeMedication,
     IpdBed,
     IpdBedAssignment,
+
+    # Nursing / clinical
+    IpdNursingNote,
+    IpdShiftHandover,
+    IpdVital,
+    IpdIntakeOutput,
+    IpdRound,
+    IpdProgressNote,
+
+    # Risk / assessments
+    IpdPainAssessment,
+    IpdFallRiskAssessment,
+    IpdPressureUlcerAssessment,
+    IpdNutritionAssessment,
+    IpdAssessment,
+
+    # Orders / drugs
+    IpdOrder,
+    IpdMedication,
+    IpdMedicationOrder,
+    IpdMedicationAdministration,
+    IpdDrugChartMeta,
+    IpdIvFluidOrder,
+    IpdDrugChartNurseRow,
+    IpdDrugChartDoctorAuth,
+
+    # Procedures / ICU
+    IpdDressingRecord,
+    IpdBloodTransfusion,
+    IpdRestraintRecord,
+    IpdIsolationPrecaution,
+    IcuFlowSheet,
+
+    # Feedback / referrals / IPD OT
+    IpdFeedback,
+    IpdAdmissionFeedback,
+    IpdReferral,
+    IpdOtCase,
+    IpdAnaesthesiaRecord,
+
+    # Combined dressing/transfusion log
+    IpdDressingTransfusion,
 )
-from app.models.ot import OtSchedule, OtCase
+
+from app.models.ot import (
+    OtSchedule,
+    OtCase,
+    OtScheduleProcedure,
+    OtProcedure,
+
+    # OT case-linked clinical records
+    PreAnaesthesiaEvaluation,
+    PreOpChecklist,
+    SurgicalSafetyChecklist,
+    AnaesthesiaRecord,
+    AnaesthesiaVitalLog,
+    AnaesthesiaDrugLog,
+    OtNursingRecord,
+    OtSpongeInstrumentCount,
+    OtImplantRecord,
+    OperationNote,
+    OtBloodTransfusionRecord,
+    PacuRecord,
+    OtCleaningLog,
+    OtEnvironmentLog,
+    OtEquipmentDailyChecklist,
+)
+
 from app.models.billing import Invoice, InvoiceItem, Payment
 
 HAS_PHARMACY = False
 try:
-   
-    from app.models.pharmacy_prescription import PharmacySale, PharmacySaleItem
-
+    from app.models.pharmacy_prescription import (
+        PharmacyPrescription,
+        PharmacyPrescriptionLine,
+        PharmacySale,
+        PharmacySaleItem,
+    )
     HAS_PHARMACY = True
 except Exception:
     HAS_PHARMACY = False
+
+# ✅ NEW: OT Orders (your "OtOrder" module) support
+HAS_OT_ORDERS = False
+try:
+    # You said your OT module uses: from app.models.ot import OtOrder, OtAttachment
+    from app.models.ot import OtOrder, OtAttachment  # type: ignore
+    HAS_OT_ORDERS = True
+except Exception:
+    HAS_OT_ORDERS = False
 
 from app.schemas.emr import (
     TimelineItemOut,
@@ -62,7 +154,10 @@ from app.schemas.emr import (
     PatientLookupOut,
     EmrExportRequest,
     FhirBundleOut,
+    TimelineType,
+    TimelineFilterIn,
 )
+
 from app.services.pdf_emr import generate_emr_pdf
 from app.services.ui_branding import get_ui_branding  # branding helper
 
@@ -77,6 +172,235 @@ def _need_any(user: User, codes: list[str]) -> None:
     if have.intersection(set(codes)):
         return
     raise HTTPException(403, "Not permitted")
+
+
+# =========================
+# ✅ OT bundle helpers (PDF-aligned)
+# =========================
+
+
+def _resolve_ot_cases_for_schedules(
+        db: Session,
+        schedules: list[OtSchedule]) -> Dict[int, Optional[OtCase]]:
+    """
+    Returns {schedule_id: OtCase or None}
+    Robust even if schedule.case_id is NULL or relationship not populated.
+    """
+    if not schedules:
+        return {}
+
+    schedule_ids = [s.id for s in schedules if getattr(s, "id", None)]
+    # 1) Prefer relationship-loaded case
+    by_schedule: Dict[int, OtCase] = {}
+    for s in schedules:
+        c = getattr(s, "case", None)
+        if c is not None:
+            by_schedule[s.id] = c
+
+    # 2) Fallback: schedule.case_id -> OtCase.id
+    case_ids = [getattr(s, "case_id", None) for s in schedules]
+    case_ids = [x for x in case_ids if x]
+    by_id: Dict[int, OtCase] = {}
+    if case_ids:
+        rows = db.query(OtCase).filter(OtCase.id.in_(case_ids)).all()
+        by_id = {c.id: c for c in rows}
+        for s in schedules:
+            if s.id in by_schedule:
+                continue
+            cid = getattr(s, "case_id", None)
+            if cid and cid in by_id:
+                by_schedule[s.id] = by_id[cid]
+
+    # 3) Fallback: OtCase.schedule_id -> schedule.id  (CRITICAL)
+    missing_schedule_ids = [
+        sid for sid in schedule_ids if sid not in by_schedule
+    ]
+    if missing_schedule_ids and hasattr(OtCase, "schedule_id"):
+        rows = db.query(OtCase).filter(
+            OtCase.schedule_id.in_(missing_schedule_ids)).all()
+        for c in rows:
+            sid = getattr(c, "schedule_id", None)
+            if sid:
+                by_schedule[sid] = c
+
+    out: Dict[int, Optional[OtCase]] = {}
+    for s in schedules:
+        out[s.id] = by_schedule.get(s.id)
+    return out
+
+
+def _prefetch_ot_children(
+    db: Session,
+    case_ids: list[int],
+) -> Dict[str, Any]:
+    """
+    Bulk prefetch child records for many OT case_ids.
+    Returns mapping dicts keyed by case_id, plus vitals/drugs keyed by anaesthesia_record_id.
+    """
+    case_ids = [x for x in case_ids if x]
+    if not case_ids:
+        return {
+            "pae_by": {},
+            "preop_by": {},
+            "safety_by": {},
+            "an_hdr_by": {},
+            "nursing_by": {},
+            "counts_by": {},
+            "opnote_by": {},
+            "pacu_by": {},
+            "implants_by": {},
+            "blood_by": {},
+            "cleaning_by": {},
+            "vitals_by_rec": {},
+            "drugs_by_rec": {},
+        }
+
+    def one_by_case(model):
+        rows = db.query(model).filter(getattr(model,
+                                              "case_id").in_(case_ids)).all()
+        return {getattr(r, "case_id"): r for r in rows}
+
+    def many_by_case(model, order_field: str = "id"):
+        q = db.query(model).filter(getattr(model, "case_id").in_(case_ids))
+        if hasattr(model, order_field):
+            q = q.order_by(getattr(model, order_field).asc())
+        rows = q.all()
+        mp: Dict[int, list] = {}
+        for r in rows:
+            mp.setdefault(getattr(r, "case_id"), []).append(r)
+        return mp
+
+    pae_by = one_by_case(PreAnaesthesiaEvaluation)
+    preop_by = one_by_case(PreOpChecklist)
+    safety_by = one_by_case(SurgicalSafetyChecklist)
+    an_hdr_by = one_by_case(AnaesthesiaRecord)
+    nursing_by = one_by_case(OtNursingRecord)
+    counts_by = one_by_case(OtSpongeInstrumentCount)
+    opnote_by = one_by_case(OperationNote)
+    pacu_by = one_by_case(PacuRecord)
+
+    implants_by = many_by_case(OtImplantRecord, "id")
+    blood_by = many_by_case(OtBloodTransfusionRecord, "id")
+    cleaning_by = many_by_case(OtCleaningLog, "id")
+
+    # Anaesthesia logs are linked by record_id (NOT case_id)
+    an_record_ids = [getattr(r, "id", None) for r in an_hdr_by.values()]
+    an_record_ids = [x for x in an_record_ids if x]
+
+    vitals_by_rec: Dict[int, list[AnaesthesiaVitalLog]] = {}
+    drugs_by_rec: Dict[int, list[AnaesthesiaDrugLog]] = {}
+    if an_record_ids:
+        vrows = (db.query(AnaesthesiaVitalLog).filter(
+            AnaesthesiaVitalLog.record_id.in_(an_record_ids)).order_by(
+                AnaesthesiaVitalLog.time.asc()).all())
+        drows = (db.query(AnaesthesiaDrugLog).filter(
+            AnaesthesiaDrugLog.record_id.in_(an_record_ids)).order_by(
+                AnaesthesiaDrugLog.time.asc()).all())
+        for r in vrows:
+            vitals_by_rec.setdefault(getattr(r, "record_id"), []).append(r)
+        for r in drows:
+            drugs_by_rec.setdefault(getattr(r, "record_id"), []).append(r)
+
+    return {
+        "pae_by": pae_by,
+        "preop_by": preop_by,
+        "safety_by": safety_by,
+        "an_hdr_by": an_hdr_by,
+        "nursing_by": nursing_by,
+        "counts_by": counts_by,
+        "opnote_by": opnote_by,
+        "pacu_by": pacu_by,
+        "implants_by": implants_by,
+        "blood_by": blood_by,
+        "cleaning_by": cleaning_by,
+        "vitals_by_rec": vitals_by_rec,
+        "drugs_by_rec": drugs_by_rec,
+    }
+
+
+def _ot_case_bundle_row(
+    sc: OtSchedule,
+    case: Optional[OtCase],
+    children: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Returns one OT bundle object aligned with your ot_case_pdf.py expectations.
+    Includes backward-compatible aliases too.
+    """
+    schedule_procs = [{
+        "link":
+        _row(x),
+        "procedure":
+        _row(x.procedure) if getattr(x, "procedure", None) else None,
+    } for x in (getattr(sc, "procedures", None) or [])]
+
+    base = {
+        "schedule":
+        _row(sc),
+        "ot_bed":
+        _row(getattr(sc, "ot_bed", None))
+        if getattr(sc, "ot_bed", None) else None,
+        "surgeon":
+        _row(getattr(sc, "surgeon", None))
+        if getattr(sc, "surgeon", None) else None,
+        "anaesthetist":
+        _row(getattr(sc, "anaesthetist", None)) if getattr(
+            sc, "anaesthetist", None) else None,
+        "schedule_procedures":
+        schedule_procs,
+        "case":
+        _row(case) if case else None,
+        "speciality":
+        _row(getattr(case, "speciality", None))
+        if case and getattr(case, "speciality", None) else None,
+    }
+
+    if not case:
+        return base
+
+    cid = getattr(case, "id", None)
+    pae = children["pae_by"].get(cid)
+    preop = children["preop_by"].get(cid)
+    safety = children["safety_by"].get(cid)
+    an_hdr = children["an_hdr_by"].get(cid)
+    nursing = children["nursing_by"].get(cid)
+    counts = children["counts_by"].get(cid)
+    opnote = children["opnote_by"].get(cid)
+    pacu = children["pacu_by"].get(cid)
+    implants = children["implants_by"].get(cid, [])
+    blood = children["blood_by"].get(cid, [])
+    cleaning = children["cleaning_by"].get(cid, [])
+
+    ana_payload = None
+    if an_hdr:
+        rid = getattr(an_hdr, "id", None)
+        ana_payload = {
+            "header": _row(an_hdr),
+            "vitals":
+            _rows(children["vitals_by_rec"].get(rid, [])) if rid else [],
+            "drugs":
+            _rows(children["drugs_by_rec"].get(rid, [])) if rid else [],
+        }
+
+    # ✅ PDF-aligned names + aliases
+    base.update({
+        "preanaesthesia": _row(pae) if pae else None,
+        "pre_anaesthesia_evaluation": _row(pae) if pae else None,  # alias
+        "preop_checklist": _row(preop) if preop else None,
+        "safety_checklist": _row(safety) if safety else None,
+        "surgical_safety_checklist": _row(safety) if safety else None,  # alias
+        "anaesthesia_record": ana_payload,
+        "nursing_record": _row(nursing) if nursing else None,
+        "counts_record": _row(counts) if counts else None,
+        "implant_records": _rows(implants),
+        "implants": _rows(implants),  # alias
+        "blood_records": _rows(blood),
+        "blood_transfusions": _rows(blood),  # alias
+        "operation_note": _row(opnote) if opnote else None,
+        "pacu_record": _row(pacu) if pacu else None,
+        "cleaning_logs": _rows(cleaning),
+    })
+    return base
 
 
 # ---------------- helpers ----------------
@@ -141,6 +465,26 @@ def _bmi(height_cm, weight_kg):
         return None
 
 
+def _date_window(
+        df: Optional[str],
+        dt: Optional[str]) -> tuple[Optional[datetime], Optional[datetime]]:
+    dfrom = dto = None
+    if df:
+        dfrom = datetime.fromisoformat(df + "T00:00:00")
+    if dt:
+        dto = datetime.fromisoformat(dt + "T23:59:59")
+    return dfrom, dto
+
+
+def _in_window(ts: datetime, dfrom: Optional[datetime],
+               dto: Optional[datetime]) -> bool:
+    if dfrom and ts < dfrom:
+        return False
+    if dto and ts > dto:
+        return False
+    return True
+
+
 def _patient_by_uhid(db: Session, uhid: str) -> Optional[Patient]:
     if not uhid:
         return None
@@ -162,38 +506,45 @@ def _patient_brief(p: Patient) -> dict:
     }
 
 
-def _date_window(
-        df: Optional[str],
-        dt: Optional[str]) -> tuple[Optional[datetime], Optional[datetime]]:
-    dfrom = dto = None
-    if df:
-        dfrom = datetime.fromisoformat(df + "T00:00:00")
-    if dt:
-        dto = datetime.fromisoformat(dt + "T23:59:59")
-    return dfrom, dto
-
-
-def _in_window(ts: datetime, dfrom: Optional[datetime],
-               dto: Optional[datetime]) -> bool:
-    if dfrom and ts < dfrom:
-        return False
-    if dto and ts > dto:
-        return False
-    return True
-
-
 def _title_for(t: str) -> str:
     return {
+        "opd_appointment": "OPD Appointment",
         "opd_visit": "OPD Visit",
-        "opd_vitals": "Vitals",
-        "rx": "Prescription",
-        "lab": "Lab Test / Result",
-        "radiology": "Radiology",
+        "opd_vitals": "OPD Vitals",
+        "rx": "OPD Prescription",
+        "opd_lab_order": "OPD Lab Order",
+        "opd_radiology_order": "OPD Radiology Order",
+        "followup": "Follow-up",
+        "lab": "LIS Lab Result",
+        "radiology": "RIS Radiology",
+        "pharmacy_rx": "Pharmacy Prescription",
         "pharmacy": "Pharmacy Dispense",
         "ipd_admission": "IPD Admission",
         "ipd_transfer": "IPD Transfer",
-        "ipd_discharge": "IPD Discharge",
-        "ot": "OT Case",
+        "ipd_discharge": "IPD Discharge Summary",
+        "ipd_discharge_checklist": "IPD Discharge Checklist",
+        "ipd_discharge_med": "IPD Discharge Medication",
+        "ipd_vitals": "IPD Vitals",
+        "ipd_nursing_note": "IPD Nursing Note",
+        "ipd_shift_handover": "IPD Shift Handover",
+        "ipd_intake_output": "IPD Intake / Output",
+        "ipd_round": "IPD Round",
+        "ipd_progress": "IPD Progress Note",
+        "ipd_risk": "IPD Risk / Assessment",
+        "ipd_orders": "IPD Orders",
+        "ipd_med_order": "IPD Medication Order",
+        "ipd_mar": "IPD Medication Administration (MAR)",
+        "ipd_drug_chart_meta": "IPD Drug Chart Meta",
+        "ipd_iv_fluid": "IPD IV Fluid",
+        "ipd_dressing": "IPD Dressing",
+        "ipd_blood": "IPD Blood Transfusion",
+        "ipd_restraint": "IPD Restraint",
+        "ipd_isolation": "IPD Isolation",
+        "ipd_icu_flow": "ICU Flow Sheet",
+        "ipd_feedback": "IPD Feedback",
+        "ipd_referral": "IPD Referral",
+        "ipd_ot_case": "IPD OT Case",
+        "ot": "OT Case (Theatre)",
         "billing": "Invoice",
         "attachment": "Attachment",
         "consent": "Consent",
@@ -204,7 +555,42 @@ def _want(typ: str, allow: Optional[Set[str]]) -> bool:
     return (not allow) or (typ in allow)
 
 
-# ---------------- core query ----------------
+# --- 핵심: "DON'T MISS ANY FIELD" serializer (all table columns) ---
+def _row(obj) -> Optional[dict]:
+    if obj is None:
+        return None
+    insp = sa_inspect(obj)
+    data: Dict[str, Any] = {}
+    for attr in insp.mapper.column_attrs:
+        data[attr.key] = getattr(obj, attr.key)
+    return jsonable_encoder(data)
+
+
+def _rows(objs) -> List[dict]:
+    return [(_row(x) or {}) for x in (objs or [])]
+
+
+def _pick_ts(obj, fields: Tuple[str, ...]) -> datetime:
+    for f in fields:
+        v = getattr(obj, f, None)
+        if v:
+            return _safe_dt(v)
+    return datetime.utcnow()
+
+
+def _planned_dt_from_schedule(sc: OtSchedule) -> Optional[datetime]:
+    if sc.date and sc.planned_start_time:
+        return datetime(
+            sc.date.year,
+            sc.date.month,
+            sc.date.day,
+            sc.planned_start_time.hour,
+            sc.planned_start_time.minute,
+        )
+    return None
+
+
+# ---------------- core timeline ----------------
 def _build_timeline(
     db: Session,
     patient_id: int,
@@ -214,31 +600,41 @@ def _build_timeline(
 ) -> list[TimelineItemOut]:
     out: list[TimelineItemOut] = []
 
-    # --- OPD Visits (full SOAP + Episode + Appointment) ---
+    # --- OPD Appointments ---
+    if _want("opd_appointment", allow):
+        appts = (db.query(Appointment).options(
+            joinedload(Appointment.doctor),
+            joinedload(Appointment.department)).filter(
+                Appointment.patient_id == patient_id).order_by(
+                    Appointment.date.desc(),
+                    Appointment.slot_start.desc()).limit(500).all())
+        for a in appts:
+            ts = _safe_dt(a.created_at or a.date)
+            if not _in_window(ts, dfrom, dto):
+                continue
+            out.append(
+                TimelineItemOut(
+                    type="opd_appointment",
+                    ts=ts,
+                    title=_title_for("opd_appointment"),
+                    subtitle=f"{a.purpose or 'Consultation'} • {a.status}",
+                    doctor_name=getattr(a.doctor, "name", None),
+                    department_name=getattr(a.department, "name", None),
+                    status=_map_ui_status(a.status),
+                    data={"appointment": _row(a)},
+                ))
+
+    # --- OPD Visits (SOAP etc) ---
     if _want("opd_visit", allow):
         visits = (db.query(Visit).options(
-            joinedload(Visit.doctor),
-            joinedload(Visit.department),
-            joinedload(Visit.appointment),
-        ).filter(Visit.patient_id == patient_id).order_by(
-            Visit.visit_at.desc()).limit(500).all())
+            joinedload(Visit.doctor), joinedload(Visit.department),
+            joinedload(Visit.appointment)).filter(
+                Visit.patient_id == patient_id).order_by(
+                    Visit.visit_at.desc()).limit(500).all())
         for v in visits:
             ts = _safe_dt(v.visit_at)
             if not _in_window(ts, dfrom, dto):
                 continue
-            appt = v.appointment
-            slot = None
-            if appt:
-                slot = {
-                    "date":
-                    appt.date.isoformat() if appt.date else None,
-                    "slot_start":
-                    appt.slot_start.isoformat() if appt.slot_start else None,
-                    "slot_end":
-                    appt.slot_end.isoformat() if appt.slot_end else None,
-                    "purpose":
-                    appt.purpose,
-                }
             out.append(
                 TimelineItemOut(
                     type="opd_visit",
@@ -249,19 +645,14 @@ def _build_timeline(
                     department_name=getattr(v.department, "name", None),
                     status=None,
                     data={
-                        "episode_id": v.episode_id,
-                        "visit_at": v.visit_at,
-                        "chief_complaint": v.chief_complaint,
-                        "symptoms": v.symptoms,
-                        "subjective": v.soap_subjective,
-                        "objective": v.soap_objective,
-                        "assessment": v.soap_assessment,
-                        "plan": v.plan,
-                        "appointment": slot,
+                        "visit":
+                        _row(v),
+                        "appointment":
+                        _row(v.appointment) if v.appointment else None,
                     },
                 ))
 
-    # --- OPD Vitals (full metrics + BMI + appointment linkage) ---
+    # --- OPD Vitals ---
     if _want("opd_vitals", allow):
         vitals = (db.query(OpdVitals).options(joinedload(
             OpdVitals.appointment)).filter(
@@ -280,17 +671,6 @@ def _build_timeline(
                 chips.append(f"Pulse {vt.pulse}/min")
             if vt.spo2:
                 chips.append(f"SpO₂ {vt.spo2}%")
-            appt = vt.appointment
-            appt_data = None
-            if appt:
-                appt_data = {
-                    "date":
-                    appt.date.isoformat() if appt.date else None,
-                    "slot_start":
-                    appt.slot_start.isoformat() if appt.slot_start else None,
-                    "slot_end":
-                    appt.slot_end.isoformat() if appt.slot_end else None,
-                }
             out.append(
                 TimelineItemOut(
                     type="opd_vitals",
@@ -298,23 +678,18 @@ def _build_timeline(
                     title=_title_for("opd_vitals"),
                     subtitle="  ·  ".join(chips)
                     if chips else "Vitals recorded",
+                    status=None,
                     data={
-                        "recorded_at": vt.created_at,
-                        "height_cm": _as_float(vt.height_cm),
-                        "weight_kg": _as_float(vt.weight_kg),
-                        "bmi": _bmi(vt.height_cm, vt.weight_kg),
-                        "bp_systolic": vt.bp_systolic,
-                        "bp_diastolic": vt.bp_diastolic,
-                        "pulse": vt.pulse,
-                        "rr": vt.rr,
-                        "temp_c": _as_float(vt.temp_c),
-                        "spo2": vt.spo2,
-                        "notes": vt.notes,
-                        "appointment": appt_data,
+                        "vitals":
+                        _row(vt),
+                        "bmi":
+                        _bmi(vt.height_cm, vt.weight_kg),
+                        "appointment":
+                        _row(vt.appointment) if vt.appointment else None,
                     },
                 ))
 
-    # --- OPD Prescriptions (items + signer) ---
+    # --- OPD Prescriptions ---
     if _want("rx", allow):
         rxs = (db.query(OpdRx).options(
             joinedload(OpdRx.visit).joinedload(Visit.doctor),
@@ -324,29 +699,11 @@ def _build_timeline(
             Visit.patient_id == patient_id).order_by(
                 OpdRx.id.desc()).limit(500).all())
         for rx in rxs:
-            ts = rx.signed_at or (rx.visit.visit_at
-                                  if rx.visit else None) or rx.visit.created_at
-            ts = _safe_dt(ts)
+            ts_raw = rx.signed_at or (rx.visit.visit_at if rx.visit else
+                                      None) or getattr(rx, "created_at", None)
+            ts = _safe_dt(ts_raw)
             if not _in_window(ts, dfrom, dto):
                 continue
-            items = []
-            for it in rx.items or []:
-                items.append({
-                    "drug_name":
-                    it.drug_name,
-                    "strength":
-                    it.strength,
-                    "frequency":
-                    it.frequency,
-                    "duration_days":
-                    it.duration_days,
-                    "quantity":
-                    it.quantity,
-                    "unit_price":
-                    _as_float(it.unit_price),
-                    "line_total":
-                    (_as_float(it.unit_price) or 0) * (it.quantity or 0),
-                })
             out.append(
                 TimelineItemOut(
                     type="rx",
@@ -357,27 +714,117 @@ def _build_timeline(
                     if rx.visit and rx.visit.doctor else None,
                     status=_map_ui_status(
                         "signed" if rx.signed_at else "draft"),
-                    ref_kind="opd_visit",
-                    ref_display="Prescription",
                     data={
-                        "notes": rx.notes,
-                        "signed_at": rx.signed_at,
-                        "signed_by": rx.signer.name if rx.signer else None,
-                        "items": items,
+                        "prescription": _row(rx),
+                        "items": _rows(rx.items),
+                        "signed_by_name":
+                        rx.signer.name if rx.signer else None,
                     },
                 ))
 
-    # --- LIS (each item + attachments, ranges, specimen, critical) ---
+    # --- OPD Lab Orders (ordered stage) ---
+    if _want("opd_lab_order", allow):
+        lab_orders = (db.query(LabOrder).options(joinedload(
+            LabOrder.visit), joinedload(LabOrder.test)).join(
+                Visit, LabOrder.visit_id == Visit.id).filter(
+                    Visit.patient_id == patient_id).order_by(
+                        LabOrder.ordered_at.desc()).limit(500).all())
+        for lo in lab_orders:
+            ts = _safe_dt(lo.ordered_at)
+            if not _in_window(ts, dfrom, dto):
+                continue
+            out.append(
+                TimelineItemOut(
+                    type="opd_lab_order",
+                    ts=ts,
+                    title=_title_for("opd_lab_order"),
+                    subtitle=
+                    f"{getattr(lo.test,'name',None) or 'Lab'} • {lo.status}",
+                    status=_map_ui_status(lo.status),
+                    data={
+                        "opd_lab_order": _row(lo),
+                        "test": _row(lo.test) if lo.test else None,
+                        "visit": _row(lo.visit) if lo.visit else None,
+                    },
+                ))
+
+    # --- OPD Radiology Orders (ordered stage) ---
+    if _want("opd_radiology_order", allow):
+        ris_orders = (db.query(RadiologyOrder).options(
+            joinedload(RadiologyOrder.visit),
+            joinedload(RadiologyOrder.test)).join(
+                Visit, RadiologyOrder.visit_id == Visit.id).filter(
+                    Visit.patient_id == patient_id).order_by(
+                        RadiologyOrder.ordered_at.desc()).limit(500).all())
+        for ro in ris_orders:
+            ts = _safe_dt(ro.ordered_at)
+            if not _in_window(ts, dfrom, dto):
+                continue
+            out.append(
+                TimelineItemOut(
+                    type="opd_radiology_order",
+                    ts=ts,
+                    title=_title_for("opd_radiology_order"),
+                    subtitle=
+                    f"{getattr(ro.test,'name',None) or 'Radiology'} • {ro.status}",
+                    status=_map_ui_status(ro.status),
+                    data={
+                        "opd_radiology_order": _row(ro),
+                        "test": _row(ro.test) if ro.test else None,
+                        "visit": _row(ro.visit) if ro.visit else None,
+                    },
+                ))
+
+    # --- Follow-ups ---
+    if _want("followup", allow):
+        fus = (db.query(FollowUp).options(joinedload(
+            FollowUp.source_visit), joinedload(FollowUp.appointment)).filter(
+                FollowUp.patient_id == patient_id).order_by(
+                    FollowUp.due_date.desc(),
+                    FollowUp.id.desc()).limit(500).all())
+        for f in fus:
+            ts = _safe_dt(
+                getattr(f, "updated_at", None)
+                or getattr(f, "created_at", None) or f.due_date)
+            if not _in_window(ts, dfrom, dto):
+                continue
+            out.append(
+                TimelineItemOut(
+                    type="followup",
+                    ts=ts,
+                    title=_title_for("followup"),
+                    subtitle=f"Due {f.due_date} • {f.status}",
+                    status=_map_ui_status(f.status),
+                    data={
+                        "followup":
+                        _row(f),
+                        "source_visit":
+                        _row(f.source_visit) if f.source_visit else None,
+                        "appointment":
+                        _row(f.appointment) if f.appointment else None,
+                    },
+                ))
+
+    # --- LIS (results + attachments + result_lines) ---
     if _want("lab", allow):
         lis_orders = (db.query(LisOrder).options(
-            joinedload(LisOrder.items).joinedload(
+            selectinload(LisOrder.items).selectinload(
                 LisOrderItem.attachments)).filter(
                     LisOrder.patient_id == patient_id).order_by(
                         LisOrder.id.desc()).limit(250).all())
+
+        order_ids = [x.id for x in lis_orders]
+        res_lines_by_order: Dict[int, List[LisResultLine]] = {}
+        if order_ids:
+            res_lines = (db.query(LisResultLine).filter(
+                LisResultLine.order_id.in_(order_ids)).order_by(
+                    LisResultLine.id.asc()).all())
+            for rl in res_lines:
+                res_lines_by_order.setdefault(rl.order_id, []).append(rl)
+
         for lo in lis_orders:
             for it in (lo.items or []):
-                ts = it.result_at or lo.reported_at or lo.created_at
-                ts = _safe_dt(ts)
+                ts = _safe_dt(it.result_at or lo.reported_at or lo.created_at)
                 if not _in_window(ts, dfrom, dto):
                     continue
                 atts = [
@@ -397,38 +844,27 @@ def _build_timeline(
                         subtitle=
                         f"{it.test_name} ({it.test_code}) • Result: {it.result_value or '—'}",
                         status=_map_ui_status(it.status),
-                        ref_kind="lab_test",
-                        ref_display=f"{it.test_name}",
                         attachments=atts,
                         data={
-                            "order_id": lo.id,
-                            "priority": lo.priority,
-                            "collected_at": lo.collected_at,
-                            "reported_at": lo.reported_at,
-                            "item": {
-                                "test_id": it.test_id,
-                                "test_name": it.test_name,
-                                "test_code": it.test_code,
-                                "unit": it.unit,
-                                "normal_range": it.normal_range,
-                                "specimen_type": it.specimen_type,
-                                "status": it.status,
-                                "result_value": it.result_value,
-                                "is_critical": it.is_critical,
-                                "result_at": it.result_at,
-                            },
+                            "lis_order":
+                            _row(lo),
+                            "lis_item":
+                            _row(it),
+                            "attachments":
+                            _rows(it.attachments),
+                            "result_lines":
+                            _rows(res_lines_by_order.get(lo.id, [])),
                         },
                     ))
 
-    # --- RIS (modality + report text + signoff + attachments) ---
+    # --- RIS (report + attachments) ---
     if _want("radiology", allow):
-        ris = (db.query(RisOrder).options(joinedload(
+        ris = (db.query(RisOrder).options(selectinload(
             RisOrder.attachments)).filter(
                 RisOrder.patient_id == patient_id).order_by(
                     RisOrder.id.desc()).limit(250).all())
         for ro in ris:
-            ts = ro.reported_at or ro.scanned_at or ro.created_at
-            ts = _safe_dt(ts)
+            ts = _safe_dt(ro.reported_at or ro.scanned_at or ro.created_at)
             if not _in_window(ts, dfrom, dto):
                 continue
             atts = [
@@ -447,127 +883,90 @@ def _build_timeline(
                     title=_title_for("radiology"),
                     subtitle=f"{ro.test_name} ({ro.test_code})",
                     status=_map_ui_status(ro.status),
-                    ref_kind="radiology_test",
-                    ref_display=ro.test_name,
                     attachments=atts,
                     data={
-                        "test_id": ro.test_id,
-                        "test_name": ro.test_name,
-                        "test_code": ro.test_code,
-                        "modality": ro.modality,
-                        "status": ro.status,
-                        "scheduled_at": ro.scheduled_at,
-                        "scanned_at": ro.scanned_at,
-                        "reported_at": ro.reported_at,
-                        "report_text": ro.report_text,
-                        "approved_at": ro.approved_at,
-                        "primary_signoff_by": ro.primary_signoff_by,
-                        "secondary_signoff_by": ro.secondary_signoff_by,
+                        "ris_order": _row(ro),
+                        "attachments": _rows(ro.attachments)
                     },
                 ))
 
-    # --- Pharmacy sale (NEW models: items list with qty & amounts) ---
-    if HAS_PHARMACY and _want("pharmacy", allow):
-        sales = (
-            db.query(PharmacySale).filter(
-                PharmacySale.patient_id == patient_id,
-                PharmacySale.invoice_status
-                != "CANCELLED",  # skip cancelled bills
-            ).order_by(PharmacySale.id.desc()).limit(250).all())
+    # --- Pharmacy Prescription (lines) ---
+    if HAS_PHARMACY and _want("pharmacy_rx", allow):
+        prxs = (db.query(PharmacyPrescription).options(
+            selectinload(PharmacyPrescription.lines)).filter(
+                PharmacyPrescription.patient_id == patient_id).order_by(
+                    PharmacyPrescription.id.desc()).limit(250).all())
+        for pr in prxs:
+            ts = _safe_dt(pr.signed_at or pr.created_at)
+            if not _in_window(ts, dfrom, dto):
+                continue
+            out.append(
+                TimelineItemOut(
+                    type="pharmacy_rx",
+                    ts=ts,
+                    title=_title_for("pharmacy_rx"),
+                    subtitle=f"{pr.type} • {pr.status}",
+                    status=_map_ui_status(pr.status),
+                    data={
+                        "pharmacy_prescription": _row(pr),
+                        "lines": _rows(pr.lines)
+                    },
+                ))
 
+    # --- Pharmacy Sale (dispense) ---
+    if HAS_PHARMACY and _want("pharmacy", allow):
+        sales = (db.query(PharmacySale).filter(
+            PharmacySale.patient_id == patient_id,
+            PharmacySale.invoice_status != "CANCELLED" if hasattr(
+                PharmacySale, "invoice_status") else True,
+        ).order_by(PharmacySale.id.desc()).limit(250).all())
         sale_ids = [s.id for s in sales]
         items_by_sale: Dict[int, List[PharmacySaleItem]] = {}
         if sale_ids:
-            items = (db.query(PharmacySaleItem).filter(
-                PharmacySaleItem.sale_id.in_(sale_ids)).all())
+            items = db.query(PharmacySaleItem).filter(
+                PharmacySaleItem.sale_id.in_(sale_ids)).all()
             for it in items:
                 items_by_sale.setdefault(it.sale_id, []).append(it)
 
         for s in sales:
-            ts = _safe_dt(s.created_at)
+            ts = _safe_dt(
+                getattr(s, "created_at", None)
+                or getattr(s, "bill_datetime", None))
             if not _in_window(ts, dfrom, dto):
                 continue
-
-            line_items = []
-            for it in items_by_sale.get(s.id, []):
-                line_items.append({
-                    # snapshot name/code from sale item itself
-                    "item_name":
-                    getattr(it, "item_name", None),
-                    "item_code":
-                    getattr(it, "item_code", None),
-                    "quantity":
-                    getattr(it, "quantity", None),
-                    "unit_price":
-                    _as_float(getattr(it, "unit_price", None)),
-                    "discount_percent":
-                    _as_float(getattr(it, "discount_percent", None)),
-                    "tax_percent":
-                    _as_float(getattr(it, "tax_percent", None)),
-                    "total_amount":
-                    _as_float(getattr(it, "total_amount", None)),
-                })
-
             total_amount = _as_float(
                 getattr(s, "net_amount", None)
                 or getattr(s, "total_amount", None) or 0) or 0.0
-
             status_raw = (getattr(s, "status", "") or "").lower()
-            status_ui = _map_ui_status(status_raw)
-
             out.append(
                 TimelineItemOut(
                     type="pharmacy",
                     ts=ts,
                     title=_title_for("pharmacy"),
                     subtitle=f"Dispense • Net ₹{float(total_amount):.2f}",
-                    status=status_ui or "completed",
-                    ref_kind="pharmacy_sale",
-                    ref_display="Pharmacy dispense",
+                    status=_map_ui_status(status_raw) or "completed",
                     data={
-                        "sale_id":
-                        s.id,
-                        "status":
-                        getattr(s, "status", None),
-                        "context_type":
-                        getattr(s, "context_type", None),
-                        "visit_id":
-                        getattr(s, "visit_id", None),
-                        "admission_id":
-                        getattr(s, "admission_id", None),
-                        "location_id":
-                        getattr(s, "location_id", None),
-                        "payment_mode":
-                        getattr(s, "payment_mode", None),
-                        "gross_amount":
-                        _as_float(getattr(s, "gross_amount", None)),
-                        "discount_amount":
-                        _as_float(getattr(s, "discount_amount", None)),
-                        "tax_amount":
-                        _as_float(getattr(s, "tax_amount", None)),
-                        "net_amount":
-                        _as_float(getattr(s, "net_amount", None))
-                        or total_amount,
-                        "items":
-                        line_items,
+                        "pharmacy_sale": _row(s),
+                        "items": _rows(items_by_sale.get(s.id, []))
                     },
                 ))
 
-    # --- IPD Admission / Transfer / Discharge (full details) ---
+    # --- IPD Admission (header) ---
     if _want("ipd_admission", allow):
         adms = (db.query(IpdAdmission).filter(
             IpdAdmission.patient_id == patient_id).order_by(
                 IpdAdmission.id.desc()).limit(200).all())
-        # current bed code lookup
         bed_ids = [a.current_bed_id for a in adms if a.current_bed_id]
-        beds = {}
+        beds: Dict[int, IpdBed] = {}
         if bed_ids:
             rows = db.query(IpdBed).filter(IpdBed.id.in_(bed_ids)).all()
-            beds = {b.id: b.code for b in rows}
+            beds = {b.id: b for b in rows}
+
         for a in adms:
             ts = _safe_dt(a.admitted_at)
             if not _in_window(ts, dfrom, dto):
                 continue
+            bed = beds.get(a.current_bed_id)
             out.append(
                 TimelineItemOut(
                     type="ipd_admission",
@@ -575,35 +974,18 @@ def _build_timeline(
                     title=_title_for("ipd_admission"),
                     subtitle=f"Admission {a.display_code}",
                     status=_map_ui_status(a.status),
-                    ref_kind="ipd_admission",
-                    ref_display=a.display_code,
                     data={
-                        "admission_code": a.display_code,
-                        "department_id": a.department_id,
-                        "practitioner_user_id": a.practitioner_user_id,
-                        "primary_nurse_user_id": a.primary_nurse_user_id,
-                        "admission_type": a.admission_type,
-                        "admitted_at": a.admitted_at,
-                        "expected_discharge_at": a.expected_discharge_at,
-                        "package_id": a.package_id,
-                        "payor_type": a.payor_type,
-                        "insurer_name": a.insurer_name,
-                        "policy_number": a.policy_number,
-                        "preliminary_diagnosis": a.preliminary_diagnosis,
-                        "history": a.history,
-                        "care_plan": a.care_plan,
-                        "current_bed_id": a.current_bed_id,
-                        "current_bed_code": beds.get(a.current_bed_id),
-                        "status": a.status,
+                        "admission": _row(a),
+                        "current_bed": _row(bed) if bed else None
                     },
                 ))
 
+    # --- IPD Transfer ---
     if _want("ipd_transfer", allow):
-        trs = (db.query(IpdTransfer).filter(
-            IpdTransfer.admission_id.in_(
-                db.query(IpdAdmission.id).filter(
-                    IpdAdmission.patient_id == patient_id))).order_by(
-                        IpdTransfer.id.desc()).limit(300).all())
+        trs = (db.query(IpdTransfer).join(
+            IpdAdmission, IpdTransfer.admission_id == IpdAdmission.id).filter(
+                IpdAdmission.patient_id == patient_id).order_by(
+                    IpdTransfer.id.desc()).limit(500).all())
         for t in trs:
             ts = _safe_dt(t.transferred_at)
             if not _in_window(ts, dfrom, dto):
@@ -615,19 +997,10 @@ def _build_timeline(
                     title=_title_for("ipd_transfer"),
                     subtitle="Bed transfer",
                     status="completed",
-                    ref_kind="ipd_transfer",
-                    ref_display="Bed transfer",
-                    data={
-                        "admission_id": t.admission_id,
-                        "from_bed_id": t.from_bed_id,
-                        "to_bed_id": t.to_bed_id,
-                        "reason": t.reason,
-                        "requested_by": t.requested_by,
-                        "approved_by": t.approved_by,
-                        "transferred_at": t.transferred_at,
-                    },
+                    data={"transfer": _row(t)},
                 ))
 
+    # --- IPD Discharge Summary ---
     if _want("ipd_discharge", allow):
         ds = (db.query(IpdDischargeSummary).join(
             IpdAdmission,
@@ -635,7 +1008,9 @@ def _build_timeline(
                 IpdAdmission.patient_id == patient_id).order_by(
                     IpdDischargeSummary.id.desc()).limit(200).all())
         for d in ds:
-            ts = _safe_dt(d.finalized_at or d.created_at)
+            ts = _safe_dt(d.finalized_at
+                          or getattr(d, "discharge_datetime", None)
+                          or getattr(d, "created_at", None))
             if not _in_window(ts, dfrom, dto):
                 continue
             out.append(
@@ -645,140 +1020,399 @@ def _build_timeline(
                     title=_title_for("ipd_discharge"),
                     subtitle="Discharge Summary",
                     status="completed" if d.finalized else "new",
-                    ref_kind="ipd_discharge",
-                    ref_display="Discharge summary",
+                    data={"discharge_summary": _row(d)},
+                ))
+
+    # --- IPD Vitals ---
+    if _want("ipd_vitals", allow):
+        vts = (db.query(IpdVital).join(
+            IpdAdmission, IpdVital.admission_id == IpdAdmission.id).options(
+                joinedload(IpdVital.recorder)).filter(
+                    IpdAdmission.patient_id == patient_id).order_by(
+                        IpdVital.recorded_at.desc()).limit(1000).all())
+        for v in vts:
+            ts = _safe_dt(v.recorded_at)
+            if not _in_window(ts, dfrom, dto):
+                continue
+            subtitle = " • ".join([
+                x for x in [
+                    f"BP {v.bp_systolic}/{v.bp_diastolic}"
+                    if v.bp_systolic and v.bp_diastolic else None,
+                    f"T {_as_float(v.temp_c)}°C" if v.
+                    temp_c is not None else None,
+                    f"Pulse {v.pulse}/min" if v.pulse else None,
+                    f"SpO₂ {v.spo2}%" if v.spo2 else None,
+                    f"RR {v.rr}/min" if v.rr else None,
+                ] if x
+            ]) or "Vitals"
+            out.append(
+                TimelineItemOut(
+                    type="ipd_vitals",
+                    ts=ts,
+                    title=_title_for("ipd_vitals"),
+                    subtitle=subtitle,
+                    status=None,
                     data={
-                        "admission_id": d.admission_id,
-                        "finalized": d.finalized,
-                        "finalized_by": d.finalized_by,
-                        "finalized_at": d.finalized_at,
-                        "demographics": d.demographics,
-                        "medical_history": d.medical_history,
-                        "treatment_summary": d.treatment_summary,
-                        "medications": d.medications,
-                        "follow_up": d.follow_up,
-                        "icd10_codes": d.icd10_codes,
+                        "ipd_vitals":
+                        _row(v),
+                        "recorded_by_name":
+                        getattr(v.recorder, "name", None)
+                        if v.recorder else None,
                     },
                 ))
 
-    # --- OT Case ---
-    # --- OT (Schedule + Case) ---
+    # --- IPD Nursing Notes (includes linked_vital) ---
+    if _want("ipd_nursing_note", allow):
+        notes = (db.query(IpdNursingNote).join(
+            IpdAdmission,
+            IpdNursingNote.admission_id == IpdAdmission.id).options(
+                joinedload(IpdNursingNote.nurse),
+                joinedload(IpdNursingNote.vitals)).filter(
+                    IpdAdmission.patient_id == patient_id).order_by(
+                        IpdNursingNote.entry_time.desc()).limit(1000).all())
+        for n in notes:
+            ts = _safe_dt(n.entry_time)
+            if not _in_window(ts, dfrom, dto):
+                continue
+            out.append(
+                TimelineItemOut(
+                    type="ipd_nursing_note",
+                    ts=ts,
+                    title=_title_for("ipd_nursing_note"),
+                    subtitle=(n.note_type or "routine"),
+                    status="locked"
+                    if getattr(n, "is_locked", False) else None,
+                    data={
+                        "nursing_note":
+                        _row(n),
+                        "nurse_name":
+                        getattr(n.nurse, "name", None) if n.nurse else None,
+                        "linked_vitals":
+                        _row(n.vitals) if n.vitals else None,
+                    },
+                ))
+
+    # --- IPD Intake/Output ---
+    if _want("ipd_intake_output", allow):
+        ios = (db.query(IpdIntakeOutput).join(
+            IpdAdmission,
+            IpdIntakeOutput.admission_id == IpdAdmission.id).filter(
+                IpdAdmission.patient_id == patient_id).order_by(
+                    IpdIntakeOutput.recorded_at.desc()).limit(2000).all())
+        for io in ios:
+            ts = _safe_dt(io.recorded_at)
+            if not _in_window(ts, dfrom, dto):
+                continue
+            out.append(
+                TimelineItemOut(
+                    type="ipd_intake_output",
+                    ts=ts,
+                    title=_title_for("ipd_intake_output"),
+                    subtitle=
+                    f"Intake {io.intake_ml} ml • Urine {io.urine_ml} ml",
+                    status=None,
+                    data={"intake_output": _row(io)},
+                ))
+
+    # --- IPD Rounds ---
+    if _want("ipd_round", allow):
+        rds = (db.query(IpdRound).join(
+            IpdAdmission, IpdRound.admission_id == IpdAdmission.id).filter(
+                IpdAdmission.patient_id == patient_id).order_by(
+                    IpdRound.created_at.desc()).limit(2000).all())
+        for r in rds:
+            ts = _safe_dt(r.created_at)
+            if not _in_window(ts, dfrom, dto):
+                continue
+            out.append(
+                TimelineItemOut(
+                    type="ipd_round",
+                    ts=ts,
+                    title=_title_for("ipd_round"),
+                    subtitle="Doctor round",
+                    data={"round": _row(r)},
+                ))
+
+    # --- IPD Progress Notes ---
+    if _want("ipd_progress", allow):
+        pns = (db.query(IpdProgressNote).join(
+            IpdAdmission,
+            IpdProgressNote.admission_id == IpdAdmission.id).filter(
+                IpdAdmission.patient_id == patient_id).order_by(
+                    IpdProgressNote.created_at.desc()).limit(2000).all())
+        for pn in pns:
+            ts = _safe_dt(pn.created_at)
+            if not _in_window(ts, dfrom, dto):
+                continue
+            out.append(
+                TimelineItemOut(
+                    type="ipd_progress",
+                    ts=ts,
+                    title=_title_for("ipd_progress"),
+                    subtitle="Progress note",
+                    data={"progress_note": _row(pn)},
+                ))
+
+    # --- IPD Risk + Assessments ---
+    if _want("ipd_risk", allow):
+
+        def _emit_many(rows, typ: str, ts_field: str):
+            for x in rows:
+                ts = _safe_dt(
+                    getattr(x, ts_field, None)
+                    or getattr(x, "created_at", None))
+                if not _in_window(ts, dfrom, dto):
+                    continue
+                out.append(
+                    TimelineItemOut(
+                        type="ipd_risk",
+                        ts=ts,
+                        title=_title_for("ipd_risk"),
+                        subtitle=typ,
+                        data={
+                            "assessment_type": typ,
+                            "row": _row(x)
+                        },
+                    ))
+
+        pain = (db.query(IpdPainAssessment).join(
+            IpdAdmission,
+            IpdPainAssessment.admission_id == IpdAdmission.id).filter(
+                IpdAdmission.patient_id == patient_id).order_by(
+                    IpdPainAssessment.recorded_at.desc()).limit(2000).all())
+        fall = (db.query(IpdFallRiskAssessment).join(
+            IpdAdmission, IpdFallRiskAssessment.admission_id == IpdAdmission.id
+        ).filter(IpdAdmission.patient_id == patient_id).order_by(
+            IpdFallRiskAssessment.recorded_at.desc()).limit(2000).all())
+        pres = (db.query(IpdPressureUlcerAssessment).join(
+            IpdAdmission,
+            IpdPressureUlcerAssessment.admission_id == IpdAdmission.id
+        ).filter(IpdAdmission.patient_id == patient_id).order_by(
+            IpdPressureUlcerAssessment.recorded_at.desc()).limit(2000).all())
+        nutr = (db.query(IpdNutritionAssessment).join(
+            IpdAdmission, IpdNutritionAssessment.admission_id == IpdAdmission.
+            id).filter(IpdAdmission.patient_id == patient_id).order_by(
+                IpdNutritionAssessment.recorded_at.desc()).limit(2000).all())
+        gen = (db.query(IpdAssessment).join(
+            IpdAdmission,
+            IpdAssessment.admission_id == IpdAdmission.id).filter(
+                IpdAdmission.patient_id == patient_id).order_by(
+                    IpdAssessment.assessed_at.desc()).limit(2000).all())
+
+        _emit_many(pain, "Pain Assessment", "recorded_at")
+        _emit_many(fall, "Fall Risk", "recorded_at")
+        _emit_many(pres, "Pressure Ulcer", "recorded_at")
+        _emit_many(nutr, "Nutrition", "recorded_at")
+        _emit_many(gen, "Generic Assessment", "assessed_at")
+
+    # --- IPD Medication Orders + MAR ---
+    if _want("ipd_med_order", allow) or _want("ipd_mar", allow):
+        mos = (db.query(IpdMedicationOrder).join(
+            IpdAdmission,
+            IpdMedicationOrder.admission_id == IpdAdmission.id).options(
+                selectinload(IpdMedicationOrder.administrations)).filter(
+                    IpdAdmission.patient_id == patient_id).order_by(
+                        IpdMedicationOrder.id.desc()).limit(2000).all())
+        if _want("ipd_med_order", allow):
+            for mo in mos:
+                ts = _safe_dt(
+                    getattr(mo, "start_datetime", None)
+                    or getattr(mo, "created_at", None))
+                if not _in_window(ts, dfrom, dto):
+                    continue
+                out.append(
+                    TimelineItemOut(
+                        type="ipd_med_order",
+                        ts=ts,
+                        title=_title_for("ipd_med_order"),
+                        subtitle=f"{mo.drug_name} • {mo.order_status}",
+                        status=_map_ui_status(mo.order_status),
+                        data={
+                            "med_order": _row(mo),
+                            "administrations": _rows(mo.administrations)
+                        },
+                    ))
+        if _want("ipd_mar", allow):
+            for mo in mos:
+                for ad in (mo.administrations or []):
+                    ts = _safe_dt(ad.given_datetime or ad.scheduled_datetime)
+                    if not _in_window(ts, dfrom, dto):
+                        continue
+                    out.append(
+                        TimelineItemOut(
+                            type="ipd_mar",
+                            ts=ts,
+                            title=_title_for("ipd_mar"),
+                            subtitle=f"{mo.drug_name} • {ad.given_status}",
+                            status=_map_ui_status(ad.given_status),
+                            data={
+                                "med_order": _row(mo),
+                                "administration": _row(ad)
+                            },
+                        ))
+
+    # --- IPD IV Fluids ---
+    if _want("ipd_iv_fluid", allow):
+        ivs = (db.query(IpdIvFluidOrder).join(
+            IpdAdmission,
+            IpdIvFluidOrder.admission_id == IpdAdmission.id).filter(
+                IpdAdmission.patient_id == patient_id).order_by(
+                    IpdIvFluidOrder.ordered_datetime.desc()).limit(2000).all())
+        for iv in ivs:
+            ts = _safe_dt(iv.ordered_datetime)
+            if not _in_window(ts, dfrom, dto):
+                continue
+            out.append(
+                TimelineItemOut(
+                    type="ipd_iv_fluid",
+                    ts=ts,
+                    title=_title_for("ipd_iv_fluid"),
+                    subtitle=iv.fluid,
+                    data={"iv_fluid": _row(iv)},
+                ))
+
+    # =========================
+    # ✅ OT (Schedule+Case) + ✅ OT Orders (your new module)
+    # =========================
+    # =========================
+    # =========================
+    # ✅ OT (Schedule+Case) + ✅ OT Orders (your new module)
+    # =========================
     if _want("ot", allow):
-        # New OT is bed-based; we use schedules and join to case
         ot_schedules = (db.query(OtSchedule).options(
             joinedload(OtSchedule.case),
             joinedload(OtSchedule.surgeon),
             joinedload(OtSchedule.anaesthetist),
-            joinedload(OtSchedule.bed),
+            joinedload(OtSchedule.ot_bed),
+            joinedload(OtSchedule.admission),
+            selectinload(OtSchedule.procedures).joinedload(
+                OtScheduleProcedure.procedure),
         ).filter(OtSchedule.patient_id == patient_id).order_by(
             OtSchedule.date.desc(),
-            OtSchedule.planned_start_time.desc(),
-        ).limit(200).all())
+            OtSchedule.planned_start_time.desc()).limit(200).all())
 
-        for oc in ot_schedules:
-            case = oc.case
+        # ✅ robust case resolve (even if schedule.case_id missing)
+        case_by_schedule = _resolve_ot_cases_for_schedules(db, ot_schedules)
+        case_ids = [
+            getattr(c, "id", None) for c in case_by_schedule.values() if c
+        ]
+        case_ids = [x for x in case_ids if x]
+        children = _prefetch_ot_children(db, case_ids)
 
-            # planned datetime (combine date + time)
-            planned_dt = None
-            if oc.date and oc.planned_start_time:
-                planned_dt = datetime(
-                    oc.date.year,
-                    oc.date.month,
-                    oc.date.day,
-                    oc.planned_start_time.hour,
-                    oc.planned_start_time.minute,
-                    oc.planned_start_time.second if hasattr(
-                        oc.planned_start_time, "second") else 0,
-                )
+        # ✅ dedupe keys for OtOrder vs schedule
+        schedule_keys: Set[str] = set()
+        for sc in ot_schedules:
+            pst = getattr(sc, "planned_start_time", None)
+            if pst and hasattr(pst, "replace"):
+                pst = pst.replace(second=0, microsecond=0)
+            k = f"{sc.patient_id}|{sc.date}|{pst}|{(sc.procedure_name or '').strip().lower()}"
+            schedule_keys.add(k)
 
-            ts_raw = ((case.actual_end_time if case else None)
-                      or (case.actual_start_time if case else None)
-                      or planned_dt or oc.created_at)
+        # 1) OT schedule items
+        for sc in ot_schedules:
+            case = case_by_schedule.get(sc.id)
+            planned_dt = _planned_dt_from_schedule(sc)
+
+            ts_raw = (
+                (getattr(case, "actual_end_time", None) if case else None)
+                or (getattr(case, "actual_start_time", None) if case else None)
+                or planned_dt or getattr(sc, "created_at", None)
+                or getattr(sc, "date", None))
             ts = _safe_dt(ts_raw)
             if not _in_window(ts, dfrom, dto):
                 continue
 
-            # Procedure name preference: final_procedure_name > schedule.procedure_name
-            proc_name = (case.final_procedure_name if case
-                         and case.final_procedure_name else oc.procedure_name)
-            subtitle = proc_name or "OT Case"
-
-            # Surgeon name (supports full_name hybrid if present)
+            proc_name = (
+                (getattr(case, "final_procedure_name", None) if case else None)
+                or getattr(sc, "procedure_name", None))
             surgeon_name = None
-            if oc.surgeon is not None:
-                surgeon_name = (getattr(oc.surgeon, "full_name", None)
-                                or getattr(oc.surgeon, "name", None)
-                                or getattr(oc.surgeon, "first_name", None))
+            if getattr(sc, "surgeon", None):
+                surgeon_name = getattr(sc.surgeon, "full_name",
+                                       None) or getattr(
+                                           sc.surgeon, "name", None)
 
-            bed_code = oc.bed.code if oc.bed is not None else None
+            ot_bundle = _ot_case_bundle_row(sc, case, children)
 
             out.append(
                 TimelineItemOut(
                     type="ot",
                     ts=ts,
                     title=_title_for("ot"),
-                    subtitle=subtitle,
-                    status=_map_ui_status(oc.status),
+                    subtitle=proc_name or "OT Case",
+                    status=_map_ui_status(getattr(sc, "status", None)),
                     doctor_name=surgeon_name,
-                    ref_kind="ot_case",
-                    ref_display=subtitle,
-                    attachments=[],  # no dedicated OT attachments model yet
                     data={
-                        # identifiers
-                        "schedule_id":
-                        oc.id,
-                        "case_id":
-                        case.id if case else None,
-                        "patient_id":
-                        oc.patient_id,
-                        "admission_id":
-                        oc.admission_id,
-
-                        # location
-                        "bed_id":
-                        oc.bed_id,
-                        "bed_code":
-                        bed_code,
-
-                        # timing
-                        "date":
-                        oc.date,
-                        "planned_start_time":
-                        oc.planned_start_time,
-                        "planned_end_time":
-                        oc.planned_end_time,
-                        "actual_start_time":
-                        case.actual_start_time if case else None,
-                        "actual_end_time":
-                        case.actual_end_time if case else None,
-
-                        # status / priority
-                        "status":
-                        oc.status,
-                        "priority":
-                        oc.priority,
-
-                        # clinical summary
-                        "procedure_name":
-                        proc_name,
-                        "final_procedure_name":
-                        case.final_procedure_name if case else None,
-                        "preop_diagnosis":
-                        case.preop_diagnosis if case else None,
-                        "postop_diagnosis":
-                        case.postop_diagnosis if case else None,
-                        "outcome":
-                        case.outcome if case else None,
-                        "icu_required":
-                        case.icu_required if case else None,
-
-                        # surgeon / anaesthetist ids
-                        "surgeon_user_id":
-                        oc.surgeon_user_id,
-                        "anaesthetist_user_id":
-                        oc.anaesthetist_user_id,
+                        "source": "ot_schedule",
+                        "ot_case": ot_bundle,  # ✅ for UI/PDF
+                        "schedule": _row(sc),  # backward compatible
+                        "case": _row(case) if case else None,
                     },
                 ))
+
+        # 2) ALSO load OtOrder (new OT module) and show it in EMR
+        if HAS_OT_ORDERS:
+            orders = (db.query(OtOrder).options(
+                selectinload(OtOrder.attachments)).filter(
+                    OtOrder.patient_id == patient_id).order_by(
+                        OtOrder.id.desc()).limit(500).all())
+
+            # surgeon name map (best effort)
+            surgeon_ids = {
+                o.surgeon_id
+                for o in orders if getattr(o, "surgeon_id", None)
+            }
+            surgeons: Dict[int, User] = {}
+            if surgeon_ids:
+                for u in db.query(User).filter(User.id.in_(
+                        list(surgeon_ids))).all():
+                    surgeons[u.id] = u
+
+            for o in orders:
+                ts = _safe_dt(o.actual_end or o.actual_start
+                              or o.scheduled_start or o.created_at)
+                if not _in_window(ts, dfrom, dto):
+                    continue
+
+                # dedupe against schedules if same planned slot
+                if o.scheduled_start:
+                    k = (
+                        f"{o.patient_id}|{o.scheduled_start.date()}|"
+                        f"{o.scheduled_start.time().replace(second=0, microsecond=0)}|"
+                        f"{(o.surgery_name or '').strip().lower()}")
+                    if k in schedule_keys:
+                        continue
+
+                atts = [
+                    AttachmentOut(
+                        label=(a.note or "OT Attachment"),
+                        url=a.file_url,
+                        content_type=None,
+                        note=a.note or None,
+                        size_bytes=None,
+                    ) for a in (o.attachments or [])
+                ]
+
+                su = surgeons.get(getattr(o, "surgeon_id", None))
+                surgeon_name = None
+                if su:
+                    surgeon_name = getattr(su, "full_name", None) or getattr(
+                        su, "name", None)
+
+                out.append(
+                    TimelineItemOut(
+                        type="ot",
+                        ts=ts,
+                        title=_title_for("ot"),
+                        subtitle=f"{o.surgery_name or 'OT'} • {o.status}",
+                        status=_map_ui_status(o.status),
+                        doctor_name=surgeon_name,
+                        attachments=atts if atts else None,
+                        data={
+                            "source": "ot_order",
+                            "ot_order": _row(o),
+                            "attachments": _rows(o.attachments),
+                        },
+                    ))
 
     # --- Billing (Invoice lines + payments) ---
     if _want("billing", allow):
@@ -790,30 +1424,6 @@ def _build_timeline(
             ts = _safe_dt(inv.finalized_at or inv.created_at)
             if not _in_window(ts, dfrom, dto):
                 continue
-            items = []
-            for li in (inv.items or []):
-                items.append({
-                    "service_type": li.service_type,
-                    "service_ref_id": li.service_ref_id,
-                    "description": li.description,
-                    "quantity": li.quantity,
-                    "unit_price": _as_float(li.unit_price),
-                    "tax_rate": _as_float(li.tax_rate),
-                    "tax_amount": _as_float(li.tax_amount),
-                    "line_total": _as_float(li.line_total),
-                    "is_voided": li.is_voided,
-                    "void_reason": li.void_reason,
-                    "voided_by": li.voided_by,
-                    "voided_at": li.voided_at,
-                })
-            pays = []
-            for p in (inv.payments or []):
-                pays.append({
-                    "amount": _as_float(p.amount),
-                    "mode": p.mode,
-                    "reference_no": p.reference_no,
-                    "paid_at": p.paid_at,
-                })
             out.append(
                 TimelineItemOut(
                     type="billing",
@@ -822,19 +1432,10 @@ def _build_timeline(
                     subtitle=
                     f"Invoice • {inv.status} • Net ₹{float(inv.net_total or 0):.2f}",
                     status=_map_ui_status(inv.status),
-                    ref_kind="invoice",
-                    ref_display="Invoice",
                     data={
-                        "invoice_id": inv.id,
-                        "status": inv.status,
-                        "gross_total": _as_float(inv.gross_total),
-                        "tax_total": _as_float(inv.tax_total),
-                        "net_total": _as_float(inv.net_total),
-                        "amount_paid": _as_float(inv.amount_paid),
-                        "balance_due": _as_float(inv.balance_due),
-                        "finalized_at": inv.finalized_at,
-                        "items": items,
-                        "payments": pays,
+                        "invoice": _row(inv),
+                        "items": _rows(inv.items),
+                        "payments": _rows(inv.payments)
                     },
                 ))
 
@@ -842,7 +1443,7 @@ def _build_timeline(
     if _want("attachment", allow):
         files = (db.query(FileAttachment).filter(
             FileAttachment.patient_id == patient_id).order_by(
-                FileAttachment.uploaded_at.desc()).limit(250).all())
+                FileAttachment.uploaded_at.desc()).limit(500).all())
         for f in files:
             ts = _safe_dt(f.uploaded_at)
             if not _in_window(ts, dfrom, dto):
@@ -862,19 +1463,14 @@ def _build_timeline(
                             size_bytes=f.size_bytes or None,
                         )
                     ],
-                    data={
-                        "filename": f.filename,
-                        "content_type": f.content_type,
-                        "note": f.note,
-                        "size_bytes": f.size_bytes,
-                    },
+                    data={"file": _row(f)},
                 ))
 
     # --- Consents ---
     if _want("consent", allow):
         cons = (db.query(PatientConsent).filter(
             PatientConsent.patient_id == patient_id).order_by(
-                PatientConsent.captured_at.desc()).limit(200).all())
+                PatientConsent.captured_at.desc()).limit(500).all())
         for c in cons:
             ts = _safe_dt(c.captured_at)
             if not _in_window(ts, dfrom, dto):
@@ -888,15 +1484,611 @@ def _build_timeline(
                     title=_title_for("consent"),
                     subtitle=subtitle,
                     status=c.type,
-                    data={
-                        "type": c.type,
-                        "text": c.text,
-                        "captured_at": c.captured_at,
-                    },
+                    data={"consent": _row(c)},
                 ))
 
     out.sort(key=lambda x: x.ts, reverse=True)
     return out
+
+
+# ---------------- FULL HISTORY (ALL SECTIONS, ALL FIELDS) ----------------
+def _build_full_history(
+    db: Session,
+    patient: Patient,
+    dfrom: Optional[datetime],
+    dto: Optional[datetime],
+    include: Optional[Set[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Returns a single JSON object containing:
+    - Patient demographics (all columns) + addresses + documents + consents
+    - OPD: appointments, visits, vitals, prescriptions+items, followups, OPD orders
+    - LIS: orders, items, attachments, result_lines
+    - RIS: orders, attachments
+    - Pharmacy: prescriptions+lines, sales+items (if enabled)
+    - IPD: admissions + ALL linked tables you shared
+    - OT: schedules + cases + ALL OT child tables you shared
+    - ✅ OT Orders (OtOrder) + its attachments (NEW)
+    - Billing: invoices + items + payments
+    - Attachments: FileAttachment
+    """
+
+    def allow(sec: str) -> bool:
+        return (include is None) or (sec in include)
+
+    pid = patient.id
+    payload: Dict[str, Any] = {
+        "generated_at": datetime.utcnow().isoformat(),
+        "date_from": dfrom.isoformat() if dfrom else None,
+        "date_to": dto.isoformat() if dto else None,
+        "patient": {
+            "core": _row(patient),
+            "addresses": _rows(getattr(patient, "addresses", None)),
+            "documents": _rows(getattr(patient, "documents", None)),
+            "consents": _rows(getattr(patient, "consents", None)),
+        },
+    }
+
+    # -------- OPD --------
+    if allow("opd"):
+        appts = (db.query(Appointment).filter(
+            Appointment.patient_id == pid).order_by(
+                Appointment.date.desc(), Appointment.slot_start.desc()).all())
+        visits = db.query(Visit).filter(Visit.patient_id == pid).order_by(
+            Visit.visit_at.desc()).all()
+        vitals = db.query(OpdVitals).filter(
+            OpdVitals.patient_id == pid).order_by(
+                OpdVitals.created_at.desc()).all()
+
+        rxs = (db.query(OpdRx).options(selectinload(
+            OpdRx.items), joinedload(OpdRx.visit)).join(
+                Visit, OpdRx.visit_id == Visit.id).filter(
+                    Visit.patient_id == pid).order_by(OpdRx.id.desc()).all())
+
+        lab_orders = (db.query(LabOrder).join(
+            Visit, LabOrder.visit_id == Visit.id).filter(
+                Visit.patient_id == pid).order_by(
+                    LabOrder.ordered_at.desc()).all())
+        rad_orders = (db.query(RadiologyOrder).join(
+            Visit, RadiologyOrder.visit_id == Visit.id).filter(
+                Visit.patient_id == pid).order_by(
+                    RadiologyOrder.ordered_at.desc()).all())
+        followups = (db.query(FollowUp).filter(
+            FollowUp.patient_id == pid).order_by(FollowUp.due_date.desc(),
+                                                 FollowUp.id.desc()).all())
+
+        if dfrom or dto:
+            appts = [
+                x for x in appts
+                if _in_window(_safe_dt(x.created_at or x.date), dfrom, dto)
+            ]
+            visits = [
+                x for x in visits
+                if _in_window(_safe_dt(x.visit_at), dfrom, dto)
+            ]
+            vitals = [
+                x for x in vitals
+                if _in_window(_safe_dt(x.created_at), dfrom, dto)
+            ]
+            rxs = [
+                x for x in rxs if _in_window(
+                    _safe_dt(x.signed_at or (x.visit.visit_at if x.visit else
+                                             None) or datetime.utcnow()),
+                    dfrom,
+                    dto,
+                )
+            ]
+            lab_orders = [
+                x for x in lab_orders
+                if _in_window(_safe_dt(x.ordered_at), dfrom, dto)
+            ]
+            rad_orders = [
+                x for x in rad_orders
+                if _in_window(_safe_dt(x.ordered_at), dfrom, dto)
+            ]
+            followups = [
+                x for x in followups if _in_window(
+                    _safe_dt(
+                        getattr(x, "updated_at", None)
+                        or getattr(x, "created_at", None) or x.due_date),
+                    dfrom,
+                    dto,
+                )
+            ]
+
+        payload["opd"] = {
+            "appointments":
+            _rows(appts),
+            "visits":
+            _rows(visits),
+            "vitals":
+            _rows(vitals),
+            "prescriptions": [{
+                "prescription": _row(rx),
+                "items": _rows(rx.items)
+            } for rx in rxs],
+            "opd_lab_orders":
+            _rows(lab_orders),
+            "opd_radiology_orders":
+            _rows(rad_orders),
+            "followups":
+            _rows(followups),
+        }
+
+    # -------- LIS --------
+    if allow("lis"):
+        lis_orders = (db.query(LisOrder).options(
+            selectinload(LisOrder.items).selectinload(
+                LisOrderItem.attachments)).filter(
+                    LisOrder.patient_id == pid).order_by(
+                        LisOrder.id.desc()).all())
+        order_ids = [o.id for o in lis_orders]
+        res_lines = []
+        if order_ids:
+            res_lines = (db.query(LisResultLine).filter(
+                LisResultLine.order_id.in_(order_ids)).order_by(
+                    LisResultLine.id.asc()).all())
+
+        res_lines_by_order: Dict[int, List[LisResultLine]] = {}
+        for rl in res_lines:
+            res_lines_by_order.setdefault(rl.order_id, []).append(rl)
+
+        if dfrom or dto:
+            lis_orders = [
+                o for o in lis_orders if _in_window(
+                    _safe_dt(o.reported_at or o.created_at), dfrom, dto)
+            ]
+
+        payload["lis"] = {
+            "orders": [{
+                "order":
+                _row(o),
+                "items": [{
+                    "item": _row(it),
+                    "attachments": _rows(it.attachments)
+                } for it in (o.items or [])],
+                "result_lines":
+                _rows(res_lines_by_order.get(o.id, [])),
+            } for o in lis_orders]
+        }
+
+    # -------- RIS --------
+    if allow("ris"):
+        ris_orders = (db.query(RisOrder).options(
+            selectinload(RisOrder.attachments)).filter(
+                RisOrder.patient_id == pid).order_by(RisOrder.id.desc()).all())
+        if dfrom or dto:
+            ris_orders = [
+                o for o in ris_orders if _in_window(
+                    _safe_dt(o.reported_at or o.scanned_at or o.created_at),
+                    dfrom, dto)
+            ]
+
+        payload["ris"] = {
+            "orders": [{
+                "order": _row(o),
+                "attachments": _rows(o.attachments)
+            } for o in ris_orders]
+        }
+
+    # -------- Pharmacy --------
+    if allow("pharmacy") and HAS_PHARMACY:
+        prxs = (db.query(PharmacyPrescription).options(
+            selectinload(PharmacyPrescription.lines)).filter(
+                PharmacyPrescription.patient_id == pid).order_by(
+                    PharmacyPrescription.id.desc()).all())
+        sales = db.query(PharmacySale).filter(
+            PharmacySale.patient_id == pid).order_by(
+                PharmacySale.id.desc()).all()
+
+        sale_ids = [s.id for s in sales]
+        sale_items = []
+        if sale_ids:
+            sale_items = db.query(PharmacySaleItem).filter(
+                PharmacySaleItem.sale_id.in_(sale_ids)).all()
+        items_by_sale: Dict[int, List[PharmacySaleItem]] = {}
+        for it in sale_items:
+            items_by_sale.setdefault(it.sale_id, []).append(it)
+
+        if dfrom or dto:
+            prxs = [
+                x for x in prxs if _in_window(
+                    _safe_dt(x.signed_at or x.created_at), dfrom, dto)
+            ]
+            sales = [
+                x for x in sales if _in_window(
+                    _safe_dt(
+                        getattr(x, "created_at", None)
+                        or getattr(x, "bill_datetime", None)), dfrom, dto)
+            ]
+
+        payload["pharmacy"] = {
+            "prescriptions": [{
+                "prescription": _row(p),
+                "lines": _rows(p.lines)
+            } for p in prxs],
+            "sales": [{
+                "sale": _row(s),
+                "items": _rows(items_by_sale.get(s.id, []))
+            } for s in sales],
+        }
+
+    # -------- IPD (ALL your models) --------
+    if allow("ipd"):
+        adms = db.query(IpdAdmission).filter(
+            IpdAdmission.patient_id == pid).order_by(
+                IpdAdmission.id.desc()).all()
+        adm_ids = [a.id for a in adms]
+
+        def by_adm(model, dt_field: str, order_desc: bool = True):
+            if not adm_ids:
+                return {}
+            q = db.query(model).filter(
+                getattr(model, "admission_id").in_(adm_ids))
+            if hasattr(model, dt_field):
+                q = q.order_by(
+                    getattr(model, dt_field).desc(
+                    ) if order_desc else getattr(model, dt_field).asc())
+            rows = q.all()
+            if dfrom or dto:
+                rows = [
+                    x for x in rows if _in_window(
+                        _safe_dt(
+                            getattr(x, dt_field, None) or getattr(
+                                x, "created_at", None) or datetime.utcnow()),
+                        dfrom,
+                        dto,
+                    )
+                ]
+            mp: Dict[int, List[Any]] = {}
+            for r in rows:
+                mp.setdefault(getattr(r, "admission_id"), []).append(r)
+            return mp
+
+        transfers_by = by_adm(IpdTransfer, "transferred_at")
+        vitals_by = by_adm(IpdVital, "recorded_at")
+        notes_by = by_adm(IpdNursingNote, "entry_time")
+        handovers_by = by_adm(IpdShiftHandover, "created_at")
+        io_by = by_adm(IpdIntakeOutput, "recorded_at")
+        rounds_by = by_adm(IpdRound, "created_at")
+        progress_by = by_adm(IpdProgressNote, "created_at")
+
+        pain_by = by_adm(IpdPainAssessment, "recorded_at")
+        fall_by = by_adm(IpdFallRiskAssessment, "recorded_at")
+        pressure_by = by_adm(IpdPressureUlcerAssessment, "recorded_at")
+        nutr_by = by_adm(IpdNutritionAssessment, "recorded_at")
+        generic_assess_by = by_adm(IpdAssessment, "assessed_at")
+
+        orders_by = by_adm(IpdOrder, "ordered_at")
+        meds_simple_by = by_adm(IpdMedication, "created_at")
+        med_orders_by = by_adm(IpdMedicationOrder, "start_datetime")
+        mar_by = by_adm(IpdMedicationAdministration, "scheduled_datetime")
+        drug_meta_by = by_adm(IpdDrugChartMeta, "updated_at")
+        iv_by = by_adm(IpdIvFluidOrder, "ordered_datetime")
+        nurse_rows_by = by_adm(IpdDrugChartNurseRow, "id", order_desc=False)
+        doctor_auth_by = by_adm(IpdDrugChartDoctorAuth, "created_at")
+
+        dressing_by = by_adm(IpdDressingRecord, "date_time")
+        blood_by = by_adm(IpdBloodTransfusion, "start_time")
+        restraint_by = by_adm(IpdRestraintRecord, "start_time")
+        isolation_by = by_adm(IpdIsolationPrecaution, "start_date")
+        icu_by = by_adm(IcuFlowSheet, "recorded_at")
+
+        feedback_entries_by = by_adm(IpdFeedback, "collected_at")
+        referrals_by = by_adm(IpdReferral, "created_at")
+        ipd_ot_by = by_adm(IpdOtCase, "scheduled_start")
+
+        summaries = []
+        checklists = []
+        dis_meds = []
+        if adm_ids:
+            summaries = db.query(IpdDischargeSummary).filter(
+                IpdDischargeSummary.admission_id.in_(adm_ids)).all()
+            checklists = db.query(IpdDischargeChecklist).filter(
+                IpdDischargeChecklist.admission_id.in_(adm_ids)).all()
+            dis_meds = db.query(IpdDischargeMedication).filter(
+                IpdDischargeMedication.admission_id.in_(adm_ids)).all()
+
+        summary_by: Dict[int, Any] = {s.admission_id: s for s in summaries}
+        checklist_by: Dict[int, Any] = {c.admission_id: c for c in checklists}
+        meds_by_adm: Dict[int, List[Any]] = {}
+        for m in dis_meds:
+            meds_by_adm.setdefault(m.admission_id, []).append(m)
+
+        adm_feedback = []
+        if adm_ids:
+            adm_feedback = db.query(IpdAdmissionFeedback).filter(
+                IpdAdmissionFeedback.admission_id.in_(adm_ids)).all()
+        adm_feedback_by: Dict[int, Any] = {
+            x.admission_id: x
+            for x in adm_feedback
+        }
+
+        bed_ids = [a.current_bed_id for a in adms if a.current_bed_id]
+        beds = {}
+        if bed_ids:
+            beds = {
+                b.id: b
+                for b in db.query(IpdBed).filter(IpdBed.id.in_(bed_ids)).all()
+            }
+
+        payload["ipd"] = {
+            "admissions": [{
+                "admission":
+                _row(a),
+                "current_bed":
+                _row(beds.get(a.current_bed_id)) if a.current_bed_id else None,
+                "transfers":
+                _rows(transfers_by.get(a.id, [])),
+                "vitals":
+                _rows(vitals_by.get(a.id, [])),
+                "nursing_notes":
+                _rows(notes_by.get(a.id, [])),
+                "shift_handovers":
+                _rows(handovers_by.get(a.id, [])),
+                "intake_outputs":
+                _rows(io_by.get(a.id, [])),
+                "rounds":
+                _rows(rounds_by.get(a.id, [])),
+                "progress_notes":
+                _rows(progress_by.get(a.id, [])),
+                "pain_assessments":
+                _rows(pain_by.get(a.id, [])),
+                "fall_risk_assessments":
+                _rows(fall_by.get(a.id, [])),
+                "pressure_ulcer_assessments":
+                _rows(pressure_by.get(a.id, [])),
+                "nutrition_assessments":
+                _rows(nutr_by.get(a.id, [])),
+                "assessments":
+                _rows(generic_assess_by.get(a.id, [])),
+                "orders":
+                _rows(orders_by.get(a.id, [])),
+                "medications_simple":
+                _rows(meds_simple_by.get(a.id, [])),
+                "medication_orders":
+                _rows(med_orders_by.get(a.id, [])),
+                "medication_administrations":
+                _rows(mar_by.get(a.id, [])),
+                "drug_chart_meta":
+                _rows(drug_meta_by.get(a.id, [])),
+                "iv_fluid_orders":
+                _rows(iv_by.get(a.id, [])),
+                "drug_chart_nurse_rows":
+                _rows(nurse_rows_by.get(a.id, [])),
+                "drug_chart_doctor_auth_rows":
+                _rows(doctor_auth_by.get(a.id, [])),
+                "dressing_records":
+                _rows(dressing_by.get(a.id, [])),
+                "blood_transfusions":
+                _rows(blood_by.get(a.id, [])),
+                "restraints":
+                _rows(restraint_by.get(a.id, [])),
+                "isolations":
+                _rows(isolation_by.get(a.id, [])),
+                "icu_flows":
+                _rows(icu_by.get(a.id, [])),
+                "feedback_entries":
+                _rows(feedback_entries_by.get(a.id, [])),
+                "feedback_summary":
+                _row(adm_feedback_by.get(a.id))
+                if adm_feedback_by.get(a.id) else None,
+                "referrals":
+                _rows(referrals_by.get(a.id, [])),
+                "ipd_ot_cases":
+                _rows(ipd_ot_by.get(a.id, [])),
+                "discharge_summary":
+                _row(summary_by.get(a.id)) if summary_by.get(a.id) else None,
+                "discharge_checklist":
+                _row(checklist_by.get(a.id))
+                if checklist_by.get(a.id) else None,
+                "discharge_medications":
+                _rows(meds_by_adm.get(a.id, [])),
+            } for a in adms if (not (dfrom or dto))
+                           or _in_window(_safe_dt(a.admitted_at), dfrom, dto)]
+        }
+
+    # -------- OT (Theatre) detailed + ✅ OtOrder list --------
+    # -------- OT (Theatre) detailed + ✅ OtOrder list --------
+
+    # -------- OT (Theatre) detailed + ✅ OtOrder list --------
+    if allow("ot"):
+        schedules = (db.query(OtSchedule).options(
+            selectinload(OtSchedule.procedures).joinedload(
+                OtScheduleProcedure.procedure),
+            joinedload(OtSchedule.case),
+            joinedload(OtSchedule.ot_bed),
+            joinedload(OtSchedule.surgeon),
+            joinedload(OtSchedule.anaesthetist),
+            joinedload(OtSchedule.admission),
+        ).filter(OtSchedule.patient_id == pid).order_by(
+            OtSchedule.date.desc(),
+            OtSchedule.planned_start_time.desc()).all())
+
+        # ✅ robust case mapping
+        case_by_schedule = _resolve_ot_cases_for_schedules(db, schedules)
+        case_ids = [
+            getattr(c, "id", None) for c in case_by_schedule.values() if c
+        ]
+        case_ids = [x for x in case_ids if x]
+        children = _prefetch_ot_children(db, case_ids)
+
+        # filter schedules by window
+        filtered: list[OtSchedule] = []
+        for s in schedules:
+            c = case_by_schedule.get(s.id)
+            planned_dt = _planned_dt_from_schedule(s)
+            ts_raw = ((getattr(c, "actual_end_time", None) if c else None)
+                      or (getattr(c, "actual_start_time", None) if c else None)
+                      or planned_dt or getattr(s, "created_at", None)
+                      or getattr(s, "date", None))
+            ts = _safe_dt(ts_raw)
+            if (not (dfrom or dto)) or _in_window(ts, dfrom, dto):
+                filtered.append(s)
+
+        eq_chk = (db.query(OtEquipmentDailyChecklist).order_by(
+            OtEquipmentDailyChecklist.date.desc(),
+            OtEquipmentDailyChecklist.id.desc()).limit(5000).all())
+        env_logs = (db.query(OtEnvironmentLog).order_by(
+            OtEnvironmentLog.date.desc(),
+            OtEnvironmentLog.time.desc()).limit(5000).all())
+        if dfrom or dto:
+            eq_chk = [
+                x for x in eq_chk if _in_window(_safe_dt(x.date), dfrom, dto)
+            ]
+            env_logs = [
+                x for x in env_logs if _in_window(_safe_dt(x.date), dfrom, dto)
+            ]
+
+        ot_payload: Dict[str, Any] = {
+            "schedules": [
+                _ot_case_bundle_row(s, case_by_schedule.get(s.id), children)
+                for s in filtered
+            ],
+            "equipment_daily_checklists":
+            _rows(eq_chk),
+            "environment_logs":
+            _rows(env_logs),
+        }
+
+        # ✅ OtOrder inclusion
+        if HAS_OT_ORDERS:
+            orders = (db.query(OtOrder).options(
+                selectinload(OtOrder.attachments)).filter(
+                    OtOrder.patient_id == pid).order_by(
+                        OtOrder.id.desc()).all())
+            if dfrom or dto:
+                orders = [
+                    o for o in orders if _in_window(
+                        _safe_dt(o.actual_end or o.actual_start or o.
+                                 scheduled_start or o.created_at), dfrom, dto)
+                ]
+            ot_payload["orders"] = [{
+                "order": _row(o),
+                "attachments": _rows(o.attachments)
+            } for o in orders]
+
+        payload["ot"] = ot_payload
+
+    # -------- Billing --------
+    if allow("billing"):
+        invs = (db.query(Invoice).options(selectinload(
+            Invoice.items), selectinload(Invoice.payments)).filter(
+                Invoice.patient_id == pid).order_by(Invoice.id.desc()).all())
+        if dfrom or dto:
+            invs = [
+                x for x in invs if _in_window(
+                    _safe_dt(x.finalized_at or x.created_at), dfrom, dto)
+            ]
+        payload["billing"] = {
+            "invoices": [{
+                "invoice": _row(inv),
+                "items": _rows(inv.items),
+                "payments": _rows(inv.payments)
+            } for inv in invs]
+        }
+
+    # -------- Attachments --------
+    if allow("attachments"):
+        files = db.query(FileAttachment).filter(
+            FileAttachment.patient_id == pid).order_by(
+                FileAttachment.uploaded_at.desc()).all()
+        if dfrom or dto:
+            files = [
+                x for x in files
+                if _in_window(_safe_dt(x.uploaded_at), dfrom, dto)
+            ]
+        payload["attachments"] = {"files": _rows(files)}
+
+    # -------- Consents --------
+    if allow("consents"):
+        cons = db.query(PatientConsent).filter(
+            PatientConsent.patient_id == pid).order_by(
+                PatientConsent.captured_at.desc()).all()
+        if dfrom or dto:
+            cons = [
+                x for x in cons
+                if _in_window(_safe_dt(x.captured_at), dfrom, dto)
+            ]
+        payload["consents"] = {"consents": _rows(cons)}
+
+    return payload
+
+
+# ---------------- REAL-TIME SNAPSHOT ----------------
+@router.get("/realtime")
+def emr_realtime(
+        patient_id: Optional[int] = Query(None),
+        uhid: Optional[str] = Query(None),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    _need_any(user, ["emr.view", "patients.view"])
+    if not patient_id and not uhid:
+        raise HTTPException(400, "Either patient_id or uhid is required")
+
+    p = None
+    if patient_id is not None:
+        p = db.get(Patient, int(patient_id))
+    elif uhid:
+        p = _patient_by_uhid(db, uhid)
+    if not p:
+        raise HTTPException(404, "Patient not found")
+
+    last_opd_v = db.query(OpdVitals).filter(
+        OpdVitals.patient_id == p.id).order_by(
+            OpdVitals.created_at.desc()).first()
+
+    active_adm = (db.query(IpdAdmission).filter(
+        IpdAdmission.patient_id == p.id,
+        IpdAdmission.status.in_(["admitted", "transferred"
+                                 ])).order_by(IpdAdmission.id.desc()).first())
+    last_ipd_v = None
+    if active_adm:
+        last_ipd_v = (db.query(IpdVital).filter(
+            IpdVital.admission_id == active_adm.id).order_by(
+                IpdVital.recorded_at.desc()).first())
+
+    last_lis_item = (db.query(LisOrderItem).join(
+        LisOrder, LisOrderItem.order_id == LisOrder.id).filter(
+            LisOrder.patient_id == p.id).order_by(
+                LisOrderItem.result_at.desc().nullslast(),
+                LisOrderItem.id.desc()).first())
+
+    last_ris = db.query(RisOrder).filter(RisOrder.patient_id == p.id).order_by(
+        RisOrder.reported_at.desc().nullslast(), RisOrder.id.desc()).first()
+
+    active_ipd_meds = []
+    if active_adm:
+        active_ipd_meds = (db.query(IpdMedicationOrder).filter(
+            IpdMedicationOrder.admission_id == active_adm.id,
+            IpdMedicationOrder.order_status == "active").order_by(
+                IpdMedicationOrder.id.desc()).limit(200).all())
+
+    return JSONResponse({
+        "patient":
+        _patient_brief(p),
+        "active_ipd_admission":
+        _row(active_adm) if active_adm else None,
+        "latest_opd_vitals": ({
+            "vitals":
+            _row(last_opd_v),
+            "bmi":
+            _bmi(getattr(last_opd_v, "height_cm", None),
+                 getattr(last_opd_v, "weight_kg", None))
+            if last_opd_v else None,
+        } if last_opd_v else None),
+        "latest_ipd_vitals":
+        _row(last_ipd_v) if last_ipd_v else None,
+        "latest_lab_result_item":
+        _row(last_lis_item) if last_lis_item else None,
+        "latest_radiology_order":
+        _row(last_ris) if last_ris else None,
+        "active_ipd_medication_orders":
+        _rows(active_ipd_meds),
+        "generated_at":
+        datetime.utcnow().isoformat(),
+    })
 
 
 # ---------------- API: Patient lookup ----------------
@@ -946,8 +2138,10 @@ def emr_timeline(
         None,
         description=
         ("comma-separated: "
-         "opd_visit,opd_vitals,rx,lab,radiology,pharmacy,"
-         "ipd_admission,ipd_transfer,ipd_discharge,ot,billing,attachment,consent"
+         "opd_appointment,opd_visit,opd_vitals,rx,opd_lab_order,opd_radiology_order,followup,"
+         "lab,radiology,pharmacy_rx,pharmacy,"
+         "ipd_admission,ipd_transfer,ipd_discharge,ipd_vitals,ipd_nursing_note,ipd_intake_output,"
+         "ipd_round,ipd_progress,ipd_risk,ipd_med_order,ipd_mar,ipd_iv_fluid,ot,billing,attachment,consent"
          ),
     ),
         db: Session = Depends(get_db),
@@ -971,6 +2165,158 @@ def emr_timeline(
     return items
 
 
+# ---------------- API: FULL HISTORY ----------------
+@router.get("/history")
+def emr_history(
+        patient_id: Optional[int] = Query(None),
+        uhid: Optional[str] = Query(None),
+        date_from: Optional[str] = Query(None, description="YYYY-MM-DD"),
+        date_to: Optional[str] = Query(None, description="YYYY-MM-DD"),
+        include:
+    Optional[str] = Query(
+        None,
+        description=
+        "comma-separated sections: patient,opd,lis,ris,pharmacy,ipd,ot,billing,attachments,consents",
+    ),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    _need_any(user, ["emr.view", "patients.view"])
+    if not patient_id and not uhid:
+        raise HTTPException(400, "Either patient_id or uhid is required")
+
+    p = None
+    if patient_id is not None:
+        p = (db.query(Patient).options(
+            selectinload(Patient.addresses), selectinload(Patient.documents),
+            selectinload(Patient.consents)).filter(
+                Patient.id == int(patient_id)).first())
+    elif uhid:
+        p = (db.query(Patient).options(selectinload(Patient.addresses),
+                                       selectinload(Patient.documents),
+                                       selectinload(Patient.consents)).filter(
+                                           Patient.uhid == uhid).first())
+    if not p:
+        raise HTTPException(404, "Patient not found")
+
+    dfrom, dto = _date_window(date_from, date_to)
+    include_set: Optional[Set[str]] = None
+    if include:
+        include_set = {x.strip() for x in include.split(",") if x.strip()}
+
+    data = _build_full_history(db, p, dfrom, dto, include_set)
+    return JSONResponse(data)
+
+
+def _ot_schedule_query_for_patient(db: Session, pid: int):
+    adm_ids = [
+        x[0] for x in db.query(IpdAdmission.id).filter(
+            IpdAdmission.patient_id == pid).all()
+    ]
+
+    q = db.query(OtSchedule).options(
+        joinedload(OtSchedule.case),
+        joinedload(OtSchedule.surgeon),
+        joinedload(OtSchedule.anaesthetist),
+        joinedload(OtSchedule.ot_bed),
+        joinedload(OtSchedule.admission),
+        selectinload(OtSchedule.procedures).joinedload(
+            OtScheduleProcedure.procedure),
+    )
+
+    conds = [OtSchedule.patient_id == pid]
+    if adm_ids:
+        conds.append(OtSchedule.admission_id.in_(adm_ids))
+
+    return q.filter(or_(*conds))
+
+
+def _call_ot_case_pdf_generator(db: Session, *, case_id: int,
+                                schedule_id: Optional[int]) -> bytes:
+    """
+    Calls your app/services/ot_case_pdf.py generator safely, even if the function name/signature varies.
+    """
+    mod = importlib.import_module("app.services.ot_case_pdf")
+
+    fn = None
+    for name in (
+            "build_ot_case_pdf",
+            "generate_ot_case_pdf",
+            "render_ot_case_pdf",
+            "make_ot_case_pdf",
+            "create_ot_case_pdf",
+    ):
+        if hasattr(mod, name):
+            fn = getattr(mod, name)
+            break
+    if fn is None:
+        raise HTTPException(
+            500, "OT PDF generator not found in app.services.ot_case_pdf")
+
+    sig = pyinspect.signature(fn)
+    params = sig.parameters
+
+    # Build kwargs based on signature
+    kwargs: Dict[str, Any] = {}
+    if "db" in params:
+        kwargs["db"] = db
+
+    if "case_id" in params:
+        kwargs["case_id"] = case_id
+    elif "ot_case_id" in params:
+        kwargs["ot_case_id"] = case_id
+    elif "schedule_id" in params:
+        if not schedule_id:
+            raise HTTPException(400,
+                                "schedule_id not available for this OT case")
+        kwargs["schedule_id"] = schedule_id
+    elif "id" in params:
+        kwargs["id"] = case_id
+
+    # Try keyword call
+    try:
+        out = fn(**kwargs) if kwargs else fn()
+    except TypeError:
+        # Try positional fallback: (db, case_id) or (case_id)
+        try:
+            out = fn(db, case_id)
+        except Exception:
+            out = fn(case_id)
+
+    # Normalize to bytes
+    if isinstance(out, (bytes, bytearray)):
+        return bytes(out)
+    if hasattr(out, "getvalue"):
+        return out.getvalue()
+    raise HTTPException(500, "OT PDF generator returned unsupported type")
+
+
+@router.get("/ot/cases/{case_id}/pdf")
+def emr_download_ot_case_pdf(
+        case_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    _need_any(user, ["emr.view", "patients.view", "ot.view", "ot.cases.view"])
+
+    case = db.query(OtCase).filter(OtCase.id == case_id).first()
+    if not case:
+        raise HTTPException(404, "OT case not found")
+
+    schedule_id = getattr(case, "schedule_id", None)
+
+    pdf_bytes = _call_ot_case_pdf_generator(db,
+                                            case_id=case_id,
+                                            schedule_id=schedule_id)
+    filename = f"OT_CASE_{case_id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.pdf"
+
+    return StreamingResponse(
+        BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 # ---------------- API: Export PDF (multipart) ----------------
 @router.post("/export/pdf")
 async def export_emr_pdf(
@@ -988,7 +2334,7 @@ async def export_emr_pdf(
 
     p = None
     if patient_id is not None:
-        p = db.query(Patient).get(int(patient_id))
+        p = db.get(Patient, int(patient_id))
     elif uhid:
         p = _patient_by_uhid(db, uhid)
     if not p:
@@ -1002,8 +2348,7 @@ async def export_emr_pdf(
         if not has_consent:
             raise HTTPException(
                 status_code=412,
-                detail="Active consent is required to export EMR.",
-            )
+                detail="Active consent is required to export EMR.")
 
     dfrom, dto = _date_window(date_from, date_to)
     items = [
@@ -1018,17 +2363,14 @@ async def export_emr_pdf(
         }
 
     letter_bytes = await letterhead.read() if letterhead is not None else None
-
-    # load UiBranding and pass into PDF generator
-    branding = get_ui_branding(db)  # may be None
+    branding = get_ui_branding(db)
 
     pdf_bytes = generate_emr_pdf(
         patient=_patient_brief(p),
         items=items,
         sections_selected=sections_selected,
-        letterhead_bytes=
-        letter_bytes,  # still supported (fallback/header override)
-        branding=branding,  # branding-based header/footer
+        letterhead_bytes=letter_bytes,
+        branding=branding,
     )
     filename = f"EMR_{p.uhid or p.id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.pdf"
     return StreamingResponse(
@@ -1049,7 +2391,7 @@ def export_emr_pdf_json(
 
     p = None
     if payload.patient_id is not None:
-        p = db.query(Patient).get(int(payload.patient_id))
+        p = db.get(Patient, int(payload.patient_id))
     elif payload.uhid:
         p = _patient_by_uhid(db, payload.uhid)
     if not p:
@@ -1061,14 +2403,14 @@ def export_emr_pdf_json(
         if not has_consent:
             raise HTTPException(
                 status_code=412,
-                detail="Active consent is required to export EMR.",
-            )
+                detail="Active consent is required to export EMR.")
 
     dfrom = payload.date_from and datetime(
         payload.date_from.year, payload.date_from.month, payload.date_from.day)
     dto = payload.date_to and (datetime(
         payload.date_to.year, payload.date_to.month, payload.date_to.day) +
                                timedelta(hours=23, minutes=59, seconds=59))
+
     items = [
         x.dict() for x in _build_timeline(db, p.id, dfrom, dto, allow=None)
     ]
@@ -1091,15 +2433,14 @@ def export_emr_pdf_json(
         }.items() if v
     }
 
-    # load UiBranding for JSON-based export as well
-    branding = get_ui_branding(db)  # may be None
+    branding = get_ui_branding(db)
 
     pdf_bytes = generate_emr_pdf(
         patient=_patient_brief(p),
         items=items,
         sections_selected=allow_sections,
-        letterhead_bytes=None,  # JSON export doesn't upload letterhead
-        branding=branding,  # branding-based header/footer
+        letterhead_bytes=None,
+        branding=branding,
     )
 
     filename = f"EMR_{p.uhid or p.id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.pdf"
@@ -1120,7 +2461,7 @@ def emr_fhir_bundle(
         user: User = Depends(current_user),
 ):
     _need_any(user, ["emr.view", "patients.view"])
-    p = db.query(Patient).get(int(patient_id))
+    p = db.get(Patient, int(patient_id))
     if not p:
         raise HTTPException(404, "Patient not found")
 
@@ -1137,17 +2478,17 @@ def emr_fhir_bundle(
         "entry": [],
     }
 
-    # Patient resource
     name = [{
         "use": "official",
-        "text": " ".join([x for x in [p.first_name, p.last_name] if x]),
+        "text": " ".join([x for x in [p.first_name, p.last_name] if x])
     }]
     identifiers = [{"system": "urn:uhid", "value": p.uhid}]
     if p.abha_number:
         identifiers.append({
             "system": "https://healthid.ndhm.gov.in",
-            "value": p.abha_number,
+            "value": p.abha_number
         })
+
     patient_res = {
         "resourceType": "Patient",
         "id": f"patient-{p.id}",
@@ -1162,7 +2503,6 @@ def emr_fhir_bundle(
     }
     bundle["entry"].append(entry(patient_res))
 
-    # Map a few essentials (you can expand later)
     for it in items:
         t = it.type
         ts = it.ts.isoformat()
@@ -1181,7 +2521,7 @@ def emr_fhir_bundle(
                 },
             }
             bundle["entry"].append(entry(enc))
-        if t == "opd_vitals":
+        if t in {"opd_vitals", "ipd_vitals"}:
             obs = {
                 "resourceType": "Observation",
                 "status": "final",
@@ -1197,7 +2537,7 @@ def emr_fhir_bundle(
                 }],
             }
             bundle["entry"].append(entry(obs))
-        if t == "rx":
+        if t in {"rx", "pharmacy_rx"}:
             mr = {
                 "resourceType": "MedicationRequest",
                 "status": "active" if it.status != "cancelled" else "stopped",

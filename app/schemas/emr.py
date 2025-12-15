@@ -18,15 +18,38 @@ class AttachmentOut(BaseModel):
 
 
 TimelineType = Literal[
+    # OPD
+    "opd_appointment",
     "opd_visit",
     "opd_vitals",
     "rx",
+    "opd_lab_order",
+    "opd_radiology_order",
+    "followup",
+
+    # LIS / RIS
     "lab",
     "radiology",
+
+    # Pharmacy
+    "pharmacy_rx",
     "pharmacy",
+
+    # IPD
     "ipd_admission",
     "ipd_transfer",
     "ipd_discharge",
+    "ipd_vitals",
+    "ipd_nursing_note",
+    "ipd_intake_output",
+    "ipd_round",
+    "ipd_progress",
+    "ipd_risk",
+    "ipd_med_order",
+    "ipd_mar",
+    "ipd_iv_fluid",
+
+    # OT / Billing / Docs
     "ot",
     "billing",
     "attachment",

@@ -51,6 +51,9 @@ from app.models.ipd import IpdAdmission
 import zlib
 from app.models.ipd import IpdPackage, IpdBed, IpdBedRate, IpdBedAssignment, IpdRoom
 from app.models.payer import Payer, Tpa, CreditPlan
+from app.core.config import settings
+from app.services.ui_branding import get_or_create_default_ui_branding
+from app.services.pdf_branding import brand_header_css, render_brand_header_html
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -1903,6 +1906,10 @@ def print_invoice(
     created_at = inv.created_at or datetime.utcnow()
     bill_date = created_at.strftime("%d-%m-%Y %H:%M")
 
+    # --- Branding header (logo + org details) ---
+    branding = get_or_create_default_ui_branding(db, updated_by_id=user.id)
+    brand_header = render_brand_header_html(branding)
+
     html_items = ""
     for idx, it in enumerate(items, start=1):
         html_items += (
@@ -1916,9 +1923,7 @@ def print_invoice(
             f"<td class='money'>{_money(it.line_total)}</td>"
             "</tr>")
     if not html_items:
-        html_items = (
-            "<tr><td colspan='7' style='text-align:center;'>No items</td></tr>"
-        )
+        html_items = "<tr><td colspan='7' style='text-align:center;'>No items</td></tr>"
 
     html_pay = ""
     for idx, pay in enumerate(payments, start=1):
@@ -1932,9 +1937,7 @@ def print_invoice(
                      f"<td class='money'>{_money(pay.amount)}</td>"
                      "</tr>")
     if not html_pay:
-        html_pay = (
-            "<tr><td colspan='5' style='text-align:center;'>No payments</td></tr>"
-        )
+        html_pay = "<tr><td colspan='5' style='text-align:center;'>No payments</td></tr>"
 
     html = f"""
 <!DOCTYPE html>
@@ -1943,153 +1946,201 @@ def print_invoice(
   <meta charset="utf-8" />
   <title>Invoice #{inv.id}</title>
   <style>
+    @page {{
+      size: A4;
+      margin: 14mm 14mm 14mm 14mm;
+    }}
+
     body {{
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       font-size: 12px;
-      margin: 16px;
-      color: #111827;
+      margin: 0;
+      color: #0f172a;
+      background: #ffffff;
     }}
+
+    .page {{ padding: 16px; }}
+
+    {brand_header_css()}
+
+    .card {{
+      border: 1px solid #e5e7eb;
+      border-radius: 18px;
+      padding: 12px;
+      background: #ffffff;
+    }}
+
     .header {{
       display: flex;
       justify-content: space-between;
       align-items: flex-start;
-      margin-bottom: 12px;
+      margin-bottom: 10px;
       gap: 16px;
       flex-wrap: wrap;
     }}
+
     .title {{
       font-size: 18px;
-      font-weight: 700;
+      font-weight: 800;
+      letter-spacing: -0.2px;
       margin-bottom: 4px;
     }}
+
     .muted {{
-      color: #6b7280;
+      color: #64748b;
       font-size: 11px;
     }}
-    .section {{
-      margin-top: 10px;
-      margin-bottom: 8px;
-    }}
+
+    .section {{ margin-top: 12px; margin-bottom: 8px; }}
+
     .section-title {{
-      font-weight: 600;
+      font-weight: 700;
       font-size: 13px;
-      margin-bottom: 4px;
+      margin-bottom: 6px;
     }}
+
     table {{
       width: 100%;
-      border-collapse: collapse;
-      margin-top: 4px;
-    }}
-    th, td {{
+      border-collapse: separate;
+      border-spacing: 0;
+      margin-top: 6px;
       border: 1px solid #e5e7eb;
-      padding: 4px 6px;
+      border-radius: 14px;
+      overflow: hidden;
+    }}
+
+    th, td {{
+      padding: 7px 8px;
       text-align: left;
+      border-bottom: 1px solid #eef2f7;
+      vertical-align: top;
     }}
+
     th {{
-      background: #f3f4f6;
-      font-weight: 600;
+      background: #f8fafc;
+      font-weight: 700;
       font-size: 11px;
+      color: #334155;
     }}
+
+    tr:last-child td {{ border-bottom: 0; }}
+
     td.money {{
       text-align: right;
       font-variant-numeric: tabular-nums;
+      white-space: nowrap;
     }}
+
     .totals {{
-      margin-top: 6px;
+      margin-top: 10px;
       width: 100%;
-      max-width: 280px;
+      max-width: 320px;
       margin-left: auto;
       border: 1px solid #e5e7eb;
-      border-radius: 4px;
+      border-radius: 14px;
+      overflow: hidden;
     }}
+
     .totals-row {{
       display: flex;
       justify-content: space-between;
-      padding: 4px 8px;
+      padding: 8px 10px;
       font-size: 11px;
+      border-bottom: 1px solid #eef2f7;
     }}
+
+    .totals-row:last-child {{ border-bottom: 0; }}
+
     .totals-row.label {{
-      background: #f9fafb;
-      font-weight: 600;
+      background: #0f172a;
+      color: #ffffff;
+      font-weight: 800;
     }}
   </style>
 </head>
 <body>
-  <div class="header">
-    <div>
-      <div class="title">Tax Invoice</div>
-      <div class="muted">Invoice ID: {inv.id}</div>
-      <div class="muted">Invoice No: {getattr(inv, 'invoice_number', inv.id)}</div>
-      <div class="muted">Date: {bill_date}</div>
-      <div class="muted">Status: {inv.status}</div>
-    </div>
-    <div style="text-align:right;">
-      <div class="section-title">Patient</div>
-      <div class="muted">UHID: {getattr(patient, 'uhid', '')}</div>
-      <div>{(patient.first_name or "")} {(patient.last_name or "")}</div>
-      <div class="muted">Phone: {patient.phone or "—"}</div>
-    </div>
-  </div>
+  <div class="page">
+    {brand_header}
 
-  <div class="section">
-    <div class="section-title">Bill Details</div>
-    <table>
-      <thead>
-        <tr>
-          <th style="width:40px;">S.No</th>
-          <th>Particulars</th>
-          <th style="width:60px;">Qty</th>
-          <th style="width:80px;">Price</th>
-          <th style="width:60px;">GST%</th>
-          <th style="width:80px;">GST Amt</th>
-          <th style="width:90px;">Line Total</th>
-        </tr>
-      </thead>
-      <tbody>
-        {html_items}
-      </tbody>
-    </table>
+    <div class="card">
+      <div class="header">
+        <div>
+          <div class="title">Tax Invoice</div>
+          <div class="muted">Invoice ID: {inv.id}</div>
+          <div class="muted">Invoice No: {getattr(inv, 'invoice_number', inv.id)}</div>
+          <div class="muted">Date: {bill_date}</div>
+          <div class="muted">Status: {inv.status}</div>
+        </div>
 
-    <div class="totals">
-      <div class="totals-row">
-        <span>Gross Amount</span>
-        <span class="money">{_money(inv.gross_total)}</span>
+        <div style="text-align:right;">
+          <div class="section-title" style="margin:0 0 6px 0;">Patient</div>
+          <div class="muted">UHID: {getattr(patient, 'uhid', '') or '—'}</div>
+          <div style="font-weight:700;">{(patient.first_name or "")} {(patient.last_name or "")}</div>
+          <div class="muted">Phone: {patient.phone or "—"}</div>
+        </div>
       </div>
-      <div class="totals-row">
-        <span>Tax Total</span>
-        <span class="money">{_money(inv.tax_total)}</span>
+
+      <div class="section">
+        <div class="section-title">Bill Details</div>
+        <table>
+          <thead>
+            <tr>
+              <th style="width:40px;">S.No</th>
+              <th>Particulars</th>
+              <th style="width:60px;">Qty</th>
+              <th style="width:80px;">Price</th>
+              <th style="width:60px;">GST%</th>
+              <th style="width:80px;">GST Amt</th>
+              <th style="width:95px;">Line Total</th>
+            </tr>
+          </thead>
+          <tbody>
+            {html_items}
+          </tbody>
+        </table>
+
+        <div class="totals">
+          <div class="totals-row">
+            <span>Gross Amount</span>
+            <span class="money">{_money(inv.gross_total)}</span>
+          </div>
+          <div class="totals-row">
+            <span>Tax Total</span>
+            <span class="money">{_money(inv.tax_total)}</span>
+          </div>
+          <div class="totals-row label">
+            <span>Net Amount</span>
+            <span class="money">{_money(inv.net_total)}</span>
+          </div>
+          <div class="totals-row">
+            <span>Amount Received</span>
+            <span class="money">{_money(inv.amount_paid)}</span>
+          </div>
+          <div class="totals-row">
+            <span>Balance Amount</span>
+            <span class="money">{_money(inv.balance_due)}</span>
+          </div>
+        </div>
       </div>
-      <div class="totals-row label">
-        <span>Net Amount</span>
-        <span class="money">{_money(inv.net_total)}</span>
-      </div>
-      <div class="totals-row">
-        <span>Amount Received</span>
-        <span class="money">{_money(inv.amount_paid)}</span>
-      </div>
-      <div class="totals-row">
-        <span>Balance Amount</span>
-        <span class="money">{_money(inv.balance_due)}</span>
+
+      <div class="section">
+        <div class="section-title">Payments</div>
+        <table>
+          <thead>
+            <tr>
+              <th style="width:40px;">#</th>
+              <th>Mode</th>
+              <th>Reference</th>
+              <th style="width:120px;">Paid At</th>
+              <th style="width:95px;">Amount</th>
+            </tr>
+          </thead>
+          <tbody>
+            {html_pay}
+          </tbody>
+        </table>
       </div>
     </div>
-  </div>
-
-  <div class="section">
-    <div class="section-title">Payments</div>
-    <table>
-      <thead>
-        <tr>
-          <th style="width:40px;">#</th>
-          <th>Mode</th>
-          <th>Reference</th>
-          <th style="width:110px;">Paid At</th>
-          <th style="width:90px;">Amount</th>
-        </tr>
-      </thead>
-      <tbody>
-        {html_pay}
-      </tbody>
-    </table>
   </div>
 </body>
 </html>
@@ -2104,7 +2155,8 @@ def print_invoice(
 
     if HTML is not None:
         try:
-            pdf_bytes = HTML(string=html).write_pdf()
+            pdf_bytes = HTML(string=html,
+                             base_url=str(settings.STORAGE_DIR)).write_pdf()
             filename = f"invoice-{invoice_id}.pdf"
             return StreamingResponse(
                 io.BytesIO(pdf_bytes),
@@ -2116,11 +2168,8 @@ def print_invoice(
         except Exception as e:
             logger.exception(
                 "WeasyPrint PDF generation failed for invoice %s, falling back to HTML: %s",
-                invoice_id,
-                e,
-            )
+                invoice_id, e)
 
-    # Fallback: return HTML so browser can still show/print
     return StreamingResponse(
         io.BytesIO(html.encode("utf-8")),
         media_type="text/html; charset=utf-8",
@@ -2151,6 +2200,10 @@ def print_patient_billing_summary(
     aging = summary["ar_aging"]
     payment_modes = summary["payment_modes"]
 
+    # --- Branding header (logo + org details) ---
+    branding = get_or_create_default_ui_branding(db, updated_by_id=user.id)
+    brand_header = render_brand_header_html(branding)
+
     rows_html = ""
     for idx, inv in enumerate(invoices, start=1):
         rows_html += ("<tr>"
@@ -2166,9 +2219,7 @@ def print_patient_billing_summary(
                       f"<td>{inv['status']}</td>"
                       "</tr>")
     if not rows_html:
-        rows_html = (
-            "<tr><td colspan='10' style='text-align:center;'>No invoices</td></tr>"
-        )
+        rows_html = "<tr><td colspan='10' style='text-align:center;'>No invoices</td></tr>"
 
     type_rows = ""
     for btype, agg in by_type.items():
@@ -2179,8 +2230,7 @@ def print_patient_billing_summary(
                       f"<td class='money'>{_money(agg['balance_due'])}</td>"
                       "</tr>")
     if not type_rows:
-        type_rows = (
-            "<tr><td colspan='4' style='text-align:center;'>No data</td></tr>")
+        type_rows = "<tr><td colspan='4' style='text-align:center;'>No data</td></tr>"
 
     aging_rows = ""
     labels = {
@@ -2204,9 +2254,7 @@ def print_patient_billing_summary(
                           f"<td class='money'>{_money(amt)}</td>"
                           "</tr>")
     if not pay_rows_html:
-        pay_rows_html = (
-            "<tr><td colspan='2' style='text-align:center;'>No payments</td></tr>"
-        )
+        pay_rows_html = "<tr><td colspan='2' style='text-align:center;'>No payments</td></tr>"
 
     html = f"""
 <!DOCTYPE html>
@@ -2215,148 +2263,195 @@ def print_patient_billing_summary(
   <meta charset="utf-8" />
   <title>Billing Summary - {summary['patient']['uhid'] or summary['patient']['id']}</title>
   <style>
+    @page {{
+      size: A4;
+      margin: 14mm 14mm 14mm 14mm;
+    }}
+
     body {{
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       font-size: 12px;
-      margin: 16px;
-      color: #111827;
+      margin: 0;
+      color: #0f172a;
+      background: #ffffff;
     }}
+
+    .page {{ padding: 16px; }}
+
+    {brand_header_css()}
+
+    .card {{
+      border: 1px solid #e5e7eb;
+      border-radius: 18px;
+      padding: 12px;
+      background: #ffffff;
+    }}
+
     .title {{
       font-size: 18px;
-      font-weight: 700;
+      font-weight: 800;
+      letter-spacing: -0.2px;
       margin-bottom: 4px;
     }}
+
     .muted {{
-      color: #6b7280;
+      color: #64748b;
       font-size: 11px;
     }}
-    .section {{
-      margin-top: 12px;
-      margin-bottom: 8px;
-    }}
+
+    .section {{ margin-top: 12px; margin-bottom: 8px; }}
+
     .section-title {{
-      font-weight: 600;
+      font-weight: 700;
       font-size: 13px;
-      margin-bottom: 4px;
+      margin-bottom: 6px;
     }}
+
     table {{
       width: 100%;
-      border-collapse: collapse;
-      margin-top: 4px;
-    }}
-    th, td {{
+      border-collapse: separate;
+      border-spacing: 0;
+      margin-top: 6px;
       border: 1px solid #e5e7eb;
-      padding: 4px 6px;
+      border-radius: 14px;
+      overflow: hidden;
+    }}
+
+    th, td {{
+      padding: 7px 8px;
       text-align: left;
+      border-bottom: 1px solid #eef2f7;
+      vertical-align: top;
     }}
+
     th {{
-      background: #f3f4f6;
-      font-weight: 600;
+      background: #f8fafc;
+      font-weight: 700;
       font-size: 11px;
+      color: #334155;
     }}
+
+    tr:last-child td {{ border-bottom: 0; }}
+
     td.money {{
       text-align: right;
       font-variant-numeric: tabular-nums;
+      white-space: nowrap;
     }}
-    .totals {{
+
+    .pills {{
       display: flex;
-      gap: 16px;
-      margin-top: 4px;
-      font-size: 11px;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 6px;
     }}
+
     .pill {{
-      padding: 4px 8px;
+      padding: 6px 10px;
       border-radius: 999px;
-      background: #f3f4f6;
+      background: #f1f5f9;
+      border: 1px solid #e5e7eb;
+      font-size: 11px;
+      color: #0f172a;
+    }}
+
+    .pill strong {{
+      font-weight: 800;
     }}
   </style>
 </head>
 <body>
-  <div class="title">Patient Billing Summary</div>
-  <div class="muted">
-    UHID: {summary['patient']['uhid'] or '—'} &nbsp;|
-    Name: {summary['patient']['name']} &nbsp;|
-    Phone: {summary['patient']['phone'] or '—'}
-  </div>
+  <div class="page">
+    {brand_header}
 
-  <div class="section">
-    <div class="section-title">Overall Totals</div>
-    <div class="totals">
-      <span class="pill">Net Total: {_money(totals['net_total'])}</span>
-      <span class="pill">Amount Received: {_money(totals['amount_paid'])}</span>
-      <span class="pill">Balance Due: {_money(totals['balance_due'])}</span>
+    <div class="card">
+      <div class="title">Patient Billing Summary</div>
+      <div class="muted">
+        UHID: {summary['patient']['uhid'] or '—'} &nbsp;|&nbsp;
+        Name: {summary['patient']['name']} &nbsp;|&nbsp;
+        Phone: {summary['patient']['phone'] or '—'}
+      </div>
+
+      <div class="section">
+        <div class="section-title">Overall Totals</div>
+        <div class="pills">
+          <span class="pill">Net Total: <strong>{_money(totals['net_total'])}</strong></span>
+          <span class="pill">Amount Received: <strong>{_money(totals['amount_paid'])}</strong></span>
+          <span class="pill">Balance Due: <strong>{_money(totals['balance_due'])}</strong></span>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Invoice-wise Details</div>
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Inv ID</th>
+              <th>Invoice No</th>
+              <th>Billing Type</th>
+              <th>Context</th>
+              <th>Date</th>
+              <th>Net</th>
+              <th>Paid</th>
+              <th>Balance</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows_html}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Revenue by Billing Type</div>
+        <table>
+          <thead>
+            <tr>
+              <th>Billing Type</th>
+              <th>Net Total</th>
+              <th>Amount Received</th>
+              <th>Balance</th>
+            </tr>
+          </thead>
+          <tbody>
+            {type_rows}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Accounts Receivable Ageing</div>
+        <table>
+          <thead>
+            <tr>
+              <th>Bucket</th>
+              <th>Invoice Count</th>
+              <th>Outstanding Amount</th>
+            </tr>
+          </thead>
+          <tbody>
+            {aging_rows}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Payment Mode Breakup</div>
+        <table>
+          <thead>
+            <tr>
+              <th>Mode</th>
+              <th>Total Amount</th>
+            </tr>
+          </thead>
+          <tbody>
+            {pay_rows_html}
+          </tbody>
+        </table>
+      </div>
     </div>
-  </div>
-
-  <div class="section">
-    <div class="section-title">Invoice-wise Details</div>
-    <table>
-      <thead>
-        <tr>
-          <th>#</th>
-          <th>Inv ID</th>
-          <th>Invoice No</th>
-          <th>Billing Type</th>
-          <th>Context</th>
-          <th>Date</th>
-          <th>Net</th>
-          <th>Paid</th>
-          <th>Balance</th>
-          <th>Status</th>
-        </tr>
-      </thead>
-      <tbody>
-        {rows_html}
-      </tbody>
-    </table>
-  </div>
-
-  <div class="section">
-    <div class="section-title">Revenue by Billing Type</div>
-    <table>
-      <thead>
-        <tr>
-          <th>Billing Type</th>
-          <th>Net Total</th>
-          <th>Amount Received</th>
-          <th>Balance</th>
-        </tr>
-      </thead>
-      <tbody>
-        {type_rows}
-      </tbody>
-    </table>
-  </div>
-
-  <div class="section">
-    <div class="section-title">Accounts Receivable Ageing</div>
-    <table>
-      <thead>
-        <tr>
-          <th>Bucket</th>
-          <th>Invoice Count</th>
-          <th>Outstanding Amount</th>
-        </tr>
-      </thead>
-      <tbody>
-        {aging_rows}
-      </tbody>
-    </table>
-  </div>
-
-  <div class="section">
-    <div class="section-title">Payment Mode Breakup</div>
-    <table>
-      <thead>
-        <tr>
-          <th>Mode</th>
-          <th>Total Amount</th>
-        </tr>
-      </thead>
-      <tbody>
-        {pay_rows_html}
-      </tbody>
-    </table>
   </div>
 </body>
 </html>
@@ -2370,7 +2465,8 @@ def print_patient_billing_summary(
 
     if HTML is not None:
         try:
-            pdf_bytes = HTML(string=html).write_pdf()
+            pdf_bytes = HTML(string=html,
+                             base_url=str(settings.STORAGE_DIR)).write_pdf()
             filename = f"billing-summary-{patient_id}.pdf"
             return StreamingResponse(
                 io.BytesIO(pdf_bytes),
@@ -2382,23 +2478,9 @@ def print_patient_billing_summary(
         except Exception as e:
             logger.exception(
                 "WeasyPrint PDF generation failed for billing summary %s, falling back to HTML: %s",
-                patient_id,
-                e,
-            )
+                patient_id, e)
 
     return StreamingResponse(
         io.BytesIO(html.encode("utf-8")),
         media_type="text/html; charset=utf-8",
     )
-
-
-# Alias for FE path: /billing/patient/{id}/summary/print
-@router.get("/patient/{patient_id}/summary/print")
-def print_patient_billing_summary_alias(
-        patient_id: int,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
-):
-    return print_patient_billing_summary(patient_id=patient_id,
-                                         db=db,
-                                         user=user)
