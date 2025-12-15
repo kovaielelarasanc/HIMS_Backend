@@ -14,6 +14,8 @@ from starlette.status import HTTP_500_INTERNAL_SERVER_ERROR
 from app.db.session import MasterSessionLocal
 from app.services.error_logger import log_error, format_exception
 from app.utils.jwt import extract_tenant_from_request
+from fastapi.responses import JSONResponse
+from fastapi import Request
 # from app.api.routes_lis_device import public_router as lis_public_router
 
 app = FastAPI(
@@ -119,37 +121,54 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         status_code=exc.status_code,
         content={"detail": exc.detail},
         headers=getattr(exc, "headers", None),
+
     )
-from fastapi.responses import JSONResponse
-from fastapi import Request
 
-
-# 🔥 Global OPTIONS handler – CORS + Cloudflare safe
 @app.options("/{rest_of_path:path}")
 async def cors_preflight_handler(rest_of_path: str, request: Request):
-    origin = request.headers.get("origin")
-    allowed_origins = settings.BACKEND_CORS_ORIGINS
+    origin = (request.headers.get("origin") or "").rstrip("/")
+
+    allowed_origins = {str(o).rstrip("/") for o in settings.BACKEND_CORS_ORIGINS}
 
     headers = {
-        "Access-Control-Allow-Methods":
-        "GET, POST, PUT, PATCH, DELETE, OPTIONS",
-        "Access-Control-Allow-Headers":
-        request.headers.get("access-control-request-headers", "*"),
-        "Access-Control-Allow-Credentials":
-        "true",
-        "Vary":
-        "Origin",
+        "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+        "Access-Control-Allow-Headers": request.headers.get("access-control-request-headers", "*"),
+        "Access-Control-Allow-Credentials": "true",
+        "Vary": "Origin",
     }
 
-    # Only echo origin if it is in the allowed list
     if origin in allowed_origins:
         headers["Access-Control-Allow-Origin"] = origin
 
-    return JSONResponse(
-        status_code=200,
-        content={"message": "preflight ok"},
-        headers=headers,
-    )
+    return JSONResponse(status_code=204, content=None, headers=headers)
+
+
+# # 🔥 Global OPTIONS handler – CORS + Cloudflare safe
+# @app.options("/{rest_of_path:path}")
+# async def cors_preflight_handler(rest_of_path: str, request: Request):
+#     origin = request.headers.get("origin")
+#     allowed_origins = settings.BACKEND_CORS_ORIGINS
+
+#     headers = {
+#         "Access-Control-Allow-Methods":
+#         "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+#         "Access-Control-Allow-Headers":
+#         request.headers.get("access-control-request-headers", "*"),
+#         "Access-Control-Allow-Credentials":
+#         "true",
+#         "Vary":
+#         "Origin",
+#     }
+
+#     # Only echo origin if it is in the allowed list
+#     if origin in allowed_origins:
+#         headers["Access-Control-Allow-Origin"] = origin
+
+#     return JSONResponse(
+#         status_code=200,
+#         content={"message": "preflight ok"},
+#         headers=headers,
+#     )
 
 # app.include_router(lis_public_router, prefix=settings.API_V1_STR)
 app.include_router(api_router, prefix=settings.API_V1_STR)
