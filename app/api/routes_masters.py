@@ -102,6 +102,62 @@ def create_lab_test(
     db.refresh(t)
     return {"id": t.id, "message": "Created"}
 
+# ----------- LAB TESTS (UPDATE) -----------
+@router.put("/lab-tests/{test_id}", response_model=dict)
+def update_lab_test(
+    test_id: int,
+    payload: dict,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    must_admin(user)
+
+    t = db.query(LabTest).filter(LabTest.id == test_id).first()
+    if not t:
+        raise HTTPException(status_code=404, detail="Lab test not found")
+
+    code = (payload.get("code") or t.code or "").strip()
+    name = (payload.get("name") or t.name or "").strip()
+    price = payload.get("price", t.price)
+
+    if not code or not name:
+        raise HTTPException(status_code=400, detail="Code & Name required")
+
+    # unique code check (if code changed)
+    exists = (
+        db.query(LabTest)
+        .filter(LabTest.code == code, LabTest.id != test_id)
+        .first()
+    )
+    if exists:
+        raise HTTPException(status_code=400, detail="Test code already exists")
+
+    t.code = code
+    t.name = name
+    t.price = price
+
+    db.commit()
+    db.refresh(t)
+    return {"id": t.id, "message": "Updated"}
+
+
+# ----------- LAB TESTS (DELETE) -----------
+@router.delete("/lab-tests/{test_id}", response_model=dict)
+def delete_lab_test(
+    test_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    must_admin(user)
+
+    t = db.query(LabTest).filter(LabTest.id == test_id).first()
+    if not t:
+        raise HTTPException(status_code=404, detail="Lab test not found")
+
+    db.delete(t)
+    db.commit()
+    return {"id": test_id, "message": "Deleted"}
+
 
 # ----------- RADIOLOGY TESTS -----------
 @router.get("/radiology-tests", response_model=List[dict])
