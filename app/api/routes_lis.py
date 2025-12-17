@@ -1,112 +1,73 @@
 # FILE: app/api/routes_lis.py
 from __future__ import annotations
 
+import logging
 from datetime import datetime
-from typing import List, Optional, Dict, Any
-from reportlab.lib import colors  # already imported above
-
-from sqlalchemy.exc import IntegrityError
-from fastapi import (
-    APIRouter,
-    Depends,
-    HTTPException,
-    Query,
-    WebSocket,
-    WebSocketDisconnect,
-)
-from sqlalchemy.orm import Session
-from sqlalchemy import text
-from app.services.lis_billing import bill_lis_order
-from app.api.deps import get_db, current_user
-from app.models.user import User
-from app.models.opd import LabTest
-from app.models.lis import (
-    LisOrder,
-    LisOrderItem,
-    LisAttachment,
-    LabDepartment,
-    LabService,
-    LisResultLine,
-)
-from app.models.patient import Patient
-from app.schemas.lis import (
-    LisOrderCreate,
-    LisCollectIn,
-    LisResultIn,
-    LisAttachmentIn,
-    LisOrderOut,
-    LisOrderItemOut,
-    LisPanelResultSaveIn,
-    LisResultLineOut,
-    LabReportOut,
-    LabReportSectionOut,
-    LabReportRowOut,
-)
-
 from io import BytesIO
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
-from reportlab.pdfgen import canvas
+from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
-from reportlab.lib import colors
 from reportlab.lib.utils import ImageReader
-from pathlib import Path
-from app.models.opd import Visit
-from app.models.ipd import IpdAdmission
-import logging
-from app.services.billing_bridge import create_or_get_invoice_for_lis_order
+from reportlab.pdfbase.pdfmetrics import stringWidth
+from reportlab.pdfgen import canvas
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from app.api.deps import get_db, current_user
 from app.core.config import settings
+from app.models.ipd import IpdAdmission
+from app.models.lis import LabDepartment, LabService, LisAttachment, LisOrder, LisOrderItem, LisResultLine
+from app.models.opd import LabTest, Visit
+from app.models.patient import Patient
+from app.models.user import User
+from app.schemas.lis import (
+    LabReportOut,
+    LabReportRowOut,
+    LabReportSectionOut,
+    LisAttachmentIn,
+    LisOrderCreate,
+    LisOrderItemOut,
+    LisOrderOut,
+    LisPanelResultSaveIn,
+    LisResultLineOut,
+)
+from app.services.lis_billing import bill_lis_order
 from app.services.ui_branding import get_ui_branding
+from app.services.lab_pdf_branding import draw_clean_brand_header
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
 # ---------------- Permission helpers ----------------
-def _has(user: User, code: str) -> bool:
-    if getattr(user, "is_admin", False):
-        return True
-    for r in user.roles:
-        for p in r.permissions:
-            if p.code == code:
-                return True
-    return False
-
-
-def _need_any(user: User, codes: list[str]):
+def _need_any(user: User, codes: List[str]) -> None:
     if getattr(user, "is_admin", False):
         return
-    for r in user.roles:
-        for p in r.permissions:
-            if p.code in codes:
+    for r in getattr(user, "roles", []) or []:
+        for p in getattr(r, "permissions", []) or []:
+            if getattr(p, "code", None) in codes:
                 return
     raise HTTPException(status_code=403, detail="Not permitted")
 
 
 def _infer_context_type(db: Session, context_id: int | None) -> str | None:
-    """
-    If context_id exists but context_type not provided:
-      - if Visit exists => opd
-      - else if Admission exists => ipd
-      - else None
-    """
     if not context_id:
         return None
-
-    v = db.query(Visit.id).filter(Visit.id == context_id).first()
-    if v:
+    if db.query(Visit.id).filter(Visit.id == context_id).first():
         return "opd"
-
-    a = db.query(IpdAdmission.id).filter(IpdAdmission.id == context_id).first()
-    if a:
+    if db.query(IpdAdmission.id).filter(IpdAdmission.id == context_id).first():
         return "ipd"
-
     return None
 
 
 # ---------------- Real-time (WebSocket) ----------------
 class _WSManager:
-
     def __init__(self):
         self.connections: set[WebSocket] = set()
 
@@ -133,7 +94,7 @@ _ws = _WSManager()
 
 @router.websocket("/ws")
 async def lab_ws(websocket: WebSocket):
-    await _ws.connect(websocket)  # ✅ correct (global instance)
+    await _ws.connect(websocket)
     try:
         while True:
             await websocket.receive_text()
@@ -145,104 +106,147 @@ async def _notify(kind: str, **data):
     await _ws.broadcast({"type": f"lab.{kind}", **data})
 
 
-def _draw_letterhead_background(
-    c: canvas.Canvas,
-    branding,
-    page_num: int = 1,
-) -> None:
+# ---------------- Reference range formatting (DISPLAY ONLY) ----------------
+def format_reference_ranges_display(ranges: list[dict] | None) -> str:
     """
-    Draw full-page letterhead background if an image letterhead is configured
-    and position is appropriate.
+    Multi-line display string for UI/PDF.
+    IMPORTANT: This is NOT stored in DB (avoid 255-limit issues).
+    """
+    if not ranges:
+        return "-"
 
-    Uses branding.letterhead_position:
-    - "background": all pages
-    - "first_page_only": only first page
-    - "none" or empty: do not draw background
+    groups: dict[str, list[dict]] = {"F": [], "M": [], "ANY": []}
+    for r in ranges:
+        sex = (r.get("sex") or "ANY").upper().strip()
+        if sex not in groups:
+            sex = "ANY"
+        groups[sex].append(r)
+
+    out: list[str] = []
+
+    def val_text(r: dict) -> str:
+        low = (r.get("low") or "").strip()
+        high = (r.get("high") or "").strip()
+        textv = (r.get("text") or "").strip()
+        if textv:
+            return textv
+        if low and high:
+            return f"{low}-{high}"
+        if low:
+            return f">= {low}"
+        if high:
+            return f"<= {high}"
+        return "-"
+
+    def age_text(r: dict) -> str:
+        age_min = r.get("age_min")
+        age_max = r.get("age_max")
+        age_unit = (r.get("age_unit") or "Y").strip()
+        if age_min is None and age_max is None:
+            return ""
+        a = "" if age_min is None else str(age_min)
+        b = "" if age_max is None else str(age_max)
+        return f" ({a}-{b}{age_unit})"
+
+    def add_group(title: str, items: list[dict], add_heading: bool):
+        if not items:
+            return
+        if add_heading:
+            out.append(title)
+        for r in items:
+            label = (r.get("label") or "Range").strip()
+            out.append(f"{label}{age_text(r)}: {val_text(r)}")
+
+    # If you have sex-specific ranges, print WOMEN/MEN headings like your sample
+    has_sex = bool(groups["F"] or groups["M"])
+    if groups["F"]:
+        add_group("WOMEN", groups["F"], add_heading=True)
+    if groups["M"]:
+        add_group("MEN", groups["M"], add_heading=True)
+    if groups["ANY"]:
+        add_group("GENERAL" if has_sex else "", groups["ANY"], add_heading=has_sex)
+
+    # remove empty headings
+    out = [x for x in out if x.strip()]
+    return "\n".join(out) if out else "-"
+
+
+def _split_text_to_lines(txt: str, font_name: str, font_size: float, max_w: float) -> list[str]:
     """
+    ReportLab wrap with newline support.
+    """
+    t = (txt or "-").replace("\r\n", "\n").strip()
+    if not t:
+        return ["-"]
+
+    out: list[str] = []
+    for para in t.split("\n"):
+        para = para.strip()
+        if not para:
+            continue
+        words = para.split(" ")
+        line = ""
+        for w in words:
+            trial = (line + " " + w).strip()
+            if stringWidth(trial, font_name, font_size) <= max_w:
+                line = trial
+                continue
+            if line:
+                out.append(line)
+                line = ""
+            # hard-wrap long token
+            if stringWidth(w, font_name, font_size) <= max_w:
+                line = w
+            else:
+                chunk = ""
+                for ch in w:
+                    trial2 = chunk + ch
+                    if stringWidth(trial2, font_name, font_size) <= max_w:
+                        chunk = trial2
+                    else:
+                        if chunk:
+                            out.append(chunk)
+                        chunk = ch
+                line = chunk
+        if line:
+            out.append(line)
+
+    return out if out else ["-"]
+
+
+# ---------------- Letterhead background (optional) ----------------
+def _draw_letterhead_background(c: canvas.Canvas, branding: Any, page_num: int = 1) -> None:
     if not branding or not getattr(branding, "letterhead_path", None):
         return
 
-    position = getattr(branding, "letterhead_position",
-                       "background") or "background"
-
-    # Respect position flag
+    position = getattr(branding, "letterhead_position", "background") or "background"
     if position == "none":
         return
     if position == "first_page_only" and page_num != 1:
         return
 
-    # Only support image type for full-page background
     if getattr(branding, "letterhead_type", None) not in {"image", None}:
         return
 
     full_path = Path(settings.STORAGE_DIR).joinpath(branding.letterhead_path)
     if not full_path.exists():
-        logger.warning("Letterhead file not found: %s", full_path)
         return
 
     try:
         img = ImageReader(str(full_path))
-        width, height = A4
-        c.drawImage(
-            img,
-            0,
-            0,
-            width=width,
-            height=height,
-            preserveAspectRatio=True,
-            mask="auto",
-        )
+        w, h = A4
+        c.drawImage(img, 0, 0, width=w, height=h, preserveAspectRatio=True, mask="auto")
     except Exception:
         logger.exception("Failed to draw letterhead background")
-        return
 
 
-# ------------------- Lab Masters (tests) -------------------
-@router.get("/masters/tests", response_model=dict)
-def list_lab_masters(
-        q: str = "",
-        active: Optional[bool] = Query(None),
-        page: int = 1,
-        page_size: int = 50,
-        db: Session = Depends(get_db),
-        user: User = Depends(current_user),
-):
-    base = db.query(LabTest)
-    if q:
-        like = f"%{q.strip()}%"
-        base = base.filter((LabTest.code.ilike(like))
-                           | (LabTest.name.ilike(like)))
-    if active is not None and hasattr(LabTest, "is_active"):
-        base = base.filter(LabTest.is_active.is_(bool(active)))
-    total = base.count()
-    rows = (base.order_by(LabTest.name.asc()).offset(
-        (page - 1) * page_size).limit(page_size).all())
-    items = [{
-        "id": m.id,
-        "code": getattr(m, "code", None),
-        "name": getattr(m, "name", None),
-        "price": float(getattr(m, "price", 0) or 0),
-        "is_active": bool(getattr(m, "is_active", True)),
-    } for m in rows]
-    return {
-        "items": items,
-        "total": total,
-        "page": page,
-        "page_size": page_size,
-    }
-
-
-# ------------------- Create Order -------------------
+# ---------------- Orders ----------------
 @router.post("/orders")
-def create_order(payload: LisOrderCreate,
-                 db: Session = Depends(get_db),
-                 user: User = Depends(current_user)):
+def create_order(payload: LisOrderCreate, db: Session = Depends(get_db), user: User = Depends(current_user)):
     _need_any(user, ["orders.lab.create", "lab.orders.create"])
-
     if not payload.items:
         raise HTTPException(422, "At least one test is required")
 
-    # ✅ auto infer context_type
     ctx_type = payload.context_type
     if not ctx_type and payload.context_id:
         ctx_type = _infer_context_type(db, payload.context_id)
@@ -264,7 +268,6 @@ def create_order(payload: LisOrderCreate,
         m = db.query(LabTest).get(it.test_id)
         if not m:
             raise HTTPException(404, f"LabTest not found: {it.test_id}")
-
         db.add(
             LisOrderItem(
                 order_id=order.id,
@@ -273,26 +276,21 @@ def create_order(payload: LisOrderCreate,
                 test_code=m.code,
                 status="ordered",
                 created_by=user.id,
-            ))
+            )
+        )
 
     db.commit()
-    return {
-        "id": order.id,
-        "context_type": order.context_type,
-        "message": "LIS order created"
-    }
+    return {"id": order.id, "context_type": order.context_type, "message": "LIS order created"}
 
 
-# ---------------- LIST ORDERS ----------------
 @router.get("/orders", response_model=list[LisOrderOut])
 def list_orders(
-        status: str | None = None,
-        patient_id: int | None = None,
-        db: Session = Depends(get_db),
-        user=Depends(current_user),
+    status: str | None = None,
+    patient_id: int | None = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
 ):
     _need_any(user, ["lab.orders.view", "orders.lab.view"])
-
     q = db.query(LisOrder)
     if status:
         q = q.filter(LisOrder.status == status)
@@ -300,11 +298,9 @@ def list_orders(
         q = q.filter(LisOrder.patient_id == patient_id)
 
     orders = q.order_by(LisOrder.id.desc()).all()
-
     out: List[LisOrderOut] = []
     for o in orders:
-        items = db.query(LisOrderItem).filter(
-            LisOrderItem.order_id == o.id).all()
+        items = db.query(LisOrderItem).filter(LisOrderItem.order_id == o.id).all()
         out.append(
             LisOrderOut(
                 id=o.id,
@@ -329,28 +325,22 @@ def list_orders(
                         normal_range=i.normal_range,
                         is_critical=bool(i.is_critical),
                         result_at=i.result_at,
-                    ) for i in items
+                    )
+                    for i in items
                 ],
-            ))
+            )
+        )
     return out
 
 
-# ------------- GET SINGLE ORDER ---------------
 @router.get("/orders/{order_id}", response_model=LisOrderOut)
-def get_order(
-        order_id: int,
-        db: Session = Depends(get_db),
-        user=Depends(current_user),
-):
+def get_order(order_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
     _need_any(user, ["lab.orders.view", "orders.lab.view"])
-
     o = db.query(LisOrder).get(order_id)
     if not o:
         raise HTTPException(404, "Order not found")
 
-    items = db.query(LisOrderItem).filter(
-        LisOrderItem.order_id == order_id).all()
-
+    items = db.query(LisOrderItem).filter(LisOrderItem.order_id == order_id).all()
     return LisOrderOut(
         id=o.id,
         patient_id=o.patient_id,
@@ -374,20 +364,20 @@ def get_order(
                 normal_range=i.normal_range,
                 is_critical=bool(i.is_critical),
                 result_at=i.result_at,
-            ) for i in items
+            )
+            for i in items
         ],
     )
 
 
-# ------------------- Panel Services -------------------
+# ---------------- Panel services (Result entry rows) ----------------
 @router.get("/orders/{order_id}/panel", response_model=List[LisResultLineOut])
 def get_order_panel_services(
-        order_id: int,
-        department_id: int = Query(..., description="Top-level department ID"),
-        sub_department_id: Optional[int] = Query(
-            None, description="Sub-department ID (panel)"),
-        db: Session = Depends(get_db),
-        user: User = Depends(current_user),
+    order_id: int,
+    department_id: int = Query(...),
+    sub_department_id: Optional[int] = Query(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
 ):
     _need_any(user, ["lab.results.enter", "lab.orders.view"])
 
@@ -395,27 +385,30 @@ def get_order_panel_services(
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    # which department owns services
     leaf_dept_id = sub_department_id or department_id
 
-    svc_q = (db.query(LabService).filter(
-        LabService.department_id == leaf_dept_id).filter(
-            LabService.is_active.is_(True)).order_by(
-                LabService.display_order.asc(), LabService.name.asc()))
-    services = svc_q.all()
+    services = (
+        db.query(LabService)
+        .filter(LabService.department_id == leaf_dept_id)
+        .filter(LabService.is_active.is_(True))
+        .order_by(LabService.display_order.asc(), LabService.name.asc())
+        .all()
+    )
 
-    existing = (db.query(LisResultLine).filter(
-        LisResultLine.order_id == order_id).filter(
-            LisResultLine.service_id.in_([s.id for s in services]
-                                         or [0])).all())
+    existing = (
+        db.query(LisResultLine)
+        .filter(LisResultLine.order_id == order_id)
+        .filter(LisResultLine.service_id.in_([s.id for s in services] or [0]))
+        .all()
+    )
     existing_map = {r.service_id: r for r in existing}
 
     out: List[LisResultLineOut] = []
 
     for svc in services:
         saved = existing_map.get(svc.id)
-
         dept = svc.department
+
         if dept and dept.parent_id:
             main_dept = db.query(LabDepartment).get(dept.parent_id)
             main_dept_id = main_dept.id if main_dept else dept.id
@@ -428,6 +421,12 @@ def get_order_panel_services(
             sub_dept_id = None
             sub_dept_name = None
 
+        rr_display = (
+            format_reference_ranges_display(getattr(svc, "reference_ranges", None))
+            if getattr(svc, "reference_ranges", None)
+            else (svc.normal_range or "-")
+        )
+
         out.append(
             LisResultLineOut(
                 id=saved.id if saved else None,
@@ -437,59 +436,44 @@ def get_order_panel_services(
                 department_name=main_dept_name,
                 sub_department_id=sub_dept_id,
                 sub_department_name=sub_dept_name,
-                service_name=saved.service_name if saved else svc.name,
-                unit=saved.unit if saved else (svc.unit or "-"),
-                normal_range=saved.normal_range if saved else
-                (svc.normal_range or "-"),
-                result_value=saved.result_value if saved else None,
-                flag=saved.flag if saved else None,
-                comments=saved.comments if saved else None,
-            ))
+                service_name=(saved.service_name if saved else svc.name),
+                unit=(saved.unit if saved else (svc.unit or "-")),
+                # IMPORTANT: always show display range (even if saved.normal_range was just "-")
+                normal_range=rr_display,
+                result_value=(saved.result_value if saved else None),
+                flag=(saved.flag if saved else None),
+                comments=(saved.comments if saved else None),
+            )
+        )
 
     return out
 
 
 @router.post("/orders/{order_id}/panel/results")
 async def save_panel_results(
-        order_id: int,
-        payload: LisPanelResultSaveIn,
-        db: Session = Depends(get_db),
-        user: User = Depends(current_user),
+    order_id: int,
+    payload: LisPanelResultSaveIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
 ):
     _need_any(user, ["lab.results.enter"])
 
-    # --- DEBUG 1: which DB am I connected to? ---
+    # debug: which DB
     try:
         current_db = db.execute(text("SELECT DATABASE()")).scalar()
-        logger.info(
-            "[LIS] save_panel_results using DB=%s order_id=%s",
-            current_db,
-            order_id,
-        )
+        logger.info("[LIS] save_panel_results DB=%s order_id=%s", current_db, order_id)
     except Exception:
         logger.exception("[LIS] failed to read current DB")
 
     order = db.query(LisOrder).get(order_id)
     if not order:
-        logger.error("[LIS] order not found in ORM for id=%s", order_id)
-        raise HTTPException(
-            status_code=404,
-            detail=f"Order not found in this DB: {order_id}",
-        )
-
-    logger.info(
-        "[LIS] ORM found order row: id=%s patient_id=%s status=%s",
-        order.id,
-        order.patient_id,
-        order.status,
-    )
+        raise HTTPException(status_code=404, detail=f"Order not found in this DB: {order_id}")
 
     service_ids = [r.service_id for r in payload.results]
     if not service_ids:
         raise HTTPException(status_code=400, detail="No results provided")
 
-    services = db.query(LabService).filter(
-        LabService.id.in_(service_ids)).all()
+    services = db.query(LabService).filter(LabService.id.in_(service_ids)).all()
     svc_map = {s.id: s for s in services}
 
     now = datetime.utcnow()
@@ -498,10 +482,7 @@ async def save_panel_results(
     for row in payload.results:
         svc = svc_map.get(row.service_id)
         if not svc:
-            raise HTTPException(
-                status_code=404,
-                detail=f"LabService not found: {row.service_id}",
-            )
+            raise HTTPException(status_code=404, detail=f"LabService not found: {row.service_id}")
 
         dept = svc.department
         if dept and dept.parent_id:
@@ -512,11 +493,16 @@ async def save_panel_results(
             main_dept_id = dept.id if dept else payload.department_id
             sub_dept_id = payload.sub_department_id
 
-        existing: Optional[LisResultLine] = (db.query(LisResultLine).filter(
-            LisResultLine.order_id == order_id).filter(
-                LisResultLine.service_id == svc.id).first())
+        existing: Optional[LisResultLine] = (
+            db.query(LisResultLine)
+            .filter(LisResultLine.order_id == order_id)
+            .filter(LisResultLine.service_id == svc.id)
+            .first()
+        )
 
         if not existing:
+            # NOTE: store SHORT normal_range only (DB safe),
+            # display is computed from svc.reference_ranges during fetch/print.
             existing = LisResultLine(
                 order_id=order_id,
                 service_id=svc.id,
@@ -524,7 +510,7 @@ async def save_panel_results(
                 sub_department_id=sub_dept_id,
                 service_name=svc.name,
                 unit=svc.unit or "-",
-                normal_range=svc.normal_range or "-",
+                normal_range=(svc.normal_range or "-"),
                 entered_by=user.id,
                 created_at=now,
             )
@@ -541,49 +527,25 @@ async def save_panel_results(
         order.updated_by = user.id
         order.updated_at = now
 
-    # --- DEBUG 2: ensure parent truly exists in SAME DB ---
-    try:
-        cnt = db.execute(
-            text("SELECT COUNT(*) FROM lis_orders WHERE id = :oid"),
-            {
-                "oid": order_id
-            },
-        ).scalar()
-        logger.info(
-            "[LIS] lis_orders count with id=%s in this DB = %s",
-            order_id,
-            cnt,
-        )
-    except Exception:
-        logger.exception("[LIS] failed to check lis_orders row before commit")
-
     try:
         db.commit()
     except IntegrityError:
         db.rollback()
-        logger.exception("[LIS] FK error while saving LIS panel results")
         raise HTTPException(
             status_code=400,
-            detail=("Cannot save results: LIS order not found "
-                    "or data is inconsistent."),
+            detail="Cannot save results: order not found or data inconsistent.",
         )
 
-    await _notify(
-        "panel_results_saved",
-        order_id=order_id,
-        department_id=payload.department_id,
-        sub_department_id=payload.sub_department_id,
-    )
+    await _notify("panel_results_saved", order_id=order_id, department_id=payload.department_id, sub_department_id=payload.sub_department_id)
     return {"message": "Panel results saved", "count": saved_count}
 
 
-# ------------------- Structured report data -------------------
-# ------------------- Structured report data -------------------
+# ---------------- Structured report data ----------------
 @router.get("/orders/{order_id}/report-data", response_model=LabReportOut)
 def get_lab_report_data(
-        order_id: int,
-        db: Session = Depends(get_db),
-        user: User = Depends(current_user),
+    order_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
 ):
     _need_any(user, ["lab.results.report", "lab.orders.view"])
 
@@ -593,14 +555,18 @@ def get_lab_report_data(
 
     patient: Optional[Patient] = db.query(Patient).get(order.patient_id)
 
-    lines: List[LisResultLine] = (db.query(LisResultLine).filter(
-        LisResultLine.order_id == order_id).order_by(
+    lines: List[LisResultLine] = (
+        db.query(LisResultLine)
+        .filter(LisResultLine.order_id == order_id)
+        .order_by(
             LisResultLine.department_id.asc(),
             LisResultLine.sub_department_id.asc(),
             LisResultLine.id.asc(),
-        ).all())
+        )
+        .all()
+    )
 
-    sections_map: Dict[tuple[int, Optional[int]], LabReportSectionOut] = {}
+    sections_map: Dict[Tuple[int, Optional[int]], LabReportSectionOut] = {}
 
     for line in lines:
         dept_id = line.department_id or 0
@@ -622,8 +588,7 @@ def get_lab_report_data(
         if line.sub_department:
             sub_name = line.sub_department.name
         else:
-            if (line.service and line.service.department
-                    and line.service.department.parent_id):
+            if line.service and line.service.department and line.service.department.parent_id:
                 sub_name = line.service.department.name
 
         key = (dept_id, sub_id)
@@ -636,23 +601,28 @@ def get_lab_report_data(
                 rows=[],
             )
 
+        svc_obj = getattr(line, "service", None)
+        rr_display = None
+        if svc_obj and getattr(svc_obj, "reference_ranges", None):
+            rr_display = format_reference_ranges_display(svc_obj.reference_ranges)
+
         sections_map[key].rows.append(
             LabReportRowOut(
                 service_name=line.service_name,
                 result_value=line.result_value,
                 unit=line.unit,
-                normal_range=line.normal_range,
+                normal_range=(rr_display or line.normal_range or "-"),
                 flag=line.flag,
                 comments=line.comments,
-            ))
+            )
+        )
 
     sections = list(sections_map.values())
-    sections.sort(
-        key=lambda s: (s.department_id or 0, s.sub_department_id or 0))
+    sections.sort(key=lambda s: (s.department_id or 0, s.sub_department_id or 0))
 
     # Age text
     age_text = None
-    if patient and patient.dob:
+    if patient and getattr(patient, "dob", None):
         try:
             today = datetime.utcnow().date()
             years = today.year - patient.dob.year
@@ -665,13 +635,11 @@ def get_lab_report_data(
         lab_no=str(order.id),
         patient_id=order.patient_id,
         patient_uhid=getattr(patient, "uhid", None),
-        patient_name=getattr(patient, "full_name", None)
-        or getattr(patient, "first_name", None),
+        patient_name=getattr(patient, "full_name", None) or getattr(patient, "first_name", None),
         patient_gender=getattr(patient, "gender", None),
-        patient_dob=patient.dob if patient and patient.dob else None,
+        patient_dob=patient.dob if patient and getattr(patient, "dob", None) else None,
         patient_age_text=age_text,
-        patient_type=order.context_type.upper()
-        if order.context_type else None,
+        patient_type=(order.context_type.upper() if order.context_type else None),
         bill_no=None,
         received_on=order.collected_at,
         reported_on=order.reported_at,
@@ -680,577 +648,329 @@ def get_lab_report_data(
     )
 
 
-def _format_lab_no(raw: Any) -> str:
-    """
-    Convert internal order/lab id into a friendly LAB-000123 style code.
-    No raw DB ids in the visible PDF.
-    """
-    if raw is None:
-        return "-"
-    try:
-        num = int(raw)
-    except (TypeError, ValueError):
-        return str(raw)
-    return f"LAB-{num:06d}"
-
-
-def _format_dt(value: Any) -> str:
-    """
-    Consistent human-readable datetime for PDF (dd-MM-YYYY HH:MM).
-    """
-    if not value:
-        return "-"
-    if isinstance(value, datetime):
-        return value.strftime("%d-%m-%Y %H:%M")
-    try:
-        parsed = datetime.fromisoformat(str(value))
-        return parsed.strftime("%d-%m-%Y %H:%M")
-    except Exception:
-        return str(value)
-
-
-# ------------------- Letterhead PDF -------------------
-# ------------------- Letterhead PDF -------------------
+# ---------------- Professional PDF (matches your screenshot style) ----------------
 @router.get("/orders/{order_id}/report-pdf")
 def get_lab_report_pdf(
-        order_id: int,
-        db: Session = Depends(get_db),
-        user: User = Depends(current_user),
+    order_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
 ):
     _need_any(user, ["lab.results.report", "lab.orders.view"])
 
-    # Fresh order + patient (for collected_at / collected_by / prefix)
     order = db.query(LisOrder).get(order_id)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
     patient: Optional[Patient] = db.query(Patient).get(order.patient_id)
-
-    # Structured data (sections, age text etc.)
     report = get_lab_report_data(order_id=order_id, db=db, user=user)
     branding = get_ui_branding(db)
 
-    # Optional: sample collected_by name (if you add LisOrder.collected_by FK)
+    # collected by (optional)
     collected_by_name = None
     collected_by_id = getattr(order, "collected_by", None)
     if collected_by_id:
         staff = db.query(User).get(collected_by_id)
         if staff:
-            collected_by_name = getattr(staff, "full_name", None) or getattr(
-                staff, "first_name", None)
+            collected_by_name = getattr(staff, "full_name", None) or getattr(staff, "first_name", None)
 
-    # Helper: nice datetime formatting
-    def fmt_datetime(v) -> str:
+    def fmt_dt(v: Any) -> str:
         if not v:
             return "-"
+        if isinstance(v, datetime):
+            return v.strftime("%d-%b-%Y %I:%M %p")
         try:
-            if isinstance(v, datetime):
-                dt = v
-            else:
-                dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
-            return dt.strftime("%d-%b-%Y %I:%M %p")
+            return datetime.fromisoformat(str(v).replace("Z", "+00:00")).strftime("%d-%b-%Y %I:%M %p")
         except Exception:
             return str(v)
 
-    # Build display patient name: "Prefix. First Last (Age / Sex)"
-    prefix = getattr(patient, "title", None) or getattr(
-        patient, "prefix", None)
+    # Patient display fields
+    prefix = getattr(patient, "title", None) or getattr(patient, "prefix", None)
     first = getattr(patient, "first_name", None)
     last = getattr(patient, "last_name", None)
-
-    base_name = report.patient_name or " ".join(
-        [p for p in [first, last] if p]).strip()
+    base_name = (report.patient_name or " ".join([p for p in [first, last] if p]).strip() or "-")
     if prefix:
-        prefix_clean = prefix.strip().rstrip(".")
-        display_name = f"{prefix_clean}. {base_name}" if base_name else f"{prefix_clean}."
+        pfx = prefix.strip().rstrip(".")
+        display_name = f"{pfx}. {base_name}" if base_name else f"{pfx}."
     else:
-        display_name = base_name or "-"
+        display_name = base_name
 
-    age_gender_parts = []
-    if report.patient_age_text:
-        age_gender_parts.append(report.patient_age_text)
-    if report.patient_gender:
-        age_gender_parts.append(report.patient_gender)
-    age_gender_text = " / ".join(
-        age_gender_parts) if age_gender_parts else None
+    age_sex = " / ".join([x for x in [report.patient_age_text, report.patient_gender] if x]) or "-"
 
-    # Lab Order Number (no raw id text)
-    lab_order_no = f"LAB-{report.order_id:06d}"
+    lab_no = f"LAB-{report.order_id:06d}"
+    collected_at = getattr(order, "collected_at", None) or report.received_on
 
-    # Sample collected
-    sample_collected_at = getattr(order, "collected_at",
-                                  None) or report.received_on
-
-    # PDF SETUP
+    # PDF
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
-    width, height = A4
+    page_w, page_h = A4
 
-    # Margins – extra room for footer so nothing overlaps
-    left_margin = 18 * mm
-    right_margin = 18 * mm
-    bottom_margin = 30 * mm  # <- bigger footer space
+    LEFT = 16 * mm
+    RIGHT = 16 * mm
+    TOP = 10 * mm
+    BOTTOM = 14 * mm
 
-    # Column positions
-    col_investigation = left_margin + 2 * mm
-    col_result = left_margin + 70 * mm
-    col_ref = left_margin + 120 * mm
-    col_unit = left_margin + 165 * mm
+    TABLE_W = page_w - LEFT - RIGHT
 
-    # Colors
-    PRIMARY = colors.HexColor("#0060B6")
-    TABLE_HEADER_BG = colors.HexColor("#F3F4F6")
-    ROW_ALT_BG = colors.HexColor("#FAFAFA")
-    TEXT_MUTED = colors.HexColor("#4B5563")
-    HIGH_COLOR = colors.HexColor("#DC2626")
-    LOW_COLOR = colors.HexColor("#2563EB")
-    NORMAL_COLOR = colors.HexColor("#16A34A")
+    # columns (match screenshot proportions)
+    W_TEST = 60 * mm
+    W_RESULT = 22 * mm
+    W_UNIT = 16 * mm
+    W_FLAG = 12 * mm
+    W_REF = TABLE_W - (W_TEST + W_RESULT + W_UNIT + W_FLAG)
 
-    # Letterhead height reservation
-    header_height_mm = getattr(branding, "pdf_header_height_mm", None) or 35
-    header_h = header_height_mm * mm
+    X_TEST = LEFT
+    X_RESULT = X_TEST + W_TEST
+    X_UNIT = X_RESULT + W_RESULT
+    X_FLAG = X_UNIT + W_UNIT
+    X_REF = X_FLAG + W_FLAG
 
-    def has_letterhead_image() -> bool:
-        return bool(branding
-                    and getattr(branding, "letterhead_type", None) == "image"
-                    and getattr(branding, "letterhead_path", None)
-                    and getattr(branding, "letterhead_position",
-                                "background") != "none")
+    PAD = 1.6 * mm
 
-    # Footer ("Generated on" + page X)
-    generated_on = fmt_datetime(report.reported_on or datetime.utcnow())
+    GRID = colors.HexColor("#E2E8F0")
+    TEXT = colors.HexColor("#0F172A")
+    MUTED = colors.HexColor("#475569")
+    BAR = colors.HexColor("#E5E7EB")
 
     def draw_footer(page_no: int):
+        c.setStrokeColor(GRID)
+        c.setLineWidth(0.7)
+        c.line(LEFT, BOTTOM - 5 * mm, page_w - RIGHT, BOTTOM - 5 * mm)
         c.setFont("Helvetica", 7)
-        c.setFillColor(TEXT_MUTED)
-        footer_y = bottom_margin - 8 * mm
-        c.drawString(left_margin, footer_y, f"Generated on: {generated_on}")
-        if getattr(branding, "pdf_show_page_number", False):
-            c.drawRightString(
-                width - right_margin,
-                footer_y,
-                f"Page {page_no}",
-            )
+        c.setFillColor(MUTED)
+        c.drawString(LEFT, BOTTOM - 9 * mm, f"Generated on: {fmt_dt(report.reported_on or datetime.utcnow())}")
+        c.drawRightString(page_w - RIGHT, BOTTOM - 9 * mm, f"Page {page_no}")
 
-    page_num = 1
+    page_no = 1
+    current_y = page_h
 
-    def start_page(page_no: int) -> float:
-        """
-        Draw letterhead + patient card (only on first page).
-        Returns starting y for content.
-        """
-        # Letterhead background (image)
+    def start_page(page_no: int, compact_meta: bool):
+        nonlocal current_y
         _draw_letterhead_background(c, branding, page_no)
 
-        y = height
+        # Header (logo + name/address)
+        y = draw_clean_brand_header(
+            c,
+            branding,
+            page_w=page_w,
+            page_h=page_h,
+            left=LEFT,
+            right=RIGHT,
+            top=TOP,
+            show_rule=True,
+        )
 
-        # Reserve letterhead area
-        y -= header_h
+        # Title centered
+        c.setFont("Helvetica-Bold", 12.5)
+        c.setFillColor(TEXT)
+        c.drawCentredString(page_w / 2, y, "LABORATORY REPORT")
+        y -= 8 * mm
 
-        # PATIENT CARD – only on first page
-        if page_no == 1:
-            y -= 6 * mm
-            box_top = y
-            box_height = 28 * mm
-            box_bottom = box_top - box_height
+        c.setStrokeColor(GRID)
+        c.setLineWidth(0.7)
+        c.line(LEFT, y, page_w - RIGHT, y)
+        y -= 8 * mm
 
-            # Card
-            c.setFillColor(colors.white)
-            c.setStrokeColor(colors.HexColor("#E5E7EB"))
-            c.setLineWidth(0.7)
-            c.roundRect(
-                left_margin,
-                box_bottom,
-                width - left_margin - right_margin,
-                box_height,
-                4 * mm,
-                stroke=1,
-                fill=1,
-            )
+        # Meta block (2-column like screenshot)
+        c.setFont("Helvetica", 9)
+        c.setFillColor(TEXT)
 
-            # Left block – patient details
-            px = left_margin + 5 * mm
-            py = box_top - 5 * mm
+        left_x = LEFT
+        right_x = LEFT + (TABLE_W / 2)
 
-            c.setFillColor(colors.black)
-            c.setFont("Helvetica-Bold", 10)
-            c.drawString(px, py, display_name)
-            py -= 4 * mm
-
-            c.setFont("Helvetica", 8)
-            c.setFillColor(TEXT_MUTED)
-            if age_gender_text:
-                c.drawString(px, py, f"({age_gender_text})")
-                py -= 4 * mm
-
-            if report.patient_uhid:
-                c.drawString(px, py, f"UHID: {report.patient_uhid}")
-                py -= 4 * mm
-
-            # Right block – order/sample details
-            rx = width / 2 + 5 * mm
-            ry = box_top - 5 * mm
-
+        def kv(x: float, y: float, label: str, value: str):
             c.setFont("Helvetica-Bold", 9)
-            c.setFillColor(colors.black)
-            c.drawString(rx, ry, "Sample / Order Details")
-            ry -= 4 * mm
+            c.setFillColor(TEXT)
+            c.drawString(x, y, f"{label} :")
+            c.setFont("Helvetica", 9)
+            c.setFillColor(TEXT)
+            c.drawString(x + 22 * mm, y, value or "-")
 
-            c.setFont("Helvetica", 8)
-            c.setFillColor(TEXT_MUTED)
-            if report.patient_type:
-                c.drawString(rx, ry, f"Type: {report.patient_type}")
-                ry -= 4 * mm
-
-            c.drawString(rx, ry, f"Lab Order No: {lab_order_no}")
-            ry -= 4 * mm
-
-            c.drawString(
-                rx,
-                ry,
-                f"Sample Collected: {fmt_datetime(sample_collected_at)}",
-            )
-            ry -= 4 * mm
-
-            c.drawString(
-                rx,
-                ry,
-                f"Sample Collected By: {collected_by_name or '-'}",
-            )
-            ry -= 4 * mm
-
-            c.drawString(
-                rx,
-                ry,
-                f"Reported On: {fmt_datetime(report.reported_on)}",
-            )
-
-            y = box_bottom - 10 * mm
+        if compact_meta:
+            kv(left_x, y, "Name", display_name)
+            kv(right_x, y, "Lab No", lab_no)
+            y -= 5 * mm
+            kv(left_x, y, "UHID", report.patient_uhid or "-")
+            kv(right_x, y, "Reported", fmt_dt(report.reported_on))
+            y -= 8 * mm
         else:
-            # Small gap below header image for inner pages
+            kv(left_x, y, "Name", display_name)
+            kv(right_x, y, "Lab No", lab_no)
+            y -= 5 * mm
+            kv(left_x, y, "Age / Sex", age_sex)
+            kv(right_x, y, "Patient ID", str(report.patient_id or "-"))
+            y -= 5 * mm
+            kv(left_x, y, "Collected", fmt_dt(collected_at))
+            kv(right_x, y, "Reported", fmt_dt(report.reported_on))
             y -= 8 * mm
 
-        # Report title
-        c.setFont("Helvetica-Bold", 12)
-        c.setFillColor(PRIMARY)
-        c.drawCentredString(width / 2, y, "LABORATORY REPORT")
+        c.setStrokeColor(GRID)
+        c.setLineWidth(0.7)
+        c.line(LEFT, y, page_w - RIGHT, y)
         y -= 10 * mm
 
-        return y
+        current_y = y
 
-    # Start first page
-    current_y = start_page(page_num)
-
-    def ensure_space(min_space_mm: float):
-        """
-        If not enough space for the next block, draw footer and start a new page.
-        """
-        nonlocal current_y, page_num
-        if current_y < bottom_margin + (min_space_mm * mm):
-            draw_footer(page_num)
+    def ensure_space(need_h: float, section: Optional[str] = None):
+        nonlocal page_no, current_y
+        if current_y - need_h < (BOTTOM + 6 * mm):
+            draw_footer(page_no)
             c.showPage()
-            page_num += 1
-            current_y = start_page(page_num)
+            page_no += 1
+            start_page(page_no, compact_meta=True)
+            if section:
+                draw_section_header(section)
 
-    # ---------- TABLE SECTIONS ----------
-    for section in report.sections:
-        ensure_space(35.0)
+    def draw_section_header(section_title: str):
+        nonlocal current_y
+        ensure_space(18 * mm)
 
-        dept_label = section.department_name or "Department"
-        sub_label = (f" / {section.sub_department_name}"
-                     if section.sub_department_name else "")
-
-        # Section title bar
-        c.setFillColor(colors.HexColor("#E5F2FF"))
-        c.rect(
-            left_margin,
-            current_y - 7 * mm,
-            width - left_margin - right_margin,
-            7 * mm,
-            stroke=0,
-            fill=1,
-        )
+        # section bar
+        c.setFillColor(BAR)
+        c.rect(LEFT, current_y - 6 * mm, TABLE_W, 6 * mm, stroke=0, fill=1)
         c.setFont("Helvetica-Bold", 9)
-        c.setFillColor(PRIMARY)
-        c.drawString(
-            left_margin + 2 * mm,
-            current_y - 5 * mm,
-            f"{dept_label}{sub_label}",
-        )
+        c.setFillColor(TEXT)
+        c.drawString(LEFT + 3 * mm, current_y - 4.2 * mm, section_title.upper())
         current_y -= 9 * mm
 
-        # Table header
-        c.setFillColor(TABLE_HEADER_BG)
-        c.rect(
-            left_margin,
-            current_y - 6 * mm,
-            width - left_margin - right_margin,
-            6 * mm,
-            stroke=0,
-            fill=1,
-        )
-        c.setFont("Helvetica-Bold", 8)
-        c.setFillColor(colors.black)
-        c.drawString(col_investigation, current_y - 4 * mm, "Investigation")
-        c.drawString(col_result, current_y - 4 * mm, "Result")
-        c.drawString(col_ref, current_y - 4 * mm, "Reference Value")
-        c.drawString(col_unit, current_y - 4 * mm, "Unit")
-        current_y -= 8 * mm
+        # table header
+        c.setFont("Helvetica-Bold", 8.5)
+        c.setFillColor(TEXT)
+        c.drawString(X_TEST + PAD, current_y, "Test Name")
+        c.drawString(X_RESULT + PAD, current_y, "Result")
+        c.drawString(X_UNIT + PAD, current_y, "Unit")
+        c.drawString(X_FLAG + PAD, current_y, "Flag")
+        c.drawString(X_REF + PAD, current_y, "Reference Range")
+        current_y -= 3.5 * mm
 
-        # Rows
-        row_idx = 0
-        c.setFont("Helvetica", 8)
-        for row in section.rows:
-            ensure_space(20.0)
-            row_height = 6 * mm
-            row_bottom = current_y - row_height
+        c.setStrokeColor(GRID)
+        c.setLineWidth(0.7)
+        c.line(LEFT, current_y, page_w - RIGHT, current_y)
+        current_y -= 5 * mm
 
-            # Alternate row background
-            if row_idx % 2 == 1:
-                c.setFillColor(ROW_ALT_BG)
-                c.rect(
-                    left_margin,
-                    row_bottom,
-                    width - left_margin - right_margin,
-                    row_height,
-                    stroke=0,
-                    fill=1,
-                )
+    # start first page
+    start_page(page_no, compact_meta=False)
 
-            # Investigation
-            c.setFillColor(colors.black)
-            c.drawString(col_investigation, current_y - 4 * mm,
-                         row.service_name or "-")
+    # content
+    for sec in report.sections:
+        title = sec.department_name or "Department"
+        if sec.sub_department_name:
+            title = f"{title} / {sec.sub_department_name}"
 
-            # Result + colored flag
-            result_val = row.result_value if row.result_value not in (
-                None, "") else "-"
-            flag_text = ""
-            flag_color = None
-            if row.flag:
-                f = str(row.flag).upper()
-                if f.startswith("H"):
-                    flag_text = "High"
-                    flag_color = HIGH_COLOR
-                elif f.startswith("L"):
-                    flag_text = "Low"
-                    flag_color = LOW_COLOR
-                elif f.startswith("N"):
-                    flag_text = "Normal"
-                    flag_color = NORMAL_COLOR
+        draw_section_header(title)
 
-            if flag_color:
-                c.setFillColor(flag_color)
-            else:
-                c.setFillColor(colors.black)
-            c.drawString(col_result, current_y - 4 * mm, str(result_val))
+        for row in sec.rows:
+            test = (row.service_name or "-").strip()
+            result = (row.result_value or "-").strip()
+            unit = (row.unit or "-").strip()
+            flag = (row.flag or "").strip()
+            ref = (row.normal_range or "-").strip()
 
-            if flag_text:
-                c.setFont("Helvetica-Bold", 8)
-                c.drawString(col_result + 28 * mm, current_y - 4 * mm,
-                             flag_text)
-                c.setFont("Helvetica", 8)
+            test_lines = _split_text_to_lines(test, "Helvetica", 8.5, W_TEST - 2 * PAD)
+            ref_lines = _split_text_to_lines(ref, "Helvetica", 8.2, W_REF - 2 * PAD)
 
-            # Ref range + unit
-            c.setFillColor(TEXT_MUTED)
-            c.drawString(col_ref, current_y - 4 * mm, row.normal_range or "-")
-            c.drawString(col_unit, current_y - 4 * mm, row.unit or "-")
+            lines_n = max(len(test_lines), len(ref_lines), 1)
+            row_h = (lines_n * 4.0 + 2.5) * mm
 
-            current_y -= row_height
-            row_idx += 1
+            ensure_space(row_h, section=title)
 
-        current_y -= 5 * mm  # gap after section
+            top_y = current_y
 
-    # ---------- NOTES + SIGNATURES ON LAST PAGE ----------
-    ensure_space(45.0)
+            # draw row text
+            c.setFillColor(TEXT)
+            c.setFont("Helvetica", 8.5)
+            y_line = top_y
 
-    # Notes
-    c.setFont("Helvetica-Bold", 8)
-    c.setFillColor(colors.black)
-    c.drawString(left_margin, current_y, "Note:")
-    current_y -= 4 * mm
+            # test
+            for i, ln in enumerate(test_lines):
+                c.drawString(X_TEST + PAD, y_line - (i * 4.0 * mm), ln)
 
-    c.setFont("Helvetica", 7)
-    c.setFillColor(TEXT_MUTED)
-    notes = [
-        "1. Laboratory values should be correlated with clinical findings.",
-        "2. Marginally abnormal values may not be clinically significant in all patients.",
-    ]
-    for line in notes:
-        c.drawString(left_margin + 4 * mm, current_y, line)
-        current_y -= 4 * mm
+            # result
+            c.drawString(X_RESULT + PAD, y_line, result)
 
-    current_y -= 10 * mm
+            # unit
+            c.setFillColor(MUTED)
+            c.drawString(X_UNIT + PAD, y_line, unit)
 
-    # Signatures above footer area
-    sig_y = bottom_margin + 22 * mm
+            # flag
+            c.setFillColor(TEXT)
+            c.drawString(X_FLAG + PAD, y_line, flag)
 
-    c.setFont("Helvetica", 8)
-    c.setFillColor(TEXT_MUTED)
+            # reference (multiline)
+            c.setFillColor(MUTED)
+            c.setFont("Helvetica", 8.2)
+            for i, ln in enumerate(ref_lines):
+                c.drawString(X_REF + PAD, y_line - (i * 4.0 * mm), ln)
 
-    # Technician
-    c.line(left_margin, sig_y, left_margin + 50 * mm, sig_y)
-    c.drawCentredString(
-        left_margin + 25 * mm,
-        sig_y - 4 * mm,
-        "Lab Technician",
-    )
+            # bottom row rule
+            c.setStrokeColor(GRID)
+            c.setLineWidth(0.5)
+            c.line(LEFT, top_y - row_h + 2 * mm, page_w - RIGHT, top_y - row_h + 2 * mm)
 
-    # Pathologist / Authorized Signatory
-    rx = width - right_margin - 50 * mm
-    c.line(rx, sig_y, rx + 50 * mm, sig_y)
-    c.drawCentredString(
-        rx + 25 * mm,
-        sig_y - 4 * mm,
-        "Pathologist / Authorized Signatory",
-    )
+            current_y = top_y - row_h
 
-    # Final footer for last page
-    draw_footer(page_num)
+        current_y -= 6 * mm  # gap after section
 
+    # signatures
+    ensure_space(30 * mm)
+    c.setStrokeColor(GRID)
+    c.setLineWidth(0.7)
+
+    sig_y = current_y - 6 * mm
+    c.line(LEFT, sig_y, LEFT + 60 * mm, sig_y)
+    c.line(page_w - RIGHT - 60 * mm, sig_y, page_w - RIGHT, sig_y)
+
+    c.setFont("Helvetica", 8.5)
+    c.setFillColor(MUTED)
+    c.drawString(LEFT, sig_y - 5 * mm, "Lab Technician")
+    c.drawRightString(page_w - RIGHT, sig_y - 5 * mm, "Authorized Signatory")
+
+    # footer + finish
+    draw_footer(page_no)
     c.save()
     buf.seek(0)
 
-    headers = {
-        "Content-Disposition":
-        f'inline; filename=\"lab-report-{order_id}.pdf\"',
-    }
-    return StreamingResponse(buf,
-                             media_type="application/pdf",
-                             headers=headers)
+    return StreamingResponse(
+        buf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="lab-report-{order_id}.pdf"'},
+    )
 
 
-# ------------------- Queue -------------------
-@router.get("/queue")
-def queue(
-        status: str = Query(
-            "in_progress",
-            pattern="^(ordered|collected|in_progress|validated)$",
-        ),
-        patient_id: Optional[int] = None,
-        db: Session = Depends(get_db),
-        user: User = Depends(current_user),
-):
-    _need_any(user, ["lab.orders.view", "orders.lab.view"])
-    q = db.query(LisOrderItem)
-    if patient_id:
-        q = q.join(LisOrder, LisOrderItem.order_id == LisOrder.id).filter(
-            LisOrder.patient_id == patient_id)
-    q = q.filter(LisOrderItem.status == status).order_by(
-        LisOrderItem.updated_at.desc())
-    rows = q.limit(200).all()
-    return [{
-        "item_id": i.id,
-        "order_id": i.order_id,
-        "test_name": i.test_name,
-        "status": i.status,
-        "barcode": i.sample_barcode,
-        "result_value": i.result_value,
-        "updated_at": i.updated_at,
-    } for i in rows]
-
-
-# ---------------- SAMPLE COLLECTION ----------------
-@router.post("/orders/{order_id}/collect")
-def collect_sample(
-        order_id: int,
-        payload: dict,
-        db: Session = Depends(get_db),
-):
-    barcode = payload.get("barcode")
-    if not barcode:
-        raise HTTPException(400, "Barcode required")
-
-    o = db.query(LisOrder).get(order_id)
-    if not o:
-        raise HTTPException(404, "Order not found")
-
-    o.collected_at = datetime.now()
-    o.status = "collected"
-    db.commit()
-    return {"message": "Sample collected"}
-
-
-# ---------------- ENTER RESULTS ----------------
-@router.post("/orders/{order_id}/results")
-def save_results(
-        order_id: int,
-        results: list[dict],
-        db: Session = Depends(get_db),
-):
-    for r in results:
-        it = db.query(LisOrderItem).get(r["item_id"])
-        if not it:
-            continue
-        it.result_value = r["result_value"]
-        it.is_critical = r.get("is_critical", False)
-        it.status = "in_progress"
-
-    db.commit()
-    return {"message": "Saved"}
-
-
-# ---------------- VALIDATE ITEM ----------------
-@router.post("/items/{item_id}/validate")
-def validate_item(
-        item_id: int,
-        db: Session = Depends(get_db),
-):
-    item = db.query(LisOrderItem).get(item_id)
-    if not item:
-        raise HTTPException(404, "Item not found")
-
-    item.status = "validated"
-    db.commit()
-    return {"message": "Validated"}
-
-
-# ---------------- FINALIZE ORDER ----------------
-
-
+# ---------------- Finalize ----------------
 @router.post("/orders/{order_id}/finalize")
-async def finalize(order_id: int,
-                   db: Session = Depends(get_db),
-                   user: User = Depends(current_user)):
-    # optional permission gate
-    _need_any(user,
-              ["lab.results.report", "lab.orders.update", "orders.lab.update"])
+async def finalize(
+    order_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    _need_any(user, ["lab.results.report", "lab.orders.update", "orders.lab.update"])
 
     o = db.query(LisOrder).get(order_id)
     if not o:
         raise HTTPException(404, "Order not found")
 
-    # ✅ LIS finalize
     now = datetime.utcnow()
     o.status = "reported"
     o.reported_at = now
     o.updated_by = user.id
     o.updated_at = now
 
-    # ✅ Auto-create billing invoice once (idempotent)
     if (getattr(o, "billing_status", None) or "not_billed") != "billed":
         inv = bill_lis_order(db, order=o, created_by=user.id)
         o.billing_invoice_id = inv.id
         o.billing_status = "billed"
 
     db.commit()
-
-    await _notify("finalized",
-                  order_id=o.id,
-                  billing_invoice_id=o.billing_invoice_id)
-    return {
-        "message": "Finalized",
-        "billing_invoice_id": o.billing_invoice_id,
-        "billing_status": o.billing_status,
-    }
+    await _notify("finalized", order_id=o.id, billing_invoice_id=o.billing_invoice_id)
+    return {"message": "Finalized", "billing_invoice_id": o.billing_invoice_id, "billing_status": o.billing_status}
 
 
-# ------------------- Attachments -------------------
+# ---------------- Attachments ----------------
 @router.post("/attachments")
 def add_attachment(
-        payload: LisAttachmentIn,
-        db: Session = Depends(get_db),
-        user: User = Depends(current_user),
+    payload: LisAttachmentIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
 ):
     _need_any(user, ["lab.attachments.add"])
     it = db.query(LisOrderItem).get(payload.item_id)

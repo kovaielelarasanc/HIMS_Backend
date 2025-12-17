@@ -1,5 +1,10 @@
 # FILE: app/crud/crud_lab_masters.py
+from __future__ import annotations
+
 from typing import List, Optional
+import re
+import html as _html
+
 from sqlalchemy.orm import Session
 
 from app.models.lis import LabDepartment, LabService
@@ -11,15 +16,60 @@ from app.schemas.lab_masters import (
     LabServiceBulkCreateItem,
 )
 
-# ---------------- Departments ----------------
+# Only strip real HTML tags like <b> </p> etc.
+# This will NOT remove values like "< 5.00" or "<= 10"
+_HTML_TAG_RE = re.compile(r"</?[a-zA-Z][^>]*>")
 
+MAX_NORMAL_RANGE_LEN = 60000
+MAX_UNIT_LEN = 64
+
+
+def _strip_html_tags_if_present(s: str) -> str:
+    if not s:
+        return s
+    if _HTML_TAG_RE.search(s):
+        s = _HTML_TAG_RE.sub("", s)
+        s = _html.unescape(s)
+    return s
+
+
+def _clean_multiline_text(s: str) -> str:
+    # normalize newlines + trim outside
+    s = (s or "").replace("\r\n", "\n").replace("\r", "\n")
+    s = _strip_html_tags_if_present(s).strip()
+    # keep user line breaks, just remove trailing spaces
+    lines = [ln.rstrip() for ln in s.split("\n")]
+    # trim empty start/end lines
+    while lines and lines[0].strip() == "":
+        lines.pop(0)
+    while lines and lines[-1].strip() == "":
+        lines.pop()
+    return "\n".join(lines).strip()
+
+
+def _normalize(unit: Optional[str], normal: Optional[str]):
+    unit = (unit or "").strip()
+    normal = _clean_multiline_text(normal or "")
+
+    if not unit:
+        unit = "-"
+    if not normal:
+        normal = "-"
+
+    # protect DB (VARCHAR sizes)
+    unit = unit[:MAX_UNIT_LEN]
+    normal = normal[:MAX_NORMAL_RANGE_LEN]
+
+    return unit, normal
+
+
+# ---------------- Departments ----------------
 
 def list_lab_departments(db: Session, *, active_only: bool = True):
     q = db.query(LabDepartment)
     if active_only:
         q = q.filter(LabDepartment.is_active.is_(True))
 
-    # MySQL-safe ordering
     return q.order_by(
         LabDepartment.display_order.asc(),
         LabDepartment.name.asc(),
@@ -34,8 +84,7 @@ def create_lab_department(db: Session, data: LabDepartmentCreate):
     return obj
 
 
-def update_lab_department(db: Session, dept_id: int,
-                          data: LabDepartmentUpdate):
+def update_lab_department(db: Session, dept_id: int, data: LabDepartmentUpdate):
     obj = db.query(LabDepartment).filter(LabDepartment.id == dept_id).first()
     if not obj:
         return None
@@ -57,13 +106,6 @@ def soft_delete_lab_department(db: Session, dept_id: int):
 
 # ---------------- Services ----------------
 
-
-def _normalize(unit: Optional[str], normal: Optional[str]):
-    unit = (unit or "").strip()
-    normal = (normal or "").strip()
-    return (unit or "-"), (normal or "-")
-
-
 def list_lab_services(
     db: Session,
     *,
@@ -76,6 +118,7 @@ def list_lab_services(
     if department_id:
         q = q.filter(LabService.department_id == department_id)
     if search:
+        # MySQL: ilike works via lower() emulation in SQLAlchemy
         q = q.filter(LabService.name.ilike(f"%{search}%"))
     if active_only:
         q = q.filter(LabService.is_active.is_(True))
@@ -99,11 +142,10 @@ def create_lab_service(db: Session, data: LabServiceCreate):
     return obj
 
 
-def bulk_create_lab_services(db: Session,
-                             items: List[LabServiceBulkCreateItem]):
+def bulk_create_lab_services(db: Session, items: List[LabServiceBulkCreateItem]):
     created = []
     for item in items:
-        if not item.name.strip():
+        if not (item.name or "").strip():
             continue
 
         unit, normal = _normalize(item.unit, item.normal_range)
@@ -129,10 +171,15 @@ def update_lab_service(db: Session, service_id: int, data: LabServiceUpdate):
 
     payload = data.model_dump(exclude_unset=True)
 
+    # normalize if unit/normal_range included
     if "unit" in payload or "normal_range" in payload:
         unit = payload.get("unit", obj.unit)
         normal = payload.get("normal_range", obj.normal_range)
         payload["unit"], payload["normal_range"] = _normalize(unit, normal)
+
+    # name trim
+    if "name" in payload and payload["name"] is not None:
+        payload["name"] = payload["name"].strip()
 
     for key, value in payload.items():
         setattr(obj, key, value)
