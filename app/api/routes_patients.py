@@ -50,6 +50,8 @@ from app.schemas.patient import (
     ConsentOut,
 )
 from app.services.audit_logger import log_audit  # adjust path if your pkg is `services`
+import re
+from app.models.ui_branding import UiBranding
 
 router = APIRouter()
 
@@ -59,8 +61,61 @@ UPLOAD_DIR = Path(settings.STORAGE_DIR).joinpath("patient_docs")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def make_uhid(id_num: int) -> str:
-    return f"NH-{id_num:06d}"
+def _acronym_from_org_name(org_name: str, max_len: int = 3) -> str:
+    """
+    "Sushrutha Medical Center" -> "SMC"
+    "Karpagam" -> "KAR" (first 3 letters)
+    """
+    name = (org_name or "").strip()
+    if not name:
+        return "NH"
+
+    words = re.findall(r"[A-Za-z0-9]+", name.upper())
+    if not words:
+        return "NH"
+
+    if len(words) >= 2:
+        code = "".join(w[0] for w in words[:max_len])
+    else:
+        code = words[0][:max_len]
+
+    return code or "NH"
+
+
+def _org_code_from_branding(db: Session, max_len: int = 3) -> str:
+    """
+    Try to read a direct code if your branding model has it,
+    else derive from org_name.
+    """
+    b = (db.query(UiBranding).order_by(UiBranding.id.desc()).first())
+    if not b:
+        return "NH"
+
+    # if you later add fields like org_code / short_code, this will auto-use them
+    direct = (getattr(b, "org_code", None)
+              or getattr(b, "org_short_code", None)
+              or getattr(b, "short_code", None))
+    if isinstance(direct, str) and direct.strip():
+        cleaned = re.sub(r"[^A-Za-z0-9]", "", direct.strip().upper())
+        return cleaned[:max_len] or "NH"
+
+    return _acronym_from_org_name(getattr(b, "org_name", "") or "",
+                                  max_len=max_len)
+
+
+def make_uhid(db: Session,
+              id_num: int,
+              *,
+              on_date: Optional[date] = None,
+              id_width: int = 2) -> str:
+    """
+    Example: org_name="Sushrutha Medical Center", date=16-12-2025, id=1
+      -> "SMC1612202501"
+    """
+    code = _org_code_from_branding(db, max_len=3)
+    d = on_date or date.today()
+    dt = d.strftime("%d%m%Y")
+    return f"{code}{dt}{id_num:0{id_width}d}"
 
 
 def has_perm(user: User, code: str) -> bool:
@@ -341,7 +396,7 @@ def create_patient(
     )
     db.add(p)
     db.flush()  # get id
-    p.uhid = make_uhid(p.id)
+    p.uhid = make_uhid(db, p.id, on_date=date.today(), id_width=4)
 
     # create initial address if sent
     if payload.address:

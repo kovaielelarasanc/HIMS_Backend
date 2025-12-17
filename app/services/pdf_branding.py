@@ -18,10 +18,10 @@ def _h(x: Any) -> str:
 
 def _logo_data_uri(branding: UiBranding,
                    *,
-                   max_px: int = 100) -> Optional[str]:
+                   max_px: int = 320) -> Optional[str]:
     """
     Read branding.logo_path and return data-uri.
-    ✅ Tries to downscale to max_px x max_px (no upscaling) if Pillow is available.
+    ✅ Downscale to max_px x max_px (no upscaling) if Pillow is available.
     """
     rel = (branding.logo_path or "").strip()
     if not rel:
@@ -35,28 +35,26 @@ def _logo_data_uri(branding: UiBranding,
     if not mime:
         mime = "image/png"
 
-    raw = None
     try:
         raw = abs_path.read_bytes()
     except Exception:
         return None
 
-    # Optional: downscale to reduce PDF weight (and guarantee max size)
+    # Optional: downscale to reduce PDF weight (and improve consistent quality)
     try:
         from PIL import Image  # type: ignore
 
         im = Image.open(BytesIO(raw))
         im.load()
-        # Don't upscale:
+
+        # Don't upscale (thumbnail only shrinks)
         im.thumbnail((max_px, max_px))
 
         out = BytesIO()
-        # Save as PNG for predictable rendering
         im.save(out, format="PNG", optimize=True)
         raw = out.getvalue()
         mime = "image/png"
     except Exception:
-        # Pillow missing or failed -> use original bytes (CSS will still constrain)
         pass
 
     enc = base64.b64encode(raw).decode("ascii")
@@ -65,53 +63,56 @@ def _logo_data_uri(branding: UiBranding,
 
 def brand_header_css() -> str:
     """
-    ✅ Two-column header.
-    - Left: Logo (max 100x100, never upscales)
-    - Right: Right-anchored info box (so it ends nicely at the right margin)
+    ✅ Bigger, header-fitted logo.
+    - Logo renders at fixed height (looks “medium” and consistent)
+    - Still safe for PDF layout (table cells)
     """
     return """
-    .brand-header {
-      width: 100%;
-      padding-bottom: 10px;
-      margin-bottom: 14px;
+    .brand-header{
+      --logo-col: 270px;   /* left column width */
+      --logo-w: 240px;     /* max logo width */
+      --logo-h: 72px;      /* logo display height (increase this if you want bigger) */
+
+      width:100%;
+      padding-bottom: 6px;
+      margin-bottom: 10px;
       border-bottom: 1px solid #e5e7eb;
     }
 
-    /* Stable PDF layout */
-    .brand-row {
+    .brand-row{
       display: table;
       width: 100%;
       table-layout: fixed;
     }
-    .brand-left {
+    .brand-left{
       display: table-cell;
-      width: 112px;        /* 100px logo + breathing room */
-      vertical-align: top;
+      width: var(--logo-col);
+      vertical-align: middle;
     }
-    .brand-right {
+    .brand-right{
       display: table-cell;
       vertical-align: top;
-      text-align: right;   /* ✅ anchor the box to the right edge */
+      text-align: right;
       padding-left: 12px;
     }
 
-    .brand-logo-wrap {
-      width: 100px;
-      height: 100px;
+    .brand-logo-wrap{
+      width: var(--logo-w);
+      height: calc(var(--logo-h) + 8px);
       display: flex;
-      align-items: flex-start;
+      align-items: center;        /* ✅ center vertically */
       justify-content: flex-start;
       overflow: hidden;
     }
-    .brand-logo {
-      max-width: 100px;
-      max-height: 100px;
-      width: auto;     /* ✅ no upscaling */
-      height: auto;    /* ✅ no upscaling */
+    .brand-logo{
+      height: var(--logo-h);      /* ✅ this makes it visibly bigger */
+      width: auto;
+      max-width: var(--logo-w);
       object-fit: contain;
       display: block;
     }
-    .brand-logo-placeholder {
+
+    .brand-logo-placeholder{
       font-size: 10px;
       color: #94a3b8;
       letter-spacing: 0.6px;
@@ -121,14 +122,13 @@ def brand_header_css() -> str:
       display: inline-block;
     }
 
-    /* This box sits at the right edge but keeps text readable */
-    .brand-box {
-      display: inline-block;     /* ✅ lets text-align:right anchor it */
-      text-align: left;          /* ✅ text inside stays left-aligned */
-      max-width: 420px;          /* prevent super-wide address lines */
+    .brand-box{
+      display: inline-block;
+      text-align: left;
+      max-width: 420px;
     }
 
-    .brand-name {
+    .brand-name{
       font-size: 16px;
       font-weight: 800;
       letter-spacing: -0.2px;
@@ -136,21 +136,21 @@ def brand_header_css() -> str:
       color: #0f172a;
       line-height: 1.1;
     }
-    .brand-tagline {
+    .brand-tagline{
       margin-top: 3px;
       font-size: 11px;
       color: #64748b;
       line-height: 1.25;
     }
 
-    .brand-meta {
+    .brand-meta{
       margin-top: 8px;
       font-size: 10.5px;
       color: #0f172a;
       line-height: 1.35;
     }
-    .brand-muted { color: #64748b; }
-    .brand-meta-line { margin-top: 2px; }
+    .brand-muted{ color: #64748b; }
+    .brand-meta-line{ margin-top: 2px; }
     """
 
 
@@ -159,7 +159,8 @@ def render_brand_header_html(branding: UiBranding) -> str:
     Left: logo_path
     Right: org_name, tagline, address, phone, email, website, GSTIN (only if present)
     """
-    logo_src = _logo_data_uri(branding, max_px=100)
+    # ✅ embed a higher-res logo so it looks crisp at bigger header size
+    logo_src = _logo_data_uri(branding, max_px=320)
 
     org_name = _h(branding.org_name or "")
     org_tagline = _h(branding.org_tagline or "")
@@ -184,14 +185,15 @@ def render_brand_header_html(branding: UiBranding) -> str:
     if email:
         contact_bits.append(
             f"<span><span class='brand-muted'>Email:</span> {email}</span>")
-    if website:
-        contact_bits.append(
-            f"<span><span class='brand-muted'>Website:</span> {website}</span>"
-        )
+   
 
     if contact_bits:
         meta_lines.append("<div class='brand-meta-line'>" +
-                          " &nbsp; • &nbsp; ".join(contact_bits) + "</div>")
+                          " &nbsp; | &nbsp; ".join(contact_bits) + "</div>")
+    if website:
+        meta_lines.append(
+             f"<div class='brand-meta-line'><span class='brand-muted'>Website:</span> {website}</div>"
+        )
 
     if gstin:
         meta_lines.append(

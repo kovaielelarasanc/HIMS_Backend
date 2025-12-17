@@ -121,6 +121,7 @@ from app.services.ipd_billing import apply_ipd_bed_charges_to_invoice
 from app.services.ipd_billing import ensure_invoice_for_context  # we will create this
 from app.services.ipd_billing import compute_ipd_bed_charges_daily
 from app.models.ipd import IpdBed, IpdBedAssignment, IpdAdmission
+from app.services.id_gen import make_ip_admission_code
 
 router = APIRouter()
 
@@ -209,8 +210,15 @@ def _need_any(user: User, codes: list[str]) -> None:
 
 
 # ---------------- Utils ----------------
-def _adm_display_code(adm_id: int) -> str:
-    return f"IP-{adm_id:06d}"
+def _adm_display_code(db: Session, adm: IpdAdmission) -> str:
+    admitted = adm.admitted_at or datetime.utcnow()
+
+    return make_ip_admission_code(
+        db,
+        adm.id,
+        on_date=admitted,  # ✅ pass datetime, NOT .date()
+        id_width=6,
+    )
 
 
 def _admission_detail(db: Session, adm: IpdAdmission) -> AdmissionDetailOut:
@@ -227,7 +235,7 @@ def _admission_detail(db: Session, adm: IpdAdmission) -> AdmissionDetailOut:
         .strip() if patient else "")
     return AdmissionDetailOut(
         id=adm.id,
-        display_code=_adm_display_code(adm.id),
+        display_code=_adm_display_code(db, adm),
         patient_id=adm.patient_id,
         patient_uhid=patient.uhid if patient else "",
         patient_name=patient_name or "-",
@@ -282,6 +290,18 @@ def create_admission(
     )
     db.add(adm)
     db.flush()
+    ip_code = make_ip_admission_code(
+        db,
+        adm.id,
+        on_date=(adm.admitted_at or datetime.utcnow()),  # ✅ datetime
+        id_width=6,
+    )
+
+    # Save it ONLY if your model has a field for it (safe)
+    for attr in ("admission_code", "admission_no", "ipd_no", "ip_uhid"):
+        if hasattr(adm, attr) and not getattr(adm, attr, None):
+            setattr(adm, attr, ip_code)
+            break
     ensure_invoice_for_context(
         db=db,
         patient_id=adm.patient_id,
@@ -302,8 +322,8 @@ def create_admission(
         ))
     db.commit()
     db.refresh(adm)
-    return adm
-
+    dto = AdmissionOut.model_validate(adm, from_attributes=True)
+    return dto.model_copy(update={"display_code": _adm_display_code(db, adm)})
 
 @router.get("/admissions", response_model=List[AdmissionOut])
 def list_admissions(
@@ -317,6 +337,7 @@ def list_admissions(
 ):
     if not has_perm(user, "ipd.view"):
         raise HTTPException(403, "Not permitted")
+
     q = db.query(IpdAdmission)
     if status:
         q = q.filter(IpdAdmission.status == status)
@@ -326,7 +347,17 @@ def list_admissions(
         q = q.filter(IpdAdmission.practitioner_user_id == practitioner_user_id)
     if department_id:
         q = q.filter(IpdAdmission.department_id == department_id)
-    return q.order_by(IpdAdmission.id.desc()).limit(min(limit, 500)).all()
+
+    rows = q.order_by(IpdAdmission.id.desc()).limit(min(limit, 500)).all()
+
+    out: List[AdmissionOut] = []
+    for adm in rows:
+        dto = AdmissionOut.model_validate(adm, from_attributes=True)
+        dto = dto.model_copy(
+            update={"display_code": _adm_display_code(db, adm)})
+        out.append(dto)
+
+    return out
 
 
 @router.get("/admissions/{admission_id}", response_model=AdmissionOut)
@@ -337,10 +368,13 @@ def get_admission(
 ):
     if not has_perm(user, "ipd.view"):
         raise HTTPException(403, "Not permitted")
+
     adm = db.query(IpdAdmission).get(admission_id)
     if not adm:
         raise HTTPException(404, "Admission not found")
-    return adm
+
+    dto = AdmissionOut.model_validate(adm, from_attributes=True)
+    return dto.model_copy(update={"display_code": _adm_display_code(db, adm)})
 
 
 @router.put("/admissions/{admission_id}", response_model=AdmissionOut)
@@ -369,7 +403,7 @@ def update_admission(
 def discharge_admission(
         admission_id: int,
         discharge_at: Optional[datetime] = None,
-        finalize_invoice: bool = False, 
+        finalize_invoice: bool = False,
         db: Session = Depends(get_db),
         user: User = Depends(auth_current_user),
 ):
@@ -425,7 +459,8 @@ def discharge_admission(
         user_id=user.id,
         tax_rate=0.0,
         invoice_id=inv.id,
-        skip_if_already_billed=False,  # keep false so updates happen if rates/room change
+        skip_if_already_billed=
+        False,  # keep false so updates happen if rates/room change
     )
 
     # 4) Recalc totals (and persist)

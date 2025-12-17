@@ -57,6 +57,8 @@ from app.services.billing_auto import (
 from zoneinfo import ZoneInfo
 import os
 from pydantic import BaseModel, Field
+import re
+from app.models.ui_branding import UiBranding
 
 router = APIRouter()
 
@@ -146,6 +148,47 @@ def vitals_done_on(db: Session, patient_id: int, d: dt_date) -> bool:
         func.date(Vitals.created_at) == d,
     ).first())
     return bool(row)
+
+
+def _acronym_from_org_name(org_name: str, max_len: int = 3) -> str:
+    name = (org_name or "").strip()
+    if not name:
+        return "NH"
+    words = re.findall(r"[A-Za-z0-9]+", name.upper())
+    if not words:
+        return "NH"
+    if len(words) >= 2:
+        code = "".join(w[0] for w in words[:max_len])
+    else:
+        code = words[0][:max_len]
+    return code or "NH"
+
+
+def _org_code_from_branding(db: Session, max_len: int = 3) -> str:
+    b = db.query(UiBranding).order_by(UiBranding.id.desc()).first()
+    if not b:
+        return "NH"
+
+    direct = (getattr(b, "org_code", None)
+              or getattr(b, "org_short_code", None)
+              or getattr(b, "short_code", None))
+    if isinstance(direct, str) and direct.strip():
+        cleaned = re.sub(r"[^A-Za-z0-9]", "", direct.strip().upper())
+        return cleaned[:max_len] or "NH"
+
+    return _acronym_from_org_name(getattr(b, "org_name", "") or "",
+                                  max_len=max_len)
+
+
+def make_op_episode_id(db: Session,
+                       visit_id: int,
+                       *,
+                       on_date: Optional[date] = None,
+                       id_width: int = 4) -> str:
+    code = _org_code_from_branding(db, max_len=3)
+    d = on_date or date.today()
+    dt = d.strftime("%d%m%Y")
+    return f"{code}OP{dt}{visit_id:0{id_width}d}"
 
 
 def episode_id_for_month(db: Session) -> str:
@@ -609,11 +652,12 @@ def update_appointment_status(
                 patient_id=ap.patient_id,
                 department_id=ap.department_id,
                 doctor_user_id=ap.doctor_user_id,
-                episode_id=epi,
+                episode_id="TEMP",
                 visit_at=now_local().replace(tzinfo=None),
             )
             db.add(visit)
             db.flush()
+            visit.episode_id = make_op_episode_id(db, visit.id, on_date=visit.visit_at.date(), id_width=4)
 
     ap.status = new_status
 
@@ -626,11 +670,12 @@ def update_appointment_status(
                 patient_id=ap.patient_id,
                 department_id=ap.department_id,
                 doctor_user_id=ap.doctor_user_id,
-                episode_id=epi,
+                episode_id="TEMP",
                 visit_at=now_local().replace(tzinfo=None),
             )
             db.add(visit)
             db.flush()
+            visit.episode_id = make_op_episode_id(db, visit.id, on_date=visit.visit_at.date(), id_width=4)
         elif visit.visit_at is None:
             visit.visit_at = now_local().replace(tzinfo=None)
 
@@ -832,7 +877,6 @@ def create_visit(
     if not ap:
         raise HTTPException(status_code=404, detail="Appointment not found")
 
-    epi = episode_id_for_month(db)
     visit_at_local = now_local().replace(tzinfo=None)
 
     v = Visit(
@@ -840,11 +884,14 @@ def create_visit(
         patient_id=ap.patient_id,
         department_id=ap.department_id,
         doctor_user_id=ap.doctor_user_id,
-        episode_id=epi,
+        episode_id="TEMP",
         visit_at=visit_at_local,
     )
     ap.status = "checked_in"
     db.add(v)
+    db.flush()  # ✅ get v.id
+    v.episode_id = make_op_episode_id(db, v.id, on_date=visit_at_local.date(), id_width=4)
+    
     db.commit()
     return {"id": v.id}
 

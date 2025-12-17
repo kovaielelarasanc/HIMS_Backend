@@ -136,15 +136,28 @@ class AdmissionUpdateIn(BaseModel):
 
 class AdmissionOut(BaseModel):
     id: int
-    patient_id: int
-    admission_type: str
-    admitted_at: datetime
-    expected_discharge_at: Optional[datetime]
-    current_bed_id: Optional[int]
-    status: str
+    display_code: Optional[str] = None  # ✅ needed for NHIP... in frontend
 
-    class Config:
-        orm_mode = True
+    patient_id: int
+    department_id: Optional[int] = None
+    practitioner_user_id: Optional[int] = None
+    primary_nurse_user_id: Optional[int] = None
+
+    admission_type: Optional[str] = None
+    admitted_at: Optional[datetime] = None
+    expected_discharge_at: Optional[datetime] = None
+    discharge_at: Optional[datetime] = None
+
+    status: str
+    current_bed_id: Optional[int] = None
+
+    # (optional, but good)
+    admission_code: Optional[str] = None
+    admission_no: Optional[str] = None
+    ipd_no: Optional[str] = None
+    ip_uhid: Optional[str] = None
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class AdmissionDetailOut(BaseModel):

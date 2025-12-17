@@ -54,6 +54,11 @@ from app.models.payer import Payer, Tpa, CreditPlan
 from app.core.config import settings
 from app.services.ui_branding import get_or_create_default_ui_branding
 from app.services.pdf_branding import brand_header_css, render_brand_header_html
+import base64
+import mimetypes
+from pathlib import Path
+
+from fastapi import Query
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -1877,53 +1882,519 @@ def patient_billing_summary_by_uhid(
 # ---------------------------------------------------------------------------
 # Printing: Single Invoice & Patient Billing Summary (PDF/HTML)
 # ---------------------------------------------------------------------------
+def _h(x: Any) -> str:
+    s = "" if x is None else str(x)
+    return (s.replace("&", "&amp;").replace("<", "&lt;").replace(
+        ">", "&gt;").replace('"', "&quot;").replace("'", "&#39;"))
+
+
+def _logo_data_uri(branding) -> Optional[str]:
+    rel = (getattr(branding, "logo_path", None) or "").strip()
+    if not rel:
+        return None
+    abs_path = Path(settings.STORAGE_DIR).joinpath(rel)
+    if not abs_path.exists() or not abs_path.is_file():
+        return None
+
+    mime, _ = mimetypes.guess_type(str(abs_path))
+    mime = mime or "image/png"
+    b64 = base64.b64encode(abs_path.read_bytes()).decode("utf-8")
+    return f"data:{mime};base64,{b64}"
+
+
+def _billing_title(bt: str | None) -> str:
+    b = (bt or "").strip().lower()
+    return {
+        "op": "OP Bill Receipt",
+        "opd": "OP Bill Receipt",
+        "lab": "Lab Bill Receipt",
+        "lis": "Lab Bill Receipt",
+        "radiology": "Radiology Bill Receipt",
+        "ris": "Radiology Bill Receipt",
+        "pharmacy": "Pharmacy Bill Receipt",
+        "ip_billing": "IP Bill Receipt",
+        "ip": "IP Bill Receipt",
+        "ot": "OT Bill Receipt",
+        "general": "Bill Receipt",
+        "": "Bill Receipt",
+    }.get(b, "Bill Receipt")
+
+
+def _qty_str(x: Any) -> str:
+    try:
+        d = _d(x)
+        if d == d.to_integral():
+            return str(int(d))
+        s = format(d.normalize(), "f")
+        return s.rstrip("0").rstrip(".")
+    except Exception:
+        return str(x or "")
+
+
+def _sex_short(v: Any) -> str:
+    s = ("" if v is None else str(v)).strip().lower()
+    return {
+        "male": "M",
+        "m": "M",
+        "female": "F",
+        "f": "F",
+        "other": "O",
+        "others": "O",
+        "transgender": "TG",
+        "tg": "TG",
+    }.get(s, (str(v).strip().title() if v else "—"))
+
+
+def _calc_age_years(dob: date | None, asof: date | None = None) -> int | None:
+    if not dob:
+        return None
+    asof = asof or date.today()
+    try:
+        years = asof.year - dob.year - (
+            (asof.month, asof.day) < (dob.month, dob.day))
+        return max(0, int(years))
+    except Exception:
+        return None
+
+
+# -------------------------------
+# Helpers (ADD THESE)
+# -------------------------------
+def _gender_short(g: str | None) -> str:
+    s = (g or "").strip().lower()
+    if not s:
+        return "—"
+    if s.startswith("m"):
+        return "M"
+    if s.startswith("f"):
+        return "F"
+    if s.startswith("o"):
+        return "O"
+    return (g or "").strip()[:1].upper() or "—"
+
+
+def _age_years_from_dob(dob: date | None, *, today: date | None = None) -> str:
+    if not dob:
+        return "—"
+    t = today or datetime.utcnow().date()
+    try:
+        years = t.year - dob.year - ((t.month, t.day) < (dob.month, dob.day))
+        if years < 0:
+            return "—"
+        return f"{years} Y"
+    except Exception:
+        return "—"
+
+
 @router.get("/invoices/{invoice_id}/print")
 def print_invoice(
         invoice_id: int,
+        paper: str
+    | None = Query(
+        default=None,
+        description=
+        "Optional: 'half' to force receipt half-page, 'full' to force A4. Default: auto.",
+    ),
         db: Session = Depends(get_db),
         user: User = Depends(auth_current_user),
 ):
-    """
-    Printable view / PDF for a single invoice with items + payments.
-
-    - If WeasyPrint + system deps are OK -> returns PDF
-    - If anything fails -> returns HTML (browser can still print)
-    """
     if not has_perm(user, "billing.view"):
         raise HTTPException(status_code=403, detail="Not permitted")
 
-    inv: Invoice | None = db.query(Invoice).get(invoice_id)
+    inv: Invoice | None = (db.query(Invoice).options(
+        joinedload(Invoice.items),
+        joinedload(Invoice.payments),
+        joinedload(Invoice.advance_adjustments),
+        joinedload(Invoice.patient),
+    ).get(invoice_id))
     if not inv:
         raise HTTPException(status_code=404, detail="Invoice not found")
 
-    patient: Patient | None = db.query(Patient).get(inv.patient_id)
+    patient: Patient | None = getattr(
+        inv, "patient", None) or db.query(Patient).get(inv.patient_id)
     if not patient:
         raise HTTPException(status_code=404, detail="Patient not found")
 
-    items = [it for it in inv.items if not it.is_voided]
+    # active items only
+    items = [
+        it for it in (inv.items or []) if not getattr(it, "is_voided", False)
+    ]
     payments = list(inv.payments or [])
 
     created_at = inv.created_at or datetime.utcnow()
-    bill_date = created_at.strftime("%d-%m-%Y %H:%M")
+    bill_date = created_at.strftime("%d %b %Y")  # ✅ date only
+    printed_at = datetime.utcnow().strftime("%d/%m/%Y %I:%M %p")
 
-    # --- Branding header (logo + org details) ---
     branding = get_or_create_default_ui_branding(db, updated_by_id=user.id)
+    receipt_title = _billing_title(getattr(inv, "billing_type", None))
+
+    # decide layout (<=10 = half receipt)
+    force = (paper or "").strip().lower()
+    if force == "half":
+        use_half = True
+    elif force == "full":
+        use_half = False
+    else:
+        use_half = (len(items) <= 12)  # ✅ exactly what you asked
+
+    # common patient fields
+    patient_name = " ".join([
+        patient.prefix or "", patient.first_name or "", patient.last_name or ""
+    ]).strip() or "—"
+
+    age_text = _age_years_from_dob(getattr(patient, "dob", None))
+    gender_text = _gender_short(getattr(patient, "gender", None))
+    marital = (getattr(patient, "marital_status", None) or "").strip() or "—"
+    phone = (getattr(patient, "phone", None) or "").strip() or "—"
+    uhid = (getattr(patient, "uhid", None) or "").strip() or "—"
+    inv_no = _h(getattr(inv, "invoice_number", None) or str(inv.id))
+
+    # payment text
+    modes = []
+    for p in payments:
+        m = (getattr(p, "mode", None) or "").strip()
+        if m and m not in modes:
+            modes.append(m)
+    payment_text = " / ".join(modes) if modes else "—"
+
+    # ============================================================
+    # HALF RECEIPT (A5 landscape)  ✅ stable single page <= 10 items
+    # ============================================================
+    if use_half:
+        n = len(items)
+
+        # ✅ dynamic density so it never collapses / splits
+        if n <= 6:
+            base_font = 10.4
+            row_pad = 3
+        elif n <= 8:
+            base_font = 9.7
+            row_pad = 2
+        else:  # 9–10
+            base_font = 9.1
+            row_pad = 2
+
+        brand_header = render_brand_header_html(branding)
+
+        # item rows (NO S.No – matches your sample)
+        rows = ""
+        for it in items:
+            desc = _h(getattr(it, "description", "") or "")
+            qty = _qty_str(getattr(it, "quantity", 0))
+            amt = _money(getattr(it, "unit_price", 0))
+            tot = _money(getattr(it, "line_total", 0))
+            rows += f"""
+              <tr>
+                <td class="svc">{desc}</td>
+                <td class="num col-qty">{qty}</td>
+                <td class="num col-amt">{amt}</td>
+                <td class="num col-tot">{tot}</td>
+              </tr>
+            """
+
+        if not rows:
+            rows = "<tr><td colspan='4' class='empty'>No items</td></tr>"
+
+        total_service = _money(getattr(inv, "gross_total", 0))
+        net_amount = _money(getattr(inv, "net_total", 0))
+        paid_amount = _money(getattr(inv, "amount_paid", 0))
+        balance_amount = _money(getattr(inv, "balance_due", 0))
+
+        html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Receipt {inv_no}</title>
+  <style>
+    @page {{
+      size: A5 landscape;
+      margin: 6mm 8mm 6mm 8mm;
+    }}
+
+    body {{
+      font-family: "SF Pro Text","SF Pro Display",-apple-system,BlinkMacSystemFont,"Inter","Segoe UI",Roboto,"Helvetica Neue",Arial,"Noto Sans",sans-serif;
+      font-size: {base_font}px;
+      color: #0f172a;
+      margin: 0;
+      background: #ffffff;
+      -webkit-print-color-adjust: exact;
+      print-color-adjust: exact;
+    }}
+
+    /* top line */
+    .topline {{
+      display: grid;
+      grid-template-columns: 1fr auto 1fr;
+      align-items: center;
+      font-size: {base_font - 1.0}px;
+      margin-bottom: 4px;
+    }}
+    .topline .center {{
+      justify-self: center;
+      font-weight: 900;
+      letter-spacing: .6px;
+      text-transform: uppercase;
+    }}
+    .topline .right {{
+      justify-self: end;
+      font-weight: 900;
+      letter-spacing: .8px;
+    }}
+
+    /* ✅ use your branding header but "receipt-tuned" */
+    {brand_header_css()}
+
+    .brand-header {{
+      --logo-col: 42mm;
+      --logo-w: 38mm;
+      --logo-h: 18mm;
+      padding-bottom: 6px;
+      margin-bottom: 6px;
+      border-bottom: 1px solid #e5e7eb;
+      break-inside: avoid;
+    }}
+    .brand-right {{
+      text-align: right;     /* ✅ center like your screenshot */
+      padding-left: 0;
+    }}
+    .brand-box {{
+      text-align: right;
+      max-width: 128mm;
+      margin: 0 auto;
+    }}
+    .brand-name {{
+      font-size: {base_font + 3.4}px;
+      font-weight: 900;
+      letter-spacing: .3px;
+      text-transform: uppercase;
+      color: #027F8B;
+    }}
+    .brand-tagline {{
+      font-size: {base_font - 1.2}px;
+      color: #000;
+      font-weight: 600;
+      
+    }}
+    .brand-meta {{
+      font-size: {base_font - 1.3}px;
+    }}
+
+    /* patient meta card */
+    .meta-card {{
+      border: 1px solid #e5e7eb;
+      padding: 6px 8px;
+      margin-top: 4px;
+      break-inside: avoid;
+    }}
+    .meta-grid {{
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10mm;
+    }}
+    .kv .row {{
+      display: grid;
+      grid-template-columns: 98px 10px 1fr;
+      align-items: baseline;
+      margin: 2px 0;
+    }}
+    .k {{
+      color: #334155;
+      font-weight: 700;
+      white-space: nowrap;
+    }}
+    .v {{
+      font-weight: 900;
+      color: #0f172a;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }}
+
+    /* items table (✅ no border radius) */
+    .items {{
+      margin-top: 6px;
+      break-inside: avoid;
+    }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      border-top: 1px solid #cbd5e1;
+      border-bottom: 1px solid #cbd5e1;
+    }}
+    thead th {{
+      text-align: left;
+      font-weight: 900;
+      font-size: {base_font - 1.2}px;
+      color: #334155;
+      padding: {row_pad}px 4px;
+      border-bottom: 1px solid #cbd5e1;
+      text-transform: uppercase;
+      letter-spacing: .6px;
+    }}
+    tbody td {{
+      padding: {row_pad}px 4px;
+      border-bottom: 1px solid #eef2f7;
+      vertical-align: top;
+    }}
+    tbody tr:last-child td {{
+      border-bottom: 0;
+    }}
+
+    .svc {{
+      width: 100%;
+      line-height: 1.15;
+    }}
+    .num {{
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }}
+    .col-qty {{ width: 12mm; }}
+    .col-amt {{ width: 20mm; }}
+    .col-tot {{ width: 22mm; }}
+
+    .empty {{
+      text-align: center;
+      padding: 8px 0;
+      color: #475569;
+    }}
+
+    /* footer + totals (✅ never split across pages) */
+    .footer {{
+      display: grid;
+      grid-template-columns: 1fr 70mm;
+      gap: 10mm;
+      margin-top: 8px;
+      break-inside: avoid;
+      page-break-inside: avoid;
+    }}
+    .code {{
+      font-weight: 900;
+      letter-spacing: .8px;
+    }}
+
+    .totals {{
+      width: 70mm;
+      margin-left: auto;
+      border-top: 1px solid #cbd5e1;
+      border-bottom: 1px solid #cbd5e1;
+      break-inside: avoid;
+      page-break-inside: avoid;
+    }}
+    .trow {{
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 4px 0;
+      border-bottom: 1px solid #eef2f7;
+      font-variant-numeric: tabular-nums;
+    }}
+    .trow:last-child {{
+      border-bottom: 0;
+    }}
+    .trow strong {{
+      font-weight: 950;
+    }}
+  </style>
+</head>
+
+<body>
+  <div class="topline">
+    <div class="center">*{inv_no}*</div>
+    <div class="right">{_h(receipt_title)}</div>
+    
+  </div>
+
+  {brand_header}
+
+  <div class="meta-card">
+    <div class="meta-grid">
+      <div class="kv">
+        <div class="row"><div class="k">Patient Name</div><div>:</div><div class="v">{_h(patient_name)}</div></div>
+        <div class="row"><div class="k">Age / Gender</div><div>:</div><div class="v">{_h(age_text)} / {_h(gender_text)}</div></div>
+        <div class="row"><div class="k">Marital Status</div><div>:</div><div class="v">{_h(marital)}</div></div>
+        <div class="row"><div class="k">Mobile No</div><div>:</div><div class="v">{_h(phone)}</div></div>
+      </div>
+
+      <div class="kv">
+        <div class="row"><div class="k">Reg No (UHID)</div><div>:</div><div class="v">{_h(uhid)}</div></div>
+        <div class="row"><div class="k">Bill No</div><div>:</div><div class="v">{inv_no}</div></div>
+        <div class="row"><div class="k">Bill Date</div><div>:</div><div class="v">{_h(bill_date)}</div></div>
+        <div class="row"><div class="k">Payment</div><div>:</div><div class="v">{_h(payment_text)}</div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="items">
+    <table>
+      <thead>
+        <tr>
+          <th>Service Name</th>
+          <th class="num col-qty">Qty</th>
+          <th class="num col-amt">Amt</th>
+          <th class="num col-tot">Total</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="footer">
+    <div>
+      <div class="code">*{_h(uhid)}*</div>
+    </div>
+
+    <div class="totals">
+      <div class="trow"><span><strong>Total Service Amount</strong></span><span><strong>{_h(total_service)}</strong></span></div>
+      <div class="trow"><span>Net Amount</span><span>{_h(net_amount)}</span></div>
+      <div class="trow"><span>Paid Amount</span><span>{_h(paid_amount)}</span></div>
+      <div class="trow"><span>Balance Amount</span><span>{_h(balance_amount)}</span></div>
+    </div>
+  </div>
+
+</body>
+</html>
+        """.strip()
+
+        try:
+            from weasyprint import HTML as _HTML  # type: ignore
+            pdf_bytes = _HTML(string=html,
+                              base_url=str(settings.STORAGE_DIR)).write_pdf()
+            filename = f"invoice-{invoice_id}-half.pdf"
+            return StreamingResponse(
+                io.BytesIO(pdf_bytes),
+                media_type="application/pdf",
+                headers={
+                    "Content-Disposition": f'inline; filename="{filename}"'
+                },
+            )
+        except Exception as e:
+            logger.exception("WeasyPrint failed (half receipt) invoice %s: %s",
+                             invoice_id, e)
+            return StreamingResponse(io.BytesIO(html.encode("utf-8")),
+                                     media_type="text/html; charset=utf-8")
+
+    # ============================================================
+    # FULL A4 (items > 10)  ✅ no table radius + better patient block
+    # ============================================================
     brand_header = render_brand_header_html(branding)
 
     html_items = ""
     for idx, it in enumerate(items, start=1):
-        html_items += (
-            "<tr>"
-            f"<td>{idx}</td>"
-            f"<td>{(it.description or '').replace('<', '&lt;').replace('>', '&gt;')}</td>"
-            f"<td class='money'>{it.quantity}</td>"
-            f"<td class='money'>{_money(it.unit_price)}</td>"
-            f"<td class='money'>{_money(it.tax_rate)}%</td>"
-            f"<td class='money'>{_money(it.tax_amount)}</td>"
-            f"<td class='money'>{_money(it.line_total)}</td>"
-            "</tr>")
+        html_items += ("<tr>"
+                       f"<td>{idx}</td>"
+                       f"<td>{_h(it.description or '')}</td>"
+                       f"<td class='money'>{_qty_str(it.quantity)}</td>"
+                       f"<td class='money'>{_money(it.unit_price)}</td>"
+                       f"<td class='money'>{_money(it.tax_rate)}%</td>"
+                       f"<td class='money'>{_money(it.tax_amount)}</td>"
+                       f"<td class='money'>{_money(it.line_total)}</td>"
+                       "</tr>")
     if not html_items:
-        html_items = "<tr><td colspan='7' style='text-align:center;'>No items</td></tr>"
+        html_items = "<tr><td colspan='7' style='text-align:left;'>No items</td></tr>"
 
     html_pay = ""
     for idx, pay in enumerate(payments, start=1):
@@ -1931,9 +2402,9 @@ def print_invoice(
             pay, "paid_at", None) else "—")
         html_pay += ("<tr>"
                      f"<td>{idx}</td>"
-                     f"<td>{pay.mode}</td>"
-                     f"<td>{(pay.reference_no or '')}</td>"
-                     f"<td>{dt}</td>"
+                     f"<td>{_h(pay.mode)}</td>"
+                     f"<td>{_h(pay.reference_no or '')}</td>"
+                     f"<td>{_h(dt)}</td>"
                      f"<td class='money'>{_money(pay.amount)}</td>"
                      "</tr>")
     if not html_pay:
@@ -1944,15 +2415,15 @@ def print_invoice(
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Invoice #{inv.id}</title>
+  <title>Invoice {inv_no}</title>
   <style>
     @page {{
       size: A4;
-      margin: 14mm 14mm 14mm 14mm;
+      margin: 2mm 2mm 2mm 2mm;
     }}
 
     body {{
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-family: "SF Pro Text","SF Pro Display",-apple-system,BlinkMacSystemFont,"Inter","Segoe UI",Roboto,"Helvetica Neue",Arial,"Noto Sans",sans-serif;
       font-size: 12px;
       margin: 0;
       color: #0f172a;
@@ -1962,6 +2433,45 @@ def print_invoice(
     .page {{ padding: 16px; }}
 
     {brand_header_css()}
+    
+    /* ✅ Horizontal totals boxes */
+.totals-strip{{
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 10px 0 6px;
+}}
+
+.tbox{{
+  flex: 1 1 180px;            /* auto wrap if needed */
+  border: 1px solid #e5e7eb;
+  border-radius: 0;            /* ✅ no radius */
+  padding: 10px 12px;
+  background: #ffffff;
+}}
+
+.tbox .k{{
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: .5px;
+  color: #64748b;
+  text-transform: uppercase;
+}}
+
+.tbox .v{{
+  margin-top: 6px;
+  font-size: 16px;
+  font-weight: 950;
+  color: #0f172a;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}}
+
+.tbox.emph{{
+  border-color: #0f172a;
+}}
+    
+    
 
     .card {{
       border: 1px solid #e5e7eb;
@@ -1981,7 +2491,7 @@ def print_invoice(
 
     .title {{
       font-size: 18px;
-      font-weight: 800;
+      font-weight: 900;
       letter-spacing: -0.2px;
       margin-bottom: 4px;
     }}
@@ -1989,24 +2499,24 @@ def print_invoice(
     .muted {{
       color: #64748b;
       font-size: 11px;
+      line-height: 1.35;
     }}
 
     .section {{ margin-top: 12px; margin-bottom: 8px; }}
 
     .section-title {{
-      font-weight: 700;
+      font-weight: 800;
       font-size: 13px;
       margin-bottom: 6px;
     }}
 
+    /* ✅ NO table border radius */
     table {{
       width: 100%;
-      border-collapse: separate;
-      border-spacing: 0;
+      border-collapse: collapse;
       margin-top: 6px;
       border: 1px solid #e5e7eb;
-      border-radius: 14px;
-      overflow: hidden;
+      border-radius: 0;
     }}
 
     th, td {{
@@ -2018,15 +2528,17 @@ def print_invoice(
 
     th {{
       background: #f8fafc;
-      font-weight: 700;
+      font-weight: 800;
       font-size: 11px;
       color: #334155;
+      text-transform: uppercase;
+      letter-spacing: .5px;
     }}
-
+    
     tr:last-child td {{ border-bottom: 0; }}
 
     td.money {{
-      text-align: right;
+      text-align: left;
       font-variant-numeric: tabular-nums;
       white-space: nowrap;
     }}
@@ -2034,11 +2546,10 @@ def print_invoice(
     .totals {{
       margin-top: 10px;
       width: 100%;
-      max-width: 320px;
+      max-width: 340px;
       margin-left: auto;
       border: 1px solid #e5e7eb;
-      border-radius: 14px;
-      overflow: hidden;
+      border-radius: 0;   /* ✅ */
     }}
 
     .totals-row {{
@@ -2047,15 +2558,23 @@ def print_invoice(
       padding: 8px 10px;
       font-size: 11px;
       border-bottom: 1px solid #eef2f7;
+      font-variant-numeric: tabular-nums;
     }}
 
     .totals-row:last-child {{ border-bottom: 0; }}
 
     .totals-row.label {{
-      background: #0f172a;
-      color: #ffffff;
-      font-weight: 800;
+      
+      color: #000;
+      font-weight: 900;
     }}
+    .container{{
+         display: flex;
+         justify-content: center;
+         align-items: center
+        }}
+        
+        
   </style>
 </head>
 <body>
@@ -2066,27 +2585,48 @@ def print_invoice(
       <div class="header">
         <div>
           <div class="title">Tax Invoice</div>
-          <div class="muted">Invoice ID: {inv.id}</div>
-          <div class="muted">Invoice No: {getattr(inv, 'invoice_number', inv.id)}</div>
-          <div class="muted">Date: {bill_date}</div>
-          <div class="muted">Status: {inv.status}</div>
+          <div class="muted">Invoice No: {inv_no}</div>
+          <div class="muted">Date: {_h(bill_date)}</div>
         </div>
 
         <div style="text-align:right;">
           <div class="section-title" style="margin:0 0 6px 0;">Patient</div>
-          <div class="muted">UHID: {getattr(patient, 'uhid', '') or '—'}</div>
-          <div style="font-weight:700;">{(patient.first_name or "")} {(patient.last_name or "")}</div>
-          <div class="muted">Phone: {patient.phone or "—"}</div>
+          <div style="font-weight:900;">{_h(patient_name)}</div>
+          <div class="muted">Reg No (UHID): {_h(uhid)}</div>
+          
+          <div class="muted">Age / Gender: {_h(age_text)} / {_h(gender_text)}</div>
+          <div class="muted">Marital Status: {_h(marital)}</div>
+          <div class="muted">Phone: {_h(phone)}</div>
         </div>
       </div>
+   <div class="totals-strip">
+  <div class="tbox">
+    <div class="k">Gross Amount</div>
+    <div class="v">{_money(inv.gross_total)}</div>
+  </div>
 
+  <div class="tbox emph">
+    <div class="k">Net Amount</div>
+    <div class="v">{_money(inv.net_total)}</div>
+  </div>
+
+  <div class="tbox">
+    <div class="k">Amount Received</div>
+    <div class="v">{_money(inv.amount_paid)}</div>
+  </div>
+
+  <div class="tbox">
+    <div class="k">Balance Amount</div>
+    <div class="v">{_money(inv.balance_due)}</div>
+  </div>
+</div>
       <div class="section">
         <div class="section-title">Bill Details</div>
         <table>
           <thead>
             <tr>
               <th style="width:40px;">S.No</th>
-              <th>Particulars</th>
+              <th>SERVICE NAME</th>
               <th style="width:60px;">Qty</th>
               <th style="width:80px;">Price</th>
               <th style="width:60px;">GST%</th>
@@ -2099,81 +2639,30 @@ def print_invoice(
           </tbody>
         </table>
 
-        <div class="totals">
-          <div class="totals-row">
-            <span>Gross Amount</span>
-            <span class="money">{_money(inv.gross_total)}</span>
-          </div>
-          <div class="totals-row">
-            <span>Tax Total</span>
-            <span class="money">{_money(inv.tax_total)}</span>
-          </div>
-          <div class="totals-row label">
-            <span>Net Amount</span>
-            <span class="money">{_money(inv.net_total)}</span>
-          </div>
-          <div class="totals-row">
-            <span>Amount Received</span>
-            <span class="money">{_money(inv.amount_paid)}</span>
-          </div>
-          <div class="totals-row">
-            <span>Balance Amount</span>
-            <span class="money">{_money(inv.balance_due)}</span>
-          </div>
-        </div>
+       
       </div>
 
-      <div class="section">
-        <div class="section-title">Payments</div>
-        <table>
-          <thead>
-            <tr>
-              <th style="width:40px;">#</th>
-              <th>Mode</th>
-              <th>Reference</th>
-              <th style="width:120px;">Paid At</th>
-              <th style="width:95px;">Amount</th>
-            </tr>
-          </thead>
-          <tbody>
-            {html_pay}
-          </tbody>
-        </table>
-      </div>
-    </div>
   </div>
 </body>
 </html>
     """.strip()
 
-    # ---------- PDF (WeasyPrint) with safe fallback ----------
     try:
         from weasyprint import HTML as _HTML  # type: ignore
-        HTML = _HTML
-    except Exception:
-        HTML = None
+        pdf_bytes = _HTML(string=html,
+                          base_url=str(settings.STORAGE_DIR)).write_pdf()
+        filename = f"invoice-{invoice_id}.pdf"
+        return StreamingResponse(
+            io.BytesIO(pdf_bytes),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'inline; filename="{filename}"'},
+        )
+    except Exception as e:
+        logger.exception("WeasyPrint failed (A4) invoice %s: %s", invoice_id,
+                         e)
 
-    if HTML is not None:
-        try:
-            pdf_bytes = HTML(string=html,
-                             base_url=str(settings.STORAGE_DIR)).write_pdf()
-            filename = f"invoice-{invoice_id}.pdf"
-            return StreamingResponse(
-                io.BytesIO(pdf_bytes),
-                media_type="application/pdf",
-                headers={
-                    "Content-Disposition": f'inline; filename="{filename}"'
-                },
-            )
-        except Exception as e:
-            logger.exception(
-                "WeasyPrint PDF generation failed for invoice %s, falling back to HTML: %s",
-                invoice_id, e)
-
-    return StreamingResponse(
-        io.BytesIO(html.encode("utf-8")),
-        media_type="text/html; charset=utf-8",
-    )
+    return StreamingResponse(io.BytesIO(html.encode("utf-8")),
+                             media_type="text/html; charset=utf-8")
 
 
 @router.get("/patients/{patient_id}/print-summary")
