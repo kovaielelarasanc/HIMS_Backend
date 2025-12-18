@@ -204,8 +204,10 @@ def get_free_slots(
             Appointment.doctor_user_id == doctor_user_id,
             Appointment.date == date,
             Appointment.status.in_(["booked", "checked_in", "in_progress"]),
+            Appointment.slot_start.isnot(None),  # ✅ ignore FREE bookings
         ).all()
     }
+
 
     free: List[str] = []
     for sch in schedules:

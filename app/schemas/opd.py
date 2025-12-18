@@ -47,17 +47,25 @@ class AppointmentCreate(BaseModel):
     department_id: int
     doctor_user_id: int
     date: date
-    # required start time
-    slot_start: str = Field(..., description="HH:MM (24h)")
-    # optional end time
+
+    # ✅ NEW: slot | free
+    appointment_type: str = Field("slot", description="slot | free")
+
+    # ✅ slot_start optional now (required only when appointment_type='slot')
+    slot_start: Optional[str] = Field(
+        None, description="HH:MM (24h), required for slot")
     slot_end: Optional[str] = None
+
     purpose: Optional[str] = "Consultation"
 
 
 class AppointmentOut(BaseModel):
     id: int
     date: date
-    slot_start: time
+    appointment_type: str
+    queue_no: int
+
+    slot_start: Optional[time] = None
     slot_end: Optional[time] = None
     status: str
     purpose: Optional[str] = None
@@ -67,6 +75,35 @@ class AppointmentOut(BaseModel):
     department: Dict[str, Any] = Field(default_factory=dict)
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class AppointmentRow(BaseModel):
+    id: int
+    queue_no: int
+    appointment_type: str
+
+    uhid: str
+    patient_name: str
+    doctor_name: str
+    department_name: str
+    date: str
+
+    slot_start: str
+    slot_end: str
+    status: str
+    visit_id: Optional[int] = None
+    vitals_registered: bool
+    purpose: Optional[str] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class AppointmentRescheduleIn(BaseModel):
+    date: date
+    # ✅ optional now (free appointments don’t need it)
+    slot_start: Optional[str] = Field(
+        None, description="HH:MM (24h), required for slot appointments")
+    create_new: bool = False
 
 
 class AppointmentStatusUpdate(BaseModel):
@@ -112,40 +149,6 @@ class DoctorFeeOut(DoctorFeeBase):
     model_config = ConfigDict(from_attributes=True)
 
 
-class AppointmentRow(BaseModel):
-    """
-    Flattened row for listing appointments / queue per day.
-    """
-
-    id: int
-    uhid: str
-    patient_name: str
-    doctor_name: str
-    department_name: str
-    date: str  # "YYYY-MM-DD"
-    slot_start: str  # "HH:MM"
-    slot_end: str  # "HH:MM"
-    status: str
-    visit_id: Optional[int] = None
-    vitals_registered: bool
-    purpose: Optional[str] = None
-
-    model_config = ConfigDict(from_attributes=True)
-
-
-# ---------- Reschedule ----------
-class AppointmentRescheduleIn(BaseModel):
-    """
-    Used for waiting-time management & no-show rebooking.
-    If create_new = True and current status is no_show, a new appointment
-    will be created (old remains as history).
-    """
-
-    date: date
-    slot_start: str = Field(..., description="HH:MM (24h)")
-    create_new: bool = False
-
-
 # ---------- Visits ----------
 class VisitCreate(BaseModel):
     appointment_id: int
@@ -171,32 +174,99 @@ class VisitOut(BaseModel):
     department_name: str
     doctor_name: str
     episode_id: str
-    visit_at: str  # ISO / formatted string
+    visit_at: str
 
     patient_id: int
     doctor_id: int
     appointment_id: Optional[int] = None
     appointment_status: Optional[str] = None
-
     current_vitals: Optional[Dict[str, Any]] = None
 
+    # existing
     chief_complaint: Optional[str] = None
     symptoms: Optional[str] = None
     soap_subjective: Optional[str] = None
     soap_objective: Optional[str] = None
     soap_assessment: Optional[str] = None
     plan: Optional[str] = None
+
+    # NEW
+    presenting_illness: Optional[str] = None
+    review_of_systems: Optional[str] = None
+
+    medical_history: Optional[str] = None
+    surgical_history: Optional[str] = None
+    medication_history: Optional[str] = None
+    drug_allergy: Optional[str] = None
+
+    family_history: Optional[str] = None
+    personal_history: Optional[str] = None
+
+    menstrual_history: Optional[str] = None
+    obstetric_history: Optional[str] = None
+    immunization_history: Optional[str] = None
+
+    general_examination: Optional[str] = None
+    systemic_examination: Optional[str] = None
+    local_examination: Optional[str] = None
+
+    provisional_diagnosis: Optional[str] = None
+    differential_diagnosis: Optional[str] = None
+    final_diagnosis: Optional[str] = None
+    diagnosis_codes: Optional[str] = None
+
+    investigations: Optional[str] = None
+    treatment_plan: Optional[str] = None
+    advice: Optional[str] = None
+    followup_plan: Optional[str] = None
+    referral_notes: Optional[str] = None
+    procedure_notes: Optional[str] = None
+    counselling_notes: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
 
 class VisitUpdate(BaseModel):
+    # existing
     chief_complaint: Optional[str] = None
     symptoms: Optional[str] = None
     soap_subjective: Optional[str] = None
     soap_objective: Optional[str] = None
     soap_assessment: Optional[str] = None
     plan: Optional[str] = None
+
+    # NEW
+    presenting_illness: Optional[str] = None
+    review_of_systems: Optional[str] = None
+
+    medical_history: Optional[str] = None
+    surgical_history: Optional[str] = None
+    medication_history: Optional[str] = None
+    drug_allergy: Optional[str] = None
+
+    family_history: Optional[str] = None
+    personal_history: Optional[str] = None
+
+    menstrual_history: Optional[str] = None
+    obstetric_history: Optional[str] = None
+    immunization_history: Optional[str] = None
+
+    general_examination: Optional[str] = None
+    systemic_examination: Optional[str] = None
+    local_examination: Optional[str] = None
+
+    provisional_diagnosis: Optional[str] = None
+    differential_diagnosis: Optional[str] = None
+    final_diagnosis: Optional[str] = None
+    diagnosis_codes: Optional[str] = None
+
+    investigations: Optional[str] = None
+    treatment_plan: Optional[str] = None
+    advice: Optional[str] = None
+    followup_plan: Optional[str] = None
+    referral_notes: Optional[str] = None
+    procedure_notes: Optional[str] = None
+    counselling_notes: Optional[str] = None
 
 
 class RxItemIn(BaseModel):

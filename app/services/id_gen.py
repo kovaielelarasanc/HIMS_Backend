@@ -1,3 +1,4 @@
+#app/service/id_gen.py
 from __future__ import annotations
 
 import re
@@ -105,3 +106,22 @@ def make_ip_admission_code(
 ) -> str:
     code = _org_code_from_branding(db, max_len=3)
     return f"{code}IP{_dt_ddmmyyyy(on_date)}{admission_id:0{id_width}d}"
+
+
+
+# ----------------------------
+# Pharmacy / Rx ID generator
+# ----------------------------
+# FILE: app/services/id_gen.py
+def make_rx_number(
+    db: Session,
+    rx_id: int,
+    *,
+    on_date: Optional[Union[date, datetime]] = None,
+    id_width: int = 5,
+) -> str:
+    code = _org_code_from_branding(db, max_len=3)
+    return f"{code}RX{_dt_ddmmyyyy(on_date)}{rx_id:0{id_width}d}"
+
+
+

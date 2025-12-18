@@ -55,43 +55,92 @@ class OpdSchedule(Base):
     doctor = relationship("User", foreign_keys=[doctor_user_id])
 
 
+class OpdQueueCounter(Base):
+    __tablename__ = "opd_queue_counters"
+    __table_args__ = (
+        UniqueConstraint("doctor_user_id", "date",
+                         name="uq_opd_q_doctor_date"),
+        Index("ix_opd_q_doctor_date", "doctor_user_id", "date"),
+        {
+            "mysql_engine": "InnoDB",
+            "mysql_charset": "utf8mb4",
+            "mysql_collate": "utf8mb4_unicode_ci",
+        },
+    )
+
+    id = Column(Integer, primary_key=True)
+    doctor_user_id = Column(Integer,
+                            ForeignKey("users.id"),
+                            nullable=False,
+                            index=True)
+    date = Column(Date, nullable=False, index=True)
+    last_queue_no = Column(Integer, nullable=False, default=0)
+    updated_at = Column(DateTime,
+                        default=datetime.utcnow,
+                        onupdate=datetime.utcnow)
+
+    doctor = relationship("User", foreign_keys=[doctor_user_id])
+
+
 class Appointment(Base):
     __tablename__ = "opd_appointments"
     __table_args__ = (
-        UniqueConstraint(
-            "doctor_user_id",
-            "date",
-            "slot_start",
-            name="uq_doctor_date_slot",
+        # slot-based unique (allows many NULLs in MySQL for free appointments)
+        UniqueConstraint("doctor_user_id",
+                         "date",
+                         "slot_start",
+                         name="uq_doctor_date_slot"),
+
+        # ✅ token/queue unique per doctor per date
+        UniqueConstraint("doctor_user_id",
+                         "date",
+                         "queue_no",
+                         name="uq_doctor_date_queue"),
+
+        # ✅ allow free appointments without time
+        CheckConstraint(
+            "(appointment_type = 'free' AND slot_start IS NULL AND slot_end IS NULL) OR "
+            "(appointment_type = 'slot' AND slot_start IS NOT NULL AND slot_end IS NOT NULL AND slot_end > slot_start)",
+            name="ck_appt_type_time",
         ),
-        CheckConstraint("slot_end > slot_start", name="ck_appt_slot_time"),
         Index("ix_opd_appt_patient_date", "patient_id", "date"),
+        Index("ix_opd_appt_doctor_date_queue", "doctor_user_id", "date",
+              "queue_no"),
+        {
+            "mysql_engine": "InnoDB",
+            "mysql_charset": "utf8mb4",
+            "mysql_collate": "utf8mb4_unicode_ci",
+        },
     )
 
     id = Column(Integer, primary_key=True, index=True)
-    patient_id = Column(
-        Integer,
-        ForeignKey("patients.id"),
-        nullable=False,
-        index=True,
-    )
-    department_id = Column(
-        Integer,
-        ForeignKey("departments.id"),
-        nullable=False,
-        index=True,
-    )
-    doctor_user_id = Column(
-        Integer,
-        ForeignKey("users.id"),
-        nullable=False,
-        index=True,
-    )
+
+    patient_id = Column(Integer,
+                        ForeignKey("patients.id"),
+                        nullable=False,
+                        index=True)
+    department_id = Column(Integer,
+                           ForeignKey("departments.id"),
+                           nullable=False,
+                           index=True)
+    doctor_user_id = Column(Integer,
+                            ForeignKey("users.id"),
+                            nullable=False,
+                            index=True)
+
     date = Column(Date, nullable=False)
-    slot_start = Column(Time, nullable=False)
-    slot_end = Column(Time, nullable=False)
+
+    # ✅ NEW
+    appointment_type = Column(String(12), nullable=False,
+                              default="slot")  # slot | free
+    queue_no = Column(Integer, nullable=False)
+
+    # ✅ make optional for free appointments
+    slot_start = Column(Time, nullable=True)
+    slot_end = Column(Time, nullable=True)
+
     purpose = Column(String(200), default="Consultation")
-    status = Column(String(30), default="booked")  # booked / checked_in / ...
+    status = Column(String(30), default="booked")
     created_at = Column(DateTime, default=datetime.utcnow)
 
     patient = relationship("Patient", foreign_keys=[patient_id])
@@ -104,11 +153,11 @@ class Visit(Base):
     __tablename__ = "opd_visits"
     __table_args__ = (
         UniqueConstraint("episode_id", name="uq_opd_visits_episode"),
-        # allows multiple NULLs
         UniqueConstraint("appointment_id", name="uq_opd_visits_appt"),
     )
 
     id = Column(Integer, primary_key=True, index=True)
+
     appointment_id = Column(
         Integer,
         ForeignKey("opd_appointments.id"),
@@ -133,34 +182,74 @@ class Visit(Base):
         nullable=False,
         index=True,
     )
-    episode_id = Column(
-        String(30),
-        nullable=False,
-        index=True,  # OP-YYYYMM-XXXX
-    )
+    episode_id = Column(String(30), nullable=False, index=True)
     visit_at = Column(DateTime, default=datetime.utcnow)
 
+    # -------------------------
+    # Core (keep existing)
+    # -------------------------
     chief_complaint = Column(String(400), nullable=True)
     symptoms = Column(String(1000), nullable=True)
+
+    # SOAP (keep for backward compatibility)
     soap_subjective = Column(Text, nullable=True)
     soap_objective = Column(Text, nullable=True)
     soap_assessment = Column(Text, nullable=True)
     plan = Column(Text, nullable=True)
 
+    # -------------------------
+    # NEW: Specialist-grade clinical note
+    # -------------------------
+    presenting_illness = Column(Text,
+                                nullable=True)  # HPI / Presenting illness
+    review_of_systems = Column(Text, nullable=True)  # ROS
+
+    medical_history = Column(Text, nullable=True)  # PMH
+    surgical_history = Column(Text, nullable=True)  # PSH
+    medication_history = Column(Text, nullable=True)  # Current meds
+    drug_allergy = Column(Text, nullable=True)  # Allergies
+
+    family_history = Column(Text, nullable=True)
+    personal_history = Column(Text,
+                              nullable=True)  # smoking/alcohol/occupation/diet
+
+    menstrual_history = Column(Text, nullable=True)  # female-specific
+    obstetric_history = Column(Text, nullable=True)  # female-specific
+    immunization_history = Column(Text, nullable=True)
+
+    general_examination = Column(
+        Text, nullable=True)  # built from vitals + general findings
+    systemic_examination = Column(Text, nullable=True)  # CVS/RS/CNS/PA etc
+    local_examination = Column(Text, nullable=True)
+
+    provisional_diagnosis = Column(Text, nullable=True)
+    differential_diagnosis = Column(Text, nullable=True)
+    final_diagnosis = Column(Text, nullable=True)
+
+    diagnosis_codes = Column(
+        String(500),
+        nullable=True)  # optional: ICD10 comma list like "I10,E11.9"
+
+    investigations = Column(Text, nullable=True)  # planned/ordered
+    treatment_plan = Column(Text, nullable=True)  # doctor plan summary
+    advice = Column(Text, nullable=True)  # diet/lifestyle/precautions
+    followup_plan = Column(Text, nullable=True)  # review date + instructions
+    referral_notes = Column(Text, nullable=True)
+    procedure_notes = Column(Text, nullable=True)
+    counselling_notes = Column(Text, nullable=True)
+
     created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(
-        DateTime,
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
-    )
+    updated_at = Column(DateTime,
+                        default=datetime.utcnow,
+                        onupdate=datetime.utcnow)
 
     appointment = relationship("Appointment", foreign_keys=[appointment_id])
     patient = relationship("Patient", foreign_keys=[patient_id])
     doctor = relationship("User", foreign_keys=[doctor_user_id])
     department = relationship("Department", foreign_keys=[department_id])
+
     @property
     def op_no(self) -> str:
-        # prefer your episode_id (OP-YYYYMM-XXXX pattern)
         return self.episode_id or f"OP-{self.id:06d}"
 
 

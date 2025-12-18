@@ -59,6 +59,14 @@ import os
 from pydantic import BaseModel, Field
 import re
 from app.models.ui_branding import UiBranding
+from app.models.opd import OpdQueueCounter
+from io import BytesIO
+from fastapi.responses import StreamingResponse
+from reportlab.lib.pagesizes import A4
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib import colors
+from reportlab.lib.units import mm
 
 router = APIRouter()
 
@@ -93,6 +101,10 @@ def _has_any_perm(user: User, codes: Set[str]) -> bool:
     return False
 
 
+def _fmt_time(t: Optional[dt_time]) -> str:
+    return t.strftime("%H:%M") if t else "—"
+
+
 # -------- constants / helpers --------
 ALLOWED_STATUS = {
     "booked",
@@ -112,25 +124,61 @@ TRANSITIONS: Dict[str, Set[str]] = {
 }
 
 
+def _ensure_not_past_date_only(d: dt_date) -> None:
+    if d < now_local().date():
+        raise HTTPException(status_code=400,
+                            detail="Cannot book to a past date")
+
+
+def _next_queue_no(db: Session, doctor_user_id: int, d: dt_date) -> int:
+    """
+    Atomic token generator per doctor+date using row lock.
+    """
+    for _ in range(3):
+        try:
+            row = (db.query(OpdQueueCounter).filter(
+                OpdQueueCounter.doctor_user_id == doctor_user_id,
+                OpdQueueCounter.date == d,
+            ).with_for_update().first())
+            if not row:
+                row = OpdQueueCounter(
+                    doctor_user_id=doctor_user_id,
+                    date=d,
+                    last_queue_no=0,
+                )
+                db.add(row)
+                db.flush()
+
+            row.last_queue_no = int(row.last_queue_no or 0) + 1
+            return row.last_queue_no
+
+        except IntegrityError:
+            db.rollback()
+
+    raise HTTPException(status_code=500,
+                        detail="Could not allocate queue number")
+
+
 def _format_visit_time(v: Visit) -> str:
     """
     Format visit time for UI.
 
     Priority:
     1. Use Visit.visit_at if set.
-    2. Fallback to appointment date + slot_start.
+    2. Fallback to appointment date + slot_start (only if slot_start exists).
     """
     dt = v.visit_at
 
     if dt is None and v.appointment is not None:
         ap = v.appointment
-        dt = datetime(
-            ap.date.year,
-            ap.date.month,
-            ap.date.day,
-            ap.slot_start.hour,
-            ap.slot_start.minute,
-        )
+        if ap.slot_start is not None:  # ✅ guard for FREE booking
+            dt = datetime(
+                ap.date.year,
+                ap.date.month,
+                ap.date.day,
+                ap.slot_start.hour,
+                ap.slot_start.minute,
+            )
 
     if dt is None:
         return ""
@@ -459,6 +507,7 @@ def get_slots(
             Appointment.doctor_user_id == doctor_user_id,
             Appointment.date == d,
             Appointment.status.in_(BUSY_STATUS),
+            Appointment.slot_start.isnot(None),  # ✅ NEW
         ).all()
     }
 
@@ -513,32 +562,83 @@ def create_appointment(
     if not patient or not patient.is_active:
         raise HTTPException(404, "Patient not found")
 
-    slot_start = _parse_slot(payload.slot_start)
-    sch = _get_active_schedule_for_doctor_and_date(
-        db,
-        payload.doctor_user_id,
-        payload.date,
-    )
-    slot_end = _compute_slot_end(payload.date, slot_start, sch.slot_minutes)
-    _check_slot_in_schedule(sch, payload.date, slot_start, slot_end)
-    _ensure_not_past(payload.date, slot_start)
+    appt_type = (getattr(payload, "appointment_type", None)
+                 or "slot").strip().lower()
+    if appt_type not in {"slot", "free"}:
+        raise HTTPException(status_code=400,
+                            detail="appointment_type must be 'slot' or 'free'")
+
+    # common rule: no duplicate ACTIVE appointment for same patient+date
     _ensure_no_patient_duplicate(db, payload.patient_id, payload.date)
-    _ensure_slot_free_for_doctor(db, payload.doctor_user_id, payload.date,
-                                 slot_start)
+
+    slot_start = None
+    slot_end = None
+
+    if appt_type == "slot":
+        if not payload.slot_start:
+            raise HTTPException(
+                status_code=400,
+                detail="slot_start is required for slot booking")
+
+        slot_start = _parse_slot(payload.slot_start)
+
+        sch = _get_active_schedule_for_doctor_and_date(db,
+                                                       payload.doctor_user_id,
+                                                       payload.date)
+        slot_end = _compute_slot_end(payload.date, slot_start,
+                                     sch.slot_minutes)
+
+        _check_slot_in_schedule(sch, payload.date, slot_start, slot_end)
+        _ensure_not_past(payload.date, slot_start)
+        _ensure_slot_free_for_doctor(db, payload.doctor_user_id, payload.date,
+                                     slot_start)
+
+    else:
+        # FREE booking: no time, only date rule
+        _ensure_not_past_date_only(payload.date)
+
+    # ✅ allocate token as late as possible (after validations)
+    queue_no = _next_queue_no(db, payload.doctor_user_id, payload.date)
 
     ap = Appointment(
         patient_id=payload.patient_id,
         department_id=payload.department_id,
         doctor_user_id=payload.doctor_user_id,
         date=payload.date,
+        appointment_type=appt_type,
+        queue_no=queue_no,
         slot_start=slot_start,
         slot_end=slot_end,
         purpose=payload.purpose or "Consultation",
         status="booked",
     )
+
+    # optional audit
+    if hasattr(Appointment, "booked_by"):
+        ap.booked_by = user.id
+
     db.add(ap)
-    db.commit()
-    return {"id": ap.id, "message": "Booked"}
+
+    try:
+        db.commit()
+        db.refresh(ap)
+    except IntegrityError:
+        db.rollback()
+        # slot collision or queue unique collision (rare). Try once more for queue.
+        if appt_type == "slot":
+            raise HTTPException(status_code=409, detail="Slot already booked")
+        queue_no = _next_queue_no(db, payload.doctor_user_id, payload.date)
+        ap.queue_no = queue_no
+        db.add(ap)
+        db.commit()
+        db.refresh(ap)
+
+    return {
+        "id": ap.id,
+        "message": "Booked",
+        "appointment_type": ap.appointment_type,
+        "queue_no": ap.queue_no,
+    }
 
 
 def vitals_done_for_appointment(db: Session, ap: Appointment) -> bool:
@@ -581,28 +681,57 @@ def list_appointments(
     ).filter(Appointment.date == date))
     if doctor_id:
         q = q.filter(Appointment.doctor_user_id == doctor_id)
-    rows = q.order_by(Appointment.slot_start).all()
 
-    vis_by_appt = {
-        v.appointment_id: v.id
-        for v in db.query(Visit).filter(
-            Visit.appointment_id.in_([r.id for r in rows])).all()
-    }
+    # ✅ queue order
+    rows: List[Appointment] = q.order_by(Appointment.queue_no.asc(),
+                                         Appointment.id.asc()).all()
+
+    appt_ids = [r.id for r in rows]
+    vis_by_appt: Dict[int, int] = {}
+    if appt_ids:
+        vis_by_appt = {
+            v.appointment_id: v.id
+            for v in db.query(Visit).filter(Visit.appointment_id.in_(
+                appt_ids)).all()
+        }
+
+    # ✅ vitals flags in batch (no per-row queries)
+    vitals_by_appt: Set[int] = set()
+    vitals_by_patient: Set[int] = set()
+
+    if appt_ids and hasattr(Vitals, "appointment_id"):
+        vit_rows = (db.query(Vitals.appointment_id).filter(
+            Vitals.appointment_id.in_(appt_ids)).distinct().all())
+        vitals_by_appt = {aid for (aid, ) in vit_rows if aid is not None}
+    else:
+        patient_ids = [r.patient_id for r in rows]
+        if patient_ids:
+            vit_pat_rows = (db.query(Vitals.patient_id).filter(
+                Vitals.patient_id.in_(patient_ids),
+                func.date(Vitals.created_at) == date).distinct().all())
+            vitals_by_patient = {
+                pid
+                for (pid, ) in vit_pat_rows if pid is not None
+            }
 
     out: List[AppointmentRow] = []
     for r in rows:
-        vitals_flag = vitals_done_for_appointment(db, r)
+        vitals_flag = (r.id in vitals_by_appt) or (r.patient_id
+                                                   in vitals_by_patient)
+
         out.append(
             AppointmentRow(
                 id=r.id,
+                queue_no=getattr(r, "queue_no", None),
+                appointment_type=getattr(r, "appointment_type", None),
                 uhid=r.patient.uhid,
                 patient_name=
                 f"{r.patient.first_name} {r.patient.last_name or ''}".strip(),
-                doctor_name=r.doctor.name,
-                department_name=r.department.name,
+                doctor_name=r.doctor.name if r.doctor else "",
+                department_name=r.department.name if r.department else "",
                 date=r.date.isoformat(),
-                slot_start=r.slot_start.strftime("%H:%M"),
-                slot_end=r.slot_end.strftime("%H:%M"),
+                slot_start=_fmt_time(r.slot_start),
+                slot_end=_fmt_time(r.slot_end),
                 status=r.status,
                 visit_id=vis_by_appt.get(r.id),
                 vitals_registered=vitals_flag,
@@ -657,7 +786,8 @@ def update_appointment_status(
             )
             db.add(visit)
             db.flush()
-            visit.episode_id = make_op_episode_id(db, visit.id, on_date=visit.visit_at.date(), id_width=4)
+            visit.episode_id = make_op_episode_id(
+                db, visit.id, on_date=visit.visit_at.date(), id_width=4)
 
     ap.status = new_status
 
@@ -675,7 +805,8 @@ def update_appointment_status(
             )
             db.add(visit)
             db.flush()
-            visit.episode_id = make_op_episode_id(db, visit.id, on_date=visit.visit_at.date(), id_width=4)
+            visit.episode_id = make_op_episode_id(
+                db, visit.id, on_date=visit.visit_at.date(), id_width=4)
         elif visit.visit_at is None:
             visit.visit_at = now_local().replace(tzinfo=None)
 
@@ -712,13 +843,6 @@ def reschedule_appointment(
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
 ):
-    """
-    Waiting-time Management:
-
-    - For normal booked appointments: updates same row.
-    - For no_show appointments: by default creates NEW appointment and keeps
-      the old as history (unless create_new=False).
-    """
     ap = db.get(Appointment, appointment_id)
     if not ap:
         raise HTTPException(status_code=404, detail="Appointment not found")
@@ -729,59 +853,112 @@ def reschedule_appointment(
         raise HTTPException(status_code=403, detail="Not permitted")
 
     new_date = payload.date
-    new_slot_start = _parse_slot(payload.slot_start)
+    appt_type = (getattr(ap, "appointment_type", None)
+                 or "slot").strip().lower()
+    if appt_type not in {"slot", "free"}:
+        appt_type = "slot"
 
-    sch = _get_active_schedule_for_doctor_and_date(db, ap.doctor_user_id,
-                                                   new_date)
-    slot_end = _compute_slot_end(new_date, new_slot_start, sch.slot_minutes)
-    _check_slot_in_schedule(sch, new_date, new_slot_start, slot_end)
-    _ensure_not_past(new_date, new_slot_start)
+    create_new = bool(getattr(payload, "create_new", False)) or (ap.status
+                                                                 == "no_show")
 
-    if payload.create_new or ap.status == "no_show":
+    # compute new time window based on appointment type
+    new_slot_start = None
+    new_slot_end = None
+
+    if appt_type == "slot":
+        if not payload.slot_start:
+            raise HTTPException(
+                status_code=400,
+                detail="slot_start is required for slot reschedule")
+
+        new_slot_start = _parse_slot(payload.slot_start)
+        sch = _get_active_schedule_for_doctor_and_date(db, ap.doctor_user_id,
+                                                       new_date)
+        new_slot_end = _compute_slot_end(new_date, new_slot_start,
+                                         sch.slot_minutes)
+
+        _check_slot_in_schedule(sch, new_date, new_slot_start, new_slot_end)
+        _ensure_not_past(new_date, new_slot_start)
+
+    else:
+        _ensure_not_past_date_only(new_date)
+
+    if create_new:
+        # If user forces create_new on active appt, convert old to cancelled for history
+        if ap.status in BUSY_STATUS and ap.status != "no_show":
+            ap.status = "cancelled"
+
+        # validate duplicates/slot for NEW appointment
         _ensure_no_patient_duplicate(db, ap.patient_id, new_date)
-        _ensure_slot_free_for_doctor(db, ap.doctor_user_id, new_date,
-                                     new_slot_start)
+        if appt_type == "slot":
+            _ensure_slot_free_for_doctor(db, ap.doctor_user_id, new_date,
+                                         new_slot_start)
+
+        queue_no = _next_queue_no(db, ap.doctor_user_id, new_date)
 
         new_ap = Appointment(
             patient_id=ap.patient_id,
             department_id=ap.department_id,
             doctor_user_id=ap.doctor_user_id,
             date=new_date,
+            appointment_type=appt_type,
+            queue_no=queue_no,
             slot_start=new_slot_start,
-            slot_end=slot_end,
+            slot_end=new_slot_end,
             purpose=ap.purpose or "Consultation",
             status="booked",
         )
+        if hasattr(Appointment, "booked_by"):
+            new_ap.booked_by = user.id
+
         db.add(new_ap)
         db.commit()
+        db.refresh(new_ap)
+
         return {
             "message": "Rescheduled as new appointment",
             "old_appointment_id": ap.id,
             "appointment_id": new_ap.id,
+            "appointment_type": new_ap.appointment_type,
+            "queue_no": new_ap.queue_no,
         }
 
-    _ensure_no_patient_duplicate(db, ap.patient_id, new_date, ap.id)
-    _ensure_slot_free_for_doctor(
-        db,
-        ap.doctor_user_id,
-        new_date,
-        new_slot_start,
-        exclude_appointment_id=ap.id,
-    )
+    # update SAME row
+    _ensure_no_patient_duplicate(db,
+                                 ap.patient_id,
+                                 new_date,
+                                 exclude_appointment_id=ap.id)
+    if appt_type == "slot":
+        _ensure_slot_free_for_doctor(
+            db,
+            ap.doctor_user_id,
+            new_date,
+            new_slot_start,
+            exclude_appointment_id=ap.id,
+        )
+
+    # If date changed → new token for that date
+    if new_date != ap.date:
+        ap.queue_no = _next_queue_no(db, ap.doctor_user_id, new_date)
 
     ap.date = new_date
     ap.slot_start = new_slot_start
-    ap.slot_end = slot_end
+    ap.slot_end = new_slot_end
+
     if ap.status in {"cancelled", "no_show"}:
         ap.status = "booked"
 
     db.commit()
+
     return {
         "message": "Appointment rescheduled",
         "appointment_id": ap.id,
-        "date": ap.date,
-        "slot_start": ap.slot_start.strftime("%H:%M"),
-        "slot_end": ap.slot_end.strftime("%H:%M"),
+        "appointment_type": ap.appointment_type,
+        "queue_no": ap.queue_no,
+        "date": str(ap.date),
+        "slot_start": _fmt_time(ap.slot_start),
+        "slot_end": _fmt_time(ap.slot_end),
+        "status": ap.status,
     }
 
 
@@ -789,16 +966,11 @@ def reschedule_appointment(
 @router.get("/appointments/noshow", response_model=List[AppointmentRow])
 def list_no_show_appointments(
         for_date: Optional[dt_date] = Query(
-            None,
-            description="If omitted, today's date will be used",
-        ),
+            None, description="If omitted, today's date will be used"),
         doctor_id: Optional[int] = Query(None),
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
 ):
-    """
-    For 'No-show appointments' management screen.
-    """
     if not has_perm(user, "appointments.view"):
         raise HTTPException(status_code=403, detail="Not permitted")
 
@@ -809,36 +981,39 @@ def list_no_show_appointments(
         joinedload(Appointment.patient),
         joinedload(Appointment.doctor),
         joinedload(Appointment.department),
-    ).filter(
-        Appointment.date == for_date,
-        Appointment.status == "no_show",
-    ))
+    ).filter(Appointment.date == for_date, Appointment.status == "no_show"))
     if doctor_id:
         q = q.filter(Appointment.doctor_user_id == doctor_id)
-    rows = q.order_by(Appointment.slot_start.asc()).all()
 
-    vis_by_appt = {
-        v.appointment_id: v.id
-        for v in db.query(Visit).filter(
-            Visit.appointment_id.in_([r.id for r in rows])).all()
-    }
+    rows = q.order_by(Appointment.queue_no.asc(), Appointment.id.asc()).all()
+
+    appt_ids = [r.id for r in rows]
+    vis_by_appt = {}
+    if appt_ids:
+        vis_by_appt = {
+            v.appointment_id: v.id
+            for v in db.query(Visit).filter(Visit.appointment_id.in_(
+                appt_ids)).all()
+        }
 
     out: List[AppointmentRow] = []
     for r in rows:
         out.append(
             AppointmentRow(
                 id=r.id,
+                queue_no=getattr(r, "queue_no", None),
+                appointment_type=getattr(r, "appointment_type", None),
                 uhid=r.patient.uhid,
                 patient_name=
                 f"{r.patient.first_name} {r.patient.last_name or ''}".strip(),
-                doctor_name=r.doctor.name,
-                department_name=r.department.name,
+                doctor_name=r.doctor.name if r.doctor else "",
+                department_name=r.department.name if r.department else "",
                 date=r.date.isoformat(),
-                slot_start=r.slot_start.strftime("%H:%M"),
-                slot_end=r.slot_end.strftime("%H:%M"),
+                slot_start=_fmt_time(r.slot_start),
+                slot_end=_fmt_time(r.slot_end),
                 status=r.status,
                 visit_id=vis_by_appt.get(r.id),
-                vitals_registered=vitals_done_on(db, r.patient_id, r.date),
+                vitals_registered=vitals_done_for_appointment(db, r),
                 purpose=r.purpose or "Consultation",
             ))
     return out
@@ -890,8 +1065,11 @@ def create_visit(
     ap.status = "checked_in"
     db.add(v)
     db.flush()  # ✅ get v.id
-    v.episode_id = make_op_episode_id(db, v.id, on_date=visit_at_local.date(), id_width=4)
-    
+    v.episode_id = make_op_episode_id(db,
+                                      v.id,
+                                      on_date=visit_at_local.date(),
+                                      id_width=4)
+
     db.commit()
     return {"id": v.id}
 
@@ -915,9 +1093,20 @@ def get_visit(
             == v.department_id or has_perm(user, "visits.view")):
         raise HTTPException(403, "Not permitted")
 
-    latest_vitals = (db.query(Vitals).filter(
-        Vitals.patient_id == v.patient_id).order_by(
-            Vitals.created_at.desc()).first())
+    latest_vitals = None
+
+    # Prefer vitals linked to this appointment (best)
+    if v.appointment_id and hasattr(Vitals, "appointment_id"):
+        latest_vitals = (db.query(Vitals).filter(
+            Vitals.appointment_id == v.appointment_id).order_by(
+                Vitals.created_at.desc()).first())
+
+    # Fallback: latest vitals for patient
+    if not latest_vitals:
+        latest_vitals = (db.query(Vitals).filter(
+            Vitals.patient_id == v.patient_id).order_by(
+                Vitals.created_at.desc()).first())
+
     vitals_dict = None
     if latest_vitals:
         vitals_dict = {
@@ -968,6 +1157,31 @@ def get_visit(
         appointment_id=v.appointment_id,
         appointment_status=v.appointment.status if v.appointment else None,
         current_vitals=vitals_dict,
+        presenting_illness=v.presenting_illness,
+        review_of_systems=v.review_of_systems,
+        medical_history=v.medical_history,
+        surgical_history=v.surgical_history,
+        medication_history=v.medication_history,
+        drug_allergy=v.drug_allergy,
+        family_history=v.family_history,
+        personal_history=v.personal_history,
+        menstrual_history=v.menstrual_history,
+        obstetric_history=v.obstetric_history,
+        immunization_history=v.immunization_history,
+        general_examination=v.general_examination,
+        systemic_examination=v.systemic_examination,
+        local_examination=v.local_examination,
+        provisional_diagnosis=v.provisional_diagnosis,
+        differential_diagnosis=v.differential_diagnosis,
+        final_diagnosis=v.final_diagnosis,
+        diagnosis_codes=v.diagnosis_codes,
+        investigations=v.investigations,
+        treatment_plan=v.treatment_plan,
+        advice=v.advice,
+        followup_plan=v.followup_plan,
+        referral_notes=v.referral_notes,
+        procedure_notes=v.procedure_notes,
+        counselling_notes=v.counselling_notes,
     )
 
 
@@ -1271,13 +1485,9 @@ def schedule_followup(
     """
     Confirm a waiting follow-up into a real Appointment.
 
-    This endpoint is intentionally lenient with payload shape to avoid 422.
-    Expected JSON body:
-
-    {
-      "date": "YYYY-MM-DD",   # optional; if missing uses followup.due_date
-      "slot_start": "HH:MM"   # required
-    }
+    ✅ Supports both:
+    - FREE booking: {"date": "YYYY-MM-DD"}  (no slot)
+    - SLOT booking: {"date": "...", "slot_start": "HH:MM"}  (slot validated)
     """
     fu = (db.query(FollowUp).options(
         joinedload(FollowUp.patient),
@@ -1298,10 +1508,7 @@ def schedule_followup(
         raise HTTPException(status_code=403, detail="Not permitted")
 
     raw_date = body.get("date")
-    raw_slot = body.get("slot_start") or body.get("slot")
-
-    if not raw_slot:
-        raise HTTPException(status_code=400, detail="slot_start is required")
+    raw_slot = body.get("slot_start") or body.get("slot")  # ✅ OPTIONAL now
 
     # Resolve date
     if raw_date:
@@ -1320,30 +1527,52 @@ def schedule_followup(
         else:
             raise HTTPException(
                 status_code=400,
-                detail="Invalid date format, expected YYYY-MM-DD",
-            )
+                detail="Invalid date format, expected YYYY-MM-DD")
     else:
         d = fu.due_date
 
-    slot_start = _parse_slot(raw_slot)
-
-    sch = _get_active_schedule_for_doctor_and_date(db, fu.doctor_user_id, d)
-    slot_end = _compute_slot_end(d, slot_start, sch.slot_minutes)
-    _check_slot_in_schedule(sch, d, slot_start, slot_end)
-    _ensure_not_past(d, slot_start)
+    # ✅ Common rule: no duplicate ACTIVE appointment for same patient+date
     _ensure_no_patient_duplicate(db, fu.patient_id, d)
-    _ensure_slot_free_for_doctor(db, fu.doctor_user_id, d, slot_start)
+
+    # Decide booking mode
+    appt_type = "slot" if (raw_slot and str(raw_slot).strip()) else "free"
+
+    slot_start = None
+    slot_end = None
+
+    if appt_type == "slot":
+        slot_start = _parse_slot(str(raw_slot).strip())
+
+        sch = _get_active_schedule_for_doctor_and_date(db, fu.doctor_user_id,
+                                                       d)
+        slot_end = _compute_slot_end(d, slot_start, sch.slot_minutes)
+
+        _check_slot_in_schedule(sch, d, slot_start, slot_end)
+        _ensure_not_past(d, slot_start)
+        _ensure_slot_free_for_doctor(db, fu.doctor_user_id, d, slot_start)
+
+    else:
+        # ✅ FREE booking: date-only validation
+        _ensure_not_past_date_only(d)
+
+    queue_no = _next_queue_no(db, fu.doctor_user_id, d)
 
     ap = Appointment(
         patient_id=fu.patient_id,
         department_id=fu.department_id,
         doctor_user_id=fu.doctor_user_id,
         date=d,
-        slot_start=slot_start,
-        slot_end=slot_end,
+        appointment_type=appt_type,  # ✅ "free" or "slot"
+        queue_no=queue_no,
+        slot_start=slot_start,  # ✅ None for free
+        slot_end=slot_end,  # ✅ None for free
         purpose="Follow-up",
         status="booked",
     )
+
+    if hasattr(Appointment, "booked_by"):
+        ap.booked_by = user.id
+
     db.add(ap)
     db.flush()
 
@@ -1353,12 +1582,15 @@ def schedule_followup(
     db.commit()
 
     return {
-        "message": "Follow-up scheduled",
+        "message": "Follow-up confirmed"
+        if appt_type == "free" else "Follow-up scheduled",
         "followup_id": fu.id,
         "appointment_id": ap.id,
+        "appointment_type": appt_type,
+        "queue_no": queue_no,
         "date": str(d),
-        "slot_start": slot_start.strftime("%H:%M"),
-        "slot_end": slot_end.strftime("%H:%M"),
+        "slot_start": slot_start.strftime("%H:%M") if slot_start else None,
+        "slot_end": slot_end.strftime("%H:%M") if slot_end else None,
     }
 
 
@@ -1652,3 +1884,209 @@ def opd_dashboard_summary(
         "top_doctor_by_appointments": top_by_appointments,
         "top_doctor_by_completed": top_by_completed,
     }
+
+
+@router.get("/visits/{visit_id}/prescription")
+def get_prescription(
+        visit_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    if not has_perm(user, "visits.view"):
+        raise HTTPException(status_code=403, detail="Not permitted")
+
+    v = db.get(Visit, visit_id)
+    if not v:
+        raise HTTPException(status_code=404, detail="Visit not found")
+
+    rx = db.query(Prescription).filter(
+        Prescription.visit_id == visit_id).first()
+    if not rx:
+        return {"notes": "", "items": []}
+
+    items = (db.query(PrescriptionItem).filter(
+        PrescriptionItem.prescription_id == rx.id).order_by(
+            PrescriptionItem.id.asc()).all())
+
+    return {
+        "notes":
+        rx.notes or "",
+        "items": [{
+            "drug_name": it.drug_name,
+            "strength": it.strength or "",
+            "frequency": it.frequency or "",
+            "duration_days": int(it.duration_days or 0),
+            "quantity": int(it.quantity or 0),
+            "unit_price": float(it.unit_price or 0),
+        } for it in items],
+    }
+
+
+
+
+
+@router.get("/visits/{visit_id}/summary.pdf")
+def visit_summary_pdf(
+        visit_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    v = db.get(Visit, visit_id)
+    if not v:
+        raise HTTPException(status_code=404, detail="Visit not found")
+
+    p = db.get(Patient, v.patient_id) if getattr(v, "patient_id",
+                                                 None) else None
+    dept = db.get(Department, v.department_id) if getattr(
+        v, "department_id", None) else None
+    doc = db.get(User, v.doctor_id) if getattr(v, "doctor_id", None) else None
+
+    vit = (db.query(Vitals).filter(Vitals.visit_id == visit_id).order_by(
+        Vitals.id.desc()).first())
+
+    def S(x):  # safe string
+        return "" if x is None else str(x)
+
+    styles = getSampleStyleSheet()
+    h1 = styles["Heading2"]
+    h2 = styles["Heading4"]
+    body = styles["BodyText"]
+    body.fontSize = 9
+    body.leading = 12
+
+    def para(txt: str):
+        t = (txt or "").strip()
+        if not t:
+            return Paragraph("<font color='#888888'>—</font>", body)
+        t = t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        t = t.replace("\n", "<br/>")
+        return Paragraph(t, body)
+
+    buff = BytesIO()
+    docpdf = SimpleDocTemplate(
+        buff,
+        pagesize=A4,
+        leftMargin=14 * mm,
+        rightMargin=14 * mm,
+        topMargin=14 * mm,
+        bottomMargin=14 * mm,
+        title=f"Visit Summary {visit_id}",
+    )
+
+    story = []
+
+    # Header
+    story.append(Paragraph("OPD Visit Summary", h1))
+    story.append(Spacer(1, 6))
+
+    # Patient/Visit table
+    left = [
+        [
+            "Patient",
+            S(getattr(p, "full_name", None) or getattr(p, "first_name", ""))
+        ],
+        ["UHID", S(getattr(p, "uhid", ""))],
+        ["Phone", S(getattr(p, "phone", ""))],
+    ]
+    right = [
+        ["Visit ID", str(visit_id)],
+        ["Episode", S(getattr(v, "episode_id", ""))],
+        ["Department", S(getattr(dept, "name", ""))],
+        [
+            "Doctor",
+            S(
+                getattr(doc, "full_name", "") or getattr(doc, "name", "")
+                or getattr(v, "doctor_name", ""))
+        ],
+        ["Visit At", S(getattr(v, "visit_at", ""))],
+    ]
+
+    t = Table(
+        [[
+            Table(left, colWidths=[28 * mm, 70 * mm]),
+            Table(right, colWidths=[28 * mm, 70 * mm])
+        ]],
+        colWidths=[98 * mm, 98 * mm],
+    )
+    t.setStyle(
+        TableStyle([
+            ("BOX", (0, 0), (-1, -1), 0.8, colors.black),
+            ("INNERGRID", (0, 0), (-1, -1), 0.4, colors.black),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("BACKGROUND", (0, 0), (-1, -1), colors.whitesmoke),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ]))
+    story.append(t)
+    story.append(Spacer(1, 8))
+
+    # Vitals block
+    if vit:
+        story.append(Paragraph("Latest Vitals", h2))
+        story.append(Spacer(1, 3))
+        vit_lines = []
+        if getattr(vit, "height_cm", None):
+            vit_lines.append(f"Height: {vit.height_cm} cm")
+        if getattr(vit, "weight_kg", None):
+            vit_lines.append(f"Weight: {vit.weight_kg} kg")
+        if getattr(vit, "temp_c", None):
+            vit_lines.append(f"Temp: {vit.temp_c} °C")
+        if getattr(vit, "bp_systolic", None):
+            vit_lines.append(
+                f"BP: {vit.bp_systolic}/{getattr(vit,'bp_diastolic','')} mmHg")
+        if getattr(vit, "pulse", None): vit_lines.append(f"Pulse: {vit.pulse}")
+        if getattr(vit, "rr", None): vit_lines.append(f"RR: {vit.rr}")
+        if getattr(vit, "spo2", None): vit_lines.append(f"SpO₂: {vit.spo2}%")
+        story.append(para("\n".join(vit_lines) if vit_lines else "—"))
+        story.append(Spacer(1, 8))
+
+    def section(title: str, value: str):
+        story.append(Paragraph(title, h2))
+        story.append(Spacer(1, 3))
+        story.append(para(value))
+        story.append(Spacer(1, 8))
+
+    # Sections (match your new columns)
+    section("Chief Complaint", S(getattr(v, "chief_complaint", "")))
+    section("Presenting Illness (HPI)", S(getattr(v, "presenting_illness",
+                                                  "")))
+    section("Symptoms", S(getattr(v, "symptoms", "")))
+    section("Review of Systems", S(getattr(v, "review_of_systems", "")))
+
+    section("Past Medical History", S(getattr(v, "medical_history", "")))
+    section("Past Surgical History", S(getattr(v, "surgical_history", "")))
+    section("Medication History", S(getattr(v, "medication_history", "")))
+    section("Drug Allergy", S(getattr(v, "drug_allergy", "")))
+    section("Family History", S(getattr(v, "family_history", "")))
+    section("Personal History", S(getattr(v, "personal_history", "")))
+
+    section("General Examination", S(getattr(v, "general_examination", "")))
+    section("Systemic Examination", S(getattr(v, "systemic_examination", "")))
+    section("Local Examination", S(getattr(v, "local_examination", "")))
+
+    section("Provisional Diagnosis", S(getattr(v, "provisional_diagnosis",
+                                               "")))
+    section("Differential Diagnosis",
+            S(getattr(v, "differential_diagnosis", "")))
+    section("Final Diagnosis", S(getattr(v, "final_diagnosis", "")))
+    section("Diagnosis Codes (ICD)", S(getattr(v, "diagnosis_codes", "")))
+
+    section("Investigations", S(getattr(v, "investigations", "")))
+    section("Treatment Plan", S(getattr(v, "treatment_plan", "")))
+    section("Advice / Counselling", S(getattr(v, "advice", "")))
+    section("Follow-up Plan", S(getattr(v, "followup_plan", "")))
+    section("Referral Notes", S(getattr(v, "referral_notes", "")))
+    section("Procedure Notes", S(getattr(v, "procedure_notes", "")))
+    section("Counselling Notes", S(getattr(v, "counselling_notes", "")))
+
+    docpdf.build(story)
+    buff.seek(0)
+
+    filename = f"visit_summary_{visit_id}.pdf"
+    return StreamingResponse(
+        buff,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+    )
