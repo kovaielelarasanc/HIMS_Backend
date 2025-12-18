@@ -4,6 +4,7 @@ from sqlalchemy import (Column, Integer, String, DateTime, Boolean, ForeignKey,
                         Numeric, Text, UniqueConstraint, Index)
 from sqlalchemy.orm import relationship
 from app.db.base import Base
+from sqlalchemy.types import JSON
 
 # -------------------------
 # Laboratory (LIS)
@@ -276,7 +277,6 @@ class LabService(Base):
 
     unit = Column(String(64), nullable=True)  # UI sends "" -> "-"
     normal_range = Column(String(255), nullable=True)  # UI sends "" -> "-"
-
     # Advanced fields (can be empty now, useful later)
     sample_type = Column(String(128), nullable=True)  # Serum / Plasma / Urine
     method = Column(String(128), nullable=True)  # Immunoassay / Colorimetric
