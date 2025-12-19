@@ -75,7 +75,7 @@ def brand_header_css() -> str:
       --logo-h: 72px;      /* logo display height (increase this if you want bigger) */
 
       width:100%;
-      padding-bottom: 6px;
+      padding-bottom: 16px;
       margin-bottom: 10px;
       border-bottom: 1px solid #e5e7eb;
     }
@@ -84,6 +84,7 @@ def brand_header_css() -> str:
       display: table;
       width: 100%;
       table-layout: fixed;
+      padding-bottom: 10px;
     }
     .brand-left{
       display: table-cell;
