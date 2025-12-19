@@ -9,6 +9,8 @@ from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import func, case
 
+from fastapi.responses import StreamingResponse
+from app.services.pdf_opd_summary import build_visit_summary_pdf
 from app.api.deps import get_db, current_user
 from app.models.user import User
 from app.models.patient import Patient
@@ -1924,169 +1926,19 @@ def get_prescription(
 
 
 
-
 @router.get("/visits/{visit_id}/summary.pdf")
 def visit_summary_pdf(
-        visit_id: int,
-        db: Session = Depends(get_db),
-        user: User = Depends(current_user),
+    visit_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
 ):
-    v = db.get(Visit, visit_id)
-    if not v:
-        raise HTTPException(status_code=404, detail="Visit not found")
+    if not has_perm(user, "visits.view"):
+        raise HTTPException(status_code=403, detail="Not permitted")
 
-    p = db.get(Patient, v.patient_id) if getattr(v, "patient_id",
-                                                 None) else None
-    dept = db.get(Department, v.department_id) if getattr(
-        v, "department_id", None) else None
-    doc = db.get(User, v.doctor_id) if getattr(v, "doctor_id", None) else None
+    buff = build_visit_summary_pdf(db, visit_id)
 
-    vit = (db.query(Vitals).filter(Vitals.visit_id == visit_id).order_by(
-        Vitals.id.desc()).first())
-
-    def S(x):  # safe string
-        return "" if x is None else str(x)
-
-    styles = getSampleStyleSheet()
-    h1 = styles["Heading2"]
-    h2 = styles["Heading4"]
-    body = styles["BodyText"]
-    body.fontSize = 9
-    body.leading = 12
-
-    def para(txt: str):
-        t = (txt or "").strip()
-        if not t:
-            return Paragraph("<font color='#888888'>—</font>", body)
-        t = t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        t = t.replace("\n", "<br/>")
-        return Paragraph(t, body)
-
-    buff = BytesIO()
-    docpdf = SimpleDocTemplate(
-        buff,
-        pagesize=A4,
-        leftMargin=14 * mm,
-        rightMargin=14 * mm,
-        topMargin=14 * mm,
-        bottomMargin=14 * mm,
-        title=f"Visit Summary {visit_id}",
-    )
-
-    story = []
-
-    # Header
-    story.append(Paragraph("OPD Visit Summary", h1))
-    story.append(Spacer(1, 6))
-
-    # Patient/Visit table
-    left = [
-        [
-            "Patient",
-            S(getattr(p, "full_name", None) or getattr(p, "first_name", ""))
-        ],
-        ["UHID", S(getattr(p, "uhid", ""))],
-        ["Phone", S(getattr(p, "phone", ""))],
-    ]
-    right = [
-        ["Visit ID", str(visit_id)],
-        ["Episode", S(getattr(v, "episode_id", ""))],
-        ["Department", S(getattr(dept, "name", ""))],
-        [
-            "Doctor",
-            S(
-                getattr(doc, "full_name", "") or getattr(doc, "name", "")
-                or getattr(v, "doctor_name", ""))
-        ],
-        ["Visit At", S(getattr(v, "visit_at", ""))],
-    ]
-
-    t = Table(
-        [[
-            Table(left, colWidths=[28 * mm, 70 * mm]),
-            Table(right, colWidths=[28 * mm, 70 * mm])
-        ]],
-        colWidths=[98 * mm, 98 * mm],
-    )
-    t.setStyle(
-        TableStyle([
-            ("BOX", (0, 0), (-1, -1), 0.8, colors.black),
-            ("INNERGRID", (0, 0), (-1, -1), 0.4, colors.black),
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("BACKGROUND", (0, 0), (-1, -1), colors.whitesmoke),
-            ("LEFTPADDING", (0, 0), (-1, -1), 6),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-            ("TOPPADDING", (0, 0), (-1, -1), 6),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-        ]))
-    story.append(t)
-    story.append(Spacer(1, 8))
-
-    # Vitals block
-    if vit:
-        story.append(Paragraph("Latest Vitals", h2))
-        story.append(Spacer(1, 3))
-        vit_lines = []
-        if getattr(vit, "height_cm", None):
-            vit_lines.append(f"Height: {vit.height_cm} cm")
-        if getattr(vit, "weight_kg", None):
-            vit_lines.append(f"Weight: {vit.weight_kg} kg")
-        if getattr(vit, "temp_c", None):
-            vit_lines.append(f"Temp: {vit.temp_c} °C")
-        if getattr(vit, "bp_systolic", None):
-            vit_lines.append(
-                f"BP: {vit.bp_systolic}/{getattr(vit,'bp_diastolic','')} mmHg")
-        if getattr(vit, "pulse", None): vit_lines.append(f"Pulse: {vit.pulse}")
-        if getattr(vit, "rr", None): vit_lines.append(f"RR: {vit.rr}")
-        if getattr(vit, "spo2", None): vit_lines.append(f"SpO₂: {vit.spo2}%")
-        story.append(para("\n".join(vit_lines) if vit_lines else "—"))
-        story.append(Spacer(1, 8))
-
-    def section(title: str, value: str):
-        story.append(Paragraph(title, h2))
-        story.append(Spacer(1, 3))
-        story.append(para(value))
-        story.append(Spacer(1, 8))
-
-    # Sections (match your new columns)
-    section("Chief Complaint", S(getattr(v, "chief_complaint", "")))
-    section("Presenting Illness (HPI)", S(getattr(v, "presenting_illness",
-                                                  "")))
-    section("Symptoms", S(getattr(v, "symptoms", "")))
-    section("Review of Systems", S(getattr(v, "review_of_systems", "")))
-
-    section("Past Medical History", S(getattr(v, "medical_history", "")))
-    section("Past Surgical History", S(getattr(v, "surgical_history", "")))
-    section("Medication History", S(getattr(v, "medication_history", "")))
-    section("Drug Allergy", S(getattr(v, "drug_allergy", "")))
-    section("Family History", S(getattr(v, "family_history", "")))
-    section("Personal History", S(getattr(v, "personal_history", "")))
-
-    section("General Examination", S(getattr(v, "general_examination", "")))
-    section("Systemic Examination", S(getattr(v, "systemic_examination", "")))
-    section("Local Examination", S(getattr(v, "local_examination", "")))
-
-    section("Provisional Diagnosis", S(getattr(v, "provisional_diagnosis",
-                                               "")))
-    section("Differential Diagnosis",
-            S(getattr(v, "differential_diagnosis", "")))
-    section("Final Diagnosis", S(getattr(v, "final_diagnosis", "")))
-    section("Diagnosis Codes (ICD)", S(getattr(v, "diagnosis_codes", "")))
-
-    section("Investigations", S(getattr(v, "investigations", "")))
-    section("Treatment Plan", S(getattr(v, "treatment_plan", "")))
-    section("Advice / Counselling", S(getattr(v, "advice", "")))
-    section("Follow-up Plan", S(getattr(v, "followup_plan", "")))
-    section("Referral Notes", S(getattr(v, "referral_notes", "")))
-    section("Procedure Notes", S(getattr(v, "procedure_notes", "")))
-    section("Counselling Notes", S(getattr(v, "counselling_notes", "")))
-
-    docpdf.build(story)
-    buff.seek(0)
-
-    filename = f"visit_summary_{visit_id}.pdf"
     return StreamingResponse(
         buff,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+        headers={"Content-Disposition": f'inline; filename="opd_summary_{visit_id}.pdf"'},
     )
