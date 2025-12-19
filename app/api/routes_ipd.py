@@ -126,6 +126,14 @@ from app.services.id_gen import make_ip_admission_code
 router = APIRouter()
 
 
+def _intake_total(payload: IOIn) -> int:
+    split = (payload.intake_oral_ml or 0) + (payload.intake_iv_ml or 0) + (payload.intake_blood_ml or 0)
+    return split if split > 0 else (payload.intake_ml or 0)
+
+def _urine_total(payload: IOIn) -> int:
+    split = (payload.urine_foley_ml or 0) + (payload.urine_voided_ml or 0)
+    return split if split > 0 else (payload.urine_ml or 0)
+
 def _get_admission_or_404(db: Session, admission_id: int) -> IpdAdmission:
     adm = db.query(IpdAdmission).get(admission_id)
     if not adm:
@@ -939,26 +947,43 @@ def get_latest_vitals(
 )
 @router.post("/admissions/{admission_id}/io", response_model=IOOut)
 def record_io(
-        admission_id: int,
-        payload: IOIn,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
+    admission_id: int,
+    payload: IOIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
 ):
     if not has_perm(user, "ipd.nursing"):
         raise HTTPException(403, "Not permitted")
+
     adm = db.query(IpdAdmission).get(admission_id)
     if not adm:
         raise HTTPException(404, "Admission not found")
+
+    intake_total = _intake_total(payload)
+    urine_total = _urine_total(payload)
+
     io = IpdIntakeOutput(
         admission_id=admission_id,
         recorded_by=user.id,
         recorded_at=payload.recorded_at or datetime.utcnow(),
-        intake_ml=payload.intake_ml,
-        urine_ml=payload.urine_ml,
-        drains_ml=payload.drains_ml,
-        stools_count=payload.stools_count,
+
+        # ✅ save split fields
+        intake_oral_ml=payload.intake_oral_ml or 0,
+        intake_iv_ml=payload.intake_iv_ml or 0,
+        intake_blood_ml=payload.intake_blood_ml or 0,
+
+        urine_foley_ml=payload.urine_foley_ml or 0,
+        urine_voided_ml=payload.urine_voided_ml or 0,
+
+        drains_ml=payload.drains_ml or 0,
+        stools_count=payload.stools_count or 0,
         remarks=payload.remarks or "",
+
+        # ✅ store totals for compatibility / reporting
+        intake_ml=intake_total,
+        urine_ml=urine_total,
     )
+
     db.add(io)
     db.commit()
     db.refresh(io)

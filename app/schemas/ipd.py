@@ -454,11 +454,23 @@ class VitalSnapshot(VitalBase):
 
 class IOIn(BaseModel):
     recorded_at: Optional[datetime] = None
-    intake_ml: int = Field(0, ge=0)
-    urine_ml: int = Field(0, ge=0)
+
+    # ✅ NEW split intake (ml)
+    intake_oral_ml: int = Field(0, ge=0)
+    intake_iv_ml: int = Field(0, ge=0)
+    intake_blood_ml: int = Field(0, ge=0)
+
+    # ✅ NEW split urine (ml)
+    urine_foley_ml: int = Field(0, ge=0)
+    urine_voided_ml: int = Field(0, ge=0)
+
     drains_ml: int = Field(0, ge=0)
     stools_count: int = Field(0, ge=0)
     remarks: Optional[str] = ""
+
+    # ✅ legacy totals (still accepted from old UI; also we can store computed totals here)
+    intake_ml: int = Field(0, ge=0)
+    urine_ml: int = Field(0, ge=0)
 
 
 class IOOut(IOIn):

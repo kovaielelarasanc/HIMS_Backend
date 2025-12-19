@@ -1436,25 +1436,46 @@ def _build_timeline(
 
     # --- IPD Intake/Output ---
     if _want("ipd_intake_output", allow):
-        ios = (db.query(IpdIntakeOutput).join(
-            IpdAdmission,
-            IpdIntakeOutput.admission_id == IpdAdmission.id).filter(
-                IpdAdmission.patient_id == patient_id).order_by(
-                    IpdIntakeOutput.recorded_at.desc()).limit(2000).all())
-        for io in ios:
-            ts = _safe_dt(io.recorded_at)
-            if not _in_window(ts, dfrom, dto):
-                continue
-            out.append(
-                TimelineItemOut(
-                    type="ipd_intake_output",
-                    ts=ts,
-                    title=_title_for("ipd_intake_output"),
-                    subtitle=
-                    f"Intake {io.intake_ml} ml • Urine {io.urine_ml} ml",
-                    status=None,
-                    data={"intake_output": _row(io)},
-                ))
+        ios = (
+            db.query(IpdIntakeOutput)
+            .join(IpdAdmission, IpdIntakeOutput.admission_id == IpdAdmission.id)
+            .filter(IpdAdmission.patient_id == patient_id)
+            .order_by(IpdIntakeOutput.recorded_at.desc())
+            .limit(2000)
+            .all()
+        )
+
+    for io in ios:
+        ts = _safe_dt(io.recorded_at)
+        if not _in_window(ts, dfrom, dto):
+            continue
+
+        # ✅ split totals with fallback to legacy
+        in_split = (int(io.intake_oral_ml or 0) + int(io.intake_iv_ml or 0) + int(io.intake_blood_ml or 0))
+        out_ur_split = (int(io.urine_foley_ml or 0) + int(io.urine_voided_ml or 0))
+
+        intake_total = in_split if in_split > 0 else int(io.intake_ml or 0)
+        urine_total = out_ur_split if out_ur_split > 0 else int(io.urine_ml or 0)
+        drains = int(io.drains_ml or 0)
+        output_total = urine_total + drains
+        net = intake_total - output_total
+
+        subtitle = (
+            f"In {intake_total} ml (Oral {int(io.intake_oral_ml or 0)}, IV {int(io.intake_iv_ml or 0)}, Blood {int(io.intake_blood_ml or 0)}) "
+            f"• Out {output_total} ml (Foley {int(io.urine_foley_ml or 0)}, Voided {int(io.urine_voided_ml or 0)}, Drains {drains}) "
+            f"• Net {('+' if net > 0 else '')}{net} ml"
+        )
+
+        out.append(
+            TimelineItemOut(
+                type="ipd_intake_output",
+                ts=ts,
+                title=_title_for("ipd_intake_output"),
+                subtitle=subtitle,
+                status=None,
+                data={"intake_output": _row(io)},
+            )
+        )
 
     # --- IPD Rounds ---
     if _want("ipd_round", allow):

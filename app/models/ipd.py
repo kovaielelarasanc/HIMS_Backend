@@ -618,8 +618,18 @@ class IpdIntakeOutput(Base):
     recorded_at = Column(DateTime, default=datetime.utcnow)
     recorded_by = Column(Integer, ForeignKey("users.id"))
 
+    # ✅ legacy totals (keep for compatibility / reporting)
     intake_ml = Column(Integer, default=0)
     urine_ml = Column(Integer, default=0)
+
+    # ✅ NEW split fields
+    intake_oral_ml = Column(Integer, default=0)
+    intake_iv_ml = Column(Integer, default=0)
+    intake_blood_ml = Column(Integer, default=0)
+
+    urine_foley_ml = Column(Integer, default=0)
+    urine_voided_ml = Column(Integer, default=0)
+
     drains_ml = Column(Integer, default=0)
     stools_count = Column(Integer, default=0)
     remarks = Column(Text, default="")
