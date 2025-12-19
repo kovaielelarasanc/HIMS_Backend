@@ -61,7 +61,7 @@ def seed_permissions(db: Session) -> None:
         # -------------------------------------------------------------------
         # IPD – Core
         # -------------------------------------------------------------------
-        ("ipd", ["view", "manage", "doctor",]),
+        ("ipd", ["view", "manage", "doctor","nursing"]),
 
         # -------------------------------------------------------------------
         # IPD Masters (Ward / Room / Bed / Bed-rates)
@@ -73,7 +73,7 @@ def seed_permissions(db: Session) -> None:
         ("ipd.beds", ["view", "manage", "reserve", "release"]),
         ("ipd.bedrates", ["view", "manage"]),
         ("ipd.packages", ["view", "manage"]),
-
+        ("ipd.nursing", ["create","view","update"]),
         # -------------------------------------------------------------------
         # IPD Admissions / Tracking
         # (these are mostly for frontend gating + future-proofing)
