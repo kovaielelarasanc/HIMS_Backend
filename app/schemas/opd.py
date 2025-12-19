@@ -363,3 +363,16 @@ class FollowUpRow(BaseModel):
     note: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class FollowUpListItem(BaseModel):
+    id: int
+    due_date: Optional[date] = None
+    status: Optional[str] = None
+    note: Optional[str] = None
+    created_at: Optional[datetime] = None
+    source_visit_id: Optional[int] = None
+    source_episode_id: Optional[str] = None
+
+    class Config:
+        from_attributes = True

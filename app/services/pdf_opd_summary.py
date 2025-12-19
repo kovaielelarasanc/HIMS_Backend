@@ -1,4 +1,4 @@
-# app/services/pdf_opd_summary.py
+# FILE: app/services/pdf_opd_summary.py
 from __future__ import annotations
 
 from io import BytesIO
@@ -9,7 +9,7 @@ import html as _html
 
 from sqlalchemy.orm import Session, joinedload
 from fastapi import HTTPException
-
+from sqlalchemy import case
 from app.core.config import settings
 from app.models.ui_branding import UiBranding
 from app.models.patient import Patient
@@ -24,6 +24,7 @@ from app.models.opd import (
     RadiologyOrder,
     LabTest,
     RadiologyTest,
+    FollowUp,
 )
 
 from app.services.pdf_branding import brand_header_css, render_brand_header_html
@@ -181,6 +182,7 @@ def _build_visit_summary_html(
     rx_items: List[PrescriptionItem],
     lab_names: List[str],
     rad_names: List[str],
+    followups: List[FollowUp],
 ) -> str:
     # ✅ OP number should be episode_id
     op_no = (_clean(getattr(visit, "episode_id", ""))
@@ -232,8 +234,17 @@ def _build_visit_summary_html(
     doc_name = _clean(getattr(doctor, "name", "")) or _clean(
         getattr(doctor, "full_name", ""))
 
-    def _field(label: str, value: Any, *, right: bool = False) -> str:
+    def _ghost() -> str:
+        return "<div class='ghost'></div>"
+
+    def _field(label: str,
+               value: Any,
+               *,
+               right: bool = False,
+               ghost_if_empty: bool = False) -> str:
         if not _present(value):
+            if ghost_if_empty:
+                return _ghost()
             return f"<div class='field empty{' right' if right else ''}'></div>"
         return (f"<div class='field{' right' if right else ''}'>"
                 f"<span class='lab'>{_esc(label)}:</span>"
@@ -248,7 +259,6 @@ def _build_visit_summary_html(
         ht = getattr(vitals, "height_cm", None)
         wt = getattr(vitals, "weight_kg", None)
         bmi = _calc_bmi(ht, wt)
-
         temp = getattr(vitals, "temp_c", None)
 
         bp_val = ""
@@ -274,12 +284,8 @@ def _build_visit_summary_html(
             ("BP", (bp_val + " mmHg") if bp_val else "—"),
             ("PULSE", (vtxt(pulse) + " /min") if _present(pulse) else "—"),
             ("RR", (vtxt(rr) + " /min") if _present(rr) else "—"),
-            ("SpO2",
-             (vtxt(spo2) + " %") if _present(spo2) else "—"),  # ✅ no subscript
+            ("SpO2", (vtxt(spo2) + " %") if _present(spo2) else "—"),
         ]
-
-        row1 = vitems[:4]
-        row2 = vitems[4:]
 
         def cell(k: str, v: str) -> str:
             return f"""
@@ -293,8 +299,8 @@ def _build_visit_summary_html(
         <div class="block" style="margin-top:10px;">
           <div class="block-title">Vitals</div>
           <table class="vgrid">
-            <tr>{''.join(cell(k, v) for k, v in row1)}</tr>
-            <tr>{''.join(cell(k, v) for k, v in row2)}</tr>
+            <tr>{''.join(cell(k, v) for k, v in vitems[:4])}</tr>
+            <tr>{''.join(cell(k, v) for k, v in vitems[4:])}</tr>
           </table>
         </div>
         """
@@ -317,6 +323,27 @@ def _build_visit_summary_html(
         <div class="block" style="margin-top:10px;">
           <div class="block-title">Orders</div>
           {''.join(orders_bits)}
+        </div>
+        """
+
+    # -----------------------------
+    # Follow-ups block (only if exists)
+    # -----------------------------
+    followup_html = ""
+    if followups:
+        rows = []
+        for idx, fu in enumerate(followups[:6], start=1):
+            due = _fmt_date(getattr(fu, "due_date", None))
+            st = _clean(getattr(fu, "status", "")) or "—"
+            note = _clean(getattr(fu, "note", "")) or ""
+            rows.append(
+                f"<div class='ord'><b>{idx}.</b> Due: {_esc(due)} &nbsp; "
+                + (f" &nbsp; | &nbsp; Note: {_esc(note)}" if note else "") +
+                "</div>")
+        followup_html = f"""
+        <div class="block" style="margin-top:10px;">
+          <div class="block-title">Follow-up</div>
+          {''.join(rows)}
         </div>
         """
 
@@ -487,6 +514,10 @@ def _build_visit_summary_html(
       gap: 14px;
     }}
 
+    .ghost {{
+      min-height: 18px;
+    }}
+
     .field {{
       min-height: 18px;
       padding: 1px 2px 2px 2px;
@@ -616,7 +647,6 @@ def _build_visit_summary_html(
       vertical-align: top;
       background: transparent;
     }}
-    tbody tr:nth-child(even) td {{ background: transparent; }}
 
     .c {{ text-align: center; }}
     .num {{ width: 26px; }}
@@ -641,11 +671,13 @@ def _build_visit_summary_html(
       <body>
         {header_html}
 
-        <div style="height:6px;"></div>
+        <!-- ✅ medium spacing between brand header & patient block -->
+        <div style="height:8px;"></div>
 
+        <!-- ✅ OP No | OP/IP (only if exists) | Date -->
         <div class="row3">
           {_field("OP No", op_no)}
-         
+          {_field("OP/IP", opip_val, ghost_if_empty=True)}
           {_field("Date", visit_date, right=True)}
         </div>
 
@@ -673,11 +705,11 @@ def _build_visit_summary_html(
 
         {vitals_html}
         {orders_html}
+        {followup_html}
 
         {sections_html}
 
         {rx_html}
-
       </body>
     </html>
     """.strip()
@@ -700,6 +732,7 @@ def _build_visit_summary_pdf_reportlab(
     rx_items: List[PrescriptionItem],
     lab_names: List[str],
     rad_names: List[str],
+    followups: List[FollowUp],
 ) -> bytes:
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.units import mm
@@ -916,12 +949,20 @@ def _build_visit_summary_pdf_reportlab(
         c.line(ul_start, y - 1.6 * mm, ul_end, y - 1.6 * mm)
 
     def draw_patient_block(y_base: float) -> float:
-        y = y_base - 6.0 * mm  # medium spacing from header
+        # ✅ medium spacing from header
+        y = y_base - 6.0 * mm
 
         col_w = (content_w - 8 * mm) / 3.0
         gap = 4 * mm
 
+        # ✅ OP No | OP/IP (only if exists; no placeholder line) | Date (right)
         _draw_underlined_field(M, y, col_w, "OP No", op_no)
+        _draw_underlined_field(M + col_w + gap,
+                               y,
+                               col_w,
+                               "OP/IP",
+                               opip_val,
+                               draw_empty_line=False)
         _draw_underlined_field(W - M - col_w,
                                y,
                                col_w,
@@ -1027,7 +1068,6 @@ def _build_visit_summary_pdf_reportlab(
         c.setFont("Helvetica-Bold", 9.6)
         c.drawString(M + pad, y_top - pad - 1.0 * mm, "VITALS")
 
-        # values
         ht = getattr(vit, "height_cm", None)
         wt = getattr(vit, "weight_kg", None)
         bmi = _calc_bmi(ht, wt)
@@ -1060,11 +1100,10 @@ def _build_visit_summary_pdf_reportlab(
         ]
 
         x0 = M + pad
-        y0 = y_top - pad - title_h - 4 * mm  # start grid top
+        y0 = y_top - pad - title_h - 4 * mm
         grid_w = content_w - 2 * pad
         cell_w = grid_w / 4.0
 
-        # draw cells
         idx = 0
         for row in range(2):
             for col in range(4):
@@ -1116,12 +1155,10 @@ def _build_visit_summary_pdf_reportlab(
         h = 8 * mm
         y_top = ensure_space(y_top, h + 2 * mm)
 
-        # header area border only
         c.setStrokeColor(LINE)
         c.setLineWidth(1)
         c.rect(M, y_top - h, content_w, h, stroke=1, fill=0)
 
-        # bottom strong line
         c.setStrokeColor(INK)
         c.setLineWidth(1.0)
         c.line(M, y_top - h, W - M, y_top - h)
@@ -1135,7 +1172,6 @@ def _build_visit_summary_pdf_reportlab(
                                 title.upper())
             xx += wcol
 
-        # vertical separators
         c.setStrokeColor(LINE)
         c.setLineWidth(1)
         xx = M
@@ -1227,11 +1263,9 @@ def _build_visit_summary_pdf_reportlab(
     y = draw_brand_header()
     y = draw_patient_block(y)
 
-    # Vitals grid (4x2)
     if vitals:
         y = draw_vitals_grid(y, vitals)
 
-    # Orders block
     if lab_names or rad_names:
         order_lines: List[str] = []
         if lab_names:
@@ -1245,7 +1279,19 @@ def _build_visit_summary_pdf_reportlab(
         if order_lines:
             y = draw_block(y, "Orders", order_lines)
 
-    # Clinical sections
+    if followups:
+        fu_lines: List[str] = []
+        for idx, fu in enumerate(followups[:6], start=1):
+            due = _fmt_date(getattr(fu, "due_date", None))
+            st = _clean(getattr(fu, "status", "")) or "—"
+            note = _clean(getattr(fu, "note", "")) or ""
+            line = f"{idx}. Due: {due}" + (f" | Note: {note}"
+                                                          if note else "")
+            fu_lines.extend(
+                wrap_paragraph(line, "Helvetica", 9, content_w - 8 * mm))
+        if fu_lines:
+            y = draw_block(y, "Follow-up", fu_lines)
+
     sections: List[Tuple[str, str]] = [
         ("Chief Complaint", _clean(getattr(visit, "chief_complaint", ""))),
         ("Presenting Illness (HPI)",
@@ -1289,7 +1335,6 @@ def _build_visit_summary_pdf_reportlab(
         if body_lines:
             y = draw_block(y, title, body_lines)
 
-    # Prescription table
     if rx_items:
         y = ensure_space(y, 22 * mm)
         y = draw_rx_legend(y)
@@ -1321,7 +1366,6 @@ def _build_visit_summary_pdf_reportlab(
 
             y = draw_rx_row(y, i, drug, sub, am, af, pm, night, days)
 
-        # Rx Notes
         rx_notes = _clean(getattr(rx, "notes", "")) if rx else ""
         if _present(rx_notes):
             lines = wrap_paragraph(rx_notes, "Helvetica", 9,
@@ -1337,12 +1381,13 @@ def _build_visit_summary_pdf_reportlab(
 # Public API (WeasyPrint + mandatory fallback)
 # -------------------------------------------------------------------
 def build_visit_summary_pdf(db: Session, visit_id: int) -> BytesIO:
+    # ✅ IMPORTANT: Query.get() ignores options; use filter().first()
     v: Visit = (db.query(Visit).options(
         joinedload(Visit.patient),
         joinedload(Visit.department),
         joinedload(Visit.doctor),
         joinedload(Visit.appointment),
-    ).get(visit_id))
+    ).filter(Visit.id == visit_id).first())
     if not v:
         raise HTTPException(status_code=404, detail="Visit not found")
 
@@ -1373,9 +1418,9 @@ def build_visit_summary_pdf(db: Session, visit_id: int) -> BytesIO:
             Vitals.appointment_id == v.appointment_id).order_by(
                 Vitals.created_at.desc()).first())
     if not vit:
-        vit = (db.query(Vitals).filter(
+        vit = db.query(Vitals).filter(
             Vitals.patient_id == v.patient_id).order_by(
-                Vitals.created_at.desc()).first())
+                Vitals.created_at.desc()).first()
 
     # prescription
     rx = db.query(Prescription).filter(
@@ -1397,6 +1442,23 @@ def build_visit_summary_pdf(db: Session, visit_id: int) -> BytesIO:
             RadiologyOrder.visit_id == visit_id).all())
     rad_names = [n for (_, n) in rad_rows if n]
 
+    # followups (optional)
+    followups_q = db.query(FollowUp)
+
+    if hasattr(FollowUp, "patient_id"):
+        followups_q = followups_q.filter(FollowUp.patient_id == v.patient_id)
+    else:
+        followups_q = followups_q.join(
+            Visit, FollowUp.source_visit_id == Visit.id).filter(
+                Visit.patient_id == v.patient_id)
+
+    followups = (
+        followups_q.order_by(
+            case((FollowUp.due_date.is_(None), 1), else_=0),  # NULLs last
+            FollowUp.due_date.desc(),
+            FollowUp.id.desc(),
+        ).limit(10).all())
+
     # Try WeasyPrint first
     try:
         from weasyprint import HTML  # type: ignore
@@ -1412,6 +1474,7 @@ def build_visit_summary_pdf(db: Session, visit_id: int) -> BytesIO:
             rx_items=rx_items,
             lab_names=lab_names,
             rad_names=rad_names,
+            followups=followups,
         )
         pdf_bytes = HTML(string=html,
                          base_url=str(settings.STORAGE_DIR)).write_pdf()
@@ -1430,6 +1493,7 @@ def build_visit_summary_pdf(db: Session, visit_id: int) -> BytesIO:
             rx_items=rx_items,
             lab_names=lab_names,
             rad_names=rad_names,
+            followups=followups,
         )
         buff = BytesIO(pdf_bytes)
         buff.seek(0)
