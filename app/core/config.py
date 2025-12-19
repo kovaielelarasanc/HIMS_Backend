@@ -29,10 +29,10 @@ class Settings(BaseModel):
     # ---------- MySQL (shared creds) ----------
     MYSQL_HOST: str = os.getenv("MYSQL_HOST", "localhost")
     MYSQL_PORT: int = int(os.getenv("MYSQL_PORT", "3306"))
-    MYSQL_USER: str = os.getenv("MYSQL_USER", "root")
-    MYSQL_PASSWORD: str = os.getenv("MYSQL_PASSWORD", "")
+    MYSQL_USER: str = os.getenv("MYSQL_USER", "nutryah_user")
+    MYSQL_PASSWORD: str = os.getenv("MYSQL_PASSWORD", "Nutryah@123")
     # This now defaults to MASTER DB name
-    MYSQL_DB: str = os.getenv("MYSQL_DB", "nabh_hims_master")
+    MYSQL_DB: str = os.getenv("MYSQL_DB", "nabh_hims_emr")
     DB_DRIVER: str = os.getenv("DB_DRIVER", "pymysql")
 
     # Central master DB (Tenant Management)
