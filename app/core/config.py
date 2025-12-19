@@ -15,6 +15,7 @@ def _split_csv(value: str) -> List[str]:
 
 class Settings(BaseModel):
     PROJECT_NAME: str = os.getenv("PROJECT_NAME", "NABH HIMS & EMR")
+    PROVIDER_TENANT_CODE: str = "NUTRYAH" 
     API_V1_STR: str = os.getenv("API_V1_STR", "/api")
     SITE_URL: str = os.getenv("SITE_URL", "http://127.0.0.1:8000")
 

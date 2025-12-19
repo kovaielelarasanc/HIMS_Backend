@@ -249,6 +249,9 @@ def seed_permissions(db: Session) -> None:
 
         # -------- Settings / Customization ----------
         ("settings.customization", ["view", "manage"]),
+        ("master.tenants", ["view", "manage"]),
+        ("master.storage", ["view", "manage"]),
+        ("master.migrations", ["view", "manage"]),
     ]
 
     from app.models.permission import Permission  # tenant-level

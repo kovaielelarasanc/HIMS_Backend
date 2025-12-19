@@ -8,7 +8,7 @@ from app.api import (
     routes_departments,
     routes_permissions,
     routes_masters,
-
+    routes_master_migrations,
     routes_patients,
     routes_abha,
     routes_patient_types,
@@ -164,6 +164,8 @@ api_router.include_router(routes_ui_branding.router)
 api_router.include_router(routes_inventory.router)
 api_router.include_router(routes_pharmacy.router)
 api_router.include_router(routes_pharmacy_accounts.router)
+# Master database migrations
+api_router.include_router(routes_master_migrations.router)
 
 api_router.include_router(
     routes_pharmacy_rx_list.router,
@@ -172,3 +174,4 @@ api_router.include_router(
 )
 
 api_router.include_router(routes_system.router, tags=["system"])
+
