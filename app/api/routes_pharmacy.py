@@ -215,19 +215,24 @@ def list_prescriptions(
 
 
 @router.get("/prescriptions/{rx_id}")
-def get_prescription_details(rx_id: int,
-                             db: Session = Depends(get_db),
-                             user: User = Depends(auth_current_user)):
-    rx = db.get(PharmacyPrescription, rx_id)
+def get_prescription_details(
+        rx_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(auth_current_user),
+):
+    # ✅ load everything properly (lines + patient + doctor)
+    rx = (_rx_base_options(db.query(PharmacyPrescription)).filter(
+        PharmacyPrescription.id == rx_id).first())
     if not rx:
         raise HTTPException(status_code=404, detail="Prescription not found")
 
-    patient = db.get(Patient, rx.patient_id) if rx.patient_id else None
-    doctor = db.get(User, rx.doctor_user_id) if getattr(
-        rx, "doctor_user_id", None) else None
+    patient = getattr(rx, "patient", None)
+    doctor = getattr(rx, "doctor", None)
 
     rx_dt_ref = getattr(rx, "rx_datetime", None) or getattr(
         rx, "created_at", None)
+
+    # Public IDs (no DB write here; just compute for display)
     rx_uuid = getattr(rx, "rx_number", None) or make_rx_number(
         db, rx.id, on_date=rx_dt_ref)
 
@@ -243,10 +248,32 @@ def get_prescription_details(rx_id: int,
 
     lines = []
     for ln in (rx.lines or []):
+        req = getattr(ln, "requested_qty", None)
+        disp = getattr(ln, "dispensed_qty", None) or 0
+        try:
+            remaining = max((req or 0) - (disp or 0), 0)
+        except Exception:
+            remaining = None
+
         lines.append({
-            "item_name":
-            getattr(ln, "item_name", None)
-            or getattr(getattr(ln, "item", None), "name", None),
+            # ✅ CRITICAL: include ids
+            "id":
+            ln.id,
+            "line_id":
+            ln.id,  # (extra alias for frontend safety)
+            "rx_line_id":
+            ln.id,  # (extra alias if some code still uses old name)
+
+            # item details
+            "item_id":
+            getattr(ln, "item_id", None),
+            "item_name": (getattr(ln, "item_name", None)
+                          or getattr(getattr(ln, "item", None), "name", None)),
+            "item_strength":
+            getattr(ln, "item_strength", None)
+            or getattr(ln, "strength", None),
+
+            # instructions
             "dose_text":
             getattr(ln, "dose_text", None),
             "frequency_code":
@@ -257,27 +284,44 @@ def get_prescription_details(rx_id: int,
             getattr(ln, "route", None),
             "timing":
             getattr(ln, "timing", None),
-            "requested_qty":
-            getattr(ln, "requested_qty", None),
             "instructions":
             getattr(ln, "instructions", None),
+
+            # quantities
+            "requested_qty":
+            req,
+            "dispensed_qty":
+            disp,
+            "remaining_qty":
+            remaining,
         })
 
     return {
         "id":
-        rx.id,  # backend internal id (ok)
+        rx.id,
         "rx_number":
-        rx_uuid,  # ✅ public UUID number
+        rx_uuid,
+        "type":
+        getattr(rx, "type", None),  # ✅ IMPORTANT (OPD/IPD/OT/COUNTER)
         "status":
         getattr(rx, "status", None),
         "rx_datetime":
-        str(rx_dt_ref or ""),
+        rx_dt_ref,
+        "created_at":
+        getattr(rx, "created_at", None),
+        "location_id":
+        getattr(rx, "location_id",
+                None),  # ✅ IMPORTANT for preselecting location
+        "patient_id":
+        getattr(rx, "patient_id", None),
+        "doctor_user_id":
+        getattr(rx, "doctor_user_id", None),
         "notes":
         getattr(rx, "notes", None),
         "op_uid":
-        op_uid,  # ✅
+        op_uid,
         "ip_uid":
-        ip_uid,  # ✅
+        ip_uid,
         "lines":
         lines,
         "patient": ({

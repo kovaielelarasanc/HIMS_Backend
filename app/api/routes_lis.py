@@ -40,6 +40,7 @@ from app.schemas.lis import (
 from app.services.lis_billing import bill_lis_order
 from app.services.ui_branding import get_ui_branding
 from app.services.lab_pdf_branding import draw_clean_brand_header
+from app.services.pdf_lab_report_weasy import build_lab_report_pdf_bytes
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -68,6 +69,7 @@ def _infer_context_type(db: Session, context_id: int | None) -> str | None:
 
 # ---------------- Real-time (WebSocket) ----------------
 class _WSManager:
+
     def __init__(self):
         self.connections: set[WebSocket] = set()
 
@@ -164,14 +166,17 @@ def format_reference_ranges_display(ranges: list[dict] | None) -> str:
     if groups["M"]:
         add_group("MEN", groups["M"], add_heading=True)
     if groups["ANY"]:
-        add_group("GENERAL" if has_sex else "", groups["ANY"], add_heading=has_sex)
+        add_group("GENERAL" if has_sex else "",
+                  groups["ANY"],
+                  add_heading=has_sex)
 
     # remove empty headings
     out = [x for x in out if x.strip()]
     return "\n".join(out) if out else "-"
 
 
-def _split_text_to_lines(txt: str, font_name: str, font_size: float, max_w: float) -> list[str]:
+def _split_text_to_lines(txt: str, font_name: str, font_size: float,
+                         max_w: float) -> list[str]:
     """
     ReportLab wrap with newline support.
     """
@@ -215,11 +220,14 @@ def _split_text_to_lines(txt: str, font_name: str, font_size: float, max_w: floa
 
 
 # ---------------- Letterhead background (optional) ----------------
-def _draw_letterhead_background(c: canvas.Canvas, branding: Any, page_num: int = 1) -> None:
+def _draw_letterhead_background(c: canvas.Canvas,
+                                branding: Any,
+                                page_num: int = 1) -> None:
     if not branding or not getattr(branding, "letterhead_path", None):
         return
 
-    position = getattr(branding, "letterhead_position", "background") or "background"
+    position = getattr(branding, "letterhead_position",
+                       "background") or "background"
     if position == "none":
         return
     if position == "first_page_only" and page_num != 1:
@@ -235,14 +243,22 @@ def _draw_letterhead_background(c: canvas.Canvas, branding: Any, page_num: int =
     try:
         img = ImageReader(str(full_path))
         w, h = A4
-        c.drawImage(img, 0, 0, width=w, height=h, preserveAspectRatio=True, mask="auto")
+        c.drawImage(img,
+                    0,
+                    0,
+                    width=w,
+                    height=h,
+                    preserveAspectRatio=True,
+                    mask="auto")
     except Exception:
         logger.exception("Failed to draw letterhead background")
 
 
 # ---------------- Orders ----------------
 @router.post("/orders")
-def create_order(payload: LisOrderCreate, db: Session = Depends(get_db), user: User = Depends(current_user)):
+def create_order(payload: LisOrderCreate,
+                 db: Session = Depends(get_db),
+                 user: User = Depends(current_user)):
     _need_any(user, ["orders.lab.create", "lab.orders.create"])
     if not payload.items:
         raise HTTPException(422, "At least one test is required")
@@ -276,19 +292,22 @@ def create_order(payload: LisOrderCreate, db: Session = Depends(get_db), user: U
                 test_code=m.code,
                 status="ordered",
                 created_by=user.id,
-            )
-        )
+            ))
 
     db.commit()
-    return {"id": order.id, "context_type": order.context_type, "message": "LIS order created"}
+    return {
+        "id": order.id,
+        "context_type": order.context_type,
+        "message": "LIS order created"
+    }
 
 
 @router.get("/orders", response_model=list[LisOrderOut])
 def list_orders(
-    status: str | None = None,
-    patient_id: int | None = None,
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+        status: str | None = None,
+        patient_id: int | None = None,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["lab.orders.view", "orders.lab.view"])
     q = db.query(LisOrder)
@@ -300,7 +319,8 @@ def list_orders(
     orders = q.order_by(LisOrder.id.desc()).all()
     out: List[LisOrderOut] = []
     for o in orders:
-        items = db.query(LisOrderItem).filter(LisOrderItem.order_id == o.id).all()
+        items = db.query(LisOrderItem).filter(
+            LisOrderItem.order_id == o.id).all()
         out.append(
             LisOrderOut(
                 id=o.id,
@@ -325,22 +345,23 @@ def list_orders(
                         normal_range=i.normal_range,
                         is_critical=bool(i.is_critical),
                         result_at=i.result_at,
-                    )
-                    for i in items
+                    ) for i in items
                 ],
-            )
-        )
+            ))
     return out
 
 
 @router.get("/orders/{order_id}", response_model=LisOrderOut)
-def get_order(order_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
+def get_order(order_id: int,
+              db: Session = Depends(get_db),
+              user: User = Depends(current_user)):
     _need_any(user, ["lab.orders.view", "orders.lab.view"])
     o = db.query(LisOrder).get(order_id)
     if not o:
         raise HTTPException(404, "Order not found")
 
-    items = db.query(LisOrderItem).filter(LisOrderItem.order_id == order_id).all()
+    items = db.query(LisOrderItem).filter(
+        LisOrderItem.order_id == order_id).all()
     return LisOrderOut(
         id=o.id,
         patient_id=o.patient_id,
@@ -364,8 +385,7 @@ def get_order(order_id: int, db: Session = Depends(get_db), user: User = Depends
                 normal_range=i.normal_range,
                 is_critical=bool(i.is_critical),
                 result_at=i.result_at,
-            )
-            for i in items
+            ) for i in items
         ],
     )
 
@@ -373,11 +393,11 @@ def get_order(order_id: int, db: Session = Depends(get_db), user: User = Depends
 # ---------------- Panel services (Result entry rows) ----------------
 @router.get("/orders/{order_id}/panel", response_model=List[LisResultLineOut])
 def get_order_panel_services(
-    order_id: int,
-    department_id: int = Query(...),
-    sub_department_id: Optional[int] = Query(None),
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+        order_id: int,
+        department_id: int = Query(...),
+        sub_department_id: Optional[int] = Query(None),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["lab.results.enter", "lab.orders.view"])
 
@@ -387,20 +407,15 @@ def get_order_panel_services(
 
     leaf_dept_id = sub_department_id or department_id
 
-    services = (
-        db.query(LabService)
-        .filter(LabService.department_id == leaf_dept_id)
-        .filter(LabService.is_active.is_(True))
-        .order_by(LabService.display_order.asc(), LabService.name.asc())
-        .all()
-    )
+    services = (db.query(LabService).filter(
+        LabService.department_id == leaf_dept_id).filter(
+            LabService.is_active.is_(True)).order_by(
+                LabService.display_order.asc(), LabService.name.asc()).all())
 
-    existing = (
-        db.query(LisResultLine)
-        .filter(LisResultLine.order_id == order_id)
-        .filter(LisResultLine.service_id.in_([s.id for s in services] or [0]))
-        .all()
-    )
+    existing = (db.query(LisResultLine).filter(
+        LisResultLine.order_id == order_id).filter(
+            LisResultLine.service_id.in_([s.id for s in services]
+                                         or [0])).all())
     existing_map = {r.service_id: r for r in existing}
 
     out: List[LisResultLineOut] = []
@@ -421,11 +436,9 @@ def get_order_panel_services(
             sub_dept_id = None
             sub_dept_name = None
 
-        rr_display = (
-            format_reference_ranges_display(getattr(svc, "reference_ranges", None))
-            if getattr(svc, "reference_ranges", None)
-            else (svc.normal_range or "-")
-        )
+        rr_display = (format_reference_ranges_display(
+            getattr(svc, "reference_ranges", None)) if getattr(
+                svc, "reference_ranges", None) else (svc.normal_range or "-"))
 
         out.append(
             LisResultLineOut(
@@ -443,37 +456,39 @@ def get_order_panel_services(
                 result_value=(saved.result_value if saved else None),
                 flag=(saved.flag if saved else None),
                 comments=(saved.comments if saved else None),
-            )
-        )
+            ))
 
     return out
 
 
 @router.post("/orders/{order_id}/panel/results")
 async def save_panel_results(
-    order_id: int,
-    payload: LisPanelResultSaveIn,
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+        order_id: int,
+        payload: LisPanelResultSaveIn,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["lab.results.enter"])
 
     # debug: which DB
     try:
         current_db = db.execute(text("SELECT DATABASE()")).scalar()
-        logger.info("[LIS] save_panel_results DB=%s order_id=%s", current_db, order_id)
+        logger.info("[LIS] save_panel_results DB=%s order_id=%s", current_db,
+                    order_id)
     except Exception:
         logger.exception("[LIS] failed to read current DB")
 
     order = db.query(LisOrder).get(order_id)
     if not order:
-        raise HTTPException(status_code=404, detail=f"Order not found in this DB: {order_id}")
+        raise HTTPException(status_code=404,
+                            detail=f"Order not found in this DB: {order_id}")
 
     service_ids = [r.service_id for r in payload.results]
     if not service_ids:
         raise HTTPException(status_code=400, detail="No results provided")
 
-    services = db.query(LabService).filter(LabService.id.in_(service_ids)).all()
+    services = db.query(LabService).filter(
+        LabService.id.in_(service_ids)).all()
     svc_map = {s.id: s for s in services}
 
     now = datetime.utcnow()
@@ -482,7 +497,9 @@ async def save_panel_results(
     for row in payload.results:
         svc = svc_map.get(row.service_id)
         if not svc:
-            raise HTTPException(status_code=404, detail=f"LabService not found: {row.service_id}")
+            raise HTTPException(
+                status_code=404,
+                detail=f"LabService not found: {row.service_id}")
 
         dept = svc.department
         if dept and dept.parent_id:
@@ -493,12 +510,9 @@ async def save_panel_results(
             main_dept_id = dept.id if dept else payload.department_id
             sub_dept_id = payload.sub_department_id
 
-        existing: Optional[LisResultLine] = (
-            db.query(LisResultLine)
-            .filter(LisResultLine.order_id == order_id)
-            .filter(LisResultLine.service_id == svc.id)
-            .first()
-        )
+        existing: Optional[LisResultLine] = (db.query(LisResultLine).filter(
+            LisResultLine.order_id == order_id).filter(
+                LisResultLine.service_id == svc.id).first())
 
         if not existing:
             # NOTE: store SHORT normal_range only (DB safe),
@@ -536,16 +550,19 @@ async def save_panel_results(
             detail="Cannot save results: order not found or data inconsistent.",
         )
 
-    await _notify("panel_results_saved", order_id=order_id, department_id=payload.department_id, sub_department_id=payload.sub_department_id)
+    await _notify("panel_results_saved",
+                  order_id=order_id,
+                  department_id=payload.department_id,
+                  sub_department_id=payload.sub_department_id)
     return {"message": "Panel results saved", "count": saved_count}
 
 
 # ---------------- Structured report data ----------------
 @router.get("/orders/{order_id}/report-data", response_model=LabReportOut)
 def get_lab_report_data(
-    order_id: int,
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+        order_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["lab.results.report", "lab.orders.view"])
 
@@ -555,16 +572,12 @@ def get_lab_report_data(
 
     patient: Optional[Patient] = db.query(Patient).get(order.patient_id)
 
-    lines: List[LisResultLine] = (
-        db.query(LisResultLine)
-        .filter(LisResultLine.order_id == order_id)
-        .order_by(
+    lines: List[LisResultLine] = (db.query(LisResultLine).filter(
+        LisResultLine.order_id == order_id).order_by(
             LisResultLine.department_id.asc(),
             LisResultLine.sub_department_id.asc(),
             LisResultLine.id.asc(),
-        )
-        .all()
-    )
+        ).all())
 
     sections_map: Dict[Tuple[int, Optional[int]], LabReportSectionOut] = {}
 
@@ -604,7 +617,8 @@ def get_lab_report_data(
         svc_obj = getattr(line, "service", None)
         rr_display = None
         if svc_obj and getattr(svc_obj, "reference_ranges", None):
-            rr_display = format_reference_ranges_display(svc_obj.reference_ranges)
+            rr_display = format_reference_ranges_display(
+                svc_obj.reference_ranges)
 
         sections_map[key].rows.append(
             LabReportRowOut(
@@ -614,11 +628,11 @@ def get_lab_report_data(
                 normal_range=(rr_display or line.normal_range or "-"),
                 flag=line.flag,
                 comments=line.comments,
-            )
-        )
+            ))
 
     sections = list(sections_map.values())
-    sections.sort(key=lambda s: (s.department_id or 0, s.sub_department_id or 0))
+    sections.sort(
+        key=lambda s: (s.department_id or 0, s.sub_department_id or 0))
 
     # Age text
     age_text = None
@@ -635,11 +649,14 @@ def get_lab_report_data(
         lab_no=str(order.id),
         patient_id=order.patient_id,
         patient_uhid=getattr(patient, "uhid", None),
-        patient_name=getattr(patient, "full_name", None) or getattr(patient, "first_name", None),
+        patient_name=getattr(patient, "full_name", None)
+        or getattr(patient, "first_name", None),
         patient_gender=getattr(patient, "gender", None),
-        patient_dob=patient.dob if patient and getattr(patient, "dob", None) else None,
+        patient_dob=patient.dob
+        if patient and getattr(patient, "dob", None) else None,
         patient_age_text=age_text,
-        patient_type=(order.context_type.upper() if order.context_type else None),
+        patient_type=(order.context_type.upper()
+                      if order.context_type else None),
         bill_no=None,
         received_on=order.collected_at,
         reported_on=order.reported_at,
@@ -648,12 +665,11 @@ def get_lab_report_data(
     )
 
 
-# ---------------- Professional PDF (matches your screenshot style) ----------------
 @router.get("/orders/{order_id}/report-pdf")
 def get_lab_report_pdf(
-    order_id: int,
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+        order_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["lab.results.report", "lab.orders.view"])
 
@@ -665,285 +681,47 @@ def get_lab_report_pdf(
     report = get_lab_report_data(order_id=order_id, db=db, user=user)
     branding = get_ui_branding(db)
 
-    # collected by (optional)
     collected_by_name = None
     collected_by_id = getattr(order, "collected_by", None)
     if collected_by_id:
         staff = db.query(User).get(collected_by_id)
         if staff:
-            collected_by_name = getattr(staff, "full_name", None) or getattr(staff, "first_name", None)
-
-    def fmt_dt(v: Any) -> str:
-        if not v:
-            return "-"
-        if isinstance(v, datetime):
-            return v.strftime("%d-%b-%Y %I:%M %p")
-        try:
-            return datetime.fromisoformat(str(v).replace("Z", "+00:00")).strftime("%d-%b-%Y %I:%M %p")
-        except Exception:
-            return str(v)
-
-    # Patient display fields
-    prefix = getattr(patient, "title", None) or getattr(patient, "prefix", None)
-    first = getattr(patient, "first_name", None)
-    last = getattr(patient, "last_name", None)
-    base_name = (report.patient_name or " ".join([p for p in [first, last] if p]).strip() or "-")
-    if prefix:
-        pfx = prefix.strip().rstrip(".")
-        display_name = f"{pfx}. {base_name}" if base_name else f"{pfx}."
-    else:
-        display_name = base_name
-
-    age_sex = " / ".join([x for x in [report.patient_age_text, report.patient_gender] if x]) or "-"
+            collected_by_name = getattr(staff, "full_name", None) or getattr(
+                staff, "first_name", None)
 
     lab_no = f"LAB-{report.order_id:06d}"
-    collected_at = getattr(order, "collected_at", None) or report.received_on
+    order_date = getattr(order, "created_at", None)
 
-    # PDF
-    buf = BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    page_w, page_h = A4
+    pdf_bytes = build_lab_report_pdf_bytes(
+        branding=branding,
+        report=report,
+        patient=patient,
+        lab_no=lab_no,
+        order_date=order_date,
+        collected_by_name=collected_by_name,
+    )
 
-    LEFT = 16 * mm
-    RIGHT = 16 * mm
-    TOP = 10 * mm
-    BOTTOM = 14 * mm
-
-    TABLE_W = page_w - LEFT - RIGHT
-
-    # columns (match screenshot proportions)
-    W_TEST = 60 * mm
-    W_RESULT = 22 * mm
-    W_UNIT = 16 * mm
-    W_FLAG = 12 * mm
-    W_REF = TABLE_W - (W_TEST + W_RESULT + W_UNIT + W_FLAG)
-
-    X_TEST = LEFT
-    X_RESULT = X_TEST + W_TEST
-    X_UNIT = X_RESULT + W_RESULT
-    X_FLAG = X_UNIT + W_UNIT
-    X_REF = X_FLAG + W_FLAG
-
-    PAD = 1.6 * mm
-
-    GRID = colors.HexColor("#E2E8F0")
-    TEXT = colors.HexColor("#0F172A")
-    MUTED = colors.HexColor("#475569")
-    BAR = colors.HexColor("#E5E7EB")
-
-    def draw_footer(page_no: int):
-        c.setStrokeColor(GRID)
-        c.setLineWidth(0.7)
-        c.line(LEFT, BOTTOM - 5 * mm, page_w - RIGHT, BOTTOM - 5 * mm)
-        c.setFont("Helvetica", 7)
-        c.setFillColor(MUTED)
-        c.drawString(LEFT, BOTTOM - 9 * mm, f"Generated on: {fmt_dt(report.reported_on or datetime.utcnow())}")
-        c.drawRightString(page_w - RIGHT, BOTTOM - 9 * mm, f"Page {page_no}")
-
-    page_no = 1
-    current_y = page_h
-
-    def start_page(page_no: int, compact_meta: bool):
-        nonlocal current_y
-        _draw_letterhead_background(c, branding, page_no)
-
-        # Header (logo + name/address)
-        y = draw_clean_brand_header(
-            c,
-            branding,
-            page_w=page_w,
-            page_h=page_h,
-            left=LEFT,
-            right=RIGHT,
-            top=TOP,
-            show_rule=True,
-        )
-
-        # Title centered
-        c.setFont("Helvetica-Bold", 12.5)
-        c.setFillColor(TEXT)
-        c.drawCentredString(page_w / 2, y, "LABORATORY REPORT")
-        y -= 8 * mm
-
-        c.setStrokeColor(GRID)
-        c.setLineWidth(0.7)
-        c.line(LEFT, y, page_w - RIGHT, y)
-        y -= 8 * mm
-
-        # Meta block (2-column like screenshot)
-        c.setFont("Helvetica", 9)
-        c.setFillColor(TEXT)
-
-        left_x = LEFT
-        right_x = LEFT + (TABLE_W / 2)
-
-        def kv(x: float, y: float, label: str, value: str):
-            c.setFont("Helvetica-Bold", 9)
-            c.setFillColor(TEXT)
-            c.drawString(x, y, f"{label} :")
-            c.setFont("Helvetica", 9)
-            c.setFillColor(TEXT)
-            c.drawString(x + 22 * mm, y, value or "-")
-
-        if compact_meta:
-            kv(left_x, y, "Name", display_name)
-            kv(right_x, y, "Lab No", lab_no)
-            y -= 5 * mm
-            kv(left_x, y, "UHID", report.patient_uhid or "-")
-            kv(right_x, y, "Reported", fmt_dt(report.reported_on))
-            y -= 8 * mm
-        else:
-            kv(left_x, y, "Name", display_name)
-            kv(right_x, y, "Lab No", lab_no)
-            y -= 5 * mm
-            kv(left_x, y, "Age / Sex", age_sex)
-            kv(right_x, y, "Patient ID", str(report.patient_id or "-"))
-            y -= 5 * mm
-            kv(left_x, y, "Collected", fmt_dt(collected_at))
-            kv(right_x, y, "Reported", fmt_dt(report.reported_on))
-            y -= 8 * mm
-
-        c.setStrokeColor(GRID)
-        c.setLineWidth(0.7)
-        c.line(LEFT, y, page_w - RIGHT, y)
-        y -= 10 * mm
-
-        current_y = y
-
-    def ensure_space(need_h: float, section: Optional[str] = None):
-        nonlocal page_no, current_y
-        if current_y - need_h < (BOTTOM + 6 * mm):
-            draw_footer(page_no)
-            c.showPage()
-            page_no += 1
-            start_page(page_no, compact_meta=True)
-            if section:
-                draw_section_header(section)
-
-    def draw_section_header(section_title: str):
-        nonlocal current_y
-        ensure_space(18 * mm)
-
-        # section bar
-        c.setFillColor(BAR)
-        c.rect(LEFT, current_y - 6 * mm, TABLE_W, 6 * mm, stroke=0, fill=1)
-        c.setFont("Helvetica-Bold", 9)
-        c.setFillColor(TEXT)
-        c.drawString(LEFT + 3 * mm, current_y - 4.2 * mm, section_title.upper())
-        current_y -= 9 * mm
-
-        # table header
-        c.setFont("Helvetica-Bold", 8.5)
-        c.setFillColor(TEXT)
-        c.drawString(X_TEST + PAD, current_y, "Test Name")
-        c.drawString(X_RESULT + PAD, current_y, "Result")
-        c.drawString(X_UNIT + PAD, current_y, "Unit")
-        c.drawString(X_FLAG + PAD, current_y, "Flag")
-        c.drawString(X_REF + PAD, current_y, "Reference Range")
-        current_y -= 3.5 * mm
-
-        c.setStrokeColor(GRID)
-        c.setLineWidth(0.7)
-        c.line(LEFT, current_y, page_w - RIGHT, current_y)
-        current_y -= 5 * mm
-
-    # start first page
-    start_page(page_no, compact_meta=False)
-
-    # content
-    for sec in report.sections:
-        title = sec.department_name or "Department"
-        if sec.sub_department_name:
-            title = f"{title} / {sec.sub_department_name}"
-
-        draw_section_header(title)
-
-        for row in sec.rows:
-            test = (row.service_name or "-").strip()
-            result = (row.result_value or "-").strip()
-            unit = (row.unit or "-").strip()
-            flag = (row.flag or "").strip()
-            ref = (row.normal_range or "-").strip()
-
-            test_lines = _split_text_to_lines(test, "Helvetica", 8.5, W_TEST - 2 * PAD)
-            ref_lines = _split_text_to_lines(ref, "Helvetica", 8.2, W_REF - 2 * PAD)
-
-            lines_n = max(len(test_lines), len(ref_lines), 1)
-            row_h = (lines_n * 4.0 + 2.5) * mm
-
-            ensure_space(row_h, section=title)
-
-            top_y = current_y
-
-            # draw row text
-            c.setFillColor(TEXT)
-            c.setFont("Helvetica", 8.5)
-            y_line = top_y
-
-            # test
-            for i, ln in enumerate(test_lines):
-                c.drawString(X_TEST + PAD, y_line - (i * 4.0 * mm), ln)
-
-            # result
-            c.drawString(X_RESULT + PAD, y_line, result)
-
-            # unit
-            c.setFillColor(MUTED)
-            c.drawString(X_UNIT + PAD, y_line, unit)
-
-            # flag
-            c.setFillColor(TEXT)
-            c.drawString(X_FLAG + PAD, y_line, flag)
-
-            # reference (multiline)
-            c.setFillColor(MUTED)
-            c.setFont("Helvetica", 8.2)
-            for i, ln in enumerate(ref_lines):
-                c.drawString(X_REF + PAD, y_line - (i * 4.0 * mm), ln)
-
-            # bottom row rule
-            c.setStrokeColor(GRID)
-            c.setLineWidth(0.5)
-            c.line(LEFT, top_y - row_h + 2 * mm, page_w - RIGHT, top_y - row_h + 2 * mm)
-
-            current_y = top_y - row_h
-
-        current_y -= 6 * mm  # gap after section
-
-    # signatures
-    ensure_space(30 * mm)
-    c.setStrokeColor(GRID)
-    c.setLineWidth(0.7)
-
-    sig_y = current_y - 6 * mm
-    c.line(LEFT, sig_y, LEFT + 60 * mm, sig_y)
-    c.line(page_w - RIGHT - 60 * mm, sig_y, page_w - RIGHT, sig_y)
-
-    c.setFont("Helvetica", 8.5)
-    c.setFillColor(MUTED)
-    c.drawString(LEFT, sig_y - 5 * mm, "Lab Technician")
-    c.drawRightString(page_w - RIGHT, sig_y - 5 * mm, "Authorized Signatory")
-
-    # footer + finish
-    draw_footer(page_no)
-    c.save()
+    buf = BytesIO(pdf_bytes)
     buf.seek(0)
-
     return StreamingResponse(
         buf,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'inline; filename="lab-report-{order_id}.pdf"'},
+        headers={
+            "Content-Disposition":
+            f'inline; filename="lab-report-{order_id}.pdf"'
+        },
     )
 
 
 # ---------------- Finalize ----------------
 @router.post("/orders/{order_id}/finalize")
 async def finalize(
-    order_id: int,
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+        order_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
 ):
-    _need_any(user, ["lab.results.report", "lab.orders.update", "orders.lab.update"])
+    _need_any(user,
+              ["lab.results.report", "lab.orders.update", "orders.lab.update"])
 
     o = db.query(LisOrder).get(order_id)
     if not o:
@@ -961,16 +739,22 @@ async def finalize(
         o.billing_status = "billed"
 
     db.commit()
-    await _notify("finalized", order_id=o.id, billing_invoice_id=o.billing_invoice_id)
-    return {"message": "Finalized", "billing_invoice_id": o.billing_invoice_id, "billing_status": o.billing_status}
+    await _notify("finalized",
+                  order_id=o.id,
+                  billing_invoice_id=o.billing_invoice_id)
+    return {
+        "message": "Finalized",
+        "billing_invoice_id": o.billing_invoice_id,
+        "billing_status": o.billing_status
+    }
 
 
 # ---------------- Attachments ----------------
 @router.post("/attachments")
 def add_attachment(
-    payload: LisAttachmentIn,
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+        payload: LisAttachmentIn,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["lab.attachments.add"])
     it = db.query(LisOrderItem).get(payload.item_id)
