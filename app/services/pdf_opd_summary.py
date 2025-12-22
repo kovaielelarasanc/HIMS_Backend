@@ -354,10 +354,11 @@ def _build_visit_summary_html(
         v = _clean(value)
         if not v:
             return ""
+        v_html = _esc(v).replace("\n", "<br/>")
         return f"""
         <div class="block" style="margin-top:10px;">
-          <div class="block-title">{_esc(title)}</div>
-          <div class="block-body">{_esc(v).replace("\n", "<br/>")}</div>
+            <div class="block-title">{_esc(title)}</div>
+            <div class="block-body">{v_html}</div>
         </div>
         """
 
@@ -440,12 +441,16 @@ def _build_visit_summary_html(
             """
 
     rx_notes = _clean(getattr(rx, "notes", "")) if rx else ""
-    rx_notes_html = (f"""
+    rx_notes_html = ""
+    if _present(rx_notes):
+        rx_notes_html_val = _esc(rx_notes).replace("\n", "<br/>")
+        rx_notes_html = f"""
         <div class="block" style="margin-top:10px;">
-          <div class="block-title">Notes</div>
-          <div class="block-body">{_esc(rx_notes).replace("\n","<br/>")}</div>
+        <div class="block-title">Notes</div>
+        <div class="block-body">{rx_notes_html_val}</div>
         </div>
-        """ if _present(rx_notes) else "")
+        """
+
 
     rx_html = ""
     if rx_items:

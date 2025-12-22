@@ -265,123 +265,166 @@ def _build_patient_and_visit_metrics(
     ]
 
 
-def _build_revenue_metrics(db: Session, start_dt: datetime,
-                           end_dt: datetime) -> Dict[str, Any]:
-    # Finalized invoice revenue in range
-    total_invoice_rev = db.query(func.coalesce(func.sum(
-        Invoice.net_total), 0)).filter(
-            Invoice.status == "finalized",
+def _build_revenue_metrics(db: Session, start_dt: datetime, end_dt: datetime) -> Dict[str, Any]:
+    """
+    Revenue = Billing Invoices only (sales source of truth).
+    Primary split: Invoice.billing_type
+    Fallback split: Invoice.context_type
+    Final fallback for streams: InvoiceItem.service_type
+    """
+
+    inv_status_lc = func.lower(func.coalesce(Invoice.status, ""))
+    bt_lc = func.lower(func.coalesce(Invoice.billing_type, ""))
+    ctx_lc = func.lower(func.coalesce(Invoice.context_type, ""))
+
+    def _sum_invoices(*, billing_types: list[str] | None = None, context_types: list[str] | None = None) -> float:
+        q = db.query(func.coalesce(func.sum(Invoice.net_total), 0)).filter(
+            inv_status_lc == "finalized",
+            Invoice.finalized_at.isnot(None),
             Invoice.finalized_at >= start_dt,
             Invoice.finalized_at < end_dt,
-        ).scalar() or 0
+        )
+        if billing_types:
+            q = q.filter(bt_lc.in_([s.lower() for s in billing_types]))
+        if context_types:
+            q = q.filter(ctx_lc.in_([s.lower() for s in context_types]))
+        return _safe_scalar(q.scalar() or 0)
 
-    opd_rev = db.query(func.coalesce(func.sum(Invoice.net_total), 0)).filter(
-        Invoice.status == "finalized",
-        Invoice.context_type == "opd",
-        Invoice.finalized_at >= start_dt,
-        Invoice.finalized_at < end_dt,
+    # ----------------------------
+    # Total finalized invoice revenue
+    # ----------------------------
+    total_invoice_rev = _sum_invoices()
+
+    # ----------------------------
+    # OP / IP (use billing_type first; fallback to context_type)
+    # ----------------------------
+    opd_rev = _sum_invoices(billing_types=["op_billing"], context_types=["opd"])
+    ipd_rev = _sum_invoices(billing_types=["ip_billing"], context_types=["ipd"])
+
+    # ----------------------------
+    # Stream invoices (Pharmacy/Lab/Radiology/OT)
+    # ----------------------------
+    pharmacy_rev = _sum_invoices(billing_types=["pharmacy"], context_types=["pharmacy"])
+    lab_rev = _sum_invoices(billing_types=["lab"], context_types=["lab", "lis"])
+    radiology_rev = _sum_invoices(billing_types=["radiology"], context_types=["radiology", "ris"])
+    ot_rev = _sum_invoices(billing_types=["ot"], context_types=["ot"])
+
+    # ----------------------------
+    # FINAL fallback: if your system stores lab/radiology/pharmacy as items inside OP/IP invoices,
+    # then billing_type might be op_billing/ip_billing and stream invoices may be 0.
+    # In that case, compute from InvoiceItem.service_type (still within Invoice system).
+    # ----------------------------
+    if (pharmacy_rev == 0) or (lab_rev == 0) or (radiology_rev == 0) or (ot_rev == 0):
+        item_rows = db.query(
+            func.lower(func.coalesce(InvoiceItem.service_type, "")).label("st"),
+            func.coalesce(func.sum(InvoiceItem.line_total), 0).label("amt"),
+        ).join(Invoice, InvoiceItem.invoice_id == Invoice.id).filter(
+            inv_status_lc == "finalized",
+            Invoice.finalized_at.isnot(None),
+            Invoice.finalized_at >= start_dt,
+            Invoice.finalized_at < end_dt,
+            InvoiceItem.is_voided.is_(False),
+        ).group_by(func.lower(func.coalesce(InvoiceItem.service_type, ""))).all()
+
+        # only fill missing ones (don’t overwrite non-zero invoice-based values)
+        for r in item_rows:
+            st = (r.st or "").strip()
+            amt = _safe_scalar(r.amt)
+
+            # pharmacy aliases
+            if pharmacy_rev == 0 and (st == "pharmacy" or st.startswith("pharmacy") or st.startswith("rx")):
+                pharmacy_rev += amt
+
+            # lab aliases
+            if lab_rev == 0 and (st == "lab" or st.startswith("lab") or st.startswith("lis")):
+                lab_rev += amt
+
+            # radiology aliases
+            if radiology_rev == 0 and (
+                st == "radiology" or st.startswith("radiology") or st.startswith("ris") or st in {"scan", "imaging"}
+            ):
+                radiology_rev += amt
+
+            # ot aliases
+            if ot_rev == 0 and (
+                st == "ot" or st.startswith("ot") or st in {"surgery", "operation_theatre", "operation_theater"}
+            ):
+                ot_rev += amt
+
+    # ----------------------------
+    # Pending invoices (snapshot) - exclude cancelled/reversed
+    # ----------------------------
+    pending_invoice_total = db.query(func.coalesce(func.sum(Invoice.net_total), 0)).filter(
+        inv_status_lc.notin_(["finalized", "cancelled", "reversed"]),
     ).scalar() or 0
 
-    ipd_rev = db.query(func.coalesce(func.sum(Invoice.net_total), 0)).filter(
-        Invoice.status == "finalized",
-        Invoice.context_type == "ipd",
-        Invoice.finalized_at >= start_dt,
-        Invoice.finalized_at < end_dt,
-    ).scalar() or 0
-
-    # Pharmacy revenue
-    pharmacy_rev = db.query(func.coalesce(func.sum(
-        PharmacySale.net_amount), 0)).filter(
-            PharmacySale.created_at >= start_dt,
-            PharmacySale.created_at < end_dt,
-            PharmacySale.invoice_status != "CANCELLED",
-        ).scalar() or 0
-
-    # Lab / Radiology / OT revenue from InvoiceItem.service_type
-    rows = db.query(
-        InvoiceItem.service_type.label("service_type"),
-        func.coalesce(func.sum(InvoiceItem.line_total), 0).label("amount"),
-    ).join(Invoice, InvoiceItem.invoice_id == Invoice.id).filter(
-        Invoice.status == "finalized",
-        Invoice.finalized_at >= start_dt,
-        Invoice.finalized_at < end_dt,
-        InvoiceItem.is_voided == False,  # noqa: E712
-    ).group_by(InvoiceItem.service_type).all()
-
-    lab_rev = 0.0
-    radiology_rev = 0.0
-    ot_rev = 0.0
-    for r in rows:
-        if r.service_type == "lab":
-            lab_rev = _safe_scalar(r.amount)
-        elif r.service_type == "radiology":
-            radiology_rev = _safe_scalar(r.amount)
-        elif r.service_type == "ot":
-            ot_rev = _safe_scalar(r.amount)
-
-    pending_invoice_total = db.query(
-        func.coalesce(func.sum(Invoice.net_total),
-                      0)).filter(Invoice.status != "finalized").scalar() or 0
-
-    total_revenue = _safe_scalar(total_invoice_rev) + _safe_scalar(
-        pharmacy_rev)
+    total_revenue = _safe_scalar(total_invoice_rev)
 
     widgets: List[DashboardWidget] = [
         DashboardWidget(
             code="revenue_total",
             title="Total Revenue",
             widget_type="metric",
-            description="Finalized invoices + pharmacy sales (selected range)",
+            description="Finalized invoices (selected range)",
             data=_safe_scalar(total_revenue),
-            config={"currency": "INR"}),
+            config={"currency": "INR"},
+        ),
         DashboardWidget(
             code="revenue_opd",
             title="OPD Revenue",
             widget_type="metric",
-            description="Finalized invoice revenue attributed to OPD",
+            description="Invoice revenue (billing_type=op_billing or context_type=opd)",
             data=_safe_scalar(opd_rev),
-            config={"currency": "INR"}),
+            config={"currency": "INR"},
+        ),
         DashboardWidget(
             code="revenue_ipd",
             title="IPD Revenue",
             widget_type="metric",
-            description="Finalized invoice revenue attributed to IPD",
+            description="Invoice revenue (billing_type=ip_billing or context_type=ipd)",
             data=_safe_scalar(ipd_rev),
-            config={"currency": "INR"}),
-        DashboardWidget(code="revenue_pharmacy",
-                        title="Pharmacy Revenue",
-                        widget_type="metric",
-                        description="Pharmacy sales amount",
-                        data=_safe_scalar(pharmacy_rev),
-                        config={"currency": "INR"}),
+            config={"currency": "INR"},
+        ),
+        DashboardWidget(
+            code="revenue_pharmacy",
+            title="Pharmacy Revenue",
+            widget_type="metric",
+            description="Invoice revenue (billing_type/context_type pharmacy; fallback from invoice items)",
+            data=_safe_scalar(pharmacy_rev),
+            config={"currency": "INR"},
+        ),
         DashboardWidget(
             code="revenue_lab",
             title="Lab Revenue",
             widget_type="metric",
-            description="Revenue from lab services (invoice items)",
+            description="Invoice revenue (billing_type/context_type lab; fallback from invoice items)",
             data=_safe_scalar(lab_rev),
-            config={"currency": "INR"}),
+            config={"currency": "INR"},
+        ),
         DashboardWidget(
             code="revenue_radiology",
             title="Radiology Revenue",
             widget_type="metric",
-            description="Revenue from radiology services (invoice items)",
+            description="Invoice revenue (billing_type/context_type radiology; fallback from invoice items)",
             data=_safe_scalar(radiology_rev),
-            config={"currency": "INR"}),
-        DashboardWidget(code="revenue_ot",
-                        title="OT Revenue",
-                        widget_type="metric",
-                        description="Revenue from OT services (invoice items)",
-                        data=_safe_scalar(ot_rev),
-                        config={"currency": "INR"}),
+            config={"currency": "INR"},
+        ),
+        DashboardWidget(
+            code="revenue_ot",
+            title="OT Revenue",
+            widget_type="metric",
+            description="Invoice revenue (billing_type/context_type ot; fallback from invoice items)",
+            data=_safe_scalar(ot_rev),
+            config={"currency": "INR"},
+        ),
         DashboardWidget(
             code="revenue_pending",
             title="Pending Bill Amount",
             widget_type="metric",
-            description=
-            "Total value of open (non-finalized) invoices (snapshot)",
+            description="Open invoices (not finalized/cancelled/reversed)",
             data=_safe_scalar(pending_invoice_total),
-            config={"currency": "INR"}),
+            config={"currency": "INR"},
+        ),
     ]
 
     streams = {
@@ -392,7 +435,9 @@ def _build_revenue_metrics(db: Session, start_dt: datetime,
         "radiology": _safe_scalar(radiology_rev),
         "ot": _safe_scalar(ot_rev),
     }
+
     return {"widgets": widgets, "streams": streams}
+
 
 
 def _build_ipd_bed_occupancy_widget(db: Session) -> DashboardWidget:
@@ -417,29 +462,33 @@ def _build_ipd_bed_occupancy_widget(db: Session) -> DashboardWidget:
     )
 
 
-def _build_top_medicines_widget(db: Session, start_dt: datetime,
-                                end_dt: datetime) -> DashboardWidget:
-    rows = db.query(
+def _build_top_medicines_widget(db: Session, start_dt: datetime, end_dt: datetime) -> DashboardWidget:
+    date_col = getattr(PharmacySale, "bill_datetime", None) or getattr(PharmacySale, "created_at", None)
+    status_lc = func.lower(func.coalesce(PharmacySale.invoice_status, ""))
+
+    q = db.query(
         PharmacySaleItem.item_name.label("medicine"),
         func.coalesce(func.sum(PharmacySaleItem.quantity), 0).label("qty"),
-    ).join(PharmacySale, PharmacySaleItem.sale_id == PharmacySale.id).filter(
-        PharmacySale.created_at >= start_dt,
-        PharmacySale.created_at < end_dt,
-        PharmacySale.invoice_status != "CANCELLED",
+    ).join(PharmacySale, PharmacySaleItem.sale_id == PharmacySale.id)
+
+    if date_col is not None:
+        q = q.filter(date_col >= start_dt, date_col < end_dt)
+
+    rows = q.filter(
+        status_lc == "finalized",
     ).group_by(PharmacySaleItem.item_name).order_by(
-        func.sum(PharmacySaleItem.quantity).desc()).limit(10).all()
+        func.sum(PharmacySaleItem.quantity).desc()
+    ).limit(10).all()
 
     return DashboardWidget(
         code="top_medicines",
         title="Top 10 Medicines (Dispensed)",
         widget_type="chart",
         description="Most frequently dispensed medicines in selected period",
-        data=[{
-            "label": r.medicine,
-            "value": int(r.qty or 0)
-        } for r in rows],
+        data=[{"label": r.medicine, "value": int(r.qty or 0)} for r in rows],
         config={"chart_type": "bar"},
     )
+
 
 
 def _build_patient_flow_chart(db: Session, end_date: date) -> DashboardWidget:
