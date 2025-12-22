@@ -1,18 +1,14 @@
-# backend/app/api/routes_dashboard.py
+# FILE: backend/app/api/routes_dashboard.py
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date
 from fastapi import APIRouter, Depends
-from sqlalchemy import func
-
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, current_user as auth_current_user
 from app.models.user import User
 from app.schemas.dashboard import DashboardDataResponse
 from app.services.dashboard_service import build_dashboard_for_user
-from app.models.pharmacy_prescription import PharmacySale, PharmacySaleItem
-from app.models.pharmacy_inventory import InventoryItem
 
 router = APIRouter()
 

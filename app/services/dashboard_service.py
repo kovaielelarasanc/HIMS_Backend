@@ -1,8 +1,8 @@
-# FILE: app/services/dashboard.py
+# FILE: app/services/dashboard_service.py
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
-from typing import Dict, List
+from typing import Dict, List, Tuple, Any
 
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -11,22 +11,16 @@ from app.models.user import User
 from app.models.patient import Patient
 from app.models.opd import Appointment, Visit
 from app.models.ipd import IpdAdmission, IpdBed
-# ✅ use NEW pharmacy models (pharmacy_prescription.py)
-from app.models.pharmacy_prescription import (
-    PharmacySale,
-    PharmacySaleItem,
-)
+from app.models.pharmacy_prescription import PharmacySale, PharmacySaleItem
 from app.models.lis import LisOrder, LisOrderItem
 from app.models.ris import RisOrder
-from app.models.ot import OtSchedule
-# ✅ include Payment for payment-mode widget
 from app.models.billing import Invoice, InvoiceItem, Payment
 from app.schemas.dashboard import DashboardDataResponse, DashboardWidget
 
 # ---------- Helpers: time range ----------
 
 
-def _dt_range(d_from: date, d_to: date) -> tuple[datetime, datetime]:
+def _dt_range(d_from: date, d_to: date) -> Tuple[datetime, datetime]:
     """
     Convert date range [date_from, date_to] into datetime range [start, end).
     """
@@ -35,24 +29,29 @@ def _dt_range(d_from: date, d_to: date) -> tuple[datetime, datetime]:
     return start, end
 
 
-def _safe_scalar(val):
-    return float(val or 0)
+def _safe_scalar(val: Any) -> float:
+    try:
+        return float(val or 0)
+    except Exception:
+        return 0.0
 
 
 # ---------- Helpers: permissions & roles ----------
 
 
-def _get_role_for_dashboard(user: User, db: Session) -> str:
+def _get_role_for_dashboard(user: User) -> str:
     """
     High-level dashboard role (admin/doctor/nurse/reception/lab/radiology/pharmacy/billing).
     """
-    if user.is_admin:
+    if getattr(user, "is_admin", False):
         return "admin"
 
     perm_codes = set()
-    for role in user.roles:
-        for p in getattr(role, "permissions", []):
-            perm_codes.add(p.code)
+    for role in getattr(user, "roles", []) or []:
+        for p in getattr(role, "permissions", []) or []:
+            code = getattr(p, "code", None)
+            if code:
+                perm_codes.add(code)
 
     def has(prefix: str) -> bool:
         return any(c.startswith(prefix) for c in perm_codes)
@@ -72,36 +71,19 @@ def _get_role_for_dashboard(user: User, db: Session) -> str:
 
 
 def _collect_perm_codes(user: User) -> set[str]:
-    """
-    Flatten all permission codes for this user.
-    """
-    if user.is_admin:
-        # Just a marker – we will treat admin as all capabilities = True
+    if getattr(user, "is_admin", False):
         return {"*"}
     codes: set[str] = set()
-    for role in getattr(user, "roles", []):
-        for p in getattr(role, "permissions", []):
-            if getattr(p, "code", None):
-                codes.add(p.code)
+    for role in getattr(user, "roles", []) or []:
+        for p in getattr(role, "permissions", []) or []:
+            code = getattr(p, "code", None)
+            if code:
+                codes.add(code)
     return codes
 
 
 def _build_capabilities(user: User) -> Dict[str, bool]:
-    """
-    Build a high-level capability map from permission codes.
-    This is what we use to decide which widgets to show.
-
-    Returned keys:
-      - can_patients
-      - can_opd
-      - can_ipd
-      - can_pharmacy
-      - can_lab
-      - can_radiology
-      - can_ot
-      - can_billing
-    """
-    if user.is_admin:
+    if getattr(user, "is_admin", False):
         return {
             "can_patients": True,
             "can_opd": True,
@@ -128,9 +110,7 @@ def _build_capabilities(user: User) -> Dict[str, bool]:
     can_ot = has("ot.")
     can_billing = has("billing.") or has("invoices.")
 
-    # Patients: if you can see OPD, IPD, or have anything clinical, you likely can see patient counts.
-    can_patients = (can_opd or can_ipd or can_lab or can_radiology
-                    or can_pharmacy or can_billing)
+    can_patients = can_opd or can_ipd or can_lab or can_radiology or can_pharmacy or can_billing
 
     return {
         "can_patients": can_patients,
@@ -144,82 +124,66 @@ def _build_capabilities(user: User) -> Dict[str, bool]:
     }
 
 
-def _filter_widgets_by_perm(
-    widgets: List[DashboardWidget],
-    caps: Dict[str, bool],
-) -> List[DashboardWidget]:
-    """
-    Filter widgets list based on capabilities.
-    Mapping is based on widget.code patterns.
-    """
+def _filter_widgets_by_perm(widgets: List[DashboardWidget],
+                            caps: Dict[str, bool]) -> List[DashboardWidget]:
     out: List[DashboardWidget] = []
 
     for w in widgets:
         code = w.code
 
-        # PATIENTS / GENERIC metrics:
-        if code.startswith("metric_new_patients"):
-            if not caps.get("can_patients", False):
-                continue
+        # PATIENTS
+        if code.startswith("metric_new_patients") and not caps.get(
+                "can_patients", False):
+            continue
 
-        # OPD / clinical flow
-        if code in {"metric_opd_visits", "appointment_status"}:
-            if not caps.get("can_opd", False):
-                continue
+        # OPD
+        if code in {"metric_opd_visits", "appointment_status"
+                    } and not caps.get("can_opd", False):
+            continue
 
-        if code == "patient_flow":
-            # Need at least some clinical access (OPD or IPD or patients)
-            if not (caps.get("can_opd", False) or caps.get("can_ipd", False)
-                    or caps.get("can_patients", False)):
-                continue
+        if code == "patient_flow" and not (caps.get("can_opd")
+                                           or caps.get("can_ipd")
+                                           or caps.get("can_patients")):
+            continue
 
         # IPD
         if code in {
-                "metric_ipd_admissions",
-                "ipd_bed_occupancy",
-                "ipd_status",
-                "recent_ipd_admissions",
-        }:
-            if not caps.get("can_ipd", False):
-                continue
+                "metric_ipd_admissions", "ipd_bed_occupancy", "ipd_status",
+                "recent_ipd_admissions"
+        } and not caps.get("can_ipd", False):
+            continue
 
         # PHARMACY
-        if code in {
-                "revenue_pharmacy",
-                "top_medicines",
-                "payment_modes",
-        }:
-            if not caps.get("can_pharmacy", False):
-                continue
+        if code in {"revenue_pharmacy", "top_medicines"
+                    } and not caps.get("can_pharmacy", False):
+            continue
+
+        # Payment modes is “billing”, not pharmacy-only (because it is Payment model)
+        if code == "payment_modes" and not caps.get("can_billing", False):
+            continue
 
         # LAB
-        if code in {"revenue_lab", "top_lab_tests"}:
-            if not caps.get("can_lab", False):
-                continue
+        if code in {"revenue_lab", "top_lab_tests"
+                    } and not caps.get("can_lab", False):
+            continue
 
         # RADIOLOGY
-        if code in {"revenue_radiology", "top_radiology_tests"}:
-            if not caps.get("can_radiology", False):
-                continue
+        if code in {"revenue_radiology", "top_radiology_tests"
+                    } and not caps.get("can_radiology", False):
+            continue
 
         # OT
-        if code == "revenue_ot":
-            if not (caps.get("can_ot", False) or caps.get("can_ipd", False)):
-                continue
+        if code == "revenue_ot" and not (caps.get("can_ot", False)
+                                         or caps.get("can_ipd", False)):
+            continue
 
-        # BILLING & GLOBAL REVENUE
+        # BILLING
         if code in {
-                "revenue_total",
-                "revenue_pending",
-                "billing_summary",
-                "revenue_opd",
-                "revenue_ipd",
-                "revenue_by_stream",
-        }:
-            if not caps.get("can_billing", False):
-                continue
+                "revenue_total", "revenue_pending", "billing_summary",
+                "revenue_opd", "revenue_ipd", "revenue_by_stream"
+        } and not caps.get("can_billing", False):
+            continue
 
-        # If nothing blocked, keep widget
         out.append(w)
 
     return out
@@ -228,174 +192,136 @@ def _filter_widgets_by_perm(
 # ---------- Core builder ----------
 
 
-def build_dashboard_for_user(
-    db: Session,
-    user: User,
-    date_from: date,
-    date_to: date,
-) -> DashboardDataResponse:
+def build_dashboard_for_user(db: Session, user: User, date_from: date,
+                             date_to: date) -> DashboardDataResponse:
     start_dt, end_dt = _dt_range(date_from, date_to)
-    role = _get_role_for_dashboard(user, db)
+    role = _get_role_for_dashboard(user)
     caps = _build_capabilities(user)
 
     widgets: List[DashboardWidget] = []
 
-    # 1. High-level patient & visit metrics
     widgets.extend(_build_patient_and_visit_metrics(db, start_dt, end_dt))
 
-    # 2. Revenues (OPD/IPD/Pharmacy/Lab/Radiology/OT/Total + pending)
     revenue_data = _build_revenue_metrics(db, start_dt, end_dt)
     widgets.extend(revenue_data["widgets"])
 
-    # 3. Bed occupancy snapshot (IPD)
     widgets.append(_build_ipd_bed_occupancy_widget(db))
-
-    # 4. Top 10 ordered / sold medicines
     widgets.append(_build_top_medicines_widget(db, start_dt, end_dt))
-
-    # 5. Patient flow chart (last 7 days)
     widgets.append(_build_patient_flow_chart(db, date_to))
-
-    # 6. Revenue by stream chart
     widgets.append(_build_revenue_stream_chart(revenue_data["streams"]))
-
-    # 7. Recent admissions
     widgets.append(_build_recent_admissions_widget(db))
-
-    # 8. Appointment status split
     widgets.append(_build_appointment_status_widget(db, date_from, date_to))
-
-    # 9. IPD status split
     widgets.append(_build_ipd_status_widget(db, start_dt, end_dt))
-
-    # 10. Payment mode usage (cash / UPI / card / on-account)
     widgets.append(_build_payment_mode_widget(db, start_dt, end_dt))
 
-    # 11. Top 5 lab & radiology tests
     lab_widget, ris_widget = _build_top_tests_widgets(db, start_dt, end_dt)
     widgets.append(lab_widget)
     widgets.append(ris_widget)
 
-    # 12. Billed vs pending amount
     widgets.append(_build_billing_summary_widget(db, start_dt, end_dt))
 
-    # --- Permission-based filtering ---
     widgets = _filter_widgets_by_perm(widgets, caps)
 
     return DashboardDataResponse(
         role=role,
         date_from=date_from,
         date_to=date_to,
-        # Put caps inside filters so frontend can also know what modules user has
         filters={"caps": caps},
         widgets=widgets,
     )
 
 
-# ---------- Metrics widgets ----------
+# ---------- Widgets ----------
 
 
 def _build_patient_and_visit_metrics(
-    db: Session,
-    start_dt: datetime,
-    end_dt: datetime,
-) -> List[DashboardWidget]:
-    total_patients = (db.query(func.count(Patient.id)).filter(
-        Patient.created_at >= start_dt, Patient.created_at < end_dt).scalar()
-                      or 0)
-
-    opd_visits = (db.query(func.count(Visit.id)).filter(
-        Visit.visit_at >= start_dt, Visit.visit_at < end_dt).scalar() or 0)
-
-    ipd_admissions = (db.query(func.count(IpdAdmission.id)).filter(
-        IpdAdmission.admitted_at >= start_dt,
-        IpdAdmission.admitted_at < end_dt,
-    ).scalar() or 0)
+        db: Session, start_dt: datetime,
+        end_dt: datetime) -> List[DashboardWidget]:
+    total_patients = db.query(func.count(Patient.id)).filter(
+        Patient.created_at >= start_dt, Patient.created_at
+        < end_dt).scalar() or 0
+    opd_visits = db.query(func.count(Visit.id)).filter(
+        Visit.visit_at >= start_dt, Visit.visit_at < end_dt).scalar() or 0
+    ipd_admissions = db.query(func.count(IpdAdmission.id)).filter(
+        IpdAdmission.admitted_at >= start_dt, IpdAdmission.admitted_at
+        < end_dt).scalar() or 0
 
     return [
-        DashboardWidget(
-            code="metric_new_patients",
-            title="New Patients",
-            widget_type="metric",
-            description="Patients registered in selected period",
-            data=int(total_patients),
-        ),
-        DashboardWidget(
-            code="metric_opd_visits",
-            title="OPD Visits",
-            widget_type="metric",
-            description="OPD visits completed in selected period",
-            data=int(opd_visits),
-        ),
-        DashboardWidget(
-            code="metric_ipd_admissions",
-            title="IPD Admissions",
-            widget_type="metric",
-            description="IPD admissions in selected period",
-            data=int(ipd_admissions),
-        ),
+        DashboardWidget(code="metric_new_patients",
+                        title="New Patients",
+                        widget_type="metric",
+                        description="Patients registered in selected period",
+                        data=int(total_patients)),
+        DashboardWidget(code="metric_opd_visits",
+                        title="OPD Visits",
+                        widget_type="metric",
+                        description="OPD visits completed in selected period",
+                        data=int(opd_visits)),
+        DashboardWidget(code="metric_ipd_admissions",
+                        title="IPD Admissions",
+                        widget_type="metric",
+                        description="IPD admissions in selected period",
+                        data=int(ipd_admissions)),
     ]
 
 
-def _build_revenue_metrics(
-    db: Session,
-    start_dt: datetime,
-    end_dt: datetime,
-) -> Dict[str, any]:
-    # Invoice-based revenue (OPD/IPD + lab/radiology/ot inside items)
-    base_invoices = (db.query(Invoice).filter(
-        Invoice.status == "finalized",
-        Invoice.finalized_at >= start_dt,
-        Invoice.finalized_at < end_dt,
-    ).subquery())
-
-    # Total invoice revenue (OPD+IPD+services)
-    total_invoice_rev = (db.query(
-        func.coalesce(func.sum(base_invoices.c.net_total), 0)).scalar() or 0)
-
-    # OPD / IPD revenue via context_type
-    opd_rev = (db.query(func.coalesce(
-        func.sum(base_invoices.c.net_total),
-        0)).filter(base_invoices.c.context_type == "opd").scalar() or 0)
-    ipd_rev = (db.query(func.coalesce(
-        func.sum(base_invoices.c.net_total),
-        0)).filter(base_invoices.c.context_type == "ipd").scalar() or 0)
-
-    # Pharmacy revenue via PharmacySale (using net_amount for full value)
-    pharmacy_rev = (db.query(
-        func.coalesce(func.sum(PharmacySale.net_amount), 0)).filter(
-            PharmacySale.created_at >= start_dt,
-            PharmacySale.created_at < end_dt,
-        ).scalar() or 0)
-
-    # Lab / Radiology / OT revenue via InvoiceItem.service_type
-    base_items = (
-        db.query(
-            InvoiceItem.service_type,
-            func.coalesce(func.sum(InvoiceItem.line_total), 0).label("amount"),
-        ).join(Invoice, InvoiceItem.invoice_id == Invoice.id).filter(
+def _build_revenue_metrics(db: Session, start_dt: datetime,
+                           end_dt: datetime) -> Dict[str, Any]:
+    # Finalized invoice revenue in range
+    total_invoice_rev = db.query(func.coalesce(func.sum(
+        Invoice.net_total), 0)).filter(
             Invoice.status == "finalized",
             Invoice.finalized_at >= start_dt,
             Invoice.finalized_at < end_dt,
-            InvoiceItem.is_voided == False,  # noqa: E712
-        ).group_by(InvoiceItem.service_type).all())
+        ).scalar() or 0
 
-    lab_rev = 0
-    radiology_rev = 0
-    ot_rev = 0
+    opd_rev = db.query(func.coalesce(func.sum(Invoice.net_total), 0)).filter(
+        Invoice.status == "finalized",
+        Invoice.context_type == "opd",
+        Invoice.finalized_at >= start_dt,
+        Invoice.finalized_at < end_dt,
+    ).scalar() or 0
 
-    for row in base_items:
-        if row.service_type == "lab":
-            lab_rev = row.amount
-        elif row.service_type == "radiology":
-            radiology_rev = row.amount
-        elif row.service_type == "ot":
-            ot_rev = row.amount
+    ipd_rev = db.query(func.coalesce(func.sum(Invoice.net_total), 0)).filter(
+        Invoice.status == "finalized",
+        Invoice.context_type == "ipd",
+        Invoice.finalized_at >= start_dt,
+        Invoice.finalized_at < end_dt,
+    ).scalar() or 0
 
-    # Pending amount (rough view = all non-finalized invoices)
-    pending_invoice_total = (db.query(
+    # Pharmacy revenue
+    pharmacy_rev = db.query(func.coalesce(func.sum(
+        PharmacySale.net_amount), 0)).filter(
+            PharmacySale.created_at >= start_dt,
+            PharmacySale.created_at < end_dt,
+            PharmacySale.invoice_status != "CANCELLED",
+        ).scalar() or 0
+
+    # Lab / Radiology / OT revenue from InvoiceItem.service_type
+    rows = db.query(
+        InvoiceItem.service_type.label("service_type"),
+        func.coalesce(func.sum(InvoiceItem.line_total), 0).label("amount"),
+    ).join(Invoice, InvoiceItem.invoice_id == Invoice.id).filter(
+        Invoice.status == "finalized",
+        Invoice.finalized_at >= start_dt,
+        Invoice.finalized_at < end_dt,
+        InvoiceItem.is_voided == False,  # noqa: E712
+    ).group_by(InvoiceItem.service_type).all()
+
+    lab_rev = 0.0
+    radiology_rev = 0.0
+    ot_rev = 0.0
+    for r in rows:
+        if r.service_type == "lab":
+            lab_rev = _safe_scalar(r.amount)
+        elif r.service_type == "radiology":
+            radiology_rev = _safe_scalar(r.amount)
+        elif r.service_type == "ot":
+            ot_rev = _safe_scalar(r.amount)
+
+    pending_invoice_total = db.query(
         func.coalesce(func.sum(Invoice.net_total),
-                      0)).filter(Invoice.status != "finalized").scalar() or 0)
+                      0)).filter(Invoice.status != "finalized").scalar() or 0
 
     total_revenue = _safe_scalar(total_invoice_rev) + _safe_scalar(
         pharmacy_rev)
@@ -405,67 +331,57 @@ def _build_revenue_metrics(
             code="revenue_total",
             title="Total Revenue",
             widget_type="metric",
-            description=
-            "Total revenue (all finalized invoices + pharmacy) in selected period",
+            description="Finalized invoices + pharmacy sales (selected range)",
             data=_safe_scalar(total_revenue),
-            config={"currency": "INR"},
-        ),
+            config={"currency": "INR"}),
         DashboardWidget(
             code="revenue_opd",
             title="OPD Revenue",
             widget_type="metric",
-            description="Invoice revenue attributed to OPD",
+            description="Finalized invoice revenue attributed to OPD",
             data=_safe_scalar(opd_rev),
-            config={"currency": "INR"},
-        ),
+            config={"currency": "INR"}),
         DashboardWidget(
             code="revenue_ipd",
             title="IPD Revenue",
             widget_type="metric",
-            description="Invoice revenue attributed to IPD",
+            description="Finalized invoice revenue attributed to IPD",
             data=_safe_scalar(ipd_rev),
-            config={"currency": "INR"},
-        ),
-        DashboardWidget(
-            code="revenue_pharmacy",
-            title="Pharmacy Revenue",
-            widget_type="metric",
-            description="Pharmacy sales amount",
-            data=_safe_scalar(pharmacy_rev),
-            config={"currency": "INR"},
-        ),
+            config={"currency": "INR"}),
+        DashboardWidget(code="revenue_pharmacy",
+                        title="Pharmacy Revenue",
+                        widget_type="metric",
+                        description="Pharmacy sales amount",
+                        data=_safe_scalar(pharmacy_rev),
+                        config={"currency": "INR"}),
         DashboardWidget(
             code="revenue_lab",
             title="Lab Revenue",
             widget_type="metric",
-            description="Revenue from laboratory services",
+            description="Revenue from lab services (invoice items)",
             data=_safe_scalar(lab_rev),
-            config={"currency": "INR"},
-        ),
+            config={"currency": "INR"}),
         DashboardWidget(
             code="revenue_radiology",
             title="Radiology Revenue",
             widget_type="metric",
-            description="Revenue from radiology services",
+            description="Revenue from radiology services (invoice items)",
             data=_safe_scalar(radiology_rev),
-            config={"currency": "INR"},
-        ),
-        DashboardWidget(
-            code="revenue_ot",
-            title="OT Revenue",
-            widget_type="metric",
-            description="Revenue from OT services",
-            data=_safe_scalar(ot_rev),
-            config={"currency": "INR"},
-        ),
+            config={"currency": "INR"}),
+        DashboardWidget(code="revenue_ot",
+                        title="OT Revenue",
+                        widget_type="metric",
+                        description="Revenue from OT services (invoice items)",
+                        data=_safe_scalar(ot_rev),
+                        config={"currency": "INR"}),
         DashboardWidget(
             code="revenue_pending",
             title="Pending Bill Amount",
             widget_type="metric",
-            description="Total value of open (non-finalized) invoices",
+            description=
+            "Total value of open (non-finalized) invoices (snapshot)",
             data=_safe_scalar(pending_invoice_total),
-            config={"currency": "INR"},
-        ),
+            config={"currency": "INR"}),
     ]
 
     streams = {
@@ -476,14 +392,13 @@ def _build_revenue_metrics(
         "radiology": _safe_scalar(radiology_rev),
         "ot": _safe_scalar(ot_rev),
     }
-
     return {"widgets": widgets, "streams": streams}
 
 
 def _build_ipd_bed_occupancy_widget(db: Session) -> DashboardWidget:
     total_beds = db.query(func.count(IpdBed.id)).scalar() or 0
-    occupied_beds = (db.query(func.count(IpdBed.id)).filter(
-        IpdBed.state.in_(["occupied", "preoccupied"])).scalar() or 0)
+    occupied_beds = db.query(func.count(IpdBed.id)).filter(
+        IpdBed.state.in_(["occupied", "preoccupied"])).scalar() or 0
     available = total_beds - occupied_beds if total_beds else 0
     occupancy_pct = (occupied_beds / total_beds * 100.0) if total_beds else 0.0
 
@@ -502,32 +417,17 @@ def _build_ipd_bed_occupancy_widget(db: Session) -> DashboardWidget:
     )
 
 
-def _build_top_medicines_widget(
-    db: Session,
-    start_dt: datetime,
-    end_dt: datetime,
-) -> DashboardWidget:
-    """
-    Top 10 dispensed medicines based on NEW PharmacySale / PharmacySaleItem models.
-    Groups by PharmacySaleItem.item_name and sums quantity.
-    """
-    rows = (db.query(
+def _build_top_medicines_widget(db: Session, start_dt: datetime,
+                                end_dt: datetime) -> DashboardWidget:
+    rows = db.query(
         PharmacySaleItem.item_name.label("medicine"),
         func.coalesce(func.sum(PharmacySaleItem.quantity), 0).label("qty"),
-        func.coalesce(func.sum(PharmacySaleItem.total_amount),
-                      0).label("amount"),
     ).join(PharmacySale, PharmacySaleItem.sale_id == PharmacySale.id).filter(
         PharmacySale.created_at >= start_dt,
         PharmacySale.created_at < end_dt,
         PharmacySale.invoice_status != "CANCELLED",
     ).group_by(PharmacySaleItem.item_name).order_by(
-        func.sum(PharmacySaleItem.quantity).desc()).limit(10).all())
-
-    data = [{
-        "medicine": r.medicine,
-        "quantity": int(r.qty or 0),
-        "amount": float(r.amount or 0),
-    } for r in rows]
+        func.sum(PharmacySaleItem.quantity).desc()).limit(10).all()
 
     return DashboardWidget(
         code="top_medicines",
@@ -535,49 +435,36 @@ def _build_top_medicines_widget(
         widget_type="chart",
         description="Most frequently dispensed medicines in selected period",
         data=[{
-            "label": r["medicine"],
-            "value": r["quantity"]
-        } for r in data],
+            "label": r.medicine,
+            "value": int(r.qty or 0)
+        } for r in rows],
         config={"chart_type": "bar"},
     )
 
 
 def _build_patient_flow_chart(db: Session, end_date: date) -> DashboardWidget:
-    """
-    Patient flow chart for last 7 days (including end_date).
-    Data points per day:
-      - new_patients
-      - opd_visits
-      - ipd_admissions
-    """
     start_date = end_date - timedelta(days=6)
     start_dt, end_dt = _dt_range(start_date, end_date)
 
-    patient_rows = (db.query(
+    patient_rows = db.query(
         func.date(Patient.created_at).label("d"),
-        func.count(Patient.id).label("c"),
-    ).filter(
-        Patient.created_at >= start_dt,
-        Patient.created_at < end_dt,
-    ).group_by(func.date(Patient.created_at)).all())
+        func.count(Patient.id).label("c")).filter(
+            Patient.created_at >= start_dt, Patient.created_at
+            < end_dt).group_by(func.date(Patient.created_at)).all()
     patient_map = {r.d: r.c for r in patient_rows}
 
-    visit_rows = (db.query(
+    visit_rows = db.query(
         func.date(Visit.visit_at).label("d"),
-        func.count(Visit.id).label("c"),
-    ).filter(
-        Visit.visit_at >= start_dt,
-        Visit.visit_at < end_dt,
-    ).group_by(func.date(Visit.visit_at)).all())
+        func.count(Visit.id).label("c")).filter(
+            Visit.visit_at >= start_dt, Visit.visit_at
+            < end_dt).group_by(func.date(Visit.visit_at)).all()
     visit_map = {r.d: r.c for r in visit_rows}
 
-    adm_rows = (db.query(
+    adm_rows = db.query(
         func.date(IpdAdmission.admitted_at).label("d"),
-        func.count(IpdAdmission.id).label("c"),
-    ).filter(
-        IpdAdmission.admitted_at >= start_dt,
-        IpdAdmission.admitted_at < end_dt,
-    ).group_by(func.date(IpdAdmission.admitted_at)).all())
+        func.count(IpdAdmission.id).label("c")).filter(
+            IpdAdmission.admitted_at >= start_dt, IpdAdmission.admitted_at
+            < end_dt).group_by(func.date(IpdAdmission.admitted_at)).all()
     adm_map = {r.d: r.c for r in adm_rows}
 
     data = []
@@ -659,9 +546,9 @@ def _build_revenue_stream_chart(streams: Dict[str, float]) -> DashboardWidget:
 
 
 def _build_recent_admissions_widget(db: Session) -> DashboardWidget:
-    from app.models.patient import Patient as PatientModel  # avoid circular
+    from app.models.patient import Patient as PatientModel
 
-    rows = (db.query(
+    rows = db.query(
         IpdAdmission.id,
         IpdAdmission.admission_code,
         IpdAdmission.admitted_at,
@@ -670,7 +557,7 @@ def _build_recent_admissions_widget(db: Session) -> DashboardWidget:
         PatientModel.first_name,
         PatientModel.last_name,
     ).join(PatientModel, IpdAdmission.patient_id == PatientModel.id).order_by(
-        IpdAdmission.admitted_at.desc()).limit(10).all())
+        IpdAdmission.admitted_at.desc()).limit(10).all()
 
     data = [{
         "ipd_id": r.id,
@@ -684,41 +571,25 @@ def _build_recent_admissions_widget(db: Session) -> DashboardWidget:
     return DashboardWidget(
         code="recent_ipd_admissions",
         title="Recent IPD Admissions",
-        widget_type="table",  # frontend renders as cards
+        widget_type="table",
         description="Last 10 IPD admissions",
         data=data,
         config={
             "columns": [
-                "admission_code",
-                "uhid",
-                "patient_name",
-                "admitted_at",
-                "status",
+                "admission_code", "uhid", "patient_name", "admitted_at",
+                "status"
             ]
         },
     )
 
 
-# ---------- NEW WIDGETS ----------
-
-
-def _build_appointment_status_widget(
-    db: Session,
-    d_from: date,
-    d_to: date,
-) -> DashboardWidget:
-    rows = (db.query(
-        Appointment.status,
-        func.count(Appointment.id).label("count"),
-    ).filter(
-        Appointment.date >= d_from,
-        Appointment.date <= d_to,
-    ).group_by(Appointment.status).all())
-
-    data = [{
-        "label": (r.status or "unknown").title(),
-        "value": int(r.count or 0),
-    } for r in rows]
+def _build_appointment_status_widget(db: Session, d_from: date,
+                                     d_to: date) -> DashboardWidget:
+    rows = db.query(Appointment.status,
+                    func.count(Appointment.id).label("count")).filter(
+                        Appointment.date >= d_from,
+                        Appointment.date <= d_to,
+                    ).group_by(Appointment.status).all()
 
     return DashboardWidget(
         code="appointment_status",
@@ -726,66 +597,44 @@ def _build_appointment_status_widget(
         widget_type="chart",
         description=
         "Booked / checked-in / completed / cancelled / no-show distribution",
-        data=data,
+        data=[{
+            "label": (r.status or "unknown").replace("_", " ").title(),
+            "value": int(r.count or 0)
+        } for r in rows],
         config={"chart_type": "pie"},
     )
 
 
-def _build_ipd_status_widget(
-    db: Session,
-    start_dt: datetime,
-    end_dt: datetime,
-) -> DashboardWidget:
-    rows = (db.query(
-        IpdAdmission.status,
-        func.count(IpdAdmission.id).label("count"),
-    ).filter(
-        IpdAdmission.admitted_at >= start_dt,
-        IpdAdmission.admitted_at < end_dt,
-    ).group_by(IpdAdmission.status).all())
-
-    data = [{
-        "label": (r.status or "unknown").title(),
-        "value": int(r.count or 0),
-    } for r in rows]
+def _build_ipd_status_widget(db: Session, start_dt: datetime,
+                             end_dt: datetime) -> DashboardWidget:
+    rows = db.query(IpdAdmission.status,
+                    func.count(IpdAdmission.id).label("count")).filter(
+                        IpdAdmission.admitted_at >= start_dt,
+                        IpdAdmission.admitted_at < end_dt,
+                    ).group_by(IpdAdmission.status).all()
 
     return DashboardWidget(
         code="ipd_status",
         title="IPD Cases by Status",
         widget_type="chart",
         description="Admitted / discharged / LAMA / cancelled etc.",
-        data=data,
+        data=[{
+            "label": (r.status or "unknown").replace("_", " ").title(),
+            "value": int(r.count or 0)
+        } for r in rows],
         config={"chart_type": "pie"},
     )
 
 
-def _build_payment_mode_widget(
-    db: Session,
-    start_dt: datetime,
-    end_dt: datetime,
-) -> DashboardWidget:
-    """
-    Income type chart: which payment mode is used more (cash / UPI / card / on-account).
-
-    Uses Billing Payment records. It tries to auto-detect:
-      - mode column: Payment.mode OR Payment.payment_mode
-      - amount column: Payment.amount OR Payment.paid_amount
-      - date column: Payment.created_at / Payment.paid_at / Payment.payment_date
-
-    So even if your Payment model uses slightly different names, this should not crash;
-    worst case it returns an empty dataset.
-    """
-    # Detect columns safely
+def _build_payment_mode_widget(db: Session, start_dt: datetime,
+                               end_dt: datetime) -> DashboardWidget:
     payment_mode_col = getattr(Payment, "mode", None) or getattr(
         Payment, "payment_mode", None)
-    amount_col = (getattr(Payment, "amount", None)
-                  or getattr(Payment, "paid_amount", None)
-                  or getattr(Payment, "value", None))
-    date_col = (getattr(Payment, "created_at", None)
-                or getattr(Payment, "paid_at", None)
-                or getattr(Payment, "payment_date", None))
+    amount_col = getattr(Payment, "amount", None) or getattr(
+        Payment, "paid_amount", None) or getattr(Payment, "value", None)
+    date_col = getattr(Payment, "created_at", None) or getattr(
+        Payment, "paid_at", None) or getattr(Payment, "payment_date", None)
 
-    # If we can't find basic columns, return an empty chart gracefully
     if payment_mode_col is None or amount_col is None:
         return DashboardWidget(
             code="payment_modes",
@@ -806,30 +655,25 @@ def _build_payment_mode_widget(
 
     rows = q.group_by(payment_mode_col).all()
 
-    data = [{
-        "label": (getattr(r, "payment_mode", None)
-                  or "unknown").replace("_", " ").title(),
-        "value":
-        float(getattr(r, "amount", 0) or 0),
-    } for r in rows]
-
     return DashboardWidget(
         code="payment_modes",
         title="Payment Modes (All Billing)",
         widget_type="chart",
         description="Cash vs UPI vs card vs on-account usage",
-        data=data,
+        data=[{
+            "label": (getattr(r, "payment_mode", None)
+                      or "unknown").replace("_", " ").title(),
+            "value":
+            float(getattr(r, "amount", 0) or 0),
+        } for r in rows],
         config={"chart_type": "pie"},
     )
 
 
 def _build_top_tests_widgets(
-    db: Session,
-    start_dt: datetime,
-    end_dt: datetime,
-) -> tuple[DashboardWidget, DashboardWidget]:
-    # Lab tests
-    lab_rows = (db.query(
+        db: Session, start_dt: datetime,
+        end_dt: datetime) -> Tuple[DashboardWidget, DashboardWidget]:
+    lab_rows = db.query(
         LisOrderItem.test_name.label("name"),
         func.count(LisOrderItem.id).label("count"),
     ).join(LisOrder, LisOrderItem.order_id == LisOrder.id).filter(
@@ -837,24 +681,21 @@ def _build_top_tests_widgets(
         LisOrder.created_at < end_dt,
         LisOrder.status != "cancelled",
     ).group_by(LisOrderItem.test_name).order_by(
-        func.count(LisOrderItem.id).desc()).limit(5).all())
-
-    lab_data = [{
-        "label": r.name,
-        "value": int(r.count or 0)
-    } for r in lab_rows]
+        func.count(LisOrderItem.id).desc()).limit(5).all()
 
     lab_widget = DashboardWidget(
         code="top_lab_tests",
         title="Top 5 Lab Tests",
         widget_type="chart",
         description="Most frequently ordered lab investigations",
-        data=lab_data,
+        data=[{
+            "label": r.name,
+            "value": int(r.count or 0)
+        } for r in lab_rows],
         config={"chart_type": "bar"},
     )
 
-    # Radiology tests
-    ris_rows = (db.query(
+    ris_rows = db.query(
         RisOrder.test_name.label("name"),
         func.count(RisOrder.id).label("count"),
     ).filter(
@@ -862,62 +703,50 @@ def _build_top_tests_widgets(
         RisOrder.created_at < end_dt,
         RisOrder.status != "cancelled",
     ).group_by(RisOrder.test_name).order_by(func.count(
-        RisOrder.id).desc()).limit(5).all())
-
-    ris_data = [{
-        "label": r.name,
-        "value": int(r.count or 0)
-    } for r in ris_rows]
+        RisOrder.id).desc()).limit(5).all()
 
     ris_widget = DashboardWidget(
         code="top_radiology_tests",
         title="Top 5 Radiology Tests",
         widget_type="chart",
         description="Most frequently ordered imaging tests",
-        data=ris_data,
+        data=[{
+            "label": r.name,
+            "value": int(r.count or 0)
+        } for r in ris_rows],
         config={"chart_type": "bar"},
     )
 
     return lab_widget, ris_widget
 
 
-def _build_billing_summary_widget(
-    db: Session,
-    start_dt: datetime,
-    end_dt: datetime,
-) -> DashboardWidget:
-    """
-    Billed vs pending.
-    Billed = finalized invoices in range.
-    Pending = all non-finalized invoices (overall snapshot).
-    """
-    billed_amount = (db.query(func.coalesce(func.sum(
+def _build_billing_summary_widget(db: Session, start_dt: datetime,
+                                  end_dt: datetime) -> DashboardWidget:
+    billed_amount = db.query(func.coalesce(func.sum(
         Invoice.net_total), 0)).filter(
             Invoice.status == "finalized",
             Invoice.finalized_at >= start_dt,
             Invoice.finalized_at < end_dt,
-        ).scalar() or 0)
+        ).scalar() or 0
 
-    pending_amount = (db.query(func.coalesce(func.sum(
-        Invoice.net_total), 0)).filter(Invoice.status != "finalized").scalar()
-                      or 0)
-
-    data = [
-        {
-            "label": "Billed (finalized)",
-            "value": _safe_scalar(billed_amount),
-        },
-        {
-            "label": "Pending (open)",
-            "value": _safe_scalar(pending_amount),
-        },
-    ]
+    pending_amount = db.query(
+        func.coalesce(func.sum(Invoice.net_total),
+                      0)).filter(Invoice.status != "finalized").scalar() or 0
 
     return DashboardWidget(
         code="billing_summary",
         title="Billing Summary (Billed vs Pending)",
         widget_type="chart",
         description="How much is already billed vs still pending",
-        data=data,
+        data=[
+            {
+                "label": "Billed (finalized)",
+                "value": _safe_scalar(billed_amount)
+            },
+            {
+                "label": "Pending (open)",
+                "value": _safe_scalar(pending_amount)
+            },
+        ],
         config={"chart_type": "bar"},
     )
