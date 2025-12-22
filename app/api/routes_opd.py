@@ -1965,7 +1965,7 @@ import os
 import re
 from datetime import datetime, date as dt_date, time as dt_time, timedelta, date
 from typing import Optional, List, Set, Dict, Any
-
+from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException, Query, Body
@@ -1973,7 +1973,7 @@ from fastapi.responses import StreamingResponse
 
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy import func, case
+from sqlalchemy import func, case, and_
 
 from app.api.deps import get_db, current_user
 from app.models.user import User
@@ -2024,6 +2024,7 @@ from app.services.billing_auto import (
     maybe_finalize_visit_invoice,
 )
 from app.services.pdf_opd_summary import build_visit_summary_pdf
+from app.schemas.opd import VitalsLatestResponse, VitalsOut
 
 router = APIRouter()
 
@@ -2046,6 +2047,68 @@ TRANSITIONS: Dict[str, Set[str]] = {
     "cancelled": set(),
     "no_show": set(),
 }
+
+# routes_opd.py (add helpers near VITALS section)
+
+
+def _pick_attr(obj, names: List[str]):
+    for n in names:
+        if hasattr(obj, n):
+            return getattr(obj, n)
+    return None
+
+
+def _set_first_attr(obj, names: List[str], value) -> None:
+    if value is None:
+        return
+    for n in names:
+        if hasattr(obj, n):
+            setattr(obj, n, value)
+            return
+
+
+def _ts_col():
+    return getattr(Vitals, "recorded_at", None) or getattr(
+        Vitals, "created_at", None)
+
+
+def _vitals_to_out(v: Vitals) -> dict:
+    # timestamps
+    created = _pick_attr(v, ["recorded_at", "created_at"])
+    created_at = created.isoformat() if created else None
+
+    # numeric
+    height = _pick_attr(v, ["height_cm"])
+    weight = _pick_attr(v, ["weight_kg"])
+    bmi = _pick_attr(v, ["bmi"])
+
+    # compute bmi if not stored
+    if bmi is None and height and weight and float(height) > 0:
+        m = float(height) / 100.0
+        bmi = round(float(weight) / (m * m), 1)
+
+    temp = _pick_attr(v, ["temp_c", "temperature_c"])
+    rr = _pick_attr(v, ["resp_rate", "rr", "respiration"])
+    sys = _pick_attr(v, ["bp_sys", "bp_systolic", "systolic"])
+    dia = _pick_attr(v, ["bp_dia", "bp_diastolic", "diastolic"])
+    notes = _pick_attr(v, ["notes", "remarks"])
+
+    return {
+        "id": v.id,
+        "patient_id": v.patient_id,
+        "appointment_id": getattr(v, "appointment_id", None),
+        "created_at": created_at,
+        "height_cm": float(height) if height is not None else None,
+        "weight_kg": float(weight) if weight is not None else None,
+        "bmi": float(bmi) if bmi is not None else None,
+        "temp_c": float(temp) if temp is not None else None,
+        "pulse": _pick_attr(v, ["pulse"]),
+        "resp_rate": rr,
+        "spo2": _pick_attr(v, ["spo2"]),
+        "bp_sys": sys,
+        "bp_dia": dia,
+        "notes": notes,
+    }
 
 
 def now_local() -> datetime:
@@ -2204,13 +2267,22 @@ def _next_queue_no(db: Session, doctor_user_id: int, d: dt_date) -> int:
 
 
 def vitals_done_on(db: Session, patient_id: int, d: dt_date) -> bool:
-    row = (db.query(Vitals.id).filter(Vitals.patient_id == patient_id,
-                                      func.date(
-                                          Vitals.created_at) == d).first())
+    """
+    Legacy helper: 'Did this patient have any vitals on this calendar date?'
+    Uses DATE(created_at) so it's robust.
+    """
+    row = (db.query(Vitals.id).filter(
+        Vitals.patient_id == patient_id,
+        func.date(Vitals.created_at) == d,
+    ).first())
     return bool(row)
 
 
 def vitals_done_for_appointment(db: Session, ap: Appointment) -> bool:
+    """
+    Preferred helper if you have Vitals.appointment_id column.
+    Falls back to legacy patient+date check.
+    """
     if hasattr(Vitals, "appointment_id"):
         exists = db.query(
             Vitals.id).filter(Vitals.appointment_id == ap.id).first()
@@ -2316,6 +2388,56 @@ def opd_roles(
         User.department_id == department_id).distinct().order_by(
             Role.name.asc()).all())
     return [{"id": r.id, "name": r.name} for r in roles]
+
+
+# @router.get("/vitals/latest", response_model=VitalsLatestResponse)
+# def get_latest_vitals(
+#         appointment_id: int = Query(..., ge=1),
+#         for_date: date = Query(...),
+#         db: Session = Depends(get_db),
+#         current_user: User = Depends(current_user),
+# ) -> VitalsLatestResponse:
+#     # Permission (keep simple)
+#     if not _has_any_perm(
+#             current_user,
+#         {"appointments.view", "vitals.create", "visits.view"}):
+#         raise HTTPException(status_code=403, detail="Not permitted")
+
+#     ap = db.get(Appointment, appointment_id)
+#     if not ap:
+#         # invalid appointment is real 404
+#         raise HTTPException(status_code=404, detail="Appointment not found")
+
+#     # pick timestamp column safely
+#     ts_col = getattr(Vitals, "recorded_at", None) or getattr(
+#         Vitals, "created_at", None)
+
+#     start_dt = datetime.combine(for_date, time.min)
+#     end_dt = start_dt + timedelta(days=1)
+
+#     q = db.query(Vitals)
+
+#     # Prefer appointment link if exists
+#     if hasattr(Vitals, "appointment_id"):
+#         q = q.filter(Vitals.appointment_id == appointment_id)
+#     else:
+#         q = q.filter(Vitals.patient_id == ap.patient_id)
+
+#     if ts_col is not None:
+#         q = q.filter(and_(ts_col >= start_dt, ts_col
+#                           < end_dt)).order_by(ts_col.desc(), Vitals.id.desc())
+#     else:
+#         q = q.order_by(Vitals.id.desc())
+
+#     vitals = q.first()
+
+#     if not vitals:
+#         return VitalsLatestResponse(exists=False, vitals=None)
+
+#     return VitalsLatestResponse(
+#         exists=True,
+#         vitals=VitalsOut.model_validate(vitals, from_attributes=True),
+#     )
 
 
 @router.get("/users", response_model=List[dict])
@@ -2894,6 +3016,11 @@ def list_no_show_appointments(
 
 
 # ------------------- VITALS -------------------
+# ------------------- VITALS -------------------
+
+from app.schemas.opd import VitalsIn, VitalsOut, VitalsLatestResponse
+
+
 @router.post("/vitals/{patient_id}")
 def record_vitals(
         patient_id: int,
@@ -2901,6 +3028,11 @@ def record_vitals(
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
 ):
+    """
+    ✅ Legacy endpoint (KEEP AS-IS for your existing frontend)
+    POST /api/opd/vitals/{patient_id}
+    Body: VitalsIn (height_cm, weight_kg, bp_systolic, bp_diastolic, pulse, rr, temp_c, spo2, notes, etc.)
+    """
     if not has_perm(user, "vitals.create"):
         raise HTTPException(status_code=403, detail="Not permitted")
 
@@ -2908,22 +3040,147 @@ def record_vitals(
     if not p:
         raise HTTPException(status_code=404, detail="Patient not found")
 
-    data = payload.model_dump(exclude_unset=True)
+    # Works for both Pydantic v1 and v2
+    data = payload.model_dump(exclude_unset=True) if hasattr(
+        payload, "model_dump") else payload.dict(exclude_unset=True)
 
-    # Optional: accept appointment_id if your schema has it
+    v = Vitals(patient_id=patient_id)
+
+    # ✅ Optional: link to appointment if your model supports it (does NOT change endpoint)
     appt_id = data.get("appointment_id")
-    if appt_id:
-        ap = db.get(Appointment, int(appt_id))
-        if not ap or ap.patient_id != patient_id:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid appointment_id for this patient")
+    if appt_id and hasattr(Vitals, "appointment_id"):
+        v.appointment_id = int(appt_id)
 
-    v = Vitals(patient_id=patient_id, **data)
+    # ✅ Assign only fields that actually exist in your Vitals model
+    for k, val in data.items():
+        if k in {"patient_id"}:
+            continue
+        if hasattr(v, k):
+            setattr(v, k, val)
+
     db.add(v)
     db.commit()
     db.refresh(v)
     return {"id": v.id, "message": "Vitals saved"}
+
+
+@router.post("/vitals/{patient_id}", response_model=VitalsOut)
+def record_vitals_for_patient(
+        patient_id: int,
+        payload: VitalsIn,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    # keep compatibility, but route to POST /vitals logic
+    patched = payload.model_copy(update={"patient_id": patient_id})
+    return record_vitals(patched, db=db, user=user)
+
+
+from sqlalchemy import and_, func
+
+
+@router.get("/vitals/latest", response_model=VitalsLatestResponse)
+def get_latest_vitals(
+        appointment_id: Optional[int] = Query(None, ge=1),
+        patient_id: Optional[int] = Query(None, ge=1),
+        for_date: Optional[date] = Query(None),
+        db: Session = Depends(get_db),
+        current_user: User = Depends(current_user),
+) -> VitalsLatestResponse:
+
+    if not _has_any_perm(
+            current_user,
+        {"appointments.view", "vitals.create", "visits.view"}):
+        raise HTTPException(status_code=403, detail="Not permitted")
+
+    ap = None
+    if appointment_id:
+        ap = db.get(Appointment, int(appointment_id))
+        if not ap:
+            raise HTTPException(status_code=404,
+                                detail="Appointment not found")
+        patient_id = ap.patient_id
+
+    if not patient_id:
+        raise HTTPException(status_code=400,
+                            detail="appointment_id or patient_id required")
+
+    ts = Vitals.created_at  # only column you have
+
+    def apply_date_and_order(q):
+        if for_date:
+            start_dt = datetime.combine(for_date, time.min)
+            end_dt = start_dt + timedelta(days=1)
+            q = q.filter(and_(ts >= start_dt, ts < end_dt))
+        return q.order_by(ts.desc(), Vitals.id.desc())
+
+    v = None
+
+    # 1) try appointment_id first
+    if appointment_id:
+        v = apply_date_and_order(
+            db.query(Vitals).filter(
+                Vitals.appointment_id == int(appointment_id))).first()
+
+    # 2) fallback to patient_id (covers old rows with appointment_id NULL)
+    if not v:
+        v = apply_date_and_order(
+            db.query(Vitals).filter(
+                Vitals.patient_id == int(patient_id))).first()
+
+    if not v:
+        return VitalsLatestResponse(exists=False, vitals=None)
+
+    return VitalsLatestResponse(exists=True,
+                                vitals=VitalsOut(**_vitals_to_out(v)))
+
+
+@router.get("/vitals/history", response_model=List[VitalsOut])
+def get_vitals_history(
+        appointment_id: Optional[int] = Query(None, ge=1),
+        patient_id: Optional[int] = Query(None, ge=1),
+        for_date: Optional[date] = Query(None),
+        limit: int = Query(14, ge=1, le=200),
+        db: Session = Depends(get_db),
+        current_user: User = Depends(current_user),
+):
+    if not _has_any_perm(
+            current_user,
+        {"appointments.view", "vitals.create", "visits.view"}):
+        raise HTTPException(status_code=403, detail="Not permitted")
+
+    ap = None
+    if appointment_id:
+        ap = db.get(Appointment, int(appointment_id))
+        if not ap:
+            raise HTTPException(status_code=404,
+                                detail="Appointment not found")
+        patient_id = ap.patient_id
+
+    if not patient_id:
+        raise HTTPException(status_code=400,
+                            detail="appointment_id or patient_id required")
+
+    q = db.query(Vitals)
+
+    if appointment_id and hasattr(Vitals, "appointment_id"):
+        q = q.filter(Vitals.appointment_id == int(appointment_id))
+    else:
+        q = q.filter(Vitals.patient_id == int(patient_id))
+
+    col = _ts_col()
+    if for_date and col is not None:
+        start_dt = datetime.combine(for_date, time.min)
+        end_dt = start_dt + timedelta(days=1)
+        q = q.filter(and_(col >= start_dt, col < end_dt))
+
+    if col is not None:
+        q = q.order_by(col.desc(), Vitals.id.desc())
+    else:
+        q = q.order_by(Vitals.id.desc())
+
+    rows = q.limit(limit).all()
+    return [VitalsOut(**_vitals_to_out(r)) for r in rows]
 
 
 # ------------------- VISITS -------------------
@@ -3759,8 +4016,7 @@ def opd_dashboard_summary(
             response_model=List[FollowUpListItem])
 def list_visit_followups(
         visit_id: int,
-        scope: str = Query(
-            "patient", pattern="^(patient|visit)$"),  # patient = full history
+        scope: str = Query("patient", pattern="^(patient|visit)$"),
         limit: int = Query(50, ge=1, le=200),
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
@@ -3769,27 +4025,22 @@ def list_visit_followups(
     if not v:
         raise HTTPException(status_code=404, detail="Visit not found")
 
-    q = db.query(FollowUp)
+    q = db.query(FollowUp).options(joinedload(FollowUp.appointment))
 
     if scope == "visit":
         q = q.filter(FollowUp.source_visit_id == visit_id)
     else:
-        # patient history (preferred)
         if hasattr(FollowUp, "patient_id"):
             q = q.filter(FollowUp.patient_id == v.patient_id)
         else:
-            # fallback if FollowUp doesn't have patient_id
             q = q.join(Visit, FollowUp.source_visit_id == Visit.id).filter(
                 Visit.patient_id == v.patient_id)
 
-    rows = (q.order_by(desc(FollowUp.due_date),
-                       desc(FollowUp.id)).limit(limit).all())
+    rows = q.order_by(desc(FollowUp.due_date),
+                      desc(FollowUp.id)).limit(limit).all()
 
-    # attach episode_id for UI/PDF clarity (optional but very useful)
-    src_ids = list({
-        getattr(r, "source_visit_id", None)
-        for r in rows if getattr(r, "source_visit_id", None)
-    })
+    # map episode_id (optional)
+    src_ids = list({r.source_visit_id for r in rows if r.source_visit_id})
     ep_map = {}
     if src_ids:
         for vid, ep in db.query(Visit.id, Visit.episode_id).filter(
@@ -3798,21 +4049,32 @@ def list_visit_followups(
 
     out = []
     for r in rows:
+        ap = getattr(r, "appointment", None)
         out.append({
             "id":
             r.id,
             "due_date":
-            getattr(r, "due_date", None),
+            r.due_date,
             "status":
-            getattr(r, "status", None),
+            r.status,
             "note":
-            getattr(r, "note", None),
+            r.note,
             "created_at":
             getattr(r, "created_at", None),
             "source_visit_id":
-            getattr(r, "source_visit_id", None),
+            r.source_visit_id,
             "source_episode_id":
-            ep_map.get(getattr(r, "source_visit_id", None)),
+            ep_map.get(r.source_visit_id),
+
+            # ✅ bring back old UI fields
+            "appointment_id":
+            r.appointment_id,
+            "appointment_date":
+            ap.date if ap else None,
+            "slot_start":
+            ap.slot_start.strftime("%H:%M") if ap and ap.slot_start else None,
+            "slot_end":
+            ap.slot_end.strftime("%H:%M") if ap and ap.slot_end else None,
         })
     return out
 

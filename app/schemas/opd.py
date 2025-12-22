@@ -2,8 +2,7 @@
 from datetime import date, time, datetime
 from typing import List, Optional, Dict, Any
 
-from pydantic import BaseModel, Field, ConfigDict
-
+from pydantic import BaseModel, Field, ConfigDict, AliasChoices
 
 # ---------- Schedules ----------
 class OpdScheduleBase(BaseModel):
@@ -154,17 +153,6 @@ class VisitCreate(BaseModel):
     appointment_id: int
 
 
-class VitalsIn(BaseModel):
-    height_cm: Optional[float] = None
-    weight_kg: Optional[float] = None
-    bmi: Optional[float] = None
-    bp_systolic: Optional[int] = None
-    bp_diastolic: Optional[int] = None
-    pulse: Optional[int] = None
-    rr: Optional[int] = None
-    temp_c: Optional[float] = None
-    spo2: Optional[int] = None
-    notes: Optional[str] = None
 
 
 class VisitOut(BaseModel):
@@ -336,6 +324,75 @@ class FollowUpScheduleIn(BaseModel):
 
     date: Optional[date] = None
     slot_start: Optional[str] = None
+
+
+
+
+
+class VitalsIn(BaseModel):
+    """
+    Accepts BOTH UI keys and DB keys via aliases.
+    Works with:
+      - UI: bp_sys, bp_dia, resp_rate, temp_c, notes
+      - DB: bp_systolic, bp_diastolic, rr, temperature_c, remarks
+    """
+    model_config = ConfigDict(extra="ignore")
+
+    appointment_id: Optional[int] = None
+    patient_id: Optional[int] = None
+    recorded_at: Optional[datetime] = None
+
+    height_cm: Optional[float] = None
+    weight_kg: Optional[float] = None
+    bmi: Optional[float] = None
+
+    temp_c: Optional[float] = Field(
+        None, validation_alias=AliasChoices("temp_c", "temperature_c")
+    )
+    pulse: Optional[int] = None
+
+    resp_rate: Optional[int] = Field(
+        None, validation_alias=AliasChoices("resp_rate", "rr", "respiration")
+    )
+    spo2: Optional[int] = None
+
+    bp_sys: Optional[int] = Field(
+        None, validation_alias=AliasChoices("bp_sys", "bp_systolic", "systolic")
+    )
+    bp_dia: Optional[int] = Field(
+        None, validation_alias=AliasChoices("bp_dia", "bp_diastolic", "diastolic")
+    )
+
+    notes: Optional[str] = Field(
+        None, validation_alias=AliasChoices("notes", "remarks")
+    )
+
+class VitalsOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    patient_id: int
+    appointment_id: Optional[int] = None
+
+    created_at: Optional[str] = None
+
+    height_cm: Optional[float] = None
+    weight_kg: Optional[float] = None
+    bmi: Optional[float] = None
+
+    temp_c: Optional[float] = None
+    pulse: Optional[int] = None
+    resp_rate: Optional[int] = None
+    spo2: Optional[int] = None
+
+    bp_sys: Optional[int] = None
+    bp_dia: Optional[int] = None
+
+    notes: Optional[str] = None
+
+class VitalsLatestResponse(BaseModel):
+    exists: bool
+    vitals: Optional[VitalsOut] = None
 
 
 class FollowUpRow(BaseModel):
