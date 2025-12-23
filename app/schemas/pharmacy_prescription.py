@@ -150,13 +150,11 @@ class PrescriptionOut(PrescriptionSummaryOut):
 class DispenseLineIn(BaseModel):
     line_id: int
     dispense_qty: Decimal = Field(..., gt=0)
-
+    batch_id: int | None = None
 
 class DispenseFromRxIn(BaseModel):
-    location_id: Optional[
-        int] = None  # optional override; will fall back to Rx.location
+    location_id: Optional[int] = None  # optional override; will fall back to Rx.location
     lines: List[DispenseLineIn]
-
     create_sale: bool = False
     context_type: Optional[Literal["OPD", "IPD", "COUNTER"]] = None
 

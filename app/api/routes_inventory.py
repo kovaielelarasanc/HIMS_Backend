@@ -50,6 +50,7 @@ from app.schemas.pharmacy_inventory import (
     ReturnOut,
     StockTransactionOut,
     DispenseRequestIn,
+    PharmacyBatchPickOut,
 )
 
 from app.services.inventory import (
@@ -272,6 +273,136 @@ def list_items(
         query = query.filter(InventoryItem.is_consumable.is_(True))
 
     return query.order_by(InventoryItem.name.asc()).limit(limit).all()
+
+
+@router.get("/item-batches", response_model=List[PharmacyBatchPickOut])
+def search_item_batches_for_billing(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(auth_current_user),
+
+    location_id: int = Query(..., description="Dispense/Billing location (pharmacy store)"),
+    q: Optional[str] = Query(None, description="Search medicine name/code/generic/batch"),
+
+    # sensible defaults for billing
+    only_in_stock: bool = Query(True, description="Show only batches with available stock"),
+    exclude_expired: bool = Query(True, description="Exclude expired batches"),
+    active_only: bool = Query(True, description="Only ACTIVE + saleable batches"),
+
+    type_: Optional[str] = Query(
+        "drug",
+        alias="type",
+        pattern="^(drug|consumable|all)$",
+        description="drug -> is_consumable False, consumable -> True, all -> no filter",
+    ),
+
+    limit: int = Query(100, ge=1, le=500),
+):
+    """
+    Batch-wise item search for Pharmacy Billing / Dispense.
+    Returns ONE ROW PER BATCH with:
+    - Medicine name
+    - Batch no
+    - Expiry
+    - Available qty (batch current_qty)
+    - Batch price (unit_cost/mrp/tax)
+    """
+
+    # Permission
+    if not has_perm(current_user, "pharmacy.inventory.items.view"):
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+
+    try:
+        today = date.today()
+
+        qry = (
+            db.query(
+                ItemBatch.id.label("batch_id"),
+                InventoryItem.id.label("item_id"),
+                InventoryItem.code,
+                InventoryItem.name,
+                InventoryItem.generic_name,
+                InventoryItem.form,
+                InventoryItem.strength,
+                InventoryItem.unit,
+                ItemBatch.batch_no,
+                ItemBatch.expiry_date,  # ✅ ONLY COLUMN (no .asc() / no null expression here)
+                ItemBatch.current_qty.label("available_qty"),
+                ItemBatch.unit_cost,
+                ItemBatch.mrp,
+                ItemBatch.tax_percent,
+                ItemBatch.location_id,
+                InventoryLocation.name.label("location_name"),
+            )
+            .join(InventoryItem, InventoryItem.id == ItemBatch.item_id)
+            .join(InventoryLocation, InventoryLocation.id == ItemBatch.location_id)
+            .filter(ItemBatch.location_id == location_id)
+        )
+
+        # Search across item + batch
+        if q and q.strip():
+            like = f"%{q.strip()}%"
+            qry = qry.filter(
+                (InventoryItem.name.ilike(like))
+                | (InventoryItem.code.ilike(like))
+                | (InventoryItem.generic_name.ilike(like))
+                | (ItemBatch.batch_no.ilike(like))
+            )
+
+        # Active filters (billing-safe)
+        if active_only:
+            qry = qry.filter(
+                InventoryItem.is_active.is_(True),
+                ItemBatch.is_active.is_(True),
+                ItemBatch.is_saleable.is_(True),
+                ItemBatch.status == "ACTIVE",
+            )
+
+        # Type filter
+        if type_ == "drug":
+            qry = qry.filter(InventoryItem.is_consumable.is_(False))
+        elif type_ == "consumable":
+            qry = qry.filter(InventoryItem.is_consumable.is_(True))
+        # type_ == "all" -> no filter
+
+        # Stock filter
+        if only_in_stock:
+            qry = qry.filter(ItemBatch.current_qty > 0)
+
+        # Expiry filter
+        if exclude_expired:
+            qry = qry.filter(or_(ItemBatch.expiry_date.is_(None), ItemBatch.expiry_date >= today))
+
+        # ✅ FEFO ordering (MySQL safe)
+        # 1) name
+        # 2) expiry NULL last
+        # 3) earliest expiry first
+        # 4) batch no
+        qry = qry.order_by(
+            InventoryItem.name.asc(),
+
+            # ✅ MySQL-safe NULLS LAST
+            ItemBatch.expiry_date.is_(None),
+
+            ItemBatch.expiry_date.asc(),
+            ItemBatch.batch_no.asc(),
+        ).limit(limit)
+
+        rows = qry.all()
+        return [dict(r._mapping) for r in rows]
+
+    except SQLAlchemyError as e:
+        # ✅ DB errors (syntax, connection, etc.)
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Database error while searching item batches. Please check query/order_by for MySQL compatibility.",
+        ) from e
+    except Exception as e:
+        # ✅ any other unexpected error
+        raise HTTPException(
+            status_code=500,
+            detail="Unexpected error while searching item batches.",
+        ) from e
 
 
 @router.post("/items", response_model=ItemOut)

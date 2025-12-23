@@ -163,6 +163,7 @@ class ItemLocationStock(Base):
     location = relationship("InventoryLocation", back_populates="stock")
 
 
+
 class ItemBatch(Base):
     """
     Batch-wise stock per location.

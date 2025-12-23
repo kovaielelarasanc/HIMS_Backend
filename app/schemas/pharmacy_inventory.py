@@ -148,6 +148,30 @@ class ItemOut(ItemBase):
 
 
 # ---------- Batches & Stock ----------
+# ---------- Billing / Dispense Batch Picker ----------
+
+class PharmacyBatchPickOut(BaseModel):
+    batch_id: int
+    item_id: int
+
+    code: str
+    name: str
+    generic_name: str | None = ""
+    form: str | None = ""
+    strength: str | None = ""
+    unit: str | None = "unit"
+
+    batch_no: str
+    expiry_date: date | None
+
+    available_qty: Quantity  # from ItemBatch.current_qty
+
+    unit_cost: Money
+    mrp: Money
+    tax_percent: Percent
+
+    location_id: int
+    location_name: str | None = None
 
 
 class ItemBatchOut(BaseModel):

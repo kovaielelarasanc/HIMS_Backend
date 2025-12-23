@@ -36,11 +36,17 @@ from app.models.patient import Patient
 from app.services.pdf_prescription import build_prescription_pdf
 
 from types import SimpleNamespace
-
+from sqlalchemy import func, case
 from app.models.ui_branding import UiBranding
 from app.services.pdf_branding import render_brand_header_html, brand_header_css  # (optional usage elsewhere)
 from app.services.id_gen import make_op_episode_id, make_ip_admission_code, make_rx_number
-
+from app.models.pharmacy_inventory import ItemBatch
+from app.models.pharmacy_inventory import InventoryItem, InventoryLocation  # if you have these names
+from app.schemas.pharmacy_inventory import PharmacyBatchPickOut
+from app.models.pharmacy_prescription import (  # type: ignore
+        PharmacyPrescription, PharmacyPrescriptionLine, PharmacySale,
+        PharmacySaleItem,
+    )
 router = APIRouter(prefix="/pharmacy", tags=["pharmacy"])
 
 # ------------------------------------------------------------------
@@ -141,10 +147,9 @@ def _attach_display_fields_many(
 
 def _rx_base_options(query):
     return query.options(
-        selectinload(PharmacyPrescription.lines),
+        selectinload(PharmacyPrescription.lines).selectinload(PharmacyPrescriptionLine.batch),
         selectinload(PharmacyPrescription.patient),
-        selectinload(PharmacyPrescription.doctor).selectinload(
-            User.department),  # ✅ IMPORTANT
+        selectinload(PharmacyPrescription.doctor).selectinload(User.department),
     )
 
 
@@ -254,7 +259,8 @@ def get_prescription_details(
             remaining = max((req or 0) - (disp or 0), 0)
         except Exception:
             remaining = None
-
+            
+        batch = getattr(ln, "batch", None)
         lines.append({
             # ✅ CRITICAL: include ids
             "id":
@@ -263,6 +269,12 @@ def get_prescription_details(
             ln.id,  # (extra alias for frontend safety)
             "rx_line_id":
             ln.id,  # (extra alias if some code still uses old name)
+            
+                    # ✅ batch fields
+            "batch_id": getattr(ln, "batch_id", None),
+            "batch_no": getattr(ln, "batch_no_snapshot", None) or getattr(batch, "batch_no", None),
+            "expiry_date": getattr(ln, "expiry_date_snapshot", None) or getattr(batch, "expiry_date", None),
+            "batch_current_qty": getattr(batch, "current_qty", None),
 
             # item details
             "item_id":
@@ -911,3 +923,66 @@ def list_payments(
     q = db.query(PharmacyPayment).filter(PharmacyPayment.sale_id == sale_id)
     q = q.order_by(PharmacyPayment.paid_on.asc())
     return q.all()
+
+@router.get("/batch-picks", response_model=List[PharmacyBatchPickOut])
+def list_batch_picks(
+    location_id: int = Query(...),
+    item_id: int = Query(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    today = date.today()
+
+    q = (
+        db.query(ItemBatch)
+        .filter(
+            ItemBatch.location_id == location_id,
+            ItemBatch.item_id == item_id,
+            ItemBatch.is_active.is_(True),
+            ItemBatch.is_saleable.is_(True),
+            ItemBatch.status == "ACTIVE",
+            ItemBatch.current_qty > 0,
+            ((ItemBatch.expiry_date.is_(None)) | (ItemBatch.expiry_date >= today)),
+        )
+        .order_by(
+            case((ItemBatch.expiry_date.is_(None), 1), else_=0),
+            ItemBatch.expiry_date.asc(),
+            ItemBatch.id.asc(),
+        )
+    )
+
+    batches = q.all()
+
+    out: List[PharmacyBatchPickOut] = []
+    for b in batches:
+        item = getattr(b, "item", None)
+        loc = getattr(b, "location", None)
+
+        out.append(
+            PharmacyBatchPickOut(
+                batch_id=b.id,
+                item_id=b.item_id,
+
+                code=getattr(item, "code", "") if item else "",
+                name=getattr(item, "name", "") if item else "",
+                generic_name=getattr(item, "generic_name", "") if item else "",
+                form=getattr(item, "form", "") if item else "",
+                strength=getattr(item, "strength", "") if item else "",
+                unit=getattr(item, "unit", "unit") if item else "unit",
+
+                batch_no=b.batch_no,
+                expiry_date=b.expiry_date,
+                available_qty=b.current_qty,
+
+                unit_cost=b.unit_cost or 0,
+                mrp=b.mrp or 0,
+                tax_percent=b.tax_percent or 0,
+
+                location_id=b.location_id,
+                location_name=getattr(loc, "name", None) if loc else None,
+            )
+        )
+
+    return out
+
+
