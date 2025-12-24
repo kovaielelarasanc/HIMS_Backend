@@ -285,6 +285,81 @@ class Vitals(Base):
     appointment = relationship("Appointment", foreign_keys=[appointment_id])
 
 
+# ---------- NEW: Follow-up tracking ----------
+class FollowUp(Base):
+    """
+    Follow-up request created from a Visit.
+
+    - Initially status = 'waiting' (no slot yet).
+    - Waiting-time screen will confirm & assign a real Appointment.
+    """
+
+    __tablename__ = "opd_followups"
+    __table_args__ = (
+        UniqueConstraint(
+            "appointment_id",
+            name="uq_followup_appointment",
+        ),  # at most one follow-up record -> appointment link
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    patient_id = Column(
+        Integer,
+        ForeignKey("patients.id"),
+        nullable=False,
+        index=True,
+    )
+    department_id = Column(
+        Integer,
+        ForeignKey("departments.id"),
+        nullable=False,
+        index=True,
+    )
+    doctor_user_id = Column(
+        Integer,
+        ForeignKey("users.id"),
+        nullable=False,
+        index=True,
+    )
+
+    source_visit_id = Column(
+        Integer,
+        ForeignKey("opd_visits.id"),
+        nullable=False,
+        index=True,
+    )
+
+    # When doctor wants patient to come again (initial target)
+    due_date = Column(Date, nullable=False)
+
+    # waiting | scheduled | completed | cancelled
+    status = Column(String(30), default="waiting")
+
+    # Once waiting is confirmed -> real appointment
+    appointment_id = Column(
+        Integer,
+        ForeignKey("opd_appointments.id"),
+        nullable=True,
+        index=True,
+    )
+
+    note = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+
+    patient = relationship("Patient", foreign_keys=[patient_id])
+    doctor = relationship("User", foreign_keys=[doctor_user_id])
+    department = relationship("Department", foreign_keys=[department_id])
+    source_visit = relationship("Visit", foreign_keys=[source_visit_id])
+    appointment = relationship("Appointment", foreign_keys=[appointment_id])
+
+
 class Prescription(Base):
     __tablename__ = "opd_prescriptions"
     __table_args__ = (UniqueConstraint("visit_id", name="uq_rx_visit"), )
@@ -444,78 +519,3 @@ class DoctorFee(Base):
     )
 
     doctor = relationship("User", foreign_keys=[doctor_user_id])
-
-
-# ---------- NEW: Follow-up tracking ----------
-class FollowUp(Base):
-    """
-    Follow-up request created from a Visit.
-
-    - Initially status = 'waiting' (no slot yet).
-    - Waiting-time screen will confirm & assign a real Appointment.
-    """
-
-    __tablename__ = "opd_followups"
-    __table_args__ = (
-        UniqueConstraint(
-            "appointment_id",
-            name="uq_followup_appointment",
-        ),  # at most one follow-up record -> appointment link
-    )
-
-    id = Column(Integer, primary_key=True, index=True)
-
-    patient_id = Column(
-        Integer,
-        ForeignKey("patients.id"),
-        nullable=False,
-        index=True,
-    )
-    department_id = Column(
-        Integer,
-        ForeignKey("departments.id"),
-        nullable=False,
-        index=True,
-    )
-    doctor_user_id = Column(
-        Integer,
-        ForeignKey("users.id"),
-        nullable=False,
-        index=True,
-    )
-
-    source_visit_id = Column(
-        Integer,
-        ForeignKey("opd_visits.id"),
-        nullable=False,
-        index=True,
-    )
-
-    # When doctor wants patient to come again (initial target)
-    due_date = Column(Date, nullable=False)
-
-    # waiting | scheduled | completed | cancelled
-    status = Column(String(30), default="waiting")
-
-    # Once waiting is confirmed -> real appointment
-    appointment_id = Column(
-        Integer,
-        ForeignKey("opd_appointments.id"),
-        nullable=True,
-        index=True,
-    )
-
-    note = Column(Text, nullable=True)
-
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(
-        DateTime,
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
-    )
-
-    patient = relationship("Patient", foreign_keys=[patient_id])
-    doctor = relationship("User", foreign_keys=[doctor_user_id])
-    department = relationship("Department", foreign_keys=[department_id])
-    source_visit = relationship("Visit", foreign_keys=[source_visit_id])
-    appointment = relationship("Appointment", foreign_keys=[appointment_id])

@@ -148,6 +148,9 @@ api_router.include_router(routes_lis_history.router)
 api_router.include_router(routes_ris_history.router)
 
 api_router.include_router(routes_emr.router, prefix="/emr", tags=["EMR"])
+
+
+
 api_router.include_router(routes_templates.router,
                           prefix="/templates",
                           tags=["Templates & Consents"])

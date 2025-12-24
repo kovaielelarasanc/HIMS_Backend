@@ -24,3 +24,4 @@ qrcode
 openpyxl
 pyserial
 requests
+pypdf
