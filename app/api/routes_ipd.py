@@ -1,6 +1,6 @@
 # FILE: app/api/routes_ipd.py
 from __future__ import annotations
-from datetime import datetime, date, timedelta, time
+from datetime import datetime, date, timedelta, time, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -122,9 +122,32 @@ from app.services.ipd_billing import ensure_invoice_for_context  # we will creat
 from app.services.ipd_billing import compute_ipd_bed_charges_daily
 from app.models.ipd import IpdBed, IpdBedAssignment, IpdAdmission
 from app.services.id_gen import make_ip_admission_code
+from zoneinfo import ZoneInfo
+
+IST = ZoneInfo("Asia/Kolkata")
 
 router = APIRouter()
 
+
+def as_aware(dt: datetime | None, assume_tz=IST) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=assume_tz)   # ✅ assume incoming naive = IST
+    return dt
+
+def to_utc(dt: datetime | None) -> datetime:
+    if dt is None:
+        return datetime.now(timezone.utc)
+    return as_aware(dt).astimezone(timezone.utc)
+
+def to_ist(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    # if DB returns naive, assume it's UTC
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(IST)
 
 def _intake_total(payload: IOIn) -> int:
     split = (payload.intake_oral_ml or 0) + (payload.intake_iv_ml or 0) + (payload.intake_blood_ml or 0)
@@ -251,7 +274,7 @@ def _admission_detail(db: Session, adm: IpdAdmission) -> AdmissionDetailOut:
         practitioner_user_id=adm.practitioner_user_id,
         practitioner_name=(doc.name if doc else None),
         admission_type=adm.admission_type,
-        admitted_at=adm.admitted_at,
+        admitted_at=adm.admitted_at.astimezone(ZoneInfo("Asia/Kolkata")),
         expected_discharge_at=adm.expected_discharge_at,
         status=adm.status,
         current_bed_id=adm.current_bed_id,
@@ -276,6 +299,9 @@ def create_admission(
         raise HTTPException(404, "Bed not found")
     if bed.state not in ("vacant", "reserved"):
         raise HTTPException(400, "Bed not available")
+    
+    admitted_at_utc = to_utc(payload.admitted_at)
+    expected_discharge_utc = to_utc(payload.expected_discharge_at) if payload.expected_discharge_at else None
 
     adm = IpdAdmission(
         patient_id=payload.patient_id,
@@ -283,8 +309,8 @@ def create_admission(
         practitioner_user_id=payload.practitioner_user_id,
         primary_nurse_user_id=payload.primary_nurse_user_id,
         admission_type=payload.admission_type,
-        admitted_at=payload.admitted_at or datetime.utcnow(),
-        expected_discharge_at=payload.expected_discharge_at,
+        admitted_at=admitted_at_utc,                 # ✅ store UTC (aware)
+        expected_discharge_at=expected_discharge_utc, # ✅ if you want consistent
         package_id=payload.package_id,
         payor_type=payload.payor_type,
         insurer_name=payload.insurer_name,
@@ -301,7 +327,7 @@ def create_admission(
     ip_code = make_ip_admission_code(
         db,
         adm.id,
-        on_date=(adm.admitted_at or datetime.utcnow()),  # ✅ datetime
+        on_date=to_ist(admitted_at_utc),  # ✅ datetime
         id_width=6,
     )
 
@@ -325,7 +351,7 @@ def create_admission(
             admission_id=adm.id,
             bed_id=bed.id,
             reason="admission",
-            from_ts=adm.admitted_at,  # ✅ critical
+            from_ts=admitted_at_utc,
             to_ts=None,
         ))
     db.commit()
