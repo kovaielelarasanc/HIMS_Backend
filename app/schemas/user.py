@@ -45,3 +45,16 @@ class UserMiniOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class UserUpdate(BaseModel):
+    name: str
+    email: EmailStr
+    department_id: Optional[int] = None
+    is_active: bool = True
+    is_doctor: bool = False
+    password: Optional[str] = None
+
+    # IMPORTANT: optional for old users; if None => keep existing roles
+    # if [] => auto-assign default role
+    role_ids: Optional[List[int]] = None
