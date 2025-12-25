@@ -12,12 +12,41 @@ from app.models.opd import Medicine, LabTest, RadiologyTest
 router = APIRouter()
 
 
+# ---------------- permissions ----------------
+def has_perm(user: User, code: str) -> bool:
+    if getattr(user, "is_admin", False):
+        return True
+    for r in (getattr(user, "roles", None) or []):
+        for p in (getattr(r, "permissions", None) or []):
+            if getattr(p, "code", None) == code:
+                return True
+    return False
+
+
 def must_admin(user: User):
     if not user.is_admin:
         raise HTTPException(status_code=403, detail="Admin only")
 
 
-# ----------- MEDICINES -----------
+def must_any_perm(user: User, codes: List[str]):
+    if any(has_perm(user, c) for c in codes):
+        return
+    raise HTTPException(status_code=403,
+                        detail=f"Missing permission: any of {codes}")
+
+
+def must_perm(user: User, code: str):
+    if not has_perm(user, code):
+        raise HTTPException(status_code=403,
+                            detail=f"Missing permission: {code}")
+
+
+# ✅ Lab masters permission codes
+LAB_MASTERS_VIEW = "lab.masters.view"
+LAB_MASTERS_MANAGE = "lab.masters.manage"
+
+
+# ----------- MEDICINES ----------- (unchanged)
 @router.get("/medicines", response_model=List[dict])
 def list_medicines(
         q: Optional[str] = Query(None),
@@ -61,13 +90,16 @@ def create_medicine(
     return {"id": m.id, "message": "Created"}
 
 
-# ----------- LAB TESTS -----------
+# ----------- LAB TESTS ----------- ✅ permission-based
 @router.get("/lab-tests", response_model=List[dict])
 def list_lab_tests(
         q: Optional[str] = Query(None),
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
 ):
+    # ✅ allow either view OR manage
+    must_any_perm(user, [LAB_MASTERS_VIEW, LAB_MASTERS_MANAGE])
+
     qry = db.query(LabTest)
     if q:
         like = f"%{q}%"
@@ -78,7 +110,7 @@ def list_lab_tests(
         "id": t.id,
         "code": t.code,
         "name": t.name,
-        "price": float(t.price or 0)
+        "price": float(t.price or 0),
     } for t in tests]
 
 
@@ -88,7 +120,9 @@ def create_lab_test(
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
 ):
-    must_admin(user)
+    # ✅ manage permission required
+    must_perm(user, LAB_MASTERS_MANAGE)
+
     code = (payload.get("code") or "").strip()
     name = (payload.get("name") or "").strip()
     price = payload.get("price") or 0
@@ -96,21 +130,23 @@ def create_lab_test(
         raise HTTPException(status_code=400, detail="Code & Name required")
     if db.query(LabTest).filter(LabTest.code == code).first():
         raise HTTPException(status_code=400, detail="Test already exists")
+
     t = LabTest(code=code, name=name, price=price)
     db.add(t)
     db.commit()
     db.refresh(t)
     return {"id": t.id, "message": "Created"}
 
-# ----------- LAB TESTS (UPDATE) -----------
+
 @router.put("/lab-tests/{test_id}", response_model=dict)
 def update_lab_test(
-    test_id: int,
-    payload: dict,
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+        test_id: int,
+        payload: dict,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
 ):
-    must_admin(user)
+    # ✅ manage permission required
+    must_perm(user, LAB_MASTERS_MANAGE)
 
     t = db.query(LabTest).filter(LabTest.id == test_id).first()
     if not t:
@@ -123,12 +159,8 @@ def update_lab_test(
     if not code or not name:
         raise HTTPException(status_code=400, detail="Code & Name required")
 
-    # unique code check (if code changed)
-    exists = (
-        db.query(LabTest)
-        .filter(LabTest.code == code, LabTest.id != test_id)
-        .first()
-    )
+    exists = (db.query(LabTest).filter(LabTest.code == code, LabTest.id
+                                       != test_id).first())
     if exists:
         raise HTTPException(status_code=400, detail="Test code already exists")
 
@@ -141,14 +173,14 @@ def update_lab_test(
     return {"id": t.id, "message": "Updated"}
 
 
-# ----------- LAB TESTS (DELETE) -----------
 @router.delete("/lab-tests/{test_id}", response_model=dict)
 def delete_lab_test(
-    test_id: int,
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+        test_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
 ):
-    must_admin(user)
+    # ✅ manage permission required
+    must_perm(user, LAB_MASTERS_MANAGE)
 
     t = db.query(LabTest).filter(LabTest.id == test_id).first()
     if not t:
@@ -159,7 +191,7 @@ def delete_lab_test(
     return {"id": test_id, "message": "Deleted"}
 
 
-# ----------- RADIOLOGY TESTS -----------
+# ----------- RADIOLOGY TESTS ----------- (unchanged)
 @router.get("/radiology-tests", response_model=List[dict])
 def list_radiology_tests(
         q: Optional[str] = Query(None),
@@ -176,7 +208,7 @@ def list_radiology_tests(
         "id": t.id,
         "code": t.code,
         "name": t.name,
-        "price": float(t.price or 0)
+        "price": float(t.price or 0),
     } for t in tests]
 
 
@@ -194,6 +226,7 @@ def create_radiology_test(
         raise HTTPException(status_code=400, detail="Code & Name required")
     if db.query(RadiologyTest).filter(RadiologyTest.code == code).first():
         raise HTTPException(status_code=400, detail="Test already exists")
+
     t = RadiologyTest(code=code, name=name, price=price)
     db.add(t)
     db.commit()
