@@ -3,7 +3,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
-
+import logging
+import sys
 from app.core.config import settings
 from app.api.router import api_router
 from fastapi import Request
@@ -35,7 +36,18 @@ app.add_middleware(
 )
 
 
+def setup_logging():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
+        force=True,  # important if uvicorn already configured logging
+    )
 
+setup_logging()
+
+logger = logging.getLogger("app")
+logger.info("✅ App starting...")
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):

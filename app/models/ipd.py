@@ -318,31 +318,13 @@ class IpdAdmission(Base):
         cascade="all, delete-orphan",
     )
 
-    dressing_records = relationship(
-        "IpdDressingRecord",
-        back_populates="admission",
-        cascade="all, delete-orphan",
-    )
-    blood_transfusions = relationship(
-        "IpdBloodTransfusion",
-        back_populates="admission",
-        cascade="all, delete-orphan",
-    )
-    restraints = relationship(
-        "IpdRestraintRecord",
-        back_populates="admission",
-        cascade="all, delete-orphan",
-    )
-    isolations = relationship(
-        "IpdIsolationPrecaution",
-        back_populates="admission",
-        cascade="all, delete-orphan",
-    )
-    icu_flows = relationship(
-        "IcuFlowSheet",
-        back_populates="admission",
-        cascade="all, delete-orphan",
-    )
+   
+    dressing_records = relationship("IpdDressingRecord", back_populates="admission", cascade="all, delete-orphan")
+    blood_transfusions = relationship("IpdBloodTransfusion", back_populates="admission", cascade="all, delete-orphan")
+    restraints = relationship("IpdRestraintRecord", back_populates="admission", cascade="all, delete-orphan")
+    isolations = relationship("IpdIsolationPrecaution", back_populates="admission", cascade="all, delete-orphan")
+    icu_flows = relationship("IcuFlowSheet", back_populates="admission", cascade="all, delete-orphan")
+    nursing_timeline = relationship("IpdNursingTimeline", back_populates="admission", cascade="all, delete-orphan")
 
     discharge_summary = relationship(
         "IpdDischargeSummary",
@@ -926,109 +908,7 @@ class IpdMedicationAdministration(Base):
     ), )
 
 
-# ---------------------------------------------------------------------
-# Procedures, Dressing, Transfusion, Restraint, Isolation, ICU
-# ---------------------------------------------------------------------
-
-
-class IpdDressingRecord(Base):
-    __tablename__ = "ipd_dressing_records"
-
-    id = Column(Integer, primary_key=True)
-    admission_id = Column(Integer, ForeignKey("ipd_admissions.id"), index=True)
-
-    wound_site = Column(String(255), default="")
-    dressing_type = Column(String(255), default="")
-    indication = Column(String(255), default="")
-
-    date_time = Column(DateTime, default=datetime.utcnow)
-    findings = Column(Text, default="")
-    next_dressing_due = Column(DateTime, nullable=True)
-
-    done_by = Column(Integer, ForeignKey("users.id"), nullable=True)
-
-    admission = relationship("IpdAdmission", back_populates="dressing_records")
-
-
-class IpdBloodTransfusion(Base):
-    __tablename__ = "ipd_blood_transfusions"
-
-    id = Column(Integer, primary_key=True)
-    admission_id = Column(Integer, ForeignKey("ipd_admissions.id"), index=True)
-
-    component_type = Column(String(100), default="")
-    bag_number = Column(String(100), default="")
-
-    start_time = Column(DateTime, nullable=False)
-    end_time = Column(DateTime, nullable=True)
-
-    pre_vitals = Column(Text, default="")
-    post_vitals = Column(Text, default="")
-
-    reaction_occurred = Column(Boolean, default=False)
-    reaction_notes = Column(Text, default="")
-    notified_to = Column(Integer, ForeignKey("users.id"), nullable=True)
-
-    admission = relationship("IpdAdmission",
-                             back_populates="blood_transfusions")
-
-
-class IpdRestraintRecord(Base):
-    __tablename__ = "ipd_restraint_records"
-
-    id = Column(Integer, primary_key=True)
-    admission_id = Column(Integer, ForeignKey("ipd_admissions.id"), index=True)
-
-    type = Column(String(20), default="")
-    reason = Column(Text, default="")
-
-    start_time = Column(DateTime, nullable=False)
-    end_time = Column(DateTime, nullable=True)
-
-    doctor_order_id = Column(Integer, ForeignKey("users.id"), nullable=True)
-    monitoring_notes = Column(Text, default="")
-
-    admission = relationship("IpdAdmission", back_populates="restraints")
-
-
-class IpdIsolationPrecaution(Base):
-    __tablename__ = "ipd_isolation_precautions"
-
-    id = Column(Integer, primary_key=True)
-    admission_id = Column(Integer, ForeignKey("ipd_admissions.id"), index=True)
-
-    indication = Column(String(255), default="")
-    start_date = Column(DateTime, nullable=False)
-    end_date = Column(DateTime, nullable=True)
-
-    measures = Column(Text, default="")
-    status = Column(
-        String(20),
-        default="active",  # active / stopped
-    )
-
-    admission = relationship("IpdAdmission", back_populates="isolations")
-
-
-class IcuFlowSheet(Base):
-    __tablename__ = "icu_flow_sheets"
-
-    id = Column(Integer, primary_key=True)
-    admission_id = Column(Integer, ForeignKey("ipd_admissions.id"), index=True)
-
-    recorded_at = Column(DateTime, default=datetime.utcnow)
-
-    vital_data = Column(Text, default="")
-    ventilator_settings = Column(Text, default="")
-    infusions = Column(Text, default="")
-
-    gcs_score = Column(Integer, nullable=True)
-    urine_output_ml = Column(Integer, nullable=True)
-    notes = Column(Text, default="")
-
-    recorded_by = Column(Integer, ForeignKey("users.id"), nullable=True)
-
-    admission = relationship("IpdAdmission", back_populates="icu_flows")
+# 
 
 
 # ---------------------------------------------------------------------

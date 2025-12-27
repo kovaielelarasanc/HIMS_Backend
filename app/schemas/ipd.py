@@ -757,106 +757,7 @@ class IpdMedicationAdministrationOut(IpdMedicationAdministrationBase):
         orm_mode = True
 
 
-# =====================================================================
-# -------- NEW: Dressing, Transfusion, Restraint, Isolation, ICU ------
-# =====================================================================
 
-
-class DressingRecordIn(BaseModel):
-    wound_site: Optional[str] = None
-    dressing_type: Optional[str] = None
-    indication: Optional[str] = None
-    date_time: Optional[datetime] = None
-    findings: Optional[str] = None
-    next_dressing_due: Optional[datetime] = None
-
-
-class DressingRecordOut(DressingRecordIn):
-    id: int
-    admission_id: int
-    done_by: Optional[int]
-
-    class Config:
-        orm_mode = True
-
-
-class BloodTransfusionIn(BaseModel):
-    component_type: Optional[str] = None
-    bag_number: Optional[str] = None
-    start_time: datetime
-    end_time: Optional[datetime] = None
-    pre_vitals: Optional[str] = None  # JSON text
-    post_vitals: Optional[str] = None
-    reaction_occurred: bool = False
-    reaction_notes: Optional[str] = None
-
-
-class BloodTransfusionOut(BloodTransfusionIn):
-    id: int
-    admission_id: int
-    notified_to: Optional[int]
-
-    class Config:
-        orm_mode = True
-
-
-class RestraintRecordIn(BaseModel):
-    type: Optional[str] = None  # physical / chemical
-    reason: Optional[str] = None
-    start_time: datetime
-    end_time: Optional[datetime] = None
-    monitoring_notes: Optional[str] = None
-
-
-class RestraintRecordOut(RestraintRecordIn):
-    id: int
-    admission_id: int
-    doctor_order_id: Optional[int]
-
-    class Config:
-        orm_mode = True
-
-
-class IsolationPrecautionIn(BaseModel):
-    indication: Optional[str] = None  # Airborne / Droplet / Contact
-    start_date: datetime
-    end_date: Optional[datetime] = None
-    measures: Optional[str] = None
-    status: str = "active"
-
-    @validator("status")
-    def validate_isolation_status(cls, v):
-        allowed = {"active", "stopped"}
-        if v not in allowed:
-            raise ValueError(f"status must be one of {sorted(allowed)}")
-        return v
-
-
-class IsolationPrecautionOut(IsolationPrecautionIn):
-    id: int
-    admission_id: int
-
-    class Config:
-        orm_mode = True
-
-
-class IcuFlowSheetIn(BaseModel):
-    recorded_at: Optional[datetime] = None
-    vital_data: Optional[str] = None   # JSON text
-    ventilator_settings: Optional[str] = None
-    infusions: Optional[str] = None
-    gcs_score: Optional[int] = Field(None, ge=0, le=15)
-    urine_output_ml: Optional[int] = Field(None, ge=0)
-    notes: Optional[str] = None
-
-
-class IcuFlowSheetOut(IcuFlowSheetIn):
-    id: int
-    admission_id: int
-    recorded_by: Optional[int]
-
-    class Config:
-        orm_mode = True
 
 
 # =====================================================================
@@ -1167,29 +1068,6 @@ class IpdMedicationOut(IpdMedicationBase):
     
     model_config = ConfigDict(from_attributes=True)
 
-# ===========================================
-# Dressing / Transfusion
-# ===========================================
-class IpdDressingTransfusionBase(BaseModel):
-    entry_type: str = "dressing"   # dressing | transfusion
-    done_at: Optional[datetime] = None
-    site: Optional[str] = None
-    product: Optional[str] = None
-    volume: Optional[str] = None
-    notes: Optional[str] = None
-
-
-class IpdDressingTransfusionCreate(IpdDressingTransfusionBase):
-    pass
-
-
-class IpdDressingTransfusionOut(IpdDressingTransfusionBase):
-    id: int
-    admission_id: int
-    created_by_id: Optional[int] = None
-    created_at: datetime
-    
-    model_config = ConfigDict(from_attributes=True)
 
 # ===========================================
 # Discharge Medications

@@ -3,13 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 from fastapi.responses import Response
 from jinja2 import Environment, FileSystemLoader, select_autoescape
-
+import json
 from datetime import datetime, time, timedelta, date
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
-
+from sqlalchemy import text
 from app.api.deps import get_db, current_user
 from app.models.user import User as UserModel
 from app.models.ipd import (
@@ -45,6 +45,8 @@ from app.schemas.ipd import (
     IpdDrugChartDoctorAuthUpdate,
     IpdDrugChartDoctorAuthOut,
 )
+import logging
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/ipd", tags=["IPD - Medications / Drug Chart"])
 
@@ -153,7 +155,7 @@ def _generate_administration_rows_for_order(
 # Medication Orders (regular / SOS / STAT / premed)
 # -------------------------------------------------------------------
 @router.get(
-    "/admissions/{admission_id}/medications",
+    "/admissions/{admission_id}/medications-order",
     response_model=List[IpdMedicationOrderOut],
 )
 def list_medication_orders_for_admission(
@@ -173,7 +175,8 @@ def list_medication_orders_for_admission(
         raise HTTPException(403, "Not permitted")
 
     _get_admission_or_404(db, admission_id)
-
+    
+    print("DB =", db.execute(text("SELECT DATABASE()")).scalar())
     q = (
         db.query(IpdMedicationOrder)
         .filter(IpdMedicationOrder.admission_id == admission_id)
@@ -186,7 +189,7 @@ def list_medication_orders_for_admission(
 
 
 @router.post(
-    "/admissions/{admission_id}/medications",
+    "/admissions/{admission_id}/medications-order",
     response_model=IpdMedicationOrderOut,
     status_code=status.HTTP_201_CREATED,
 )
@@ -225,8 +228,9 @@ def create_medication_order_for_admission(
         special_instructions=payload.special_instructions or "",
         order_status=payload.order_status or "active",
         order_type=getattr(payload, "order_type", None) or "regular",
-        ordered_by=user.id,
+        ordered_by_id=user.id,   # ✅ FIX (was ordered_by=user.id)
     )
+
 
     db.add(order)
     db.flush()  # get order.id
@@ -234,14 +238,14 @@ def create_medication_order_for_admission(
     # Auto-generate Hrs/Sign entries only for regular / stat orders (configurable).
     if order.order_type in {"regular", "stat"} and (order.duration_days or 0) > 0:
         _generate_administration_rows_for_order(db, order=order)
-
+    print("DB =", db.execute(text("SELECT DATABASE()")).scalar())
     db.commit()
     db.refresh(order)
     return order
 
 
 @router.put(
-    "/medications/{order_id}",
+    "/medications-order/{order_id}",
     response_model=IpdMedicationOrderOut,
 )
 def update_medication_order(
@@ -264,7 +268,7 @@ def update_medication_order(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Medication order not found",
         )
-
+    
     data = payload.dict(exclude_unset=True)
     # Never allow admission_id change from here
     data.pop("admission_id", None)
@@ -272,18 +276,18 @@ def update_medication_order(
     # Map ordered_by_id (schema) -> ordered_by (model) if present
     ordered_by_id = data.pop("ordered_by_id", None)
     if ordered_by_id is not None:
-        order.ordered_by = ordered_by_id
+        order.ordered_by_id = ordered_by_id 
 
     for field, value in data.items():
         setattr(order, field, value)
-
+    print("DB =", db.execute(text("SELECT DATABASE()")).scalar())
     db.commit()
     db.refresh(order)
     return order
 
 
 @router.post(
-    "/medications/{order_id}/regenerate-admin",
+    "/medications-order/{order_id}/regenerate-admin",
     response_model=List[IpdMedicationAdministrationOut],
 )
 def regenerate_medication_administration(
@@ -711,6 +715,7 @@ def list_doctor_authorisations(
     return rows
 
 
+
 @router.post(
     "/admissions/{admission_id}/drug-chart/doctor-auth",
     response_model=IpdDrugChartDoctorAuthOut,
@@ -724,15 +729,22 @@ def create_doctor_authorisation(
 ):
     """
     Create a new Doctor’s Daily Authorisation row.
-    Doctor_id comes from User; doctor_name/sign can be snapshotted for PDF.
+    doctor_id and doctor_name are taken from token user.
     """
     if not (has_perm(user, "ipd.doctor") or has_perm(user, "ipd.manage")):
         raise HTTPException(403, "Not permitted")
 
     _get_admission_or_404(db, admission_id)
 
-    data = payload.dict()
+    # debug (optional)
+    # print(json.dumps(sa_to_dict_safe(user), default=str, indent=2), flush=True)
+
+    data = payload.dict(exclude_unset=True)
+
+    # ✅ Always force from path + token (ignore any FE doctor_id/doctor_name)
     data["admission_id"] = admission_id
+    data["doctor_id"] = getattr(user, "id", None)
+    data["doctor_name"] = (getattr(user, "name", "") or "").strip()
 
     # default auth_date to today if not sent
     if not data.get("auth_date"):
@@ -757,6 +769,7 @@ def update_doctor_authorisation(
 ):
     """
     Edit an existing Doctor’s Daily Authorisation row.
+    doctor_id and doctor_name cannot be changed from frontend.
     """
     if not (has_perm(user, "ipd.doctor") or has_perm(user, "ipd.manage")):
         raise HTTPException(403, "Not permitted")
@@ -769,7 +782,14 @@ def update_doctor_authorisation(
     if not obj:
         raise HTTPException(404, "Doctor authorisation row not found")
 
-    for field, value in payload.dict(exclude_unset=True).items():
+    data = payload.dict(exclude_unset=True)
+
+    # ✅ Do NOT allow FE to change these fields
+    data.pop("doctor_id", None)
+    data.pop("doctor_name", None)
+    data.pop("admission_id", None)
+
+    for field, value in data.items():
         setattr(obj, field, value)
 
     db.commit()
