@@ -1,13 +1,13 @@
 # FILE: app/schemas/ot.py
 from __future__ import annotations
 
-from datetime import date, time, datetime
+from datetime import date, time, datetime, timezone
 from typing import Any, Dict, List, Optional, Union
 from sqlalchemy import Boolean, Text, JSON, Column
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
 from .user import UserOut, UserMiniOut
 from .patient import PatientOut
-
+from zoneinfo import ZoneInfo
 JsonDict = Dict[str, Any]
 JsonValue = Union[JsonDict, List[Any], None]
 
@@ -17,57 +17,127 @@ JsonValue = Union[JsonDict, List[Any], None]
 
 # ---------- OtSpeciality ----------
 
-
-class OtSpecialityBase(BaseModel):
-    code: str = Field(..., max_length=50)
-    name: str = Field(..., max_length=255)
+IST = ZoneInfo("Asia/Kolkata")
+# -------------------------
+# Speciality
+# -------------------------
+class OtSpecialityCreate(BaseModel):
+    code: str
+    name: str
     description: Optional[str] = None
     is_active: bool = True
 
 
-class OtSpecialityCreate(OtSpecialityBase):
-    pass
-
-
-class OtProcedureBase(BaseModel):
-    code: str = Field(..., max_length=50)
-    name: str = Field(..., max_length=255)
-
-    # ✅ must match DB + route + frontend
-    speciality_id: Optional[int] = None
-    default_duration_min: Optional[int] = Field(None, ge=0)
-    rate_per_hour: Optional[float] = Field(None, ge=0)
-
-    description: Optional[str] = None
-    is_active: bool = True
-
-
-class OtProcedureCreate(OtProcedureBase):
-    """
-    Used for POST /ot/procedures
-    All fields allowed, code + name required.
-    """
-    pass
-
-
-class OtProcedureUpdate(BaseModel):
-    """
-    Used for PUT /ot/procedures/{id}
-    All fields optional; we use exclude_unset=True in the route.
-    """
-    code: Optional[str] = Field(None, max_length=50)
-    name: Optional[str] = Field(None, max_length=255)
-
-    speciality_id: Optional[int] = None
-    default_duration_min: Optional[int] = Field(None, ge=0)
-    rate_per_hour: Optional[float] = Field(None, ge=0)
-
+class OtSpecialityUpdate(BaseModel):
+    code: Optional[str] = None
+    name: Optional[str] = None
     description: Optional[str] = None
     is_active: Optional[bool] = None
 
 
-class OtProcedureOut(OtProcedureBase):
+class OtSpecialityOut(BaseModel):
     id: int
+    code: str
+    name: str
+    description: Optional[str] = None
+    is_active: bool
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# -------------------------
+# Equipment Master
+# -------------------------
+class OtEquipmentMasterCreate(BaseModel):
+    code: str
+    name: str
+    category: Optional[str] = None
+    description: Optional[str] = None
+    is_critical: bool = False
+    is_active: bool = True
+
+
+class OtEquipmentMasterUpdate(BaseModel):
+    code: Optional[str] = None
+    name: Optional[str] = None
+    category: Optional[str] = None
+    description: Optional[str] = None
+    is_critical: Optional[bool] = None
+    is_active: Optional[bool] = None
+
+
+class OtEquipmentMasterOut(BaseModel):
+    id: int
+    code: str
+    name: str
+    category: Optional[str] = None
+    description: Optional[str] = None
+    is_critical: bool
+    is_active: bool
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# -------------------------
+# Procedure Master (UPDATED)
+# -------------------------
+class OtProcedureCreate(BaseModel):
+    code: str
+    name: str
+    speciality_id: Optional[int] = None
+
+    default_duration_min: Optional[int] = None
+    rate_per_hour: Optional[float] = None
+    description: Optional[str] = None
+
+    # ✅ NEW fixed-cost split-up
+    base_cost: float = 0
+    anesthesia_cost: float = 0
+    surgeon_cost: float = 0
+    petitory_cost: float = 0
+    asst_doctor_cost: float = 0
+
+    is_active: bool = True
+
+
+class OtProcedureUpdate(BaseModel):
+    code: Optional[str] = None
+    name: Optional[str] = None
+    speciality_id: Optional[int] = None
+
+    default_duration_min: Optional[int] = None
+    rate_per_hour: Optional[float] = None
+    description: Optional[str] = None
+
+    # ✅ NEW fixed-cost split-up (optional on update)
+    base_cost: Optional[float] = None
+    anesthesia_cost: Optional[float] = None
+    surgeon_cost: Optional[float] = None
+    petitory_cost: Optional[float] = None
+    asst_doctor_cost: Optional[float] = None
+
+    is_active: Optional[bool] = None
+
+
+class OtProcedureOut(BaseModel):
+    id: int
+    code: str
+    name: str
+    speciality_id: Optional[int] = None
+
+    default_duration_min: Optional[int] = None
+    rate_per_hour: Optional[float] = None
+    description: Optional[str] = None
+
+    base_cost: float
+    anesthesia_cost: float
+    surgeon_cost: float
+    petitory_cost: float
+    asst_doctor_cost: float
+    total_fixed_cost: float
+
+    is_active: bool
+
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -95,7 +165,7 @@ class OtSpecialityUpdate(BaseModel):
     is_active: Optional[bool] = None
 
 
-class OtSpecialityOut(OtSpecialityBase):
+class OtSpecialityOut(OtSpecialityCreate):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
@@ -141,37 +211,52 @@ class OtEquipmentMasterOut(OtEquipmentMasterBase):
 # ---------- OtSchedule ----------
 
 
-class OtScheduleBedOut(BaseModel):
+def _db_utc_to_ist(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    # DB stores naive UTC -> assume UTC
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(IST)
+
+
+# ---------- Theater Mini ----------
+class OtTheaterOutMini(BaseModel):
     id: int
     code: str
-    ward_name: Optional[str] = None
-    room_name: Optional[str] = None
+    name: str
+    is_active: bool
 
     model_config = ConfigDict(from_attributes=True)
 
 
+# ---------- Admission Mini (keep - not OT location) ----------
 class OtScheduleAdmissionOut(BaseModel):
     id: int
     admission_code: Optional[str] = None
     display_code: str
     admitted_at: Optional[datetime] = None
 
-    current_bed: Optional[OtScheduleBedOut] = None
-
     model_config = ConfigDict(from_attributes=True)
 
+    @field_serializer("admitted_at")
+    def _ser_admitted_at(self, v: datetime | None):
+        return _db_utc_to_ist(v)
 
+
+# ---------- Procedure link out (as you already have) ----------
 class OtScheduleProcedureLinkOut(BaseModel):
     id: int
     procedure_id: int
     is_primary: bool
-    procedure: Optional[OtProcedureOut] = None
+    procedure: Optional[
+        "OtProcedureOut"] = None  # keep your existing OtProcedureOut
 
     model_config = ConfigDict(from_attributes=True)
 
 
 class OtScheduleBase(BaseModel):
-    # 🗓️ Timing
+    # 🗓️ Timing (IST slot)
     date: date
     planned_start_time: time
     planned_end_time: Optional[time] = None
@@ -180,12 +265,15 @@ class OtScheduleBase(BaseModel):
     patient_id: Optional[int] = None
     admission_id: Optional[int] = None
 
-    # ✅ FIXED: OT LOCATION (NOT bed_id)
-    ot_bed_id: Optional[int] = None
+    # ✅ OT THEATER (NEW)
+    ot_theater_id: Optional[int] = None
 
     # 👨‍⚕️ Staff
     surgeon_user_id: int
-    anaesthetist_user_id: Optional[int] = None
+    anaesthetist_user_id: int  # ✅ required as per your request
+
+    petitory_user_id: Optional[int] = None
+    asst_doctor_user_id: Optional[int] = None
 
     # 🧠 Clinical
     procedure_name: str
@@ -207,11 +295,12 @@ class OtScheduleUpdate(BaseModel):
     patient_id: Optional[int] = None
     admission_id: Optional[int] = None
 
-    # ✅ FIXED
-    ot_bed_id: Optional[int] = None
+    ot_theater_id: Optional[int] = None
 
     surgeon_user_id: Optional[int] = None
     anaesthetist_user_id: Optional[int] = None
+    petitory_user_id: Optional[int] = None
+    asst_doctor_user_id: Optional[int] = None
 
     procedure_name: Optional[str] = None
     side: Optional[str] = None
@@ -223,35 +312,36 @@ class OtScheduleUpdate(BaseModel):
 
 
 class OtScheduleOut(OtScheduleBase):
-    """
-    Main DTO for OT schedule listing / detail.
-    """
     id: int
     status: str
     case_id: Optional[int] = None
 
     primary_procedure_id: Optional[int] = None
 
-    # 🔗 Relations
-    patient: Optional["PatientOut"] = None
-    surgeon: Optional["UserMiniOut"] = None
-    anaesthetist: Optional["UserMiniOut"] = None
-
+    # Relations
+    patient: Optional[PatientOut] = None
     admission: Optional[OtScheduleAdmissionOut] = None
 
-    # ✅ FIXED: name must match ORM relationship
-    ot_bed: Optional[OtScheduleBedOut] = None
+    theater: Optional[OtTheaterOutMini] = None
 
-    # UI helper
-    op_no: Optional[str] = None
+    surgeon: Optional[UserMiniOut] = None
+    anaesthetist: Optional[UserMiniOut] = None
+    petitory: Optional[UserMiniOut] = None
+    asst_doctor: Optional[UserMiniOut] = None
 
-    primary_procedure: Optional[OtProcedureOut] = None
+    primary_procedure: Optional["OtProcedureOut"] = None
     procedures: List[OtScheduleProcedureLinkOut] = []
+    
+    op_no: Optional[str] = None
 
     created_at: datetime
     updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+    @field_serializer("created_at", "updated_at")
+    def _ser_created_updated(self, v: datetime):
+        return _db_utc_to_ist(v)
 
 
 class OtScheduleUserOut(BaseModel):
@@ -314,15 +404,15 @@ class OtCaseOut(OtCaseBase):
     model_config = ConfigDict(from_attributes=True)
     schedule: Optional[OtScheduleOut] = None
     id: int
-    
+
     patient_id: Optional[int] = None
     patient_name: Optional[str] = None
     uhid: Optional[str] = None
     age: Optional[int] = None
     sex: Optional[str] = None
-    
+
     op_no: Optional[str] = None
-    
+
     created_at: datetime
     updated_at: datetime
     schedule_id: Optional[int] = None
@@ -715,6 +805,9 @@ class OtAnaesthesiaRecordIn(BaseModel):
     block_adequacy: Optional[str] = None  # Excellent / Adequate / Poor
     sedation_needed: Optional[bool] = None
     conversion_to_ga: Optional[bool] = None
+    
+    airway_device_ids: List[int] = Field(default_factory=list)
+    monitor_device_ids: List[int] = Field(default_factory=list)
 
     # Free-form notes (used for intra-op summary)
     notes: Optional[str] = None
@@ -748,6 +841,8 @@ class OtAnaesthesiaRecordOut(OtAnaesthesiaRecordIn):
     id: int
     case_id: int
     anaesthetist_user_id: Optional[int] = None
+    airway_device_ids: List[int] = Field(default_factory=list)
+    monitor_device_ids: List[int] = Field(default_factory=list)
     created_at: datetime
     # we don’t have updated_at column; just expose created_at as “last updated”
     updated_at: Optional[datetime] = None

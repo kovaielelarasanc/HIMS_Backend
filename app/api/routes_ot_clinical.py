@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 from typing import List, Optional
-from datetime import datetime, date, time
+from datetime import datetime, date, time, timezone
+from zoneinfo import ZoneInfo
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
+from sqlalchemy import func  # noqa: F401 (keep if used elsewhere)
 
 from app.api.deps import get_db, current_user
+from app.models.user import User
 from app.models.ot import (
     OtCase,
     PreAnaesthesiaEvaluation,
@@ -23,8 +27,9 @@ from app.models.ot import (
     PacuRecord,
     OtCleaningLog,
     OtEnvironmentLog,
-    OtCase,
+    AnaesthesiaDeviceUse,
 )
+from app.models.ot_master import OtDeviceMaster
 from app.schemas.ot import (
     # Pre-anaesthesia
     PreAnaesthesiaEvaluationCreate,
@@ -35,17 +40,14 @@ from app.schemas.ot import (
     PreOpChecklistUpdate,
     PreOpChecklistOut,
     # Safety checklist
-    OtPreopChecklistIn,
     OtSafetyChecklistIn,
     OtSafetyChecklistOut,
     OtSafetyPhaseSignIn,
     OtSafetyPhaseTimeOut,
     OtSafetyPhaseSignOut,
     # Anaesthesia record
-    AnaesthesiaVitalLogCreate,
     AnaesthesiaVitalLogUpdate,
     AnaesthesiaVitalLogOut,
-    AnaesthesiaDrugLogCreate,
     AnaesthesiaDrugLogUpdate,
     AnaesthesiaDrugLogOut,
     OtAnaesthesiaRecordIn,
@@ -59,9 +61,6 @@ from app.schemas.ot import (
     OtNursingRecordUpdate,
     OtNursingRecordOut,
     # Sponge & instrument
-    OtSpongeInstrumentCountCreate,
-    OtSpongeInstrumentCountUpdate,
-    OtSpongeInstrumentCountOut,
     OtCountsIn,
     OtCountsOut,
     # Implants
@@ -79,6 +78,7 @@ from app.schemas.ot import (
     # PACU
     PacuUiIn,
     PacuUiOut,
+    # Logs
     OtCleaningLogCreate,
     OtCleaningLogUpdate,
     OtCleaningLogOut,
@@ -86,27 +86,31 @@ from app.schemas.ot import (
     OtEnvironmentLogUpdate,
     OtEnvironmentLogOut,
 )
-from app.models.user import User
-from app.services.ot_billing import ensure_ot_invoice_and_items
+
+# Optional import - keep if you use it elsewhere in this file
+from app.services.ot_billing import ensure_ot_invoice_and_items  # noqa: F401
 
 router = APIRouter(prefix="/ot", tags=["OT - Clinical Records"])
 
+IST = ZoneInfo("Asia/Kolkata")
+UTC = timezone.utc
 
 # ============================================================
-#  HELPER
+#  HELPERS
 # ============================================================
-# ---------------- RBAC ----------------
+
+
 def _need_any(user: User, codes: list[str]) -> None:
     if getattr(user, "is_admin", False):
         return
     have = {p.code for r in (user.roles or []) for p in (r.permissions or [])}
     if have.intersection(set(codes)):
         return
-    raise HTTPException(403, "Not permitted")
+    raise HTTPException(status_code=403, detail="Not permitted")
 
 
-def _get_case_or_404(db: Session, case_id: int):
-    case = db.query(OtCase).get(case_id)
+def _get_case_or_404(db: Session, case_id: int) -> OtCase:
+    case = db.get(OtCase, case_id)
     if not case:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -115,49 +119,226 @@ def _get_case_or_404(db: Session, case_id: int):
     return case
 
 
-def _time_str_to_dt(value: Optional[str]) -> Optional[datetime]:
+def _now_ist() -> datetime:
+    return datetime.now(tz=IST)
+
+
+def _base_date_for_case(case: OtCase) -> date:
+    if getattr(case, "schedule", None) and getattr(case.schedule, "date",
+                                                   None):
+        return case.schedule.date
+    return _now_ist().date()
+
+
+def _as_utc(dt: datetime) -> datetime:
+    """Treat naive datetimes as UTC; convert aware to UTC."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+
+def _to_ist_dt(dt: Optional[datetime]) -> Optional[datetime]:
+    """Convert stored dt (naive assumed UTC) to IST aware dt."""
+    if not dt:
+        return None
+    return _as_utc(dt).astimezone(IST)
+
+
+def _to_hhmm(dt: Optional[datetime]) -> Optional[str]:
+    """Convert stored dt (naive assumed UTC) -> HH:MM in IST."""
+    d = _to_ist_dt(dt)
+    return d.strftime("%H:%M") if d else None
+
+
+def _hhmm_to_utc_naive_for_case(case: OtCase,
+                                t: Optional[str]) -> Optional[datetime]:
     """
-    Convert 'HH:MM' string from UI into a datetime for DB.
-    Uses today's date for now.
+    Parse UI 'HH:MM' (assumed IST) with case base date -> store as UTC naive datetime.
+    """
+    if not t:
+        return None
+    try:
+        hour, minute = [int(x) for x in t.split(":", 1)]
+    except (ValueError, TypeError):
+        return None
+
+    base_date = _base_date_for_case(case)
+    dt_ist = datetime.combine(base_date,
+                              time(hour=hour, minute=minute),
+                              tzinfo=IST)
+    dt_utc = dt_ist.astimezone(UTC)
+    return dt_utc.replace(tzinfo=None)
+
+
+# Backward compatible alias used by PACU endpoints
+def _time_str_to_dt(value: Optional[str],
+                    case: Optional[OtCase] = None) -> Optional[datetime]:
+    """
+    Parse 'HH:MM' in IST and store as UTC naive.
+    If case is provided, uses case.schedule.date; else uses today's IST date.
     """
     if not value:
         return None
-    try:
-        h, m = map(int, value.split(':')[:2])
-    except ValueError:
-        return None
-    today = datetime.utcnow().date()
-    return datetime.combine(today, time(hour=h, minute=m))
+    dummy_case = case or OtCase()
+    return _hhmm_to_utc_naive_for_case(dummy_case, value)
 
 
 def _dt_to_time_str(value: Optional[datetime]) -> Optional[str]:
-    """Convert datetime from DB into 'HH:MM' string for UI."""
-    if not value:
-        return None
-    return value.strftime("%H:%M")
+    """Convert stored dt (naive assumed UTC) into 'HH:MM' string in IST."""
+    return _to_hhmm(value)
+
+
+# ============================================================
+#  OT DEVICE MASTERS (AIRWAY / MONITOR)
+#  ✅ Used by Anaesthesia UI for dynamic device selection
+# ============================================================
+
+
+@router.get("/device-masters", response_model=List[dict])
+def list_ot_device_masters(
+        category: Optional[str] = Query(None, description="AIRWAY or MONITOR"),
+        q: Optional[str] = Query(None),
+        active: Optional[bool] = Query(True),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    _need_any(
+        user,
+        ["ot.masters.view", "ot.anaesthesia_record.view", "ot.cases.view"])
+
+    qry = db.query(OtDeviceMaster)
+
+    if category:
+        cat = category.strip().upper()
+        if cat not in ("AIRWAY", "MONITOR"):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid category (use AIRWAY or MONITOR)")
+        qry = qry.filter(OtDeviceMaster.category == cat)
+
+    if active is not None:
+        qry = qry.filter(OtDeviceMaster.is_active == active)
+
+    if q:
+        like = f"%{q.strip()}%"
+        qry = qry.filter(OtDeviceMaster.name.ilike(like))
+
+    rows = qry.order_by(OtDeviceMaster.category.asc(),
+                        OtDeviceMaster.name.asc()).all()
+
+    return [{
+        "id": r.id,
+        "category": r.category,
+        "code": r.code,
+        "name": r.name,
+        "cost": float(r.cost or 0),
+        "description": r.description,
+        "is_active": r.is_active,
+    } for r in rows]
+
+
+# ============================================================
+#  DEVICE SYNC HELPERS (Anaesthesia record)
+# ============================================================
+
+
+def _validate_device_ids_by_category(db: Session, ids: list[int],
+                                     category: str) -> list[int]:
+    clean = sorted({int(x) for x in (ids or []) if x})
+    if not clean:
+        return []
+    cat = category.strip().upper()
+
+    rows = (db.query(OtDeviceMaster.id).filter(
+        OtDeviceMaster.id.in_(clean)).filter(
+            OtDeviceMaster.category == cat).all())
+    found = {rid for (rid, ) in rows}
+    missing = set(clean) - found
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid {cat} device ids: {sorted(missing)}")
+    return clean
+
+
+def _get_device_ids_for_record(db: Session,
+                               record_id: int) -> tuple[list[int], list[int]]:
+    rows = (db.query(
+        AnaesthesiaDeviceUse.device_id, OtDeviceMaster.category).join(
+            OtDeviceMaster,
+            OtDeviceMaster.id == AnaesthesiaDeviceUse.device_id).filter(
+                AnaesthesiaDeviceUse.record_id == record_id).all())
+    airway_ids: list[int] = []
+    monitor_ids: list[int] = []
+    for did, cat in rows:
+        if cat == "AIRWAY":
+            airway_ids.append(did)
+        elif cat == "MONITOR":
+            monitor_ids.append(did)
+    airway_ids.sort()
+    monitor_ids.sort()
+    return airway_ids, monitor_ids
+
+
+def _sync_anaesthesia_devices(db: Session, record: AnaesthesiaRecord,
+                              device_ids: list[int]) -> None:
+    """
+    AnaesthesiaDeviceUse is the source of truth for devices used.
+    device_ids must be the final selected list (AIRWAY + MONITOR).
+    """
+    clean = sorted({int(x) for x in (device_ids or []) if x})
+
+    existing_rows = (db.query(AnaesthesiaDeviceUse).filter(
+        AnaesthesiaDeviceUse.record_id == record.id).all())
+    existing_ids = {r.device_id for r in existing_rows}
+
+    if not clean:
+        for r in existing_rows:
+            db.delete(r)
+        return
+
+    valid_ids = {
+        did
+        for (did, ) in db.query(OtDeviceMaster.id).filter(
+            OtDeviceMaster.id.in_(clean)).all()
+    }
+    invalid = set(clean) - valid_ids
+    if invalid:
+        raise HTTPException(status_code=400,
+                            detail=f"Invalid device ids: {sorted(invalid)}")
+
+    # delete removed
+    for r in existing_rows:
+        if r.device_id not in valid_ids:
+            db.delete(r)
+
+    # add new
+    for did in clean:
+        if did not in existing_ids:
+            db.add(
+                AnaesthesiaDeviceUse(record_id=record.id, device_id=did,
+                                     qty=1))
 
 
 # ============================================================
 #  PRE-ANAESTHESIA EVALUATION
+#  ✅ GET returns 200 with null (Optional) on first open
 # ============================================================
 
 
-@router.get(
-    "/cases/{case_id}/pre-anaesthesia",
-    response_model=PreAnaesthesiaEvaluationOut,
-)
+@router.get("/cases/{case_id}/pre-anaesthesia",
+            response_model=Optional[PreAnaesthesiaEvaluationOut])
 def get_pre_anaesthesia_for_case(
         case_id: int,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.pre_anaesthesia.view", "ot.cases.view"])
 
-    case = _get_case_or_404(case_id, db)
+    case = _get_case_or_404(db, case_id)
     record = case.preanaesthesia
     if not record:
-        raise HTTPException(status_code=404,
-                            detail="Pre-anaesthesia record not found")
+        return None
     return record
 
 
@@ -170,23 +351,19 @@ def create_pre_anaesthesia_for_case(
         case_id: int,
         payload: PreAnaesthesiaEvaluationCreate,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.pre_anaesthesia.create"])
 
-    case = _get_case_or_404(case_id, db)
+    case = _get_case_or_404(db, case_id)
     if case.preanaesthesia:
         raise HTTPException(
             status_code=400,
-            detail="Pre-anaesthesia record already exists for this case",
-        )
+            detail="Pre-anaesthesia record already exists for this case")
 
     if payload.case_id != case_id:
-        # enforce consistency
-        raise HTTPException(
-            status_code=400,
-            detail="case_id in body does not match URL",
-        )
+        raise HTTPException(status_code=400,
+                            detail="case_id in body does not match URL")
 
     record = PreAnaesthesiaEvaluation(
         case_id=case_id,
@@ -205,28 +382,24 @@ def create_pre_anaesthesia_for_case(
     return record
 
 
-@router.put(
-    "/cases/{case_id}/pre-anaesthesia",
-    response_model=PreAnaesthesiaEvaluationOut,
-)
+@router.put("/cases/{case_id}/pre-anaesthesia",
+            response_model=PreAnaesthesiaEvaluationOut)
 def update_pre_anaesthesia_for_case(
         case_id: int,
         payload: PreAnaesthesiaEvaluationUpdate,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.pre_anaesthesia.update"])
 
-    case = _get_case_or_404(case_id, db)
+    case = _get_case_or_404(db, case_id)
     record = case.preanaesthesia
     if not record:
         raise HTTPException(status_code=404,
                             detail="Pre-anaesthesia record not found")
 
     data = payload.model_dump(exclude_unset=True)
-    # Never allow case_id change via this endpoint
     data.pop("case_id", None)
-
     for field, value in data.items():
         setattr(record, field, value)
 
@@ -237,13 +410,103 @@ def update_pre_anaesthesia_for_case(
 
 
 # ============================================================
-#  SURGICAL SAFETY CHECKLIST (WHO)
+#  PRE-OP CHECKLIST
+#  ✅ GET returns 200 with null (Optional) on first open
 # ============================================================
+
+
+@router.get("/cases/{case_id}/pre-op-checklist",
+            response_model=Optional[PreOpChecklistOut])
+def get_preop_checklist_for_case(
+        case_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    _need_any(user, ["ot.preop_checklist.view", "ot.cases.view"])
+
+    case = _get_case_or_404(db, case_id)
+    record = getattr(case, "preop_checklist", None)
+    if not record:
+        return None
+    return record
+
+
+@router.post(
+    "/cases/{case_id}/pre-op-checklist",
+    response_model=PreOpChecklistOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_preop_checklist_for_case(
+        case_id: int,
+        payload: PreOpChecklistCreate,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    _need_any(user, ["ot.preop_checklist.create"])
+
+    case = _get_case_or_404(db, case_id)
+    existing = getattr(case, "preop_checklist", None)
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail="Pre-op checklist already exists for this case")
+
+    if getattr(payload, "case_id", case_id) != case_id:
+        raise HTTPException(status_code=400,
+                            detail="case_id in body does not match URL")
+
+    record = PreOpChecklist(case_id=case_id)
+    data = payload.model_dump(exclude_unset=True)
+    data.pop("case_id", None)
+    for k, v in data.items():
+        if hasattr(record, k):
+            setattr(record, k, v)
+
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+@router.put("/cases/{case_id}/pre-op-checklist",
+            response_model=PreOpChecklistOut)
+def update_preop_checklist_for_case(
+        case_id: int,
+        payload: PreOpChecklistUpdate,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    _need_any(user, ["ot.preop_checklist.update"])
+
+    case = _get_case_or_404(db, case_id)
+    record = getattr(case, "preop_checklist", None)
+    if not record:
+        create_payload = PreOpChecklistCreate(**payload.model_dump(
+            exclude_unset=True),
+                                              case_id=case_id)  # type: ignore
+        return create_preop_checklist_for_case(case_id, create_payload, db,
+                                               user)
+
+    data = payload.model_dump(exclude_unset=True)
+    data.pop("case_id", None)
+    for k, v in data.items():
+        if hasattr(record, k):
+            setattr(record, k, v)
+
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+# ============================================================
+#  SURGICAL SAFETY CHECKLIST (WHO)
+#  ✅ GET returns 200 with null (Optional) on first open
+#  ✅ IST HH:MM parsing + formatting
+# ============================================================
+
+
 def _build_anaes_json_from_payload(payload: OtAnaesthesiaRecordIn) -> dict:
-    """
-    Flatten OtAnaesthesiaRecordIn into a JSON dict that we store inside
-    AnaesthesiaRecord.preop_vitals. This is flexible and backwards compatible.
-    """
     return {
         # ---- PRE-OP ----
         "asa_grade": payload.asa_grade,
@@ -268,7 +531,6 @@ def _build_anaes_json_from_payload(payload: OtAnaesthesiaRecordIn) -> dict:
         "risk_factors": payload.risk_factors,
         "anaesthetic_plan_detail": payload.anaesthetic_plan_detail,
         "preop_instructions": payload.preop_instructions,
-
         # ---- INTRA-OP SETTINGS ----
         "preoxygenation": payload.preoxygenation,
         "cricoid_pressure": payload.cricoid_pressure,
@@ -285,13 +547,14 @@ def _build_anaes_json_from_payload(payload: OtAnaesthesiaRecordIn) -> dict:
         "bilateral_breath_sounds": payload.bilateral_breath_sounds,
         "added_sounds": payload.added_sounds,
         "laryngoscopy_grade": payload.laryngoscopy_grade,
-        "airway_devices": payload.airway_devices,
+        # legacy free-text/arrays (keep if your UI still uses)
+        "airway_devices": getattr(payload, "airway_devices", None),
+        "monitors": getattr(payload, "monitors", None),
         "ventilation_mode_baseline": payload.ventilation_mode_baseline,
         "ventilator_vt": payload.ventilator_vt,
         "ventilator_rate": payload.ventilator_rate,
         "ventilator_peep": payload.ventilator_peep,
         "breathing_system": payload.breathing_system,
-        "monitors": payload.monitors,
         "lines": payload.lines,
         "tourniquet_used": payload.tourniquet_used,
         "patient_position": payload.patient_position,
@@ -314,64 +577,30 @@ def _build_anaes_json_from_payload(payload: OtAnaesthesiaRecordIn) -> dict:
     }
 
 
-def _parse_time_str_for_case(case: OtCase,
-                             t: Optional[str]) -> Optional[datetime]:
-    """
-    Convert 'HH:MM' string from UI into a datetime using case.schedule.date.
-    Falls back to today's date if missing.
-    """
-    if not t:
-        return None
-    try:
-        hour, minute = [int(x) for x in t.split(":", 1)]
-    except (ValueError, TypeError):
-        return None
-
-    if case.schedule and case.schedule.date:
-        base_date = case.schedule.date
-    else:
-        base_date = datetime.utcnow().date()
-
-    return datetime.combine(base_date, time(hour=hour, minute=minute))
-
-
-def _to_hhmm(dt: Optional[datetime]) -> Optional[str]:
-    if not dt:
-        return None
-    return dt.strftime("%H:%M")
-
-
-@router.get(
-    "/cases/{case_id}/safety-checklist",
-    response_model=OtSafetyChecklistOut,
-)
+@router.get("/cases/{case_id}/safety-checklist",
+            response_model=Optional[OtSafetyChecklistOut])
 def get_safety_checklist_for_case(
         case_id: int,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.safety.view", "ot.cases.view"])
 
     case = _get_case_or_404(db, case_id)
     record = case.safety_checklist
     if not record:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Safety checklist not found",
-        )
+        return None
 
     sign_in_data = record.sign_in_data or {}
     time_out_data = record.time_out_data or {}
     sign_out_data = record.sign_out_data or {}
 
-    # derive "done" flags
     sign_in_done = bool(sign_in_data.get("done") or record.sign_in_done_by_id)
     time_out_done = bool(
         time_out_data.get("done") or record.time_out_done_by_id)
     sign_out_done = bool(
         sign_out_data.get("done") or record.sign_out_done_by_id)
 
-    # hydrate phase models from JSON (missing keys → defaults)
     sign_in_phase = OtSafetyPhaseSignIn.model_validate({
         k: v
         for k, v in sign_in_data.items() if k != "done"
@@ -386,10 +615,8 @@ def get_safety_checklist_for_case(
     })
 
     updated_candidates = [
-        record.sign_in_time,
-        record.time_out_time,
-        record.sign_out_time,
-        record.created_at,
+        record.sign_in_time, record.time_out_time, record.sign_out_time,
+        record.created_at
     ]
     updated_at = max([d for d in updated_candidates if d is not None])
 
@@ -404,16 +631,14 @@ def get_safety_checklist_for_case(
         sign_in=sign_in_phase,
         time_out=time_out_phase,
         sign_out=sign_out_phase,
-        created_at=record.created_at,
-        updated_at=updated_at,
+        created_at=_to_ist_dt(record.created_at),
+        updated_at=_to_ist_dt(updated_at),
     )
 
 
-@router.post(
-    "/cases/{case_id}/safety-checklist",
-    response_model=OtSafetyChecklistOut,
-    status_code=status.HTTP_201_CREATED,
-)
+@router.post("/cases/{case_id}/safety-checklist",
+             response_model=OtSafetyChecklistOut,
+             status_code=status.HTTP_201_CREATED)
 def create_safety_checklist_for_case(
         case_id: int,
         payload: OtSafetyChecklistIn,
@@ -426,12 +651,11 @@ def create_safety_checklist_for_case(
     if case.safety_checklist:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Safety checklist already exists for this case",
-        )
+            detail="Safety checklist already exists for this case")
 
-    sign_in_time = _parse_time_str_for_case(case, payload.sign_in_time)
-    time_out_time = _parse_time_str_for_case(case, payload.time_out_time)
-    sign_out_time = _parse_time_str_for_case(case, payload.sign_out_time)
+    sign_in_time = _hhmm_to_utc_naive_for_case(case, payload.sign_in_time)
+    time_out_time = _hhmm_to_utc_naive_for_case(case, payload.time_out_time)
+    sign_out_time = _hhmm_to_utc_naive_for_case(case, payload.sign_out_time)
 
     sign_in_data = payload.sign_in.model_dump()
     sign_in_data["done"] = bool(payload.sign_in_done)
@@ -460,33 +684,29 @@ def create_safety_checklist_for_case(
     db.refresh(record)
 
     updated_candidates = [
-        record.sign_in_time,
-        record.time_out_time,
-        record.sign_out_time,
-        record.created_at,
+        record.sign_in_time, record.time_out_time, record.sign_out_time,
+        record.created_at
     ]
     updated_at = max([d for d in updated_candidates if d is not None])
 
     return OtSafetyChecklistOut(
         case_id=case_id,
         sign_in_done=payload.sign_in_done,
-        sign_in_time=payload.sign_in_time,
+        sign_in_time=_to_hhmm(record.sign_in_time),
         time_out_done=payload.time_out_done,
-        time_out_time=payload.time_out_time,
+        time_out_time=_to_hhmm(record.time_out_time),
         sign_out_done=payload.sign_out_done,
-        sign_out_time=payload.sign_out_time,
+        sign_out_time=_to_hhmm(record.sign_out_time),
         sign_in=payload.sign_in,
         time_out=payload.time_out,
         sign_out=payload.sign_out,
-        created_at=record.created_at,
-        updated_at=updated_at,
+        created_at=_to_ist_dt(record.created_at),
+        updated_at=_to_ist_dt(updated_at),
     )
 
 
-@router.put(
-    "/cases/{case_id}/safety-checklist",
-    response_model=OtSafetyChecklistOut,
-)
+@router.put("/cases/{case_id}/safety-checklist",
+            response_model=OtSafetyChecklistOut)
 def update_safety_checklist_for_case(
         case_id: int,
         payload: OtSafetyChecklistIn,
@@ -498,98 +718,93 @@ def update_safety_checklist_for_case(
     case = _get_case_or_404(db, case_id)
     record = case.safety_checklist
 
-    # If no record yet, behave like create()
     if not record:
-        return create_safety_checklist_for_case(
-            case_id=case_id,
-            payload=payload,
-            db=db,
-            user=user,
-        )
+        return create_safety_checklist_for_case(case_id=case_id,
+                                                payload=payload,
+                                                db=db,
+                                                user=user)
 
-    sign_in_time = _parse_time_str_for_case(case, payload.sign_in_time)
-    time_out_time = _parse_time_str_for_case(case, payload.time_out_time)
-    sign_out_time = _parse_time_str_for_case(case, payload.sign_out_time)
+    record.sign_in_time = _hhmm_to_utc_naive_for_case(case,
+                                                      payload.sign_in_time)
+    record.time_out_time = _hhmm_to_utc_naive_for_case(case,
+                                                       payload.time_out_time)
+    record.sign_out_time = _hhmm_to_utc_naive_for_case(case,
+                                                       payload.sign_out_time)
 
     record.sign_in_data = payload.sign_in.model_dump()
     record.sign_in_data["done"] = bool(payload.sign_in_done)
     record.sign_in_done_by_id = user.id if payload.sign_in_done else None
-    record.sign_in_time = sign_in_time
 
     record.time_out_data = payload.time_out.model_dump()
     record.time_out_data["done"] = bool(payload.time_out_done)
     record.time_out_done_by_id = user.id if payload.time_out_done else None
-    record.time_out_time = time_out_time
 
     record.sign_out_data = payload.sign_out.model_dump()
     record.sign_out_data["done"] = bool(payload.sign_out_done)
     record.sign_out_done_by_id = user.id if payload.sign_out_done else None
-    record.sign_out_time = sign_out_time
 
     db.add(record)
     db.commit()
     db.refresh(record)
 
     updated_candidates = [
-        record.sign_in_time,
-        record.time_out_time,
-        record.sign_out_time,
-        record.created_at,
+        record.sign_in_time, record.time_out_time, record.sign_out_time,
+        record.created_at
     ]
     updated_at = max([d for d in updated_candidates if d is not None])
 
     return OtSafetyChecklistOut(
         case_id=case_id,
         sign_in_done=payload.sign_in_done,
-        sign_in_time=payload.sign_in_time,
+        sign_in_time=_to_hhmm(record.sign_in_time),
         time_out_done=payload.time_out_done,
-        time_out_time=payload.time_out_time,
+        time_out_time=_to_hhmm(record.time_out_time),
         sign_out_done=payload.sign_out_done,
-        sign_out_time=payload.sign_out_time,
+        sign_out_time=_to_hhmm(record.sign_out_time),
         sign_in=payload.sign_in,
         time_out=payload.time_out,
         sign_out=payload.sign_out,
-        created_at=record.created_at,
-        updated_at=updated_at,
+        created_at=_to_ist_dt(record.created_at),
+        updated_at=_to_ist_dt(updated_at),
     )
 
 
 # ============================================================
 #  ANAESTHESIA RECORD + VITALS + DRUG LOGS
+#  ✅ GET returns 200 with null (Optional) on first open
+#  ✅ Device master IDs via AnaesthesiaDeviceUse
 # ============================================================
 
 
-@router.get(
-    "/cases/{case_id}/anaesthesia-record",
-    response_model=OtAnaesthesiaRecordOut,
-)
+@router.get("/cases/{case_id}/anaesthesia-record",
+            response_model=Optional[OtAnaesthesiaRecordOut])
 def get_anaesthesia_record_for_case(
         case_id: int,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.anaesthesia_record.view", "ot.cases.view"])
 
     case = _get_case_or_404(db, case_id)
     record = case.anaesthesia_record
     if not record:
-        raise HTTPException(status_code=404,
-                            detail="Anaesthesia record not found")
+        return None
 
     data = record.preop_vitals or {}
+    airway_ids, monitor_ids = _get_device_ids_for_record(db, record.id)
 
     return OtAnaesthesiaRecordOut(
         id=record.id,
         case_id=case_id,
         anaesthetist_user_id=record.anaesthetist_user_id,
-        created_at=record.created_at,
-        updated_at=None,
-
-        # header
+        created_at=_to_ist_dt(record.created_at),
+        updated_at=_to_ist_dt(getattr(record, "updated_at", None)),
+        # ✅ device master IDs (make sure schemas include these)
+        airway_device_ids=airway_ids,
+        monitor_device_ids=monitor_ids,
+        # existing fields
         anaesthesia_type=record.plan or None,
         notes=record.intraop_summary or None,
-
-        # ---- PRE-OP ----
         asa_grade=data.get("asa_grade"),
         airway_assessment=data.get("airway_assessment"),
         comorbidities=data.get("comorbidities"),
@@ -612,8 +827,6 @@ def get_anaesthesia_record_for_case(
         risk_factors=data.get("risk_factors"),
         anaesthetic_plan_detail=data.get("anaesthetic_plan_detail"),
         preop_instructions=data.get("preop_instructions"),
-
-        # ---- INTRA-OP ----
         preoxygenation=data.get("preoxygenation"),
         cricoid_pressure=data.get("cricoid_pressure"),
         induction_route=data.get("induction_route"),
@@ -667,7 +880,7 @@ def create_anaesthesia_record_for_case(
         case_id: int,
         payload: OtAnaesthesiaRecordIn,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.anaesthesia_record.create"])
 
@@ -675,91 +888,95 @@ def create_anaesthesia_record_for_case(
     if case.anaesthesia_record:
         raise HTTPException(
             status_code=400,
-            detail="Anaesthesia record already exists for this case",
-        )
-
-    preop_vitals = _build_anaes_json_from_payload(payload)
+            detail="Anaesthesia record already exists for this case")
 
     record = AnaesthesiaRecord(
         case_id=case_id,
         anaesthetist_user_id=user.id,
-        preop_vitals=preop_vitals,
+        preop_vitals=_build_anaes_json_from_payload(payload),
         plan=payload.anaesthesia_type,
         intraop_summary=payload.notes,
         airway_plan=None,
         complications=None,
     )
     db.add(record)
+    db.flush()  # get record.id before commit
+
+    airway_ids = _validate_device_ids_by_category(
+        db,
+        getattr(payload, "airway_device_ids", []) or [], "AIRWAY")
+    monitor_ids = _validate_device_ids_by_category(
+        db,
+        getattr(payload, "monitor_device_ids", []) or [], "MONITOR")
+    _sync_anaesthesia_devices(db, record, airway_ids + monitor_ids)
+
     db.commit()
     db.refresh(record)
+    return get_anaesthesia_record_for_case(case_id, db, user)  # type: ignore
 
-    return get_anaesthesia_record_for_case(case_id, db, user)
 
-
-@router.put(
-    "/cases/{case_id}/anaesthesia-record",
-    response_model=OtAnaesthesiaRecordOut,
-)
+@router.put("/cases/{case_id}/anaesthesia-record",
+            response_model=OtAnaesthesiaRecordOut)
 def update_anaesthesia_record_for_case(
         case_id: int,
         payload: OtAnaesthesiaRecordIn,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.anaesthesia_record.update"])
 
     case = _get_case_or_404(db, case_id)
     record = case.anaesthesia_record
     if not record:
-        raise HTTPException(status_code=404,
-                            detail="Anaesthesia record not found")
+        return create_anaesthesia_record_for_case(case_id, payload, db, user)
 
-    preop_vitals = _build_anaes_json_from_payload(payload)
-    record.preop_vitals = preop_vitals
+    record.preop_vitals = _build_anaes_json_from_payload(payload)
     record.plan = payload.anaesthesia_type
     record.intraop_summary = payload.notes
-
     db.add(record)
+    db.flush()
+
+    airway_ids = _validate_device_ids_by_category(
+        db,
+        getattr(payload, "airway_device_ids", []) or [], "AIRWAY")
+    monitor_ids = _validate_device_ids_by_category(
+        db,
+        getattr(payload, "monitor_device_ids", []) or [], "MONITOR")
+    _sync_anaesthesia_devices(db, record, airway_ids + monitor_ids)
+
     db.commit()
     db.refresh(record)
-
-    return get_anaesthesia_record_for_case(case_id, db, user)
+    return get_anaesthesia_record_for_case(case_id, db, user)  # type: ignore
 
 
 # ---- Anaesthesia Vitals ----
 
 
-@router.get(
-    "/anaesthesia-records/{record_id}/vitals",
-    response_model=List[OtAnaesthesiaVitalOut],
-)
+@router.get("/anaesthesia-records/{record_id}/vitals",
+            response_model=List[OtAnaesthesiaVitalOut])
 def list_anaesthesia_vitals(
         record_id: int,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user,
               ["ot.anaesthesia_vitals.view", "ot.anaesthesia_record.view"])
 
-    record = db.query(AnaesthesiaRecord).get(record_id)
+    record = db.get(AnaesthesiaRecord, record_id)
     if not record:
         raise HTTPException(status_code=404,
                             detail="Anaesthesia record not found")
 
     out: list[OtAnaesthesiaVitalOut] = []
     for v in record.vitals:
-        time_str = _to_hhmm(v.time) if v.time else None
-
-        if v.bp_systolic is not None and v.bp_diastolic is not None:
-            bp_str = f"{v.bp_systolic}/{v.bp_diastolic}"
-        else:
-            bp_str = None
+        bp_str = f"{v.bp_systolic}/{v.bp_diastolic}" if (
+            v.bp_systolic is not None and v.bp_diastolic is not None) else None
 
         out.append(
             OtAnaesthesiaVitalOut(
                 id=v.id,
                 record_id=v.record_id,
-                time=time_str,
+                time=_to_hhmm(v.time),
                 hr=v.pulse,
                 bp=bp_str,
                 spo2=v.spo2,
@@ -779,11 +996,9 @@ def list_anaesthesia_vitals(
     return out
 
 
-@router.post(
-    "/anaesthesia-records/{record_id}/vitals",
-    response_model=OtAnaesthesiaVitalOut,
-    status_code=status.HTTP_201_CREATED,
-)
+@router.post("/anaesthesia-records/{record_id}/vitals",
+             response_model=OtAnaesthesiaVitalOut,
+             status_code=status.HTTP_201_CREATED)
 def create_anaesthesia_vital(
         record_id: int,
         payload: OtAnaesthesiaVitalIn,
@@ -792,21 +1007,17 @@ def create_anaesthesia_vital(
 ):
     _need_any(user, ["ot.anaesthesia_vitals.create"])
 
-    record = db.query(AnaesthesiaRecord).get(record_id)
+    record = db.get(AnaesthesiaRecord, record_id)
     if not record:
         raise HTTPException(status_code=404,
                             detail="Anaesthesia record not found")
-
     if not payload.time:
-        raise HTTPException(
-            status_code=400,
-            detail="Time is required in HH:MM format",
-        )
+        raise HTTPException(status_code=400,
+                            detail="Time is required in HH:MM format")
 
     case = record.case
-    time_dt = _parse_time_str_for_case(case, payload.time)
+    time_dt = _hhmm_to_utc_naive_for_case(case, payload.time)
 
-    # BP parsing "120/80"
     bp_systolic = bp_diastolic = None
     if payload.bp:
         try:
@@ -840,9 +1051,9 @@ def create_anaesthesia_vital(
     db.commit()
     db.refresh(vital)
 
-    bp_str = (f"{vital.bp_systolic}/{vital.bp_diastolic}"
-              if vital.bp_systolic is not None
-              and vital.bp_diastolic is not None else None)
+    bp_str = f"{vital.bp_systolic}/{vital.bp_diastolic}" if (
+        vital.bp_systolic is not None
+        and vital.bp_diastolic is not None) else None
 
     return OtAnaesthesiaVitalOut(
         id=vital.id,
@@ -866,25 +1077,33 @@ def create_anaesthesia_vital(
     )
 
 
-@router.put(
-    "/anaesthesia-vitals/{vital_id}",
-    response_model=AnaesthesiaVitalLogOut,
-)
+@router.put("/anaesthesia-vitals/{vital_id}",
+            response_model=AnaesthesiaVitalLogOut)
 def update_anaesthesia_vital(
         vital_id: int,
         payload: AnaesthesiaVitalLogUpdate,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.anaesthesia_vitals.update"])
 
-    vital = db.query(AnaesthesiaVitalLog).get(vital_id)
+    vital = db.get(AnaesthesiaVitalLog, vital_id)
     if not vital:
         raise HTTPException(status_code=404,
                             detail="Anaesthesia vital entry not found")
 
     data = payload.model_dump(exclude_unset=True)
     data.pop("record_id", None)
+
+    # ✅ handle time if UI sends HH:MM
+    if "time" in data and data["time"] is not None:
+        v = data["time"]
+        if isinstance(v, str):
+            data["time"] = _hhmm_to_utc_naive_for_case(
+                vital.record.case,
+                v) if vital.record and vital.record.case else None
+        elif isinstance(v, datetime):
+            data["time"] = _as_utc(v).replace(tzinfo=None)
 
     for field, value in data.items():
         setattr(vital, field, value)
@@ -895,18 +1114,16 @@ def update_anaesthesia_vital(
     return vital
 
 
-@router.delete(
-    "/anaesthesia-vitals/{vital_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-)
+@router.delete("/anaesthesia-vitals/{vital_id}",
+               status_code=status.HTTP_204_NO_CONTENT)
 def delete_anaesthesia_vital(
         vital_id: int,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.anaesthesia_vitals.delete"])
 
-    vital = db.query(AnaesthesiaVitalLog).get(vital_id)
+    vital = db.get(AnaesthesiaVitalLog, vital_id)
     if not vital:
         raise HTTPException(status_code=404,
                             detail="Anaesthesia vital entry not found")
@@ -919,19 +1136,17 @@ def delete_anaesthesia_vital(
 # ---- Anaesthesia Drug Log ----
 
 
-@router.get(
-    "/anaesthesia-records/{record_id}/drugs",
-    response_model=List[OtAnaesthesiaDrugOut],
-)
+@router.get("/anaesthesia-records/{record_id}/drugs",
+            response_model=List[OtAnaesthesiaDrugOut])
 def list_anaesthesia_drugs(
         record_id: int,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user,
               ["ot.anaesthesia_drugs.view", "ot.anaesthesia_record.view"])
 
-    record = db.query(AnaesthesiaRecord).get(record_id)
+    record = db.get(AnaesthesiaRecord, record_id)
     if not record:
         raise HTTPException(status_code=404,
                             detail="Anaesthesia record not found")
@@ -942,7 +1157,7 @@ def list_anaesthesia_drugs(
             OtAnaesthesiaDrugOut(
                 id=d.id,
                 record_id=d.record_id,
-                time=_to_hhmm(d.time) if d.time else None,
+                time=_to_hhmm(d.time),
                 drug_name=d.drug_name,
                 dose=d.dose,
                 route=d.route,
@@ -951,32 +1166,27 @@ def list_anaesthesia_drugs(
     return out
 
 
-@router.post(
-    "/anaesthesia-records/{record_id}/drugs",
-    response_model=OtAnaesthesiaDrugOut,
-    status_code=status.HTTP_201_CREATED,
-)
+@router.post("/anaesthesia-records/{record_id}/drugs",
+             response_model=OtAnaesthesiaDrugOut,
+             status_code=status.HTTP_201_CREATED)
 def create_anaesthesia_drug(
         record_id: int,
         payload: OtAnaesthesiaDrugIn,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.anaesthesia_drugs.create"])
 
-    record = db.query(AnaesthesiaRecord).get(record_id)
+    record = db.get(AnaesthesiaRecord, record_id)
     if not record:
         raise HTTPException(status_code=404,
                             detail="Anaesthesia record not found")
-
     if not payload.time:
-        raise HTTPException(
-            status_code=400,
-            detail="Time is required in HH:MM format",
-        )
+        raise HTTPException(status_code=400,
+                            detail="Time is required in HH:MM format")
 
     case = record.case
-    time_dt = _parse_time_str_for_case(case, payload.time)
+    time_dt = _hhmm_to_utc_naive_for_case(case, payload.time)
 
     drug = AnaesthesiaDrugLog(
         record_id=record_id,
@@ -1001,25 +1211,33 @@ def create_anaesthesia_drug(
     )
 
 
-@router.put(
-    "/anaesthesia-drugs/{drug_id}",
-    response_model=AnaesthesiaDrugLogOut,
-)
+@router.put("/anaesthesia-drugs/{drug_id}",
+            response_model=AnaesthesiaDrugLogOut)
 def update_anaesthesia_drug(
         drug_id: int,
         payload: AnaesthesiaDrugLogUpdate,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.anaesthesia_drugs.update"])
 
-    drug = db.query(AnaesthesiaDrugLog).get(drug_id)
+    drug = db.get(AnaesthesiaDrugLog, drug_id)
     if not drug:
         raise HTTPException(status_code=404,
                             detail="Anaesthesia drug entry not found")
 
     data = payload.model_dump(exclude_unset=True)
     data.pop("record_id", None)
+
+    # ✅ handle time if UI sends HH:MM
+    if "time" in data and data["time"] is not None:
+        v = data["time"]
+        if isinstance(v, str):
+            data["time"] = _hhmm_to_utc_naive_for_case(
+                drug.record.case,
+                v) if drug.record and drug.record.case else None
+        elif isinstance(v, datetime):
+            data["time"] = _as_utc(v).replace(tzinfo=None)
 
     for field, value in data.items():
         setattr(drug, field, value)
@@ -1030,18 +1248,16 @@ def update_anaesthesia_drug(
     return drug
 
 
-@router.delete(
-    "/anaesthesia-drugs/{drug_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-)
+@router.delete("/anaesthesia-drugs/{drug_id}",
+               status_code=status.HTTP_204_NO_CONTENT)
 def delete_anaesthesia_drug(
         drug_id: int,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.anaesthesia_drugs.delete"])
 
-    drug = db.query(AnaesthesiaDrugLog).get(drug_id)
+    drug = db.get(AnaesthesiaDrugLog, drug_id)
     if not drug:
         raise HTTPException(status_code=404,
                             detail="Anaesthesia drug entry not found")
@@ -1053,46 +1269,34 @@ def delete_anaesthesia_drug(
 
 # ============================================================
 #  INTRA-OP NURSING RECORD
+#  ✅ GET returns 200 with null (Optional) on first open
 # ============================================================
 
-# FILE: app/api/routes_ot_clinical.py
 
-
-@router.get(
-    "/cases/{case_id}/nursing-record",
-    response_model=OtNursingRecordOut,
-)
+@router.get("/cases/{case_id}/nursing-record",
+            response_model=Optional[OtNursingRecordOut])
 def get_nursing_record_for_case(
         case_id: int,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.nursing_record.view", "ot.cases.view"])
 
-    # ✅ IMPORTANT: pass (db, case_id) – new helper signature
     case = _get_case_or_404(db, case_id)
-
     record = case.nursing_record
     if not record:
-        # Frontend NursingTab already handles 404 and shows empty form
-        raise HTTPException(status_code=404, detail="Nursing record not found")
-
+        return None
     return record
 
 
-# FILE: app/api/routes_ot_clinical.py
-
-
-@router.post(
-    "/cases/{case_id}/nursing-record",
-    response_model=OtNursingRecordOut,
-    status_code=status.HTTP_201_CREATED,
-)
+@router.post("/cases/{case_id}/nursing-record",
+             response_model=OtNursingRecordOut,
+             status_code=status.HTTP_201_CREATED)
 def create_nursing_record_for_case(
         case_id: int,
         payload: OtNursingRecordCreate,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.nursing_record.create"])
 
@@ -1100,14 +1304,11 @@ def create_nursing_record_for_case(
     if case.nursing_record:
         raise HTTPException(
             status_code=400,
-            detail="Nursing record already exists for this case",
-        )
+            detail="Nursing record already exists for this case")
 
     if payload.case_id != case_id:
-        raise HTTPException(
-            status_code=400,
-            detail="case_id in body does not match URL",
-        )
+        raise HTTPException(status_code=400,
+                            detail="case_id in body does not match URL")
 
     record = OtNursingRecord(
         case_id=case_id,
@@ -1130,27 +1331,28 @@ def create_nursing_record_for_case(
     return record
 
 
-@router.put(
-    "/cases/{case_id}/nursing-record",
-    response_model=OtNursingRecordOut,
-)
+@router.put("/cases/{case_id}/nursing-record",
+            response_model=OtNursingRecordOut)
 def update_nursing_record_for_case(
         case_id: int,
         payload: OtNursingRecordUpdate,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.nursing_record.update"])
 
     case = _get_case_or_404(db, case_id)
     record = case.nursing_record
     if not record:
-        raise HTTPException(status_code=404, detail="Nursing record not found")
+        create_payload = OtNursingRecordCreate(**payload.model_dump(
+            exclude_unset=True),
+                                               case_id=case_id)  # type: ignore
+        return create_nursing_record_for_case(case_id, create_payload, db,
+                                              user)
 
     data = payload.model_dump(exclude_unset=True)
     data.pop("case_id", None)
 
-    # If primary_nurse_id omitted, keep existing; if explicitly null, set to current user.
     if "primary_nurse_id" in data and data["primary_nurse_id"] is None:
         data["primary_nurse_id"] = user.id
 
@@ -1165,30 +1367,22 @@ def update_nursing_record_for_case(
 
 # ============================================================
 #  SPONGE & INSTRUMENT COUNT – flat UI API
+#  ✅ GET returns 200 with null (Optional) on first open
 # ============================================================
 
-from app.schemas.ot import OtCountsIn, OtCountsOut
-from app.models.ot import OtSpongeInstrumentCount
 
-
-@router.get(
-    "/cases/{case_id}/counts",
-    response_model=OtCountsOut,
-)
+@router.get("/cases/{case_id}/counts", response_model=Optional[OtCountsOut])
 def get_counts_for_case(
         case_id: int,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.counts.view", "ot.cases.view"])
 
     case = _get_case_or_404(db, case_id)
-    record: OtSpongeInstrumentCount = case.counts_record
+    record: Optional[OtSpongeInstrumentCount] = case.counts_record
     if not record:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Sponge & instrument count not found",
-        )
+        return None
 
     initial = record.initial_count_data or {}
     final = record.final_count_data or {}
@@ -1207,21 +1401,19 @@ def get_counts_for_case(
         xray_done=bool(initial.get("xray_done") or False),
         resolved_by=initial.get("resolved_by"),
         notes=initial.get("notes"),
-        created_at=record.created_at,
-        updated_at=getattr(record, "updated_at", None),
+        created_at=_to_ist_dt(record.created_at),
+        updated_at=_to_ist_dt(getattr(record, "updated_at", None)),
     )
 
 
-@router.post(
-    "/cases/{case_id}/counts",
-    response_model=OtCountsOut,
-    status_code=status.HTTP_201_CREATED,
-)
+@router.post("/cases/{case_id}/counts",
+             response_model=OtCountsOut,
+             status_code=status.HTTP_201_CREATED)
 def create_counts_for_case(
         case_id: int,
         payload: OtCountsIn,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.counts.create"])
 
@@ -1229,8 +1421,7 @@ def create_counts_for_case(
     if case.counts_record:
         raise HTTPException(
             status_code=400,
-            detail="Counts record already exists for this case",
-        )
+            detail="Counts record already exists for this case")
 
     initial_count_data = {
         "sponges_initial": payload.sponges_initial,
@@ -1241,7 +1432,6 @@ def create_counts_for_case(
         "resolved_by": payload.resolved_by,
         "notes": payload.notes,
     }
-
     final_count_data = {
         "sponges_final": payload.sponges_final,
         "instruments_final": payload.instruments_final,
@@ -1276,34 +1466,28 @@ def create_counts_for_case(
         xray_done=bool(initial.get("xray_done") or False),
         resolved_by=initial.get("resolved_by"),
         notes=initial.get("notes"),
-        created_at=record.created_at,
-        updated_at=getattr(record, "updated_at", None),
+        created_at=_to_ist_dt(record.created_at),
+        updated_at=_to_ist_dt(getattr(record, "updated_at", None)),
     )
 
 
-@router.put(
-    "/cases/{case_id}/counts",
-    response_model=OtCountsOut,
-)
+@router.put("/cases/{case_id}/counts", response_model=OtCountsOut)
 def update_counts_for_case(
         case_id: int,
         payload: OtCountsIn,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.counts.update"])
 
     case = _get_case_or_404(db, case_id)
-    record: OtSpongeInstrumentCount = case.counts_record
-
-    # If no record yet, behave like upsert → reuse POST logic
+    record: Optional[OtSpongeInstrumentCount] = case.counts_record
     if not record:
         return create_counts_for_case(case_id, payload, db, user)
 
     initial = record.initial_count_data or {}
     final = record.final_count_data or {}
 
-    # update initial JSON
     initial.update({
         "sponges_initial": payload.sponges_initial,
         "sponges_added": payload.sponges_added,
@@ -1313,8 +1497,6 @@ def update_counts_for_case(
         "resolved_by": payload.resolved_by,
         "notes": payload.notes,
     })
-
-    # update final JSON
     final.update({
         "sponges_final": payload.sponges_final,
         "instruments_final": payload.instruments_final,
@@ -1344,8 +1526,8 @@ def update_counts_for_case(
         xray_done=bool(initial.get("xray_done") or False),
         resolved_by=initial.get("resolved_by"),
         notes=initial.get("notes"),
-        created_at=record.created_at,
-        updated_at=getattr(record, "updated_at", None),
+        created_at=_to_ist_dt(record.created_at),
+        updated_at=_to_ist_dt(getattr(record, "updated_at", None)),
     )
 
 
@@ -1354,41 +1536,33 @@ def update_counts_for_case(
 # ============================================================
 
 
-@router.get(
-    "/cases/{case_id}/implants",
-    response_model=List[OtImplantRecordOut],
-)
+@router.get("/cases/{case_id}/implants",
+            response_model=List[OtImplantRecordOut])
 def list_implants_for_case(
         case_id: int,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.implants.view", "ot.cases.view"])
-
-    case = _get_case_or_404(case_id, db)
+    case = _get_case_or_404(db, case_id)
     return case.implant_records
 
 
-@router.post(
-    "/cases/{case_id}/implants",
-    response_model=OtImplantRecordOut,
-    status_code=status.HTTP_201_CREATED,
-)
+@router.post("/cases/{case_id}/implants",
+             response_model=OtImplantRecordOut,
+             status_code=status.HTTP_201_CREATED)
 def create_implant_for_case(
         case_id: int,
         payload: OtImplantRecordCreate,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.implants.create"])
-
-    _get_case_or_404(case_id, db)
+    _get_case_or_404(db, case_id)
 
     if payload.case_id != case_id:
-        raise HTTPException(
-            status_code=400,
-            detail="case_id in body does not match URL",
-        )
+        raise HTTPException(status_code=400,
+                            detail="case_id in body does not match URL")
 
     record = OtImplantRecord(
         case_id=case_id,
@@ -1406,25 +1580,21 @@ def create_implant_for_case(
     return record
 
 
-@router.put(
-    "/implants/{implant_id}",
-    response_model=OtImplantRecordOut,
-)
+@router.put("/implants/{implant_id}", response_model=OtImplantRecordOut)
 def update_implant(
         implant_id: int,
         payload: OtImplantRecordUpdate,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.implants.update"])
 
-    record = db.query(OtImplantRecord).get(implant_id)
+    record = db.get(OtImplantRecord, implant_id)
     if not record:
         raise HTTPException(status_code=404, detail="Implant record not found")
 
     data = payload.model_dump(exclude_unset=True)
     data.pop("case_id", None)
-
     for field, value in data.items():
         setattr(record, field, value)
 
@@ -1434,18 +1604,16 @@ def update_implant(
     return record
 
 
-@router.delete(
-    "/implants/{implant_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-)
+@router.delete("/implants/{implant_id}",
+               status_code=status.HTTP_204_NO_CONTENT)
 def delete_implant(
         implant_id: int,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.implants.delete"])
 
-    record = db.query(OtImplantRecord).get(implant_id)
+    record = db.get(OtImplantRecord, implant_id)
     if not record:
         raise HTTPException(status_code=404, detail="Implant record not found")
 
@@ -1456,37 +1624,34 @@ def delete_implant(
 
 # ============================================================
 #  OPERATION NOTE (SURGEON)
+#  ✅ GET returns 200 with null (Optional) on first open
 # ============================================================
 
 
-@router.get(
-    "/cases/{case_id}/operation-note",
-    response_model=OperationNoteOut,
-)
+@router.get("/cases/{case_id}/operation-note",
+            response_model=Optional[OperationNoteOut])
 def get_operation_note_for_case(
         case_id: int,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.operation_notes.view", "ot.cases.view"])
 
     case = _get_case_or_404(db, case_id)
     record = case.operation_note
     if not record:
-        raise HTTPException(status_code=404, detail="Operation note not found")
+        return None
     return record
 
 
-@router.post(
-    "/cases/{case_id}/operation-note",
-    response_model=OperationNoteOut,
-    status_code=status.HTTP_201_CREATED,
-)
+@router.post("/cases/{case_id}/operation-note",
+             response_model=OperationNoteOut,
+             status_code=status.HTTP_201_CREATED)
 def create_operation_note_for_case(
         case_id: int,
         payload: OperationNoteCreate,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.operation_notes.create"])
 
@@ -1494,14 +1659,11 @@ def create_operation_note_for_case(
     if case.operation_note:
         raise HTTPException(
             status_code=400,
-            detail="Operation note already exists for this case",
-        )
+            detail="Operation note already exists for this case")
 
     if payload.case_id != case_id:
-        raise HTTPException(
-            status_code=400,
-            detail="case_id in body does not match URL",
-        )
+        raise HTTPException(status_code=400,
+                            detail="case_id in body does not match URL")
 
     surgeon_id = payload.surgeon_user_id or user.id
 
@@ -1524,27 +1686,27 @@ def create_operation_note_for_case(
     return record
 
 
-@router.put(
-    "/cases/{case_id}/operation-note",
-    response_model=OperationNoteOut,
-)
+@router.put("/cases/{case_id}/operation-note", response_model=OperationNoteOut)
 def update_operation_note_for_case(
         case_id: int,
         payload: OperationNoteUpdate,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.operation_notes.update"])
 
     case = _get_case_or_404(db, case_id)
     record = case.operation_note
     if not record:
-        raise HTTPException(status_code=404, detail="Operation note not found")
+        create_payload = OperationNoteCreate(**payload.model_dump(
+            exclude_unset=True),
+                                             case_id=case_id)  # type: ignore
+        return create_operation_note_for_case(case_id, create_payload, db,
+                                              user)
 
     data = payload.model_dump(exclude_unset=True)
     data.pop("case_id", None)
 
-    # if surgeon_user_id explicitly null, reset to current user
     if "surgeon_user_id" in data and data["surgeon_user_id"] is None:
         data["surgeon_user_id"] = user.id
 
@@ -1561,44 +1723,34 @@ def update_operation_note_for_case(
 #  BLOOD / BLOOD COMPONENT TRANSFUSION
 # ============================================================
 
-# FILE: app/api/routes_ot_clinical.py
 
-
-@router.get(
-    "/cases/{case_id}/blood-transfusions",
-    response_model=List[OtBloodTransfusionRecordOut],
-)
+@router.get("/cases/{case_id}/blood-transfusions",
+            response_model=List[OtBloodTransfusionRecordOut])
 def list_blood_transfusions_for_case(
         case_id: int,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.blood_transfusion.view", "ot.cases.view"])
-
-    case = _get_case_or_404(db, case_id)  # ✅ fixed
+    case = _get_case_or_404(db, case_id)
     return case.blood_records
 
 
-@router.post(
-    "/cases/{case_id}/blood-transfusions",
-    response_model=OtBloodTransfusionRecordOut,
-    status_code=status.HTTP_201_CREATED,
-)
+@router.post("/cases/{case_id}/blood-transfusions",
+             response_model=OtBloodTransfusionRecordOut,
+             status_code=status.HTTP_201_CREATED)
 def create_blood_transfusion_for_case(
         case_id: int,
         payload: OtBloodTransfusionRecordCreate,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.blood_transfusion.create"])
-
-    _get_case_or_404(db, case_id)  # ✅ fixed
+    _get_case_or_404(db, case_id)
 
     if payload.case_id != case_id:
-        raise HTTPException(
-            status_code=400,
-            detail="case_id in body does not match URL",
-        )
+        raise HTTPException(status_code=400,
+                            detail="case_id in body does not match URL")
 
     record = OtBloodTransfusionRecord(
         case_id=case_id,
@@ -1615,62 +1767,23 @@ def create_blood_transfusion_for_case(
     return record
 
 
-@router.post(
-    "/cases/{case_id}/blood-transfusions",
-    response_model=OtBloodTransfusionRecordOut,
-    status_code=status.HTTP_201_CREATED,
-)
-def create_blood_transfusion_for_case(
-        case_id: int,
-        payload: OtBloodTransfusionRecordCreate,
-        db: Session = Depends(get_db),
-        user=Depends(current_user),
-):
-    _need_any(user, ["ot.blood_transfusion.create"])
-
-    _get_case_or_404(case_id, db)
-
-    if payload.case_id != case_id:
-        raise HTTPException(
-            status_code=400,
-            detail="case_id in body does not match URL",
-        )
-
-    record = OtBloodTransfusionRecord(
-        case_id=case_id,
-        component=payload.component,
-        units=payload.units,
-        start_time=payload.start_time,
-        end_time=payload.end_time,
-        reaction=payload.reaction,
-        notes=payload.notes,
-    )
-    db.add(record)
-    db.commit()
-    db.refresh(record)
-    return record
-
-
-@router.put(
-    "/blood-transfusions/{record_id}",
-    response_model=OtBloodTransfusionRecordOut,
-)
+@router.put("/blood-transfusions/{record_id}",
+            response_model=OtBloodTransfusionRecordOut)
 def update_blood_transfusion(
         record_id: int,
         payload: OtBloodTransfusionRecordUpdate,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.blood_transfusion.update"])
 
-    record = db.query(OtBloodTransfusionRecord).get(record_id)
+    record = db.get(OtBloodTransfusionRecord, record_id)
     if not record:
         raise HTTPException(status_code=404,
                             detail="Blood transfusion record not found")
 
     data = payload.model_dump(exclude_unset=True)
     data.pop("case_id", None)
-
     for field, value in data.items():
         setattr(record, field, value)
 
@@ -1680,18 +1793,16 @@ def update_blood_transfusion(
     return record
 
 
-@router.delete(
-    "/blood-transfusions/{record_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-)
+@router.delete("/blood-transfusions/{record_id}",
+               status_code=status.HTTP_204_NO_CONTENT)
 def delete_blood_transfusion(
         record_id: int,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.blood_transfusion.delete"])
 
-    record = db.query(OtBloodTransfusionRecord).get(record_id)
+    record = db.get(OtBloodTransfusionRecord, record_id)
     if not record:
         raise HTTPException(status_code=404,
                             detail="Blood transfusion record not found")
@@ -1703,24 +1814,23 @@ def delete_blood_transfusion(
 
 # ============================================================
 #  PACU / POST-ANAESTHESIA RECOVERY RECORD – UI FLAT
+#  ✅ GET returns 200 with null (Optional) on first open
+#  ✅ IST HH:MM parsing + formatting
 # ============================================================
 
 
-@router.get(
-    "/cases/{case_id}/pacu",
-    response_model=PacuUiOut,
-)
+@router.get("/cases/{case_id}/pacu", response_model=Optional[PacuUiOut])
 def get_pacu_for_case(
         case_id: int,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.pacu.view", "ot.cases.view"])
 
     case = _get_case_or_404(db, case_id)
     record = case.pacu_record
     if not record:
-        raise HTTPException(status_code=404, detail="PACU record not found")
+        return None
 
     pain_data = record.pain_scores or {}
     vitals = record.vitals or {}
@@ -1739,34 +1849,30 @@ def get_pacu_for_case(
         discharge_criteria_met=bool(
             vitals.get("discharge_criteria_met") or False),
         notes=vitals.get("notes"),
-        created_at=record.created_at,
-        updated_at=getattr(record, "updated_at", None),
+        created_at=_to_ist_dt(record.created_at),
+        updated_at=_to_ist_dt(getattr(record, "updated_at", None)),
     )
 
 
-@router.post(
-    "/cases/{case_id}/pacu",
-    response_model=PacuUiOut,
-    status_code=status.HTTP_201_CREATED,
-)
+@router.post("/cases/{case_id}/pacu",
+             response_model=PacuUiOut,
+             status_code=status.HTTP_201_CREATED)
 def create_pacu_for_case(
         case_id: int,
         payload: PacuUiIn,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.pacu.create"])
 
     case = _get_case_or_404(db, case_id)
     if case.pacu_record:
-        raise HTTPException(
-            status_code=400,
-            detail="PACU record already exists for this case",
-        )
+        raise HTTPException(status_code=400,
+                            detail="PACU record already exists for this case")
 
-    pain_scores = ({
+    pain_scores = {
         "score": payload.pain_score
-    } if payload.pain_score is not None else None)
+    } if payload.pain_score is not None else None
 
     vitals = {
         "nausea_vomiting": payload.nausea_vomiting,
@@ -1780,9 +1886,10 @@ def create_pacu_for_case(
 
     record = PacuRecord(
         case_id=case_id,
-        nurse_user_id=user.id,  # current user as PACU nurse
-        admission_time=_time_str_to_dt(payload.arrival_time),
-        discharge_time=_time_str_to_dt(payload.departure_time),
+        nurse_user_id=user.id,
+        admission_time=_hhmm_to_utc_naive_for_case(case, payload.arrival_time),
+        discharge_time=_hhmm_to_utc_naive_for_case(case,
+                                                   payload.departure_time),
         pain_scores=pain_scores,
         vitals=vitals,
         complications=payload.complications,
@@ -1809,33 +1916,28 @@ def create_pacu_for_case(
         discharge_criteria_met=bool(
             vitals.get("discharge_criteria_met") or False),
         notes=vitals.get("notes"),
-        created_at=record.created_at,
-        updated_at=getattr(record, "updated_at", None),
+        created_at=_to_ist_dt(record.created_at),
+        updated_at=_to_ist_dt(getattr(record, "updated_at", None)),
     )
 
 
-@router.put(
-    "/cases/{case_id}/pacu",
-    response_model=PacuUiOut,
-)
+@router.put("/cases/{case_id}/pacu", response_model=PacuUiOut)
 def update_pacu_for_case(
         case_id: int,
         payload: PacuUiIn,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.pacu.update"])
 
     case = _get_case_or_404(db, case_id)
     record = case.pacu_record
-
-    # optional upsert: if no record, behave like create
     if not record:
         return create_pacu_for_case(case_id, payload, db, user)
 
-    pain_scores = ({
+    pain_scores = {
         "score": payload.pain_score
-    } if payload.pain_score is not None else None)
+    } if payload.pain_score is not None else None
 
     vitals = {
         "nausea_vomiting": payload.nausea_vomiting,
@@ -1847,8 +1949,10 @@ def update_pacu_for_case(
     if all(v is None for v in vitals.values()):
         vitals = None
 
-    record.admission_time = _time_str_to_dt(payload.arrival_time)
-    record.discharge_time = _time_str_to_dt(payload.departure_time)
+    record.admission_time = _hhmm_to_utc_naive_for_case(
+        case, payload.arrival_time)
+    record.discharge_time = _hhmm_to_utc_naive_for_case(
+        case, payload.departure_time)
     record.pain_scores = pain_scores
     record.vitals = vitals
     record.complications = payload.complications
@@ -1874,18 +1978,17 @@ def update_pacu_for_case(
         discharge_criteria_met=bool(
             vitals.get("discharge_criteria_met") or False),
         notes=vitals.get("notes"),
-        created_at=record.created_at,
-        updated_at=getattr(record, "updated_at", None),
+        created_at=_to_ist_dt(record.created_at),
+        updated_at=_to_ist_dt(getattr(record, "updated_at", None)),
     )
 
 
 # ============================================================
-#  OT ADMIN / CLEANING / STERILITY LOG
+#  OT ADMIN / CLEANING LOG
 # ============================================================
-@router.get(
-    "/cleaning-logs",
-    response_model=List[OtCleaningLogOut],
-)
+
+
+@router.get("/cleaning-logs", response_model=List[OtCleaningLogOut])
 def list_cleaning_logs(
         theatre_id: Optional[int] = Query(None),
         case_id: Optional[int] = Query(None),
@@ -1894,7 +1997,7 @@ def list_cleaning_logs(
         to_date: Optional[date] = Query(None),
         session: Optional[str] = Query(None),
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.logs.cleaning.view", "ot.logs.view", "ot.cases.view"])
 
@@ -1918,36 +2021,30 @@ def list_cleaning_logs(
         OtCleaningLog.created_at.desc(),
         OtCleaningLog.id.desc(),
     )
-
     return q.all()
 
 
-@router.get(
-    "/cleaning-logs/{log_id}",
-    response_model=OtCleaningLogOut,
-)
+@router.get("/cleaning-logs/{log_id}", response_model=OtCleaningLogOut)
 def get_cleaning_log(
         log_id: int,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.logs.cleaning.view", "ot.logs.view"])
 
-    log = db.query(OtCleaningLog).get(log_id)
+    log = db.get(OtCleaningLog, log_id)
     if not log:
         raise HTTPException(status_code=404, detail="Cleaning log not found")
     return log
 
 
-@router.post(
-    "/cleaning-logs",
-    response_model=OtCleaningLogOut,
-    status_code=status.HTTP_201_CREATED,
-)
+@router.post("/cleaning-logs",
+             response_model=OtCleaningLogOut,
+             status_code=status.HTTP_201_CREATED)
 def create_cleaning_log(
         payload: OtCleaningLogCreate,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.logs.cleaning.create", "ot.logs.manage"])
 
@@ -1955,7 +2052,7 @@ def create_cleaning_log(
         theatre_id=payload.theatre_id,
         date=payload.date,
         session=payload.session,
-        case_id=payload.case_id,  # can be None or an OT case ID
+        case_id=payload.case_id,
         method=payload.method,
         done_by_user_id=payload.done_by_user_id,
         remarks=payload.remarks,
@@ -1966,19 +2063,16 @@ def create_cleaning_log(
     return log
 
 
-@router.put(
-    "/cleaning-logs/{log_id}",
-    response_model=OtCleaningLogOut,
-)
+@router.put("/cleaning-logs/{log_id}", response_model=OtCleaningLogOut)
 def update_cleaning_log(
         log_id: int,
         payload: OtCleaningLogUpdate,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.logs.cleaning.update", "ot.logs.manage"])
 
-    log = db.query(OtCleaningLog).get(log_id)
+    log = db.get(OtCleaningLog, log_id)
     if not log:
         raise HTTPException(status_code=404, detail="Cleaning log not found")
 
@@ -1992,18 +2086,16 @@ def update_cleaning_log(
     return log
 
 
-@router.delete(
-    "/cleaning-logs/{log_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-)
+@router.delete("/cleaning-logs/{log_id}",
+               status_code=status.HTTP_204_NO_CONTENT)
 def delete_cleaning_log(
         log_id: int,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.logs.cleaning.delete", "ot.logs.manage"])
 
-    log = db.query(OtCleaningLog).get(log_id)
+    log = db.get(OtCleaningLog, log_id)
     if not log:
         raise HTTPException(status_code=404, detail="Cleaning log not found")
 
@@ -2013,21 +2105,18 @@ def delete_cleaning_log(
 
 
 # ============================================================
-#  OT ADMIN / ENVIRONMENT LOG (TEMP / HUMIDITY / PRESSURE)
+#  OT ADMIN / ENVIRONMENT LOG
 # ============================================================
 
 
-@router.get(
-    "/environment-logs",
-    response_model=List[OtEnvironmentLogOut],
-)
+@router.get("/environment-logs", response_model=List[OtEnvironmentLogOut])
 def list_environment_logs(
         theatre_id: Optional[int] = Query(None),
         date: Optional[date] = Query(None),
         from_date: Optional[date] = Query(None),
         to_date: Optional[date] = Query(None),
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.logs.environment.view", "ot.logs.view"])
 
@@ -2047,37 +2136,31 @@ def list_environment_logs(
         OtEnvironmentLog.time.desc(),
         OtEnvironmentLog.created_at.desc(),
     )
-
     return q.all()
 
 
-@router.get(
-    "/environment-logs/{log_id}",
-    response_model=OtEnvironmentLogOut,
-)
+@router.get("/environment-logs/{log_id}", response_model=OtEnvironmentLogOut)
 def get_environment_log(
         log_id: int,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.logs.environment.view", "ot.logs.view"])
 
-    log = db.query(OtEnvironmentLog).get(log_id)
+    log = db.get(OtEnvironmentLog, log_id)
     if not log:
         raise HTTPException(status_code=404,
                             detail="Environment log not found")
     return log
 
 
-@router.post(
-    "/environment-logs",
-    response_model=OtEnvironmentLogOut,
-    status_code=status.HTTP_201_CREATED,
-)
+@router.post("/environment-logs",
+             response_model=OtEnvironmentLogOut,
+             status_code=status.HTTP_201_CREATED)
 def create_environment_log(
         payload: OtEnvironmentLogCreate,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.logs.environment.create", "ot.logs.manage"])
 
@@ -2096,19 +2179,16 @@ def create_environment_log(
     return log
 
 
-@router.put(
-    "/environment-logs/{log_id}",
-    response_model=OtEnvironmentLogOut,
-)
+@router.put("/environment-logs/{log_id}", response_model=OtEnvironmentLogOut)
 def update_environment_log(
         log_id: int,
         payload: OtEnvironmentLogUpdate,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.logs.environment.update", "ot.logs.manage"])
 
-    log = db.query(OtEnvironmentLog).get(log_id)
+    log = db.get(OtEnvironmentLog, log_id)
     if not log:
         raise HTTPException(status_code=404,
                             detail="Environment log not found")
@@ -2123,18 +2203,16 @@ def update_environment_log(
     return log
 
 
-@router.delete(
-    "/environment-logs/{log_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-)
+@router.delete("/environment-logs/{log_id}",
+               status_code=status.HTTP_204_NO_CONTENT)
 def delete_environment_log(
         log_id: int,
         db: Session = Depends(get_db),
-        user=Depends(current_user),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.logs.environment.delete", "ot.logs.manage"])
 
-    log = db.query(OtEnvironmentLog).get(log_id)
+    log = db.get(OtEnvironmentLog, log_id)
     if not log:
         raise HTTPException(status_code=404,
                             detail="Environment log not found")

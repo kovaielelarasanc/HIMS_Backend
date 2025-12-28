@@ -12,9 +12,33 @@ from app.schemas.ot_master import OtSurgeryMasterIn, OtSurgeryMasterOut
 from app.schemas.ot import (OtOrderCreate, OtOrderScheduleIn, OtOrderStatusIn,
                             OtAttachmentIn, OtOrderOut)
 from app.utils.files import save_upload
+from datetime import datetime, date, timedelta, time, timezone
+from zoneinfo import ZoneInfo
 
 router = APIRouter(prefix="/ot", tags=["OT"])
 
+
+IST = ZoneInfo("Asia/Kolkata")
+
+def as_aware(dt: datetime | None, assume_tz=IST) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=assume_tz)  
+    return dt
+
+def to_utc(dt: datetime | None) -> datetime:
+    if dt is None:
+        return datetime.now(timezone.utc)
+    return as_aware(dt).astimezone(timezone.utc)
+
+def to_ist(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    # if DB returns naive, assume it's UTC
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(IST)
 
 def _to_out(o: OtOrder) -> dict:
     iso = lambda dt: dt.isoformat() if dt else None

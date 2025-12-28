@@ -21,6 +21,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import relationship
 
 from app.db.base import Base
+from app.models.ot_master import OtDeviceMaster
 
 MYSQL_ARGS = {
     "mysql_engine": "InnoDB",
@@ -66,7 +67,13 @@ class OtProcedure(Base):
     """
     Master list of OT Procedures:
     - used for scheduling & billing
-    - rate is defined per hour (can be used to auto-calculate billing)
+
+    NEW REQUIREMENT:
+    - Procedure fixed cost split-up:
+      base_cost + anesthesia_cost + surgeon_cost + petitory_cost(optional) + asst_doctor_cost(optional)
+
+    Note:
+    - We KEEP old rate_per_hour/default_duration_min for backward compatibility.
     """
     __tablename__ = "ot_procedures"
     __table_args__ = (
@@ -87,8 +94,19 @@ class OtProcedure(Base):
     rate_per_hour = Column(Numeric(10, 2), nullable=True)
     description = Column(Text, nullable=True)
 
+    # ✅ NEW: Fixed cost split-up
+    base_cost = Column(Numeric(12, 2), nullable=False, default=0)
+    anesthesia_cost = Column(Numeric(12, 2), nullable=False, default=0)
+    surgeon_cost = Column(Numeric(12, 2), nullable=False, default=0)
+    petitory_cost = Column(Numeric(12, 2), nullable=False, default=0)
+    asst_doctor_cost = Column(Numeric(12, 2), nullable=False, default=0)
+
     is_active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime,
+                        default=datetime.utcnow,
+                        onupdate=datetime.utcnow,
+                        nullable=False)
 
     speciality = relationship("OtSpeciality", back_populates="procedures")
 
@@ -97,6 +115,12 @@ class OtProcedure(Base):
         back_populates="procedure",
         cascade="all, delete-orphan",
     )
+
+    @property
+    def total_fixed_cost(self):
+        return ((self.base_cost or 0) + (self.anesthesia_cost or 0) +
+                (self.surgeon_cost or 0) + (self.petitory_cost or 0) +
+                (self.asst_doctor_cost or 0))
 
 
 class OtEquipmentMaster(Base):
@@ -163,18 +187,17 @@ class OtScheduleProcedure(Base):
 
 class OtSchedule(Base):
     """
-    OT Schedule – uses IPD bed master as OT location (OT theatre/room).
-    NOTE:
-      - ot_bed_id means OT LOCATION bed (your replacement for OT theatre master)
-      - patient's actual IPD bed comes from IpdAdmission.current_bed_id / assignments
+    OT Schedule – OT THEATER based (NO IPD bed master as OT location).
+    Date + planned times are treated as IST-local schedule slots.
+
+    DB stores created_at/updated_at in UTC (datetime.utcnow()) as naive.
     """
     __tablename__ = "ot_schedules"
     __table_args__ = (
-        # ✅ Enforce true 1:1 schedule <-> case when case_id is set
         UniqueConstraint("case_id", name="uq_ot_schedules_case_id"),
         Index("ix_ot_schedules_date", "date"),
         Index("ix_ot_schedules_status", "status"),
-        Index("ix_ot_schedules_ot_bed_date", "ot_bed_id", "date"),
+        Index("ix_ot_schedules_theater_date", "ot_theater_id", "date"),
         Index("ix_ot_schedules_admission", "admission_id"),
         Index("ix_ot_schedules_patient", "patient_id"),
         MYSQL_ARGS,
@@ -195,10 +218,11 @@ class OtSchedule(Base):
                           ForeignKey("ipd_admissions.id", ondelete="SET NULL"),
                           nullable=True)
 
-    # ✅ OT Location (shared bed master)
-    ot_bed_id = Column(Integer,
-                       ForeignKey("ipd_beds.id", ondelete="SET NULL"),
-                       nullable=True)
+    # ✅ OT THEATER (matches your DB: ot_theater_masters)
+    ot_theater_id = Column(Integer,
+                           ForeignKey("ot_theater_masters.id",
+                                      ondelete="SET NULL"),
+                           nullable=True)
 
     # Staff
     surgeon_user_id = Column(Integer,
@@ -208,16 +232,23 @@ class OtSchedule(Base):
                                   ForeignKey("users.id", ondelete="SET NULL"),
                                   nullable=True)
 
+    # Optional doctors
+    petitory_user_id = Column(Integer,
+                              ForeignKey("users.id", ondelete="SET NULL"),
+                              nullable=True)
+    asst_doctor_user_id = Column(Integer,
+                                 ForeignKey("users.id", ondelete="SET NULL"),
+                                 nullable=True)
+
     # Procedure details
-    procedure_name = Column(String(255),
-                            nullable=True)  # free-text display name
+    procedure_name = Column(String(255), nullable=True)
     side = Column(String(50), nullable=True)
     priority = Column(String(50), default="Elective", nullable=False)
     notes = Column(Text, nullable=True)
 
     status = Column(String(50), default="planned", nullable=False)
 
-    # Link to OT Case (central surgery record)
+    # Link to OT Case
     case_id = Column(Integer,
                      ForeignKey("ot_cases.id", ondelete="SET NULL"),
                      nullable=True)
@@ -228,7 +259,7 @@ class OtSchedule(Base):
                         onupdate=datetime.utcnow,
                         nullable=False)
 
-    # Primary procedure from master (quick access)
+    # Primary procedure from master
     primary_procedure_id = Column(Integer,
                                   ForeignKey("ot_procedures.id",
                                              ondelete="SET NULL"),
@@ -238,11 +269,15 @@ class OtSchedule(Base):
     patient = relationship("Patient")
     admission = relationship("IpdAdmission")
 
-    # ✅ OT location bed
-    ot_bed = relationship("IpdBed", foreign_keys=[ot_bed_id], lazy="joined")
+    # ✅ MUST match your master class name: OtTheaterMaster
+    theater = relationship("OtTheaterMaster",
+                           foreign_keys=[ot_theater_id],
+                           lazy="joined")
 
     surgeon = relationship("User", foreign_keys=[surgeon_user_id])
     anaesthetist = relationship("User", foreign_keys=[anaesthetist_user_id])
+    petitory = relationship("User", foreign_keys=[petitory_user_id])
+    asst_doctor = relationship("User", foreign_keys=[asst_doctor_user_id])
 
     primary_procedure = relationship("OtProcedure",
                                      foreign_keys=[primary_procedure_id])
@@ -253,7 +288,6 @@ class OtSchedule(Base):
         cascade="all, delete-orphan",
     )
 
-    # ✅ schedule -> case is 1:1 (because case_id is UNIQUE)
     case = relationship(
         "OtCase",
         back_populates="schedule",
@@ -534,6 +568,40 @@ class AnaesthesiaRecord(Base):
         back_populates="record",
         cascade="all, delete-orphan",
     )
+    devices = relationship("AnaesthesiaDeviceUse",
+                           back_populates="record",
+                           cascade="all, delete-orphan")
+
+
+class AnaesthesiaDeviceUse(Base):
+    """
+    Used OT devices during anaesthesia.
+    Billing can read this table to auto-add invoice items.
+    """
+    __tablename__ = "ot_anaesthesia_device_uses"
+    __table_args__ = (
+        UniqueConstraint("record_id", "device_id", name="uq_ot_anaes_device"),
+        Index("ix_ot_anaes_device_record", "record_id"),
+        Index("ix_ot_anaes_device_device", "device_id"),
+        MYSQL_ARGS,
+    )
+
+    id = Column(Integer, primary_key=True)
+    record_id = Column(Integer,
+                       ForeignKey("ot_anaesthesia_records.id",
+                                  ondelete="CASCADE"),
+                       nullable=False)
+    device_id = Column(Integer,
+                       ForeignKey("ot_device_masters.id", ondelete="RESTRICT"),
+                       nullable=False)
+
+    qty = Column(Integer, nullable=False, default=1)
+    notes = Column(String(255), nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    record = relationship("AnaesthesiaRecord", back_populates="devices")
+    device = relationship("OtDeviceMaster", lazy="joined")
 
 
 class AnaesthesiaVitalLog(Base):
