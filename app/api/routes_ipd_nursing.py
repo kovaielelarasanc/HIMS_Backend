@@ -1,37 +1,60 @@
 # FILE: app/api/routes_ipd_nursing.py
 from __future__ import annotations
 
-from datetime import datetime
-from typing import List
+import logging
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session, joinedload
 
 from app.api.deps import get_db, current_user as auth_current_user
-from app.utils.resp import ok, err
-from app.services.perm import need_any
-from app.services.ipd_nursing_service import (
-    utcnow, get_admission, add_timeline, compute_due_alerts
-)
-
-from app.models.user import User
 from app.models.ipd_nursing import (
-    IpdDressingRecord, IpdBloodTransfusion,
-    IpdRestraintRecord, IpdIsolationPrecaution,
-    IcuFlowSheet
+    IcuFlowSheet,
+    IpdBloodTransfusion,
+    IpdDressingRecord,
+    IpdIsolationPrecaution,
+    IpdRestraintRecord,
 )
-
+from app.models.user import User
 from app.schemas.ipd_nursing import (
-    DressingCreate, DressingUpdate, DressingOut,
-    IcuFlowCreate, IcuFlowUpdate, IcuFlowOut,
-    IsolationCreate, IsolationUpdate, IsolationStop, IsolationOut,
-    RestraintCreate, RestraintUpdate, RestraintStop, RestraintAppendMonitoring, RestraintOut,
-    TransfusionCreate, TransfusionUpdate, TransfusionAppendVital, TransfusionMarkReaction, TransfusionOut
+    DressingCreate,
+    DressingOut,
+    DressingUpdate,
+    IcuFlowCreate,
+    IcuFlowOut,
+    IcuFlowUpdate,
+    IsolationCreate,
+    IsolationOut,
+    IsolationStop,
+    IsolationUpdate,
+    RestraintAppendMonitoring,
+    RestraintCreate,
+    RestraintOut,
+    RestraintStop,
+    RestraintUpdate,
+    TransfusionAppendVital,
+    TransfusionCreate,
+    TransfusionMarkReaction,
+    TransfusionOut,
+    TransfusionUpdate,
 )
+from app.services.ipd_nursing_service import (
+    add_timeline,
+    compute_due_alerts,
+    get_admission,
+    utcnow,
+)
+from app.services.perm import need_any
+from app.utils.resp import err, ok
 
 router = APIRouter(prefix="/ipd", tags=["IPD Nursing"])
+log = logging.getLogger(__name__)
 
 
+# =========================================================
+# HELPERS
+# =========================================================
 def _adm_or_404(db: Session, admission_id: int):
     adm = get_admission(db, admission_id)
     if not adm:
@@ -39,8 +62,90 @@ def _adm_or_404(db: Session, admission_id: int):
     return adm, None
 
 
+def _commit(db: Session, msg: str = "Database error"):
+    try:
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        log.exception(msg)
+        return err(msg, 500)
+    return None
+
+
+def _merge_json(old: Optional[dict], new: Optional[dict]) -> dict:
+    out = dict(old or {})
+    for k, v in (new or {}).items():
+        out[k] = v
+    return out
+
+
+def _load_isolation(db: Session, iso_id: int):
+    return (
+        db.query(IpdIsolationPrecaution)
+        .options(
+            joinedload(IpdIsolationPrecaution.ordered_by),
+            joinedload(IpdIsolationPrecaution.updated_by),
+            joinedload(IpdIsolationPrecaution.stopped_by),
+        )
+        .filter(IpdIsolationPrecaution.id == iso_id)
+        .first()
+    )
+
+
+def _load_restraint(db: Session, restraint_id: int):
+    return (
+        db.query(IpdRestraintRecord)
+        .options(
+            joinedload(IpdRestraintRecord.ordered_by),
+            joinedload(IpdRestraintRecord.updated_by),
+            joinedload(IpdRestraintRecord.stopped_by),
+        )
+        .filter(IpdRestraintRecord.id == restraint_id)
+        .first()
+    )
+
+
+def _load_transfusion(db: Session, transfusion_id: int):
+    return (
+        db.query(IpdBloodTransfusion)
+        .options(
+            joinedload(IpdBloodTransfusion.created_by),
+            joinedload(IpdBloodTransfusion.updated_by),
+            joinedload(IpdBloodTransfusion.ordered_by),
+        )
+        .filter(IpdBloodTransfusion.id == transfusion_id)
+        .first()
+    )
+
+
+def _load_dressing(db: Session, record_id: int):
+    return (
+        db.query(IpdDressingRecord)
+        .options(
+            joinedload(IpdDressingRecord.performed_by),
+            joinedload(IpdDressingRecord.verified_by),
+            joinedload(IpdDressingRecord.updated_by),
+        )
+        .filter(IpdDressingRecord.id == record_id)
+        .first()
+    )
+
+
+def _load_icu(db: Session, flow_id: int):
+    return (
+        db.query(IcuFlowSheet)
+        .options(
+            joinedload(IcuFlowSheet.recorded_by),
+            joinedload(IcuFlowSheet.verified_by),
+            joinedload(IcuFlowSheet.updated_by),
+        )
+        .filter(IcuFlowSheet.id == flow_id)
+        .first()
+    )
+
+
 # =========================================================
-# DUE ALERTS (automation helper)
+# DUE ALERTS
 # =========================================================
 @router.get("/admissions/{admission_id}/nursing/alerts")
 def nursing_alerts(
@@ -52,6 +157,7 @@ def nursing_alerts(
     adm, resp = _adm_or_404(db, admission_id)
     if resp:
         return resp
+
     data = compute_due_alerts(db, admission_id)
     return ok(data)
 
@@ -90,10 +196,13 @@ def create_dressing(
         created_at=utcnow(),
     )
     db.add(rec)
-    db.flush()  # to get rec.id
+    db.flush()  # rec.id
 
     add_timeline(
-        db, admission_id, "dressing", rec.performed_at,
+        db,
+        admission_id,
+        "dressing",
+        rec.performed_at,
         title="Dressing done",
         summary=f"{rec.wound_site} • {rec.dressing_type}".strip(" •"),
         ref_table="ipd_dressing_records",
@@ -101,8 +210,11 @@ def create_dressing(
         created_by_id=user.id,
     )
 
-    db.commit()
-    db.refresh(rec)
+    resp = _commit(db, "Failed to save dressing")
+    if resp:
+        return resp
+
+    rec = _load_dressing(db, rec.id) or rec
     return ok(DressingOut.model_validate(rec), 201)
 
 
@@ -120,6 +232,11 @@ def list_dressing(
 
     rows = (
         db.query(IpdDressingRecord)
+        .options(
+            joinedload(IpdDressingRecord.performed_by),
+            joinedload(IpdDressingRecord.verified_by),
+            joinedload(IpdDressingRecord.updated_by),
+        )
         .filter(IpdDressingRecord.admission_id == admission_id)
         .order_by(IpdDressingRecord.performed_at.desc())
         .all()
@@ -149,7 +266,7 @@ def update_dressing(
     if payload.assessment is not None:
         rec.assessment = payload.assessment.model_dump()
     if payload.procedure is not None:
-        rec.procedure = payload.procedure.model_dump()
+        rec.procedure_json = payload.procedure.model_dump()
     if payload.asepsis is not None:
         rec.asepsis = payload.asepsis.model_dump()
     if payload.pain_score is not None:
@@ -167,8 +284,11 @@ def update_dressing(
     rec.updated_by_id = user.id
     rec.edit_reason = payload.edit_reason
 
-    db.commit()
-    db.refresh(rec)
+    resp = _commit(db, "Failed to update dressing")
+    if resp:
+        return resp
+
+    rec = _load_dressing(db, rec.id) or rec
     return ok(DressingOut.model_validate(rec))
 
 
@@ -206,7 +326,10 @@ def create_icu_flow(
     db.flush()
 
     add_timeline(
-        db, admission_id, "icu", rec.recorded_at,
+        db,
+        admission_id,
+        "icu",
+        rec.recorded_at,
         title="ICU flow recorded",
         summary=f"Shift: {rec.shift or '-'} • GCS: {rec.gcs_score if rec.gcs_score is not None else '-'}",
         ref_table="icu_flow_sheets",
@@ -214,8 +337,11 @@ def create_icu_flow(
         created_by_id=user.id,
     )
 
-    db.commit()
-    db.refresh(rec)
+    resp = _commit(db, "Failed to save ICU flow")
+    if resp:
+        return resp
+
+    rec = _load_icu(db, rec.id) or rec
     return ok(IcuFlowOut.model_validate(rec), 201)
 
 
@@ -233,6 +359,11 @@ def list_icu_flow(
 
     rows = (
         db.query(IcuFlowSheet)
+        .options(
+            joinedload(IcuFlowSheet.recorded_by),
+            joinedload(IcuFlowSheet.verified_by),
+            joinedload(IcuFlowSheet.updated_by),
+        )
         .filter(IcuFlowSheet.admission_id == admission_id)
         .order_by(IcuFlowSheet.recorded_at.desc())
         .all()
@@ -254,6 +385,11 @@ def latest_icu_flow(
 
     rec = (
         db.query(IcuFlowSheet)
+        .options(
+            joinedload(IcuFlowSheet.recorded_by),
+            joinedload(IcuFlowSheet.verified_by),
+            joinedload(IcuFlowSheet.updated_by),
+        )
         .filter(IcuFlowSheet.admission_id == admission_id)
         .order_by(IcuFlowSheet.recorded_at.desc())
         .first()
@@ -295,8 +431,11 @@ def update_icu_flow(
     rec.updated_by_id = user.id
     rec.edit_reason = payload.edit_reason
 
-    db.commit()
-    db.refresh(rec)
+    resp = _commit(db, "Failed to update ICU flow")
+    if resp:
+        return resp
+
+    rec = _load_icu(db, rec.id) or rec
     return ok(IcuFlowOut.model_validate(rec))
 
 
@@ -333,7 +472,10 @@ def create_isolation(
     db.flush()
 
     add_timeline(
-        db, admission_id, "isolation", rec.started_at,
+        db,
+        admission_id,
+        "isolation",
+        rec.started_at,
         title=f"Isolation started ({rec.precaution_type})",
         summary=rec.indication or "",
         ref_table="ipd_isolation_precautions",
@@ -341,8 +483,11 @@ def create_isolation(
         created_by_id=user.id,
     )
 
-    db.commit()
-    db.refresh(rec)
+    resp = _commit(db, "Failed to save isolation")
+    if resp:
+        return resp
+
+    rec = _load_isolation(db, rec.id) or rec
     return ok(IsolationOut.model_validate(rec), 201)
 
 
@@ -360,6 +505,11 @@ def list_isolation(
 
     rows = (
         db.query(IpdIsolationPrecaution)
+        .options(
+            joinedload(IpdIsolationPrecaution.ordered_by),
+            joinedload(IpdIsolationPrecaution.updated_by),
+            joinedload(IpdIsolationPrecaution.stopped_by),
+        )
         .filter(IpdIsolationPrecaution.admission_id == admission_id)
         .order_by(IpdIsolationPrecaution.started_at.desc())
         .all()
@@ -395,8 +545,11 @@ def update_isolation(
     rec.updated_by_id = user.id
     rec.edit_reason = payload.edit_reason
 
-    db.commit()
-    db.refresh(rec)
+    resp = _commit(db, "Failed to update isolation")
+    if resp:
+        return resp
+
+    rec = _load_isolation(db, rec.id) or rec
     return ok(IsolationOut.model_validate(rec))
 
 
@@ -422,7 +575,10 @@ def stop_isolation(
     rec.edit_reason = f"Stopped: {payload.stop_reason}"
 
     add_timeline(
-        db, rec.admission_id, "isolation", rec.stopped_at,
+        db,
+        rec.admission_id,
+        "isolation",
+        rec.stopped_at,
         title="Isolation stopped",
         summary=payload.stop_reason,
         ref_table="ipd_isolation_precautions",
@@ -430,8 +586,11 @@ def stop_isolation(
         created_by_id=user.id,
     )
 
-    db.commit()
-    db.refresh(rec)
+    resp = _commit(db, "Failed to stop isolation")
+    if resp:
+        return resp
+
+    rec = _load_isolation(db, rec.id) or rec
     return ok(IsolationOut.model_validate(rec))
 
 
@@ -472,7 +631,10 @@ def create_restraint(
     db.flush()
 
     add_timeline(
-        db, admission_id, "restraint", rec.started_at,
+        db,
+        admission_id,
+        "restraint",
+        rec.started_at,
         title="Restraint started",
         summary=f"{rec.restraint_type} • {rec.device} • {rec.site}".strip(" •"),
         ref_table="ipd_restraint_records",
@@ -480,8 +642,11 @@ def create_restraint(
         created_by_id=user.id,
     )
 
-    db.commit()
-    db.refresh(rec)
+    resp = _commit(db, "Failed to save restraint")
+    if resp:
+        return resp
+
+    rec = _load_restraint(db, rec.id) or rec
     return ok(RestraintOut.model_validate(rec), 201)
 
 
@@ -499,6 +664,11 @@ def list_restraints(
 
     rows = (
         db.query(IpdRestraintRecord)
+        .options(
+            joinedload(IpdRestraintRecord.ordered_by),
+            joinedload(IpdRestraintRecord.updated_by),
+            joinedload(IpdRestraintRecord.stopped_by),
+        )
         .filter(IpdRestraintRecord.admission_id == admission_id)
         .order_by(IpdRestraintRecord.started_at.desc())
         .all()
@@ -540,8 +710,11 @@ def update_restraint(
     rec.updated_by_id = user.id
     rec.edit_reason = payload.edit_reason
 
-    db.commit()
-    db.refresh(rec)
+    resp = _commit(db, "Failed to update restraint")
+    if resp:
+        return resp
+
+    rec = _load_restraint(db, rec.id) or rec
     return ok(RestraintOut.model_validate(rec))
 
 
@@ -560,16 +733,19 @@ def append_restraint_monitoring(
     if rec.status != "active":
         return err("Restraint is not active", 400)
 
-    log = rec.monitoring_log or []
-    log.append(payload.point.model_dump())
-    rec.monitoring_log = log
+    log_points = list(rec.monitoring_log or [])
+    log_points.append(payload.point.model_dump())
+    rec.monitoring_log = log_points
 
     rec.updated_at = utcnow()
     rec.updated_by_id = user.id
     rec.edit_reason = "Monitoring added"
 
-    db.commit()
-    db.refresh(rec)
+    resp = _commit(db, "Failed to append restraint monitoring")
+    if resp:
+        return resp
+
+    rec = _load_restraint(db, rec.id) or rec
     return ok(RestraintOut.model_validate(rec))
 
 
@@ -590,17 +766,17 @@ def stop_restraint(
     rec.stopped_at = payload.stopped_at or utcnow()
     rec.stopped_by_id = user.id
     rec.stop_reason = payload.stop_reason
-    if payload.ended_at is not None:
-        rec.ended_at = payload.ended_at
-    else:
-        rec.ended_at = rec.stopped_at
+    rec.ended_at = payload.ended_at if payload.ended_at is not None else rec.stopped_at
 
     rec.updated_at = utcnow()
     rec.updated_by_id = user.id
     rec.edit_reason = f"Stopped: {payload.stop_reason}"
 
     add_timeline(
-        db, rec.admission_id, "restraint", rec.stopped_at,
+        db,
+        rec.admission_id,
+        "restraint",
+        rec.stopped_at,
         title="Restraint stopped",
         summary=payload.stop_reason,
         ref_table="ipd_restraint_records",
@@ -608,8 +784,11 @@ def stop_restraint(
         created_by_id=user.id,
     )
 
-    db.commit()
-    db.refresh(rec)
+    resp = _commit(db, "Failed to stop restraint")
+    if resp:
+        return resp
+
+    rec = _load_restraint(db, rec.id) or rec
     return ok(RestraintOut.model_validate(rec))
 
 
@@ -617,11 +796,11 @@ def stop_restraint(
 # TRANSFUSION
 # =========================================================
 def _auto_transfusion_status(payload: TransfusionCreate) -> str:
-    # safe automation:
     admin = payload.administration or {}
     reaction = payload.reaction or {}
     if reaction.get("occurred"):
         return "reaction"
+
     st = admin.get("start_time")
     en = admin.get("end_time")
     if st and not en:
@@ -651,21 +830,17 @@ def create_transfusion(
         status=status,
         indication=payload.indication or "",
         ordered_at=payload.ordered_at,
-        ordered_by_id=(user.id if status == "ordered" and payload.ordered_at else None),
-
+        ordered_by_id=(user.id if payload.ordered_at else None),
         consent_taken=payload.consent_taken,
         consent_doc_ref=payload.consent_doc_ref,
-
         unit=payload.unit or {},
         compatibility=payload.compatibility or {},
         issue=payload.issue or {},
         bedside_verification=payload.bedside_verification or {},
-
         administration=payload.administration or {},
         baseline_vitals=payload.baseline_vitals or {},
-        monitoring_vitals=[v.model_dump() for v in (payload.monitoring_vitals or [])],
+        monitoring_vitals=[v.to_json() for v in (payload.monitoring_vitals or [])],
         reaction=payload.reaction or {},
-
         created_by_id=user.id,
         created_at=utcnow(),
     )
@@ -673,16 +848,22 @@ def create_transfusion(
     db.flush()
 
     add_timeline(
-        db, admission_id, "transfusion", utcnow(),
+        db,
+        admission_id,
+        "transfusion",
+        utcnow(),
         title="Transfusion created",
-        summary=(payload.unit.get("component_type") or "") if payload.unit else "",
+        summary=(rec.unit or {}).get("component_type") or "",
         ref_table="ipd_blood_transfusions",
         ref_id=rec.id,
         created_by_id=user.id,
     )
 
-    db.commit()
-    db.refresh(rec)
+    resp = _commit(db, "Failed to create transfusion")
+    if resp:
+        return resp
+
+    rec = _load_transfusion(db, rec.id) or rec
     return ok(TransfusionOut.model_validate(rec), 201)
 
 
@@ -700,6 +881,11 @@ def list_transfusions(
 
     rows = (
         db.query(IpdBloodTransfusion)
+        .options(
+            joinedload(IpdBloodTransfusion.created_by),
+            joinedload(IpdBloodTransfusion.updated_by),
+            joinedload(IpdBloodTransfusion.ordered_by),
+        )
         .filter(IpdBloodTransfusion.admission_id == admission_id)
         .order_by(IpdBloodTransfusion.created_at.desc())
         .all()
@@ -729,29 +915,40 @@ def update_transfusion(
     if payload.consent_doc_ref is not None:
         rec.consent_doc_ref = payload.consent_doc_ref
 
+    # merge JSON blobs (prevents data loss)
     if payload.unit is not None:
-        rec.unit = payload.unit
+        rec.unit = _merge_json(rec.unit, payload.unit)
     if payload.compatibility is not None:
-        rec.compatibility = payload.compatibility
+        rec.compatibility = _merge_json(rec.compatibility, payload.compatibility)
     if payload.issue is not None:
-        rec.issue = payload.issue
+        rec.issue = _merge_json(rec.issue, payload.issue)
     if payload.bedside_verification is not None:
-        rec.bedside_verification = payload.bedside_verification
+        rec.bedside_verification = _merge_json(rec.bedside_verification, payload.bedside_verification)
     if payload.administration is not None:
-        rec.administration = payload.administration
+        rec.administration = _merge_json(rec.administration, payload.administration)
     if payload.baseline_vitals is not None:
-        rec.baseline_vitals = payload.baseline_vitals
+        rec.baseline_vitals = _merge_json(rec.baseline_vitals, payload.baseline_vitals)
 
-    # Automation: if reaction occurred in stored JSON, set status=reaction
+    # automation status
     if (rec.reaction or {}).get("occurred"):
         rec.status = "reaction"
+    else:
+        st = (rec.administration or {}).get("start_time")
+        en = (rec.administration or {}).get("end_time")
+        if st and not en and rec.status in {"ordered", "issued"}:
+            rec.status = "in_progress"
+        if st and en:
+            rec.status = "completed"
 
     rec.updated_at = utcnow()
     rec.updated_by_id = user.id
     rec.edit_reason = payload.edit_reason
 
-    db.commit()
-    db.refresh(rec)
+    resp = _commit(db, "Failed to update transfusion")
+    if resp:
+        return resp
+
+    rec = _load_transfusion(db, rec.id) or rec
     return ok(TransfusionOut.model_validate(rec))
 
 
@@ -768,11 +965,11 @@ def append_transfusion_vital(
     if not rec:
         return err("Transfusion record not found", 404)
 
-    vitals = rec.monitoring_vitals or []
-    vitals.append(payload.point.model_dump())
+    vitals = list(rec.monitoring_vitals or [])
+    vitals.append(payload.point.to_json())
     rec.monitoring_vitals = vitals
 
-    # automation: if monitoring added and start_time exists -> in_progress
+    # automation
     st = (rec.administration or {}).get("start_time")
     en = (rec.administration or {}).get("end_time")
     if st and not en and rec.status in {"ordered", "issued"}:
@@ -782,8 +979,11 @@ def append_transfusion_vital(
     rec.updated_by_id = user.id
     rec.edit_reason = "Vitals appended"
 
-    db.commit()
-    db.refresh(rec)
+    resp = _commit(db, "Failed to append transfusion vitals")
+    if resp:
+        return resp
+
+    rec = _load_transfusion(db, rec.id) or rec
     return ok(TransfusionOut.model_validate(rec))
 
 
@@ -817,14 +1017,20 @@ def mark_transfusion_reaction(
     rec.edit_reason = "Reaction marked"
 
     add_timeline(
-        db, rec.admission_id, "transfusion", utcnow(),
+        db,
+        rec.admission_id,
+        "transfusion",
+        utcnow(),
         title="Transfusion reaction flagged",
-        summary="; ".join(payload.symptoms)[:200],
+        summary="; ".join(payload.symptoms)[:200] if payload.symptoms else "",
         ref_table="ipd_blood_transfusions",
         ref_id=rec.id,
         created_by_id=user.id,
     )
 
-    db.commit()
-    db.refresh(rec)
+    resp = _commit(db, "Failed to mark transfusion reaction")
+    if resp:
+        return resp
+
+    rec = _load_transfusion(db, rec.id) or rec
     return ok(TransfusionOut.model_validate(rec))

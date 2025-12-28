@@ -17,7 +17,7 @@ from app.api import (
     routes_opd_schedules,
     routes_opd,
     routes_opd_clinical,
-
+    routes_ipd_transfers,
     routes_ipd_masters,
     routes_ipd,
     routes_ipd_medications,
@@ -113,6 +113,7 @@ api_router.include_router(routes_ipd.router, prefix="/ipd", tags=["ipd"])
 api_router.include_router(routes_ipd_medications.router)
 api_router.include_router(routes_ipd_discharge.router)
 api_router.include_router(routes_ipd_nursing.router)
+api_router.include_router(routes_ipd_transfers.router)
 
 api_router.include_router(routes_inventory_po.router)
 api_router.include_router(routes_inventory_grn.router)

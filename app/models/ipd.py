@@ -317,6 +317,12 @@ class IpdAdmission(Base):
         back_populates="admission",
         cascade="all, delete-orphan",
     )
+    transfers = relationship(
+        "IpdTransfer",
+        back_populates="admission",
+        cascade="all, delete-orphan",
+    )
+
 
    
     dressing_records = relationship("IpdDressingRecord", back_populates="admission", cascade="all, delete-orphan")
@@ -411,22 +417,79 @@ class IpdAdmission(Base):
         return self.admission_code or f"IP-{self.id:06d}"
 
 
+# ✅ REPLACE your old IpdTransfer with this NABH-ready version
 class IpdTransfer(Base):
     __tablename__ = "ipd_transfers"
-    __table_args__ = {
-        "mysql_engine": "InnoDB",
-        "mysql_charset": "utf8mb4",
-        "mysql_collate": "utf8mb4_unicode_ci",
-    }
+    __table_args__ = (
+        Index("ix_ipd_transfers_adm_status", "admission_id", "status"),
+        Index("ix_ipd_transfers_requested_at", "requested_at"),
+        {
+            "mysql_engine": "InnoDB",
+            "mysql_charset": "utf8mb4",
+            "mysql_collate": "utf8mb4_unicode_ci",
+        },
+    )
 
     id = Column(Integer, primary_key=True)
-    admission_id = Column(Integer, ForeignKey("ipd_admissions.id"), index=True)
-    from_bed_id = Column(Integer, ForeignKey("ipd_beds.id"))
-    to_bed_id = Column(Integer, ForeignKey("ipd_beds.id"))
+
+    admission_id = Column(Integer, ForeignKey("ipd_admissions.id"), index=True, nullable=False)
+
+    # Bed movement
+    from_bed_id = Column(Integer, ForeignKey("ipd_beds.id"), nullable=True)
+    to_bed_id = Column(Integer, ForeignKey("ipd_beds.id"), nullable=True)
+
+    # ✅ Link to bed assignment rows for traceability (NABH audit)
+    from_assignment_id = Column(Integer, ForeignKey("ipd_bed_assignments.id"), nullable=True)
+    to_assignment_id = Column(Integer, ForeignKey("ipd_bed_assignments.id"), nullable=True)
+
+    # NABH transfer metadata
+    transfer_type = Column(String(30), default="transfer")  # upgrade/downgrade/isolation/transfer
+    priority = Column(String(20), default="routine")        # routine/urgent
+    status = Column(String(20), default="requested")        # requested/approved/rejected/scheduled/completed/cancelled
+
     reason = Column(String(255), default="")
-    requested_by = Column(Integer, ForeignKey("users.id"))
+    request_note = Column(Text, default="")
+
+    # scheduling/reservation
+    scheduled_at = Column(DateTime, nullable=True)
+    reserved_until = Column(DateTime, nullable=True)
+
+    # Who/When audit
+    requested_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    requested_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
     approved_by = Column(Integer, ForeignKey("users.id"), nullable=True)
-    transferred_at = Column(DateTime, default=datetime.utcnow)
+    approved_at = Column(DateTime, nullable=True)
+    approval_note = Column(Text, default="")
+
+    rejected_reason = Column(Text, default="")
+
+    cancelled_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    cancelled_at = Column(DateTime, nullable=True)
+    cancel_reason = Column(Text, default="")
+
+    # Execution timestamps
+    vacated_at = Column(DateTime, nullable=True)
+    occupied_at = Column(DateTime, nullable=True)
+    completed_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+
+    # Optional handover checklist JSON/text (store as JSON string)
+    handover_json = Column(Text, default="")
+
+    # --- relationships ---
+    admission = relationship("IpdAdmission", lazy="joined")
+
+    from_bed = relationship("IpdBed", foreign_keys=[from_bed_id], lazy="joined")
+    to_bed = relationship("IpdBed", foreign_keys=[to_bed_id], lazy="joined")
+
+    from_assignment = relationship("IpdBedAssignment", foreign_keys=[from_assignment_id], lazy="joined")
+    to_assignment = relationship("IpdBedAssignment", foreign_keys=[to_assignment_id], lazy="joined")
+
+    requested_by_user = relationship("User", foreign_keys=[requested_by], lazy="joined")
+    approved_by_user = relationship("User", foreign_keys=[approved_by], lazy="joined")
+    cancelled_by_user = relationship("User", foreign_keys=[cancelled_by], lazy="joined")
+    completed_by_user = relationship("User", foreign_keys=[completed_by], lazy="joined")
 
 
 # ---------------------------------------------------------------------

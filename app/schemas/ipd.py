@@ -1,14 +1,20 @@
 # FILE: app/schemas/ipd.py
 from __future__ import annotations
-
+import json
 from datetime import datetime, date, time
-from typing import Optional, List
+from typing import Optional, List, Dict
 from decimal import Decimal
 from pydantic import BaseModel, Field, validator, ConfigDict, model_validator, field_validator
 
 # =====================================================================
 # ------------------------------- Masters ------------------------------
 # =====================================================================
+
+TRANSFER_TYPES = {"transfer", "upgrade", "downgrade", "isolation", "operational"}
+TRANSFER_PRIORITIES = {"routine", "urgent"}
+TRANSFER_STATUSES = {"requested", "approved", "rejected", "scheduled", "completed", "cancelled"}
+
+
 class Paginated(BaseModel):
     total: int
     items: list
@@ -210,23 +216,122 @@ class AdmissionIn(BaseModel):
         if v not in PAYOR_TYPES:
             raise ValueError(f"payor_type must be one of {sorted(PAYOR_TYPES)}")
         return v
+# -------------------------------------------------------------------------------
+# ----------------------------bed transfer---------------------------------------
+# -------------------------------------------------------------------------------
+
+class TransferRequestIn(BaseModel):
+    # optional at request stage (you can select later in assign step)
+    to_bed_id: Optional[int] = Field(None, gt=0)
+
+    transfer_type: str = Field("transfer")
+    priority: str = Field("routine")
+
+    reason: str = Field("", max_length=255)
+    request_note: Optional[str] = ""
+
+    scheduled_at: Optional[datetime] = None
+    reserve_minutes: Optional[int] = Field(30, ge=0, le=24 * 60)  # 0 disables reserve
+
+    @validator("transfer_type")
+    def _vt(cls, v):
+        if v not in TRANSFER_TYPES:
+            raise ValueError(f"transfer_type must be one of {sorted(TRANSFER_TYPES)}")
+        return v
+
+    @validator("priority")
+    def _vp(cls, v):
+        if v not in TRANSFER_PRIORITIES:
+            raise ValueError(f"priority must be one of {sorted(TRANSFER_PRIORITIES)}")
+        return v
 
 
-class TransferIn(BaseModel):
+class TransferApproveIn(BaseModel):
+    approve: bool = True
+    approval_note: Optional[str] = ""
+    rejected_reason: Optional[str] = ""
+
+
+class TransferAssignBedIn(BaseModel):
     to_bed_id: int = Field(..., gt=0)
+    scheduled_at: Optional[datetime] = None
+    reserve_minutes: Optional[int] = Field(30, ge=0, le=24 * 60)
+
+
+class TransferCompleteIn(BaseModel):
+    vacated_at: Optional[datetime] = None
+    occupied_at: Optional[datetime] = None
+
+    # store dict → backend will json.dumps()
+    handover: Optional[Dict[str, Any]] = None
+
+
+class TransferCancelIn(BaseModel):
     reason: Optional[str] = ""
 
 
-class TransferOut(BaseModel):
+class BedLocOut(BaseModel):
+    bed_id: Optional[int] = None
+    bed_code: Optional[str] = None
+    room_id: Optional[int] = None
+    room_number: Optional[str] = None
+    ward_id: Optional[int] = None
+    ward_name: Optional[str] = None
+    room_type: Optional[str] = None
+    bed_state: Optional[str] = None
+
+
+class TransferOutV2(BaseModel):
     id: int
     admission_id: int
-    from_bed_id: Optional[int]
-    to_bed_id: int
-    reason: str
-    transferred_at: datetime
 
-    class Config:
-        orm_mode = True
+    status: str
+    transfer_type: str
+    priority: str
+
+    reason: str
+    request_note: str
+
+    scheduled_at: Optional[datetime] = None
+    reserved_until: Optional[datetime] = None
+
+    requested_by: int
+    requested_at: datetime
+
+    approved_by: Optional[int] = None
+    approved_at: Optional[datetime] = None
+    approval_note: str = ""
+
+    rejected_reason: str = ""
+
+    cancelled_by: Optional[int] = None
+    cancelled_at: Optional[datetime] = None
+    cancel_reason: str = ""
+
+    vacated_at: Optional[datetime] = None
+    occupied_at: Optional[datetime] = None
+    completed_by: Optional[int] = None
+    completed_at: Optional[datetime] = None
+
+    from_assignment_id: Optional[int] = None
+    to_assignment_id: Optional[int] = None
+
+    from_location: Optional[BedLocOut] = None
+    to_location: Optional[BedLocOut] = None
+
+    handover: Optional[Dict[str, Any]] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ✅ Backward compatibility (old UI still sending TransferIn)
+class TransferIn(TransferRequestIn):
+    # old required to_bed_id
+    to_bed_id: int = Field(..., gt=0)
+
+
+class TransferOut(TransferOutV2):
+    pass
 
 
 # =====================================================================

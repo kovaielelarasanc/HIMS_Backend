@@ -12,7 +12,7 @@ from app.models.ipd import (
     IpdBed,
     IpdAdmission,
     IpdBedAssignment,
-    IpdTransfer,
+    # IpdTransfer,
     IpdNursingNote,
     IpdShiftHandover,
     IpdVital,
@@ -45,8 +45,8 @@ from app.schemas.ipd import (
     AdmissionOut,
     AdmissionUpdateIn,
     AdmissionDetailOut,
-    TransferIn,
-    TransferOut,
+    # TransferIn,
+    # TransferOut,
     NursingNoteCreate,
     NursingNoteUpdate,
     NursingNoteOut,
@@ -532,70 +532,70 @@ def cancel_admission(
     return {"message": "Admission cancelled"}
 
 
-# ---------------- Transfers ----------------
-@router.post("/admissions/{admission_id}/transfer", response_model=TransferOut)
-def transfer_bed(
-        admission_id: int,
-        payload: TransferIn,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
-):
-    if not has_perm(user, "ipd.manage"):
-        raise HTTPException(403, "Not permitted")
-    adm = db.query(IpdAdmission).get(admission_id)
-    if adm and adm.billing_locked:
-        raise HTTPException(
-            400, "Billing is locked for this admission (discharged).")
+# # ---------------- Transfers ----------------
+# @router.post("/admissions/{admission_id}/transfer", response_model=TransferOut)
+# def transfer_bed(
+#         admission_id: int,
+#         payload: TransferIn,
+#         db: Session = Depends(get_db),
+#         user: User = Depends(auth_current_user),
+# ):
+#     if not has_perm(user, "ipd.manage"):
+#         raise HTTPException(403, "Not permitted")
+#     adm = db.query(IpdAdmission).get(admission_id)
+#     if adm and adm.billing_locked:
+#         raise HTTPException(
+#             400, "Billing is locked for this admission (discharged).")
 
-    if not adm or adm.status != "admitted":
-        raise HTTPException(404, "Admission not found/active")
+#     if not adm or adm.status != "admitted":
+#         raise HTTPException(404, "Admission not found/active")
 
-    to_bed = db.query(IpdBed).get(payload.to_bed_id)
-    if not to_bed:
-        raise HTTPException(404, "Target bed not found")
-    if to_bed.state != "vacant":
-        raise HTTPException(400, "Target bed not vacant")
+#     to_bed = db.query(IpdBed).get(payload.to_bed_id)
+#     if not to_bed:
+#         raise HTTPException(404, "Target bed not found")
+#     if to_bed.state != "vacant":
+#         raise HTTPException(400, "Target bed not vacant")
 
-    from_bed_id = adm.current_bed_id
+#     from_bed_id = adm.current_bed_id
 
-    now = datetime.utcnow()
+#     now = datetime.utcnow()
 
-    # close current open assignment
-    last_assign = (db.query(IpdBedAssignment).filter(
-        IpdBedAssignment.admission_id == admission_id,
-        IpdBedAssignment.to_ts.is_(None),
-    ).order_by(IpdBedAssignment.id.desc()).first())
-    if last_assign:
-        last_assign.to_ts = now  # ✅ stop previous bed billing exactly here
+#     # close current open assignment
+#     last_assign = (db.query(IpdBedAssignment).filter(
+#         IpdBedAssignment.admission_id == admission_id,
+#         IpdBedAssignment.to_ts.is_(None),
+#     ).order_by(IpdBedAssignment.id.desc()).first())
+#     if last_assign:
+#         last_assign.to_ts = now  # ✅ stop previous bed billing exactly here
 
-    if from_bed_id:
-        old = db.query(IpdBed).get(from_bed_id)
-        if old:
-            old.state = "vacant"
+#     if from_bed_id:
+#         old = db.query(IpdBed).get(from_bed_id)
+#         if old:
+#             old.state = "vacant"
 
-    to_bed.state = "occupied"
-    adm.current_bed_id = to_bed.id
+#     to_bed.state = "occupied"
+#     adm.current_bed_id = to_bed.id
 
-    tr = IpdTransfer(
-        admission_id=admission_id,
-        from_bed_id=from_bed_id,
-        to_bed_id=to_bed.id,
-        reason=payload.reason or "",
-        requested_by=user.id,
-        approved_by=user.id,
-    )
-    db.add(tr)
-    db.add(
-        IpdBedAssignment(
-            admission_id=admission_id,
-            bed_id=to_bed.id,
-            reason="transfer",
-            from_ts=now,  # ✅ start new bed billing exactly here
-            to_ts=None,
-        ))
-    db.commit()
-    db.refresh(tr)
-    return tr
+#     tr = IpdTransfer(
+#         admission_id=admission_id,
+#         from_bed_id=from_bed_id,
+#         to_bed_id=to_bed.id,
+#         reason=payload.reason or "",
+#         requested_by=user.id,
+#         approved_by=user.id,
+#     )
+#     db.add(tr)
+#     db.add(
+#         IpdBedAssignment(
+#             admission_id=admission_id,
+#             bed_id=to_bed.id,
+#             reason="transfer",
+#             from_ts=now,  # ✅ start new bed billing exactly here
+#             to_ts=None,
+#         ))
+#     db.commit()
+#     db.refresh(tr)
+#     return tr
 
 
 LOCK_AFTER_HOURS = 24
