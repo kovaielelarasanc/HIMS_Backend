@@ -21,7 +21,6 @@ from app.models.ipd import (
     IpdProgressNote,
     IpdDischargeSummary,
     IpdDischargeChecklist,
-    IpdReferral,
     IpdOtCase,
     IpdAnaesthesiaRecord,
     IpdRoom,
@@ -65,8 +64,6 @@ from app.schemas.ipd import (
     DischargeChecklistIn,
     DischargeChecklistOut,
     DueDischargeOut,
-    ReferralIn,
-    ReferralOut,
     OtCaseIn,
     OtCaseOut,
     AnaesthesiaIn,
@@ -1099,45 +1096,6 @@ def list_progress(
         IpdProgressNote.admission_id == admission_id).order_by(
             IpdProgressNote.id.desc()).all())
 
-
-# ---------------- Referrals ----------------
-@router.post(
-    "/admissions/{admission_id}/referrals",
-    response_model=ReferralOut,
-)
-def create_referral(
-        admission_id: int,
-        payload: ReferralIn,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
-):
-    if not (has_perm(user, "ipd.nursing") or has_perm(user, "ipd.doctor")
-            or has_perm(user, "ipd.manage")):
-        raise HTTPException(403, "Not permitted")
-    adm = db.query(IpdAdmission).get(admission_id)
-    if not adm:
-        raise HTTPException(404, "Admission not found")
-    ref = IpdReferral(admission_id=admission_id, **payload.dict())
-    db.add(ref)
-    db.commit()
-    db.refresh(ref)
-    return ref
-
-
-@router.get(
-    "/admissions/{admission_id}/referrals",
-    response_model=List[ReferralOut],
-)
-def list_referrals(
-        admission_id: int,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
-):
-    if not has_perm(user, "ipd.view"):
-        raise HTTPException(403, "Not permitted")
-    return (db.query(IpdReferral).filter(
-        IpdReferral.admission_id == admission_id).order_by(
-            IpdReferral.id.desc()).all())
 
 
 # ---------------- OT & Anaesthesia ----------------

@@ -36,7 +36,7 @@ from app.api import (
     routes_ot_schedule_cases,
     routes_ot_clinical,
     routes_ot_admin_logs,
-
+    routes_ipd_referrals, 
     routes_system,
     routes_files,
     routes_lis_history,
@@ -114,6 +114,7 @@ api_router.include_router(routes_ipd_medications.router)
 api_router.include_router(routes_ipd_discharge.router)
 api_router.include_router(routes_ipd_nursing.router)
 api_router.include_router(routes_ipd_transfers.router)
+api_router.include_router(routes_ipd_referrals.router)
 
 api_router.include_router(routes_inventory_po.router)
 api_router.include_router(routes_inventory_grn.router)

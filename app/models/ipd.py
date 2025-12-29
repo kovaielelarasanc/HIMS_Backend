@@ -1163,29 +1163,6 @@ class IpdAdmissionFeedback(Base):
     created_by = relationship("User")
 
 
-# ---------------------------------------------------------------------
-# Referrals
-# ---------------------------------------------------------------------
-
-
-class IpdReferral(Base):
-    __tablename__ = "ipd_referrals"
-
-    id = Column(Integer, primary_key=True)
-    admission_id = Column(Integer, ForeignKey("ipd_admissions.id"), index=True)
-
-    type = Column(String(20), default="internal")  # internal/external
-    to_department = Column(String(120), default="")
-    to_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
-    external_org = Column(String(200), default="")
-    reason = Column(Text, default="")
-    created_at = Column(DateTime, default=datetime.utcnow)
-    status = Column(
-        String(20),
-        default="requested",  # requested/accepted/completed/cancelled
-    )
-
-    admission = relationship("IpdAdmission", back_populates="referrals")
 
 
 # ---------------------------------------------------------------------

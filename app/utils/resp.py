@@ -1,4 +1,4 @@
-# FILE: app/api/utils/resp.py
+# FILE: app/utils/resp.py
 from __future__ import annotations
 
 from typing import Any

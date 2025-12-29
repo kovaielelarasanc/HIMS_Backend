@@ -989,27 +989,6 @@ class DischargeMedicationOut(DischargeMedicationIn):
         orm_mode = True
 
 
-# =====================================================================
-# ---------------------------- Referrals -------------------------------
-# =====================================================================
-
-
-class ReferralIn(BaseModel):
-    type: Optional[str] = "internal"
-    to_department: Optional[str] = ""
-    to_user_id: Optional[int] = None
-    external_org: Optional[str] = ""
-    reason: Optional[str] = ""
-
-
-class ReferralOut(ReferralIn):
-    id: int
-    admission_id: int
-    status: str
-
-    class Config:
-        orm_mode = True
-
 
 # =====================================================================
 # ------------------------------- OT ----------------------------------
