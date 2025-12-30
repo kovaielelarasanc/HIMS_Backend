@@ -55,7 +55,10 @@ from app.api import (
     routes_lis_device,
     routes_billing_advances,
     routes_billing_invoice_wallet,
-    routes_billing_wallet
+    routes_billing_wallet,
+    routes_pdf_templates,
+    routes_ipd_pdfs,
+    routes_ipd_drug_chart_form_pdf 
 )
 from app.api.routes_lis_device import connector_router as lis_connector_router
 
@@ -115,6 +118,9 @@ api_router.include_router(routes_ipd_discharge.router)
 api_router.include_router(routes_ipd_nursing.router)
 api_router.include_router(routes_ipd_transfers.router)
 api_router.include_router(routes_ipd_referrals.router)
+api_router.include_router(routes_ipd_pdfs.router)
+api_router.include_router(routes_pdf_templates.router)
+api_router.include_router(routes_ipd_drug_chart_form_pdf.router)
 
 api_router.include_router(routes_inventory_po.router)
 api_router.include_router(routes_inventory_grn.router)

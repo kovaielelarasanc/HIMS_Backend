@@ -801,167 +801,167 @@ def update_doctor_authorisation(
 
 
 
-@router.get(
-    "/admissions/{admission_id}/drug-chart/pdf",
-    response_class=Response,
-)
-def download_drug_chart_pdf(
-    admission_id: int,
-    db: Session = Depends(get_db),
-    user: UserModel = Depends(current_user),
-):
-    """
-    Generate NABH-style Drug Chart PDF for the given admission.
+# @router.get(
+#     "/admissions/{admission_id}/drug-chart/pdf",
+#     response_class=Response,
+# )
+# def download_drug_chart_pdf(
+#     admission_id: int,
+#     db: Session = Depends(get_db),
+#     user: UserModel = Depends(current_user),
+# ):
+#     """
+#     Generate NABH-style Drug Chart PDF for the given admission.
 
-    Layout includes:
-    - Patient details + Allergies + Diagnosis + Weight / Height / BMI / Blood group / BSA
-    - Dietary advice (oral fluids, salt, calorie, protein)
-    - Intravenous fluids table
-    - Nurse signature block (Name, specimen sign, Emp no.)
-    - Regular medication orders with Hrs & Nurse sign grid
-    - SOS medications table
-    - STAT / Premedication table
-    - Doctor's Daily Authorisation + NOTE section
-    """
-    if not has_perm(user, "ipd.view"):
-        raise HTTPException(403, "Not permitted")
+#     Layout includes:
+#     - Patient details + Allergies + Diagnosis + Weight / Height / BMI / Blood group / BSA
+#     - Dietary advice (oral fluids, salt, calorie, protein)
+#     - Intravenous fluids table
+#     - Nurse signature block (Name, specimen sign, Emp no.)
+#     - Regular medication orders with Hrs & Nurse sign grid
+#     - SOS medications table
+#     - STAT / Premedication table
+#     - Doctor's Daily Authorisation + NOTE section
+#     """
+#     if not has_perm(user, "ipd.view"):
+#         raise HTTPException(403, "Not permitted")
 
-    adm = _get_admission_or_404(db, admission_id)
+#     adm = _get_admission_or_404(db, admission_id)
 
-    # --- Load related data ---
-    meta = (
-        db.query(IpdDrugChartMeta)
-        .filter(IpdDrugChartMeta.admission_id == admission_id)
-        .first()
-    )
+#     # --- Load related data ---
+#     meta = (
+#         db.query(IpdDrugChartMeta)
+#         .filter(IpdDrugChartMeta.admission_id == admission_id)
+#         .first()
+#     )
 
-    iv_fluids = (
-        db.query(IpdIvFluidOrder)
-        .filter(IpdIvFluidOrder.admission_id == admission_id)
-        .order_by(IpdIvFluidOrder.ordered_datetime.asc(), IpdIvFluidOrder.id.asc())
-        .all()
-    )
+#     iv_fluids = (
+#         db.query(IpdIvFluidOrder)
+#         .filter(IpdIvFluidOrder.admission_id == admission_id)
+#         .order_by(IpdIvFluidOrder.ordered_datetime.asc(), IpdIvFluidOrder.id.asc())
+#         .all()
+#     )
 
-    nurse_rows = (
-        db.query(IpdDrugChartNurseRow)
-        .filter(IpdDrugChartNurseRow.admission_id == admission_id)
-        .order_by(IpdDrugChartNurseRow.serial_no.asc(), IpdDrugChartNurseRow.id.asc())
-        .all()
-    )
+#     nurse_rows = (
+#         db.query(IpdDrugChartNurseRow)
+#         .filter(IpdDrugChartNurseRow.admission_id == admission_id)
+#         .order_by(IpdDrugChartNurseRow.serial_no.asc(), IpdDrugChartNurseRow.id.asc())
+#         .all()
+#     )
 
-    doctor_auths = (
-        db.query(IpdDrugChartDoctorAuth)
-        .filter(IpdDrugChartDoctorAuth.admission_id == admission_id)
-        .order_by(IpdDrugChartDoctorAuth.auth_date.asc(), IpdDrugChartDoctorAuth.id.asc())
-        .all()
-    )
+#     doctor_auths = (
+#         db.query(IpdDrugChartDoctorAuth)
+#         .filter(IpdDrugChartDoctorAuth.admission_id == admission_id)
+#         .order_by(IpdDrugChartDoctorAuth.auth_date.asc(), IpdDrugChartDoctorAuth.id.asc())
+#         .all()
+#     )
 
-    med_orders = (
-        db.query(IpdMedicationOrder)
-        .filter(IpdMedicationOrder.admission_id == admission_id)
-        .order_by(IpdMedicationOrder.start_datetime.asc(), IpdMedicationOrder.id.asc())
-        .all()
-    )
+#     med_orders = (
+#         db.query(IpdMedicationOrder)
+#         .filter(IpdMedicationOrder.admission_id == admission_id)
+#         .order_by(IpdMedicationOrder.start_datetime.asc(), IpdMedicationOrder.id.asc())
+#         .all()
+#     )
 
-    # Group orders by type (default -> regular)
-    regular_orders = []
-    sos_orders = []
-    stat_orders = []
-    premed_orders = []
-    for o in med_orders:
-        t = (o.order_type or "regular").lower()
-        if t == "sos":
-            sos_orders.append(o)
-        elif t == "stat":
-            stat_orders.append(o)
-        elif t in {"premed", "pre-med", "pre_medic"}:
-            premed_orders.append(o)
-        else:
-            regular_orders.append(o)
+#     # Group orders by type (default -> regular)
+#     regular_orders = []
+#     sos_orders = []
+#     stat_orders = []
+#     premed_orders = []
+#     for o in med_orders:
+#         t = (o.order_type or "regular").lower()
+#         if t == "sos":
+#             sos_orders.append(o)
+#         elif t == "stat":
+#             stat_orders.append(o)
+#         elif t in {"premed", "pre-med", "pre_medic"}:
+#             premed_orders.append(o)
+#         else:
+#             regular_orders.append(o)
 
-    # Drug chart administrations (for Hrs grid)
-    admins = (
-        db.query(IpdMedicationAdministration)
-        .filter(IpdMedicationAdministration.admission_id == admission_id)
-        .order_by(IpdMedicationAdministration.scheduled_datetime.asc())
-        .all()
-    )
+#     # Drug chart administrations (for Hrs grid)
+#     admins = (
+#         db.query(IpdMedicationAdministration)
+#         .filter(IpdMedicationAdministration.admission_id == admission_id)
+#         .order_by(IpdMedicationAdministration.scheduled_datetime.asc())
+#         .all()
+#     )
 
-    # Group admins by med_order_id
-    admin_by_order = {}
-    for a in admins:
-        admin_by_order.setdefault(a.med_order_id, []).append(a)
+#     # Group admins by med_order_id
+#     admin_by_order = {}
+#     for a in admins:
+#         admin_by_order.setdefault(a.med_order_id, []).append(a)
 
-    # --- Patient snapshot for header ---
-    patient = getattr(adm, "patient", None)
-    # You can adjust these field names as per your Patient model
-    patient_name = ""
-    if patient is not None:
-        name_parts = [
-            getattr(patient, "prefix", "") or "",
-            getattr(patient, "first_name", "") or "",
-            getattr(patient, "last_name", "") or "",
-        ]
-        patient_name = " ".join([p for p in name_parts if p]).strip()
+#     # --- Patient snapshot for header ---
+#     patient = getattr(adm, "patient", None)
+#     # You can adjust these field names as per your Patient model
+#     patient_name = ""
+#     if patient is not None:
+#         name_parts = [
+#             getattr(patient, "prefix", "") or "",
+#             getattr(patient, "first_name", "") or "",
+#             getattr(patient, "last_name", "") or "",
+#         ]
+#         patient_name = " ".join([p for p in name_parts if p]).strip()
 
-    uhid = getattr(patient, "uhid", None) or getattr(patient, "patient_code", "") or ""
-    gender = getattr(patient, "gender", "") or ""
-    age_str = ""
-    if getattr(patient, "dob", None):
-        # simple age calc (years only)
-        today = datetime.utcnow().date()
-        dob = patient.dob
-        if isinstance(dob, datetime):
-            dob = dob.date()
-        age_years = today.year - dob.year - (
-            (today.month, today.day) < (dob.month, dob.day)
-        )
-        age_str = f"{age_years} Y"
+#     uhid = getattr(patient, "uhid", None) or getattr(patient, "patient_code", "") or ""
+#     gender = getattr(patient, "gender", "") or ""
+#     age_str = ""
+#     if getattr(patient, "dob", None):
+#         # simple age calc (years only)
+#         today = datetime.utcnow().date()
+#         dob = patient.dob
+#         if isinstance(dob, datetime):
+#             dob = dob.date()
+#         age_years = today.year - dob.year - (
+#             (today.month, today.day) < (dob.month, dob.day)
+#         )
+#         age_str = f"{age_years} Y"
 
-    # Height/weight/BMI from meta
-    weight_kg = getattr(meta, "weight_kg", None) if meta else None
-    height_cm = getattr(meta, "height_cm", None) if meta else None
-    bmi = getattr(meta, "bmi", None) if meta else None
-    if bmi is None and weight_kg and height_cm:
-        try:
-            h_m = float(height_cm) / 100.0
-            if h_m > 0:
-                bmi = round(float(weight_kg) / (h_m * h_m), 2)
-        except Exception:
-            bmi = None
+#     # Height/weight/BMI from meta
+#     weight_kg = getattr(meta, "weight_kg", None) if meta else None
+#     height_cm = getattr(meta, "height_cm", None) if meta else None
+#     bmi = getattr(meta, "bmi", None) if meta else None
+#     if bmi is None and weight_kg and height_cm:
+#         try:
+#             h_m = float(height_cm) / 100.0
+#             if h_m > 0:
+#                 bmi = round(float(weight_kg) / (h_m * h_m), 2)
+#         except Exception:
+#             bmi = None
 
-    # --- Build Jinja context ---
-    ctx = {
-        "admission": adm,
-        "patient_name": patient_name,
-        "uhid": uhid,
-        "age_str": age_str,
-        "gender": gender,
-        "meta": meta,
-        "weight_kg": weight_kg,
-        "height_cm": height_cm,
-        "bmi": bmi,
-        "iv_fluids": iv_fluids,
-        "nurse_rows": nurse_rows,
-        "doctor_auths": doctor_auths,
-        "regular_orders": regular_orders,
-        "sos_orders": sos_orders,
-        "stat_orders": stat_orders,
-        "premed_orders": premed_orders,
-        "admin_by_order": admin_by_order,
-        # For Hrs header – 24 hour slots or reduce if you want
-        "hour_slots": [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22],
-        "generated_at": datetime.utcnow(),
-    }
+#     # --- Build Jinja context ---
+#     ctx = {
+#         "admission": adm,
+#         "patient_name": patient_name,
+#         "uhid": uhid,
+#         "age_str": age_str,
+#         "gender": gender,
+#         "meta": meta,
+#         "weight_kg": weight_kg,
+#         "height_cm": height_cm,
+#         "bmi": bmi,
+#         "iv_fluids": iv_fluids,
+#         "nurse_rows": nurse_rows,
+#         "doctor_auths": doctor_auths,
+#         "regular_orders": regular_orders,
+#         "sos_orders": sos_orders,
+#         "stat_orders": stat_orders,
+#         "premed_orders": premed_orders,
+#         "admin_by_order": admin_by_order,
+#         # For Hrs header – 24 hour slots or reduce if you want
+#         "hour_slots": [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22],
+#         "generated_at": datetime.utcnow(),
+#     }
 
-    template = _pdf_env.get_template("ipd/drug_chart.html")
-    html_str = template.render(ctx)
+#     template = _pdf_env.get_template("ipd/drug_chart.html")
+#     html_str = template.render(ctx)
 
-    pdf_bytes = HTML(string=html_str, base_url=str(TEMPLATES_DIR)).write_pdf()
+#     pdf_bytes = HTML(string=html_str, base_url=str(TEMPLATES_DIR)).write_pdf()
 
-    filename = f"drug-chart-admission-{admission_id}.pdf"
-    headers = {
-        "Content-Disposition": f'inline; filename="{filename}"',
-        "Content-Type": "application/pdf",
-    }
-    return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
+#     filename = f"drug-chart-admission-{admission_id}.pdf"
+#     headers = {
+#         "Content-Disposition": f'inline; filename="{filename}"',
+#         "Content-Type": "application/pdf",
+#     }
+#     return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)

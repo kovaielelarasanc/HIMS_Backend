@@ -238,7 +238,7 @@ class IpdAdmission(Base):
     discharge_at = Column(DateTime, nullable=True)
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
-
+    
     # ---- Relationships ----
     current_bed = relationship(
         "IpdBed",
