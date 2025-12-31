@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from typing import List, Optional, Any
 
 from fastapi import APIRouter, Depends
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, joinedload
-
+from datetime import datetime, date
 from app.api.deps import get_db, current_user as auth_current_user
 from app.models.ipd_nursing import (
     IcuFlowSheet,
@@ -718,6 +718,17 @@ def update_restraint(
     return ok(RestraintOut.model_validate(rec))
 
 
+def _jsonable(v: Any):
+    """Convert datetimes inside nested dict/list to ISO strings (JSON-safe)."""
+    if isinstance(v, (datetime, date)):
+        return v.isoformat()
+    if isinstance(v, dict):
+        return {k: _jsonable(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_jsonable(x) for x in v]
+    return v
+
+
 @router.post("/restraints/{restraint_id}/monitor")
 def append_restraint_monitoring(
     restraint_id: int,
@@ -733,8 +744,15 @@ def append_restraint_monitoring(
     if rec.status != "active":
         return err("Restraint is not active", 400)
 
-    log_points = list(rec.monitoring_log or [])
-    log_points.append(payload.point.model_dump())
+    # ✅ sanitize existing log (in case older entries already contain datetime objects)
+    log_points = _jsonable(list(rec.monitoring_log or []))
+
+    # ✅ make new point JSON-safe
+    # If you're on Pydantic v2, this also works: payload.point.model_dump(mode="json")
+    point = _jsonable(payload.point.model_dump(mode="json"))
+    
+
+    log_points.append(point)
     rec.monitoring_log = log_points
 
     rec.updated_at = utcnow()
@@ -747,6 +765,7 @@ def append_restraint_monitoring(
 
     rec = _load_restraint(db, rec.id) or rec
     return ok(RestraintOut.model_validate(rec))
+
 
 
 @router.post("/restraints/{restraint_id}/stop")

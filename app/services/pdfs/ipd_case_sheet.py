@@ -9,93 +9,74 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import joinedload
 
-from reportlab.platypus import (
-    Paragraph,
-    Spacer,
-    KeepTogether,
-    Table,
-    TableStyle,
-    Image,
-)
+from reportlab.platypus import Paragraph, Spacer, Table, TableStyle, Image
 from reportlab.lib import colors
 from reportlab.lib.units import mm
 
+# ✅ Patient model import can vary by project; keep it safe
+try:
+    from app.models.patient import Patient  # common split model
+except Exception:  # pragma: no cover
+    from app.models.ipd import Patient  # fallback if Patient is in ipd.py
+
 from app.models.ui_branding import UiBranding
 from app.models.ipd import (
-    IpdAdmission, IpdBed, IpdRoom,
-    IpdVital, IpdNursingNote, IpdIntakeOutput,
-    IpdTransfer, IpdMedicationOrder, IpdMedicationAdministration,
-    IpdPainAssessment, IpdFallRiskAssessment, IpdPressureUlcerAssessment, IpdNutritionAssessment,
-    IpdDischargeSummary
+    IpdAdmission,
+    IpdBed,
+    IpdRoom,
+    IpdVital,
+    IpdNursingNote,
+    IpdIntakeOutput,
+    IpdTransfer,
+    IpdMedicationOrder,
+    IpdMedicationAdministration,
+    IpdPainAssessment,
+    IpdFallRiskAssessment,
+    IpdPressureUlcerAssessment,
+    IpdNutritionAssessment,
+    IpdDischargeSummary,
 )
+
+# ✅ optional discharge medications table support (won’t crash if model absent)
+try:
+    from app.models.ipd import IpdDischargeMedication
+except Exception:  # pragma: no cover
+    IpdDischargeMedication = None  # type: ignore
+
 from app.models.ipd_referral import IpdReferral
 from app.models.ipd_nursing import (
-    IpdDressingRecord, IpdBloodTransfusion, IpdRestraintRecord, IpdIsolationPrecaution, IcuFlowSheet
+    IpdDressingRecord,
+    IpdBloodTransfusion,
+    IpdRestraintRecord,
+    IpdIsolationPrecaution,
+    IcuFlowSheet,
 )
 from app.models.pdf_template import PdfTemplate
 
 from app.services.pdfs.engine import (
-    build_pdf, PdfBuildContext, get_styles, section_title,
-    kv_table as _kv_table, simple_table as _simple_table, fmt_ist, _safe_str
+    build_pdf,
+    PdfBuildContext,
+    get_styles,
+    section_title,
+    kv_table as _kv_table,
+    simple_table as _simple_table,
+    fmt_ist,
+    _safe_str,
 )
 
 STYLES = get_styles()
 
-def kv_table_fullwidth(rows: List[List[str]], label_w: float = 48 * mm):
-    # clone a wrap-friendly style
-    try:
-        s = STYLES["Small"].clone("SmallWrap")
-        s.wordWrap = "CJK"  # helps break long words/codes
-        s.leading = max(getattr(s, "leading", 10), 10)
-    except Exception:
-        s = STYLES["Small"]
 
-    data = []
-    for k, v in rows:
-        key = Paragraph(f"<b>{_safe_str(k)}</b>", s)
-
-        # ✅ preserve newlines (medications/day-wise notes etc.)
-        vv = _safe_str(v or "—")
-        vv = vv.replace("\r\n", "\n").replace("\r", "\n")
-        vv = vv.replace("\n", "<br/>")
-
-        val = Paragraph(vv, s)
-        data.append([key, val])
-
-    t = Table(data, colWidths=[label_w, None], hAlign="LEFT", splitByRow=1)
-    t.setStyle(TableStyle([
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("BOX", (0, 0), (-1, -1), 0.6, colors.black),
-        ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.lightgrey),
-        ("LEFTPADDING", (0, 0), (-1, -1), 5),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-    ]))
-    return t
-
-def kv_table(*args, **kwargs):
-    t = _kv_table(*args, **kwargs)
-    try:
-        t.hAlign = "LEFT"
-    except Exception:
-        pass
-    return t
-
-def simple_table(*args, **kwargs):
-    t = _simple_table(*args, **kwargs)
-    try:
-        t.hAlign = "LEFT"
-    except Exception:
-        pass
-    return t
-
-
+# -------------------------------
+# Small helpers
+# -------------------------------
 def _sty(name: str, fallback: str = "Normal"):
     return STYLES.get(name) or STYLES.get(fallback) or STYLES.get("Small")
 
 
 def _get(obj: Any, *names: str, default: Any = "") -> Any:
+    if not obj:
+        return default
     for n in names:
         try:
             v = getattr(obj, n, None)
@@ -128,6 +109,84 @@ def _in_range(dt: Optional[datetime], start: Optional[datetime], end: Optional[d
     return True
 
 
+def kv_table(*args, **kwargs):
+    t = _kv_table(*args, **kwargs)
+    try:
+        t.hAlign = "LEFT"
+    except Exception:
+        pass
+    return t
+
+
+def simple_table(*args, **kwargs):
+    t = _simple_table(*args, **kwargs)
+    try:
+        t.hAlign = "LEFT"
+    except Exception:
+        pass
+    return t
+
+
+def kv_table_fullwidth(rows: List[List[str]], label_w: float = 52 * mm):
+    """2-col key/value table that wraps + splits across pages safely."""
+    try:
+        s = STYLES["Small"].clone("SmallWrap")
+        s.wordWrap = "CJK"
+        s.leading = max(getattr(s, "leading", 10), 10)
+    except Exception:
+        s = STYLES["Small"]
+
+    data = []
+    for k, v in rows:
+        key = Paragraph(f"<b>{_safe_str(k)}</b>", s)
+        vv = _safe_str(v or "—").replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br/>")
+        val = Paragraph(vv, s)
+        data.append([key, val])
+
+    t = Table(data, colWidths=[label_w, None], hAlign="LEFT", splitByRow=1)
+    t.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("BOX", (0, 0), (-1, -1), 0.6, colors.black),
+        ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.lightgrey),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    return t
+
+
+def _patient_full_name(p: Any) -> str:
+    if not p:
+        return ""
+    parts = [getattr(p, "prefix", ""), getattr(p, "first_name", ""), getattr(p, "last_name", "")]
+    return " ".join([str(x).strip() for x in parts if x and str(x).strip()]).strip()
+
+
+def _patient_address(p: Any) -> str:
+    """Safe address resolution: Patient.addresses[0] if present, else fallback fields."""
+    if not p:
+        return ""
+    addrs = getattr(p, "addresses", None) or []
+    if addrs:
+        a = addrs[0]
+        parts = [
+            _get(a, "line1", "address_line1", "address1", default=""),
+            _get(a, "line2", "address_line2", "address2", default=""),
+            _get(a, "area", "locality", default=""),
+            _get(a, "city", default=""),
+            _get(a, "state", default=""),
+            _get(a, "pincode", "pin_code", "zip", default=""),
+        ]
+        return ", ".join([x for x in parts if x and str(x).strip()]).strip(", ")
+
+    # fallback if your Patient stores address directly
+    return _safe_str(_get(p, "address", "full_address", "address_line", default=""))
+
+
+# -------------------------------
+# Template resolve
+# -------------------------------
 def get_ipd_case_sheet_default_template() -> Dict[str, Any]:
     return {
         "name": "IPD Case Sheet (NABH)",
@@ -170,6 +229,9 @@ def _resolve_template(db, template_id: Optional[int]) -> Dict[str, Any]:
     return get_ipd_case_sheet_default_template()
 
 
+# -------------------------------
+# Data container
+# -------------------------------
 @dataclass
 class IpdCaseSheetData:
     admission: IpdAdmission
@@ -190,6 +252,7 @@ class IpdCaseSheetData:
     isolations: List[IpdIsolationPrecaution]
     icu_flows: List[IcuFlowSheet]
     discharge: Optional[IpdDischargeSummary]
+    discharge_meds: List[Any]
 
 
 def _load_ipd_case_sheet_data(
@@ -200,69 +263,77 @@ def _load_ipd_case_sheet_data(
     end: Optional[datetime],
     max_rows: int,
 ) -> IpdCaseSheetData:
+    # ✅ DO NOT joinedload(patient_id). It's a column.
+    # ✅ Load admission + bed/ward first
     adm = db.query(IpdAdmission).options(
         joinedload(IpdAdmission.current_bed)
-        .joinedload(IpdBed.room)
-        .joinedload(IpdRoom.ward),
-        # patient relation may exist; safe if it doesn't
+            .joinedload(IpdBed.room)
+            .joinedload(IpdRoom.ward),
     ).filter(IpdAdmission.id == admission_id).first()
     if not adm:
         raise ValueError("Admission not found")
 
-    vitals = []
-    nursing_notes = []
-    io_rows = []
-    transfers = []
-    referrals = []
-    med_orders = []
-    mar_rows = []
-    pain = []
-    fall = []
-    pressure = []
-    nutrition = []
-    dressings = []
-    transfusions = []
-    restraints = []
-    isolations = []
-    icu_flows = []
-    discharge = None
+    # ✅ Load patient separately (works even if you didn't define relationship in model)
+    patient = None
+    try:
+        patient = db.query(Patient).options(
+            joinedload(getattr(Patient, "addresses"))
+        ).filter(Patient.id == adm.patient_id).first()
+    except Exception:
+        patient = db.query(Patient).filter(Patient.id == adm.patient_id).first()
+
+    # attach for PDF usage
+    try:
+        setattr(adm, "patient", patient)
+    except Exception:
+        pass
+
+    vitals: List[IpdVital] = []
+    nursing_notes: List[IpdNursingNote] = []
+    io_rows: List[IpdIntakeOutput] = []
+    transfers: List[IpdTransfer] = []
+    referrals: List[IpdReferral] = []
+    med_orders: List[IpdMedicationOrder] = []
+    mar_rows: List[IpdMedicationAdministration] = []
+    pain: List[IpdPainAssessment] = []
+    fall: List[IpdFallRiskAssessment] = []
+    pressure: List[IpdPressureUlcerAssessment] = []
+    nutrition: List[IpdNutritionAssessment] = []
+    dressings: List[IpdDressingRecord] = []
+    transfusions: List[IpdBloodTransfusion] = []
+    restraints: List[IpdRestraintRecord] = []
+    isolations: List[IpdIsolationPrecaution] = []
+    icu_flows: List[IcuFlowSheet] = []
+    discharge: Optional[IpdDischargeSummary] = None
+    discharge_meds: List[Any] = []
 
     if "vitals" in enabled_section_codes:
-        q = db.query(IpdVital).filter(IpdVital.admission_id == admission_id).order_by(IpdVital.recorded_at.desc())
-        rows = q.limit(max_rows * 3).all()
-        vitals = [r for r in rows if _in_range(r.recorded_at, start, end)][:max_rows]
+        rows = db.query(IpdVital).filter(IpdVital.admission_id == admission_id).order_by(IpdVital.recorded_at.desc()).limit(max_rows * 3).all()
+        vitals = [r for r in rows if _in_range(getattr(r, "recorded_at", None), start, end)][:max_rows]
 
     if "nursing_notes" in enabled_section_codes:
-        q = db.query(IpdNursingNote).filter(IpdNursingNote.admission_id == admission_id).order_by(IpdNursingNote.entry_time.desc())
-        rows = q.limit(max_rows * 3).all()
-        nursing_notes = [r for r in rows if _in_range(r.entry_time, start, end)][:max_rows]
+        rows = db.query(IpdNursingNote).filter(IpdNursingNote.admission_id == admission_id).order_by(IpdNursingNote.entry_time.desc()).limit(max_rows * 3).all()
+        nursing_notes = [r for r in rows if _in_range(getattr(r, "entry_time", None), start, end)][:max_rows]
 
     if "intake_output" in enabled_section_codes:
-        q = db.query(IpdIntakeOutput).filter(IpdIntakeOutput.admission_id == admission_id).order_by(IpdIntakeOutput.recorded_at.desc())
-        rows = q.limit(max_rows * 3).all()
-        io_rows = [r for r in rows if _in_range(r.recorded_at, start, end)][:max_rows]
+        rows = db.query(IpdIntakeOutput).filter(IpdIntakeOutput.admission_id == admission_id).order_by(IpdIntakeOutput.recorded_at.desc()).limit(max_rows * 3).all()
+        io_rows = [r for r in rows if _in_range(getattr(r, "recorded_at", None), start, end)][:max_rows]
 
     if "bed_transfers" in enabled_section_codes:
-        q = db.query(IpdTransfer).filter(IpdTransfer.admission_id == admission_id).order_by(IpdTransfer.requested_at.desc())
-        rows = q.limit(max_rows * 2).all()
-        transfers = [r for r in rows if _in_range(r.requested_at, start, end)][:max_rows]
+        rows = db.query(IpdTransfer).filter(IpdTransfer.admission_id == admission_id).order_by(IpdTransfer.requested_at.desc()).limit(max_rows * 2).all()
+        transfers = [r for r in rows if _in_range(getattr(r, "requested_at", None), start, end)][:max_rows]
 
     if "referrals" in enabled_section_codes:
-        q = db.query(IpdReferral).filter(IpdReferral.admission_id == admission_id).order_by(IpdReferral.requested_at.desc())
-        rows = q.limit(max_rows * 2).all()
-        referrals = [r for r in rows if _in_range(r.requested_at, start, end)][:max_rows]
+        rows = db.query(IpdReferral).filter(IpdReferral.admission_id == admission_id).order_by(IpdReferral.requested_at.desc()).limit(max_rows * 2).all()
+        referrals = [r for r in rows if _in_range(getattr(r, "requested_at", None), start, end)][:max_rows]
 
     if "med_orders" in enabled_section_codes:
-        q = db.query(IpdMedicationOrder).filter(IpdMedicationOrder.admission_id == admission_id).order_by(IpdMedicationOrder.start_datetime.desc())
-        rows = q.limit(max_rows * 3).all()
-        med_orders = [r for r in rows if _in_range(r.start_datetime, start, end)][:max_rows]
+        rows = db.query(IpdMedicationOrder).filter(IpdMedicationOrder.admission_id == admission_id).order_by(IpdMedicationOrder.start_datetime.desc()).limit(max_rows * 3).all()
+        med_orders = [r for r in rows if _in_range(getattr(r, "start_datetime", None), start, end)][:max_rows]
 
     if "mar" in enabled_section_codes:
-        q = db.query(IpdMedicationAdministration).filter(
-            IpdMedicationAdministration.admission_id == admission_id
-        ).order_by(IpdMedicationAdministration.scheduled_datetime.desc())
-        rows = q.limit(max_rows * 4).all()
-        mar_rows = [r for r in rows if _in_range(r.scheduled_datetime, start, end)][:max_rows]
+        rows = db.query(IpdMedicationAdministration).filter(IpdMedicationAdministration.admission_id == admission_id).order_by(IpdMedicationAdministration.scheduled_datetime.desc()).limit(max_rows * 4).all()
+        mar_rows = [r for r in rows if _in_range(getattr(r, "scheduled_datetime", None), start, end)][:max_rows]
 
     if "assessments" in enabled_section_codes:
         pain = db.query(IpdPainAssessment).filter(IpdPainAssessment.admission_id == admission_id).order_by(IpdPainAssessment.recorded_at.desc()).limit(max_rows).all()
@@ -279,6 +350,11 @@ def _load_ipd_case_sheet_data(
 
     if "discharge" in enabled_section_codes:
         discharge = db.query(IpdDischargeSummary).filter(IpdDischargeSummary.admission_id == admission_id).first()
+        # discharge meds (optional)
+        if IpdDischargeMedication is not None:
+            discharge_meds = db.query(IpdDischargeMedication).filter(
+                IpdDischargeMedication.admission_id == admission_id
+            ).order_by(IpdDischargeMedication.id.asc()).all()
 
     return IpdCaseSheetData(
         admission=adm,
@@ -299,13 +375,14 @@ def _load_ipd_case_sheet_data(
         isolations=isolations,
         icu_flows=icu_flows,
         discharge=discharge,
+        discharge_meds=discharge_meds,
     )
 
 
 # -------------------------------
-# Header (Logo + Org details)
+# Header (Logo + Org details + Doc title)
 # -------------------------------
-def _sec_header(db) -> List[Any]:
+def _sec_header(db, doc_title: str = "IPD Case Sheet") -> List[Any]:
     branding = None
     try:
         branding = db.query(UiBranding).filter(
@@ -320,7 +397,6 @@ def _sec_header(db) -> List[Any]:
     phone = _safe_str(_get(branding, "phone", "phone_number", "mobile", "contact_number", default=""))
     website = _safe_str(_get(branding, "website", "web", "url", default=""))
 
-    # logo sources (support common patterns)
     logo_flow = None
     logo_bytes = _get(branding, "logo_bytes", "logo_blob", "logo_data", default=None)
     logo_path = _get(branding, "logo_path", "logo_file_path", "logo_local_path", default=None)
@@ -336,27 +412,30 @@ def _sec_header(db) -> List[Any]:
     if not logo_flow:
         logo_flow = Spacer(22 * mm, 22 * mm)
 
-    right_lines = []
+    left_lines = []
     if org_name:
-        right_lines.append(f"<b>{org_name}</b>")
+        left_lines.append(f"<b>{org_name}</b>")
     if tagline:
-        right_lines.append(f"<font size='9'>{tagline}</font>")
+        left_lines.append(f"<font size='9'>{tagline}</font>")
     if address:
-        right_lines.append(f"<font size='8'>{address}</font>")
+        left_lines.append(f"<font size='8'>{address}</font>")
+
     contact_bits = []
     if phone:
-        contact_bits.append(f"Phone: {phone}")
+        contact_bits.append(phone)
     if website:
-        contact_bits.append(f"Web: {website}")
+        contact_bits.append(website)
     if contact_bits:
-        right_lines.append(f"<font size='8'>{'  |  '.join(contact_bits)}</font>")
+        left_lines.append(f"<font size='8'>{' | '.join(contact_bits)}</font>")
 
-    right_html = "<br/>".join(right_lines) if right_lines else "<b> </b>"
-    right = Paragraph(right_html, _sty("Normal"))
+    left_html = "<br/>".join(left_lines) if left_lines else "<b> </b>"
+    left = Paragraph(left_html, _sty("Normal"))
+
+    right = Paragraph(f"<para align='right'><b>{_safe_str(doc_title)}</b></para>", _sty("Normal"))
 
     hdr = Table(
-        [[logo_flow, right]],
-        colWidths=[26 * mm, None],
+        [[logo_flow, left, right]],
+        colWidths=[26 * mm, None, 40 * mm],
         hAlign="LEFT",
     )
     hdr.setStyle(TableStyle([
@@ -377,6 +456,9 @@ def _sec_header(db) -> List[Any]:
     return [hdr, sep, Spacer(1, 2)]
 
 
+# -------------------------------
+# Build PDF
+# -------------------------------
 def build_ipd_case_sheet_pdf(
     *,
     db,
@@ -393,9 +475,7 @@ def build_ipd_case_sheet_pdf(
     max_rows = int(settings.get("max_rows_per_section") or 30)
     show_empty = bool(settings.get("show_empty_sections") or False)
 
-    data = _load_ipd_case_sheet_data(
-        db, admission_id, enabled_codes, period_from, period_to, max_rows
-    )
+    data = _load_ipd_case_sheet_data(db, admission_id, enabled_codes, period_from, period_to, max_rows)
 
     adm = data.admission
     subtitle = ""
@@ -403,15 +483,13 @@ def build_ipd_case_sheet_pdf(
         subtitle = f"Report Period: {_safe_str(period_from.date() if period_from else '')} to {_safe_str(period_to.date() if period_to else '')}"
 
     story: List[Any] = []
-    # ✅ NEW: Header block (logo + org info)
-    # story.extend(_sec_header(db))
-    # story.append(Spacer(1, 4))
+    story.extend(_sec_header(db, doc_title="IPD Case Sheet"))
+    story.append(Spacer(1, 4))
 
     for s in sections:
         code = s.get("code")
         required = bool(s.get("required"))
         enabled = bool(s.get("enabled"))
-
         if not (enabled or required):
             continue
 
@@ -446,11 +524,12 @@ def build_ipd_case_sheet_pdf(
 
         story.append(Spacer(1, 6))
 
+    # ✅ Important: keep ctx.title blank to avoid duplicate engine header blocks (if engine prints title)
     pdf = build_pdf(
         db=db,
         ctx=PdfBuildContext(
-            title="IPD Case Sheet",
-            subtitle=subtitle,
+            title="",
+            subtitle=subtitle or "",
             meta={"admission_id": admission_id},
         ),
         story=story,
@@ -464,7 +543,6 @@ def build_ipd_case_sheet_pdf(
 # Layout helpers
 # -------------------------------
 def _kv_box(rows: List[List[str]]) -> Table:
-    # rows: [[label, value], ...]
     data = []
     for k, v in rows:
         data.append([
@@ -489,31 +567,31 @@ def _kv_box(rows: List[List[str]]) -> Table:
 # -------------------------------
 def _sec_patient_admission(d: IpdCaseSheetData) -> List[Any]:
     """
-    ✅ Required layout:
+    ✅ Layout:
     - 2 rows × 2 columns
-    - 5 fields in each column (total 20 fields)
+    - 5 fields in each column
     """
     adm = d.admission
     bed = getattr(adm, "current_bed", None)
     room = getattr(bed, "room", None) if bed else None
     ward = getattr(room, "ward", None) if room else None
 
-    # patient relation (safe)
     patient = getattr(adm, "patient", None)
-    patient_name = _safe_str(_get(patient, "name", "full_name", default=""))
-    patient_code = _safe_str(_get(patient, "display_code", "uhid", "patient_code", default=""))
-    gender = _safe_str(_get(patient, "gender", "sex", default=""))
-    dob = _get(patient, "dob", "date_of_birth", default=None)
-    age = _calc_age_years(dob)
-    phone = _safe_str(_get(patient, "phone", "mobile", "contact", default=""))
-    address = _safe_str(_get(patient, "address", "full_address", "address_line", default=""))
 
-    # useful admission fields (safe)
+    patient_name = _safe_str(_patient_full_name(patient))
+    patient_code = _safe_str(_get(patient, "uhid", default=""))
+    abha = _safe_str(_get(patient, "abha_number", default=""))
+    gender = _safe_str(_get(patient, "gender", default=""))
+    dob = _get(patient, "dob", default=None)
+    age = _calc_age_years(dob)
+    phone = _safe_str(_get(patient, "phone", default=""))
+    address = _safe_str(_patient_address(patient))
+
     primary_doc = _safe_str(_get(adm, "practitioner_user_id", "primary_doctor_user_id", default=""))
     primary_nurse = _safe_str(_get(adm, "primary_nurse_user_id", "nurse_user_id", default=""))
 
     top_left = _kv_box([
-        ["UHID / Patient ID", patient_code],
+        ["UHID", patient_code],
         ["Patient Name", patient_name],
         ["Age / Gender", f"{age} / {gender}".strip(" /")],
         ["Mobile", phone],
@@ -540,15 +618,11 @@ def _sec_patient_admission(d: IpdCaseSheetData) -> List[Any]:
         ["Payor Type", _safe_str(getattr(adm, "payor_type", ""))],
         ["Insurer", _safe_str(getattr(adm, "insurer_name", ""))],
         ["Policy No", _safe_str(getattr(adm, "policy_number", ""))],
-        ["TPA / Corporate", _safe_str(_get(adm, "tpa_name", "corporate_name", default=""))],
+        ["ABHA No", abha],
         ["Remarks", _safe_str(_get(adm, "remarks", "notes", default=""))],
     ])
 
-    grid = Table(
-        [[top_left, top_right], [bottom_left, bottom_right]],
-        colWidths=[None, None],
-        hAlign="LEFT",
-    )
+    grid = Table([[top_left, top_right], [bottom_left, bottom_right]], colWidths=[None, None], hAlign="LEFT")
     grid.setStyle(TableStyle([
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("BOX", (0, 0), (-1, -1), 0.8, colors.black),
@@ -559,18 +633,10 @@ def _sec_patient_admission(d: IpdCaseSheetData) -> List[Any]:
         ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
     ]))
 
-    story = [section_title("Patient & Admission Snapshot")]
-    story.append(grid)
-    return story
+    return [section_title("Patient & Admission Snapshot"), grid]
 
 
 def _sec_diagnosis_plan(d: IpdCaseSheetData) -> List[Any]:
-    """
-    ✅ Required layout:
-    - 2 rows
-      Row-1: 2 columns
-      Row-2: 1 full-width column
-    """
     adm = d.admission
     story = [section_title("Diagnosis, History & Care Plan")]
 
@@ -587,11 +653,7 @@ def _sec_diagnosis_plan(d: IpdCaseSheetData) -> List[Any]:
         _sty("Small", "Small"),
     )
 
-    t = Table(
-        [[diag, hist], [plan, ""]],
-        colWidths=[None, None],
-        hAlign="LEFT",
-    )
+    t = Table([[diag, hist], [plan, ""]], colWidths=[None, None], hAlign="LEFT")
     t.setStyle(TableStyle([
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("SPAN", (0, 1), (-1, 1)),
@@ -617,11 +679,11 @@ def _sec_bed_transfers(d: IpdCaseSheetData, show_empty: bool) -> List[Any]:
     data = [["Requested At", "From Bed", "To Bed", "Status", "Reason"]]
     for x in d.transfers:
         data.append([
-            fmt_ist(x.requested_at),
-            _safe_str(getattr(x.from_bed, "code", "")),
-            _safe_str(getattr(x.to_bed, "code", "")),
-            _safe_str(x.status),
-            _safe_str(x.reason),
+            fmt_ist(getattr(x, "requested_at", None)),
+            _safe_str(getattr(getattr(x, "from_bed", None), "code", "")),
+            _safe_str(getattr(getattr(x, "to_bed", None), "code", "")),
+            _safe_str(getattr(x, "status", "")),
+            _safe_str(getattr(x, "reason", "")),
         ])
     story.append(simple_table(data, col_widths=[mm * 35, mm * 25, mm * 25, mm * 25, None]))
     return story
@@ -637,15 +699,15 @@ def _sec_vitals(d: IpdCaseSheetData, show_empty: bool) -> List[Any]:
     data = [["Recorded At", "BP", "Pulse", "RR", "SpO2", "Temp (C)"]]
     for v in d.vitals:
         bp = ""
-        if v.bp_systolic is not None or v.bp_diastolic is not None:
-            bp = f"{_safe_str(v.bp_systolic)}/{_safe_str(v.bp_diastolic)}"
+        if getattr(v, "bp_systolic", None) is not None or getattr(v, "bp_diastolic", None) is not None:
+            bp = f"{_safe_str(getattr(v, 'bp_systolic', ''))}/{_safe_str(getattr(v, 'bp_diastolic', ''))}"
         data.append([
-            fmt_ist(v.recorded_at),
+            fmt_ist(getattr(v, "recorded_at", None)),
             bp,
-            _safe_str(v.pulse),
-            _safe_str(v.rr),
-            _safe_str(v.spo2),
-            _safe_str(v.temp_c),
+            _safe_str(getattr(v, "pulse", "")),
+            _safe_str(getattr(v, "rr", "")),
+            _safe_str(getattr(v, "spo2", "")),
+            _safe_str(getattr(v, "temp_c", "")),
         ])
     story.append(simple_table(data, col_widths=[mm * 38, mm * 24, mm * 18, mm * 16, mm * 18, mm * 20]))
     return story
@@ -661,14 +723,14 @@ def _sec_nursing_notes(d: IpdCaseSheetData, show_empty: bool) -> List[Any]:
     data = [["Entry Time", "Shift", "Condition", "Interventions / Response"]]
     for n in d.nursing_notes:
         summary = " | ".join([x for x in [
-            _safe_str(n.nursing_interventions),
-            _safe_str(n.response_progress),
-            _safe_str(n.significant_events),
+            _safe_str(getattr(n, "nursing_interventions", "")),
+            _safe_str(getattr(n, "response_progress", "")),
+            _safe_str(getattr(n, "significant_events", "")),
         ] if x])
         data.append([
-            fmt_ist(n.entry_time),
-            _safe_str(n.shift),
-            (_safe_str(n.patient_condition)[:120] or "—"),
+            fmt_ist(getattr(n, "entry_time", None)),
+            _safe_str(getattr(n, "shift", "")),
+            (_safe_str(getattr(n, "patient_condition", ""))[:120] or "—"),
             (summary[:180] or "—"),
         ])
     story.append(simple_table(data, col_widths=[mm * 35, mm * 20, mm * 55, None]))
@@ -684,15 +746,15 @@ def _sec_intake_output(d: IpdCaseSheetData, show_empty: bool) -> List[Any]:
 
     data = [["Recorded At", "Oral", "IV", "Blood", "Urine", "Drains", "Remarks"]]
     for x in d.io_rows:
-        urine = (x.urine_foley_ml or 0) + (x.urine_voided_ml or 0)
+        urine = (getattr(x, "urine_foley_ml", 0) or 0) + (getattr(x, "urine_voided_ml", 0) or 0)
         data.append([
-            fmt_ist(x.recorded_at),
-            _safe_str(x.intake_oral_ml),
-            _safe_str(x.intake_iv_ml),
-            _safe_str(x.intake_blood_ml),
+            fmt_ist(getattr(x, "recorded_at", None)),
+            _safe_str(getattr(x, "intake_oral_ml", "")),
+            _safe_str(getattr(x, "intake_iv_ml", "")),
+            _safe_str(getattr(x, "intake_blood_ml", "")),
             _safe_str(urine),
-            _safe_str(x.drains_ml),
-            _safe_str(x.remarks)[:90],
+            _safe_str(getattr(x, "drains_ml", "")),
+            _safe_str(getattr(x, "remarks", ""))[:90],
         ])
     story.append(simple_table(data, col_widths=[mm * 35, mm * 18, mm * 18, mm * 18, mm * 18, mm * 18, None]))
     return story
@@ -716,25 +778,25 @@ def _sec_assessments(d: IpdCaseSheetData, show_empty: bool) -> List[Any]:
     if d.pain:
         rows = [["Recorded At", "Score", "Intervention / Notes"]]
         for x in d.pain[:10]:
-            rows.append([fmt_ist(x.recorded_at), _safe_str(x.score), _safe_str(x.intervention)[:120]])
+            rows.append([fmt_ist(getattr(x, "recorded_at", None)), _safe_str(getattr(x, "score", "")), _safe_str(getattr(x, "intervention", ""))[:120]])
         add_block("Pain Assessment", rows)
 
     if d.fall:
         rows = [["Recorded At", "Risk Level", "Precautions"]]
         for x in d.fall[:10]:
-            rows.append([fmt_ist(x.recorded_at), _safe_str(x.risk_level), _safe_str(x.precautions)[:120]])
+            rows.append([fmt_ist(getattr(x, "recorded_at", None)), _safe_str(getattr(x, "risk_level", "")), _safe_str(getattr(x, "precautions", ""))[:120]])
         add_block("Fall Risk", rows)
 
     if d.pressure:
         rows = [["Recorded At", "Risk Level", "Plan"]]
         for x in d.pressure[:10]:
-            rows.append([fmt_ist(x.recorded_at), _safe_str(x.risk_level), _safe_str(x.management_plan)[:120]])
+            rows.append([fmt_ist(getattr(x, "recorded_at", None)), _safe_str(getattr(x, "risk_level", "")), _safe_str(getattr(x, "management_plan", ""))[:120]])
         add_block("Pressure Ulcer Risk", rows)
 
     if d.nutrition:
         rows = [["Recorded At", "Risk Level", "Dietician Referral"]]
         for x in d.nutrition[:10]:
-            rows.append([fmt_ist(x.recorded_at), _safe_str(x.risk_level), "Yes" if x.dietician_referral else "No"])
+            rows.append([fmt_ist(getattr(x, "recorded_at", None)), _safe_str(getattr(x, "risk_level", "")), "Yes" if getattr(x, "dietician_referral", False) else "No"])
         add_block("Nutrition", rows)
 
     return story
@@ -750,15 +812,15 @@ def _sec_med_orders(d: IpdCaseSheetData, show_empty: bool) -> List[Any]:
     data = [["Start", "Drug", "Dose", "Route", "Freq", "Status"]]
     for x in d.med_orders:
         dose = ""
-        if x.dose is not None:
-            dose = f"{_safe_str(x.dose)} {_safe_str(x.dose_unit)}".strip()
+        if getattr(x, "dose", None) is not None:
+            dose = f"{_safe_str(getattr(x, 'dose', ''))} {_safe_str(getattr(x, 'dose_unit', ''))}".strip()
         data.append([
-            fmt_ist(x.start_datetime),
-            _safe_str(x.drug_name)[:45],
+            fmt_ist(getattr(x, "start_datetime", None)),
+            _safe_str(getattr(x, "drug_name", ""))[:45],
             dose,
-            _safe_str(x.route),
-            _safe_str(x.frequency),
-            _safe_str(x.order_status),
+            _safe_str(getattr(x, "route", "")),
+            _safe_str(getattr(x, "frequency", "")),
+            _safe_str(getattr(x, "order_status", "")),
         ])
     story.append(simple_table(data, col_widths=[mm * 35, None, mm * 25, mm * 22, mm * 22, mm * 20]))
     return story
@@ -774,10 +836,10 @@ def _sec_mar(d: IpdCaseSheetData, show_empty: bool) -> List[Any]:
     data = [["Scheduled", "Status", "Given At", "Remarks"]]
     for x in d.mar_rows:
         data.append([
-            fmt_ist(x.scheduled_datetime),
-            _safe_str(x.given_status),
-            fmt_ist(x.given_datetime),
-            _safe_str(x.remarks)[:90],
+            fmt_ist(getattr(x, "scheduled_datetime", None)),
+            _safe_str(getattr(x, "given_status", "")),
+            fmt_ist(getattr(x, "given_datetime", None)),
+            _safe_str(getattr(x, "remarks", ""))[:90],
         ])
     story.append(simple_table(data, col_widths=[mm * 40, mm * 25, mm * 35, None]))
     return story
@@ -792,14 +854,20 @@ def _sec_referrals(d: IpdCaseSheetData, show_empty: bool) -> List[Any]:
 
     data = [["Requested At", "Type", "Category", "Priority", "To", "Status"]]
     for r in d.referrals:
-        to_txt = r.to_department or r.to_service or _safe_str(getattr(r.to_user, "name", "")) or r.external_org
+        to_txt = (
+            getattr(r, "to_department", None)
+            or getattr(r, "to_service", None)
+            or _safe_str(getattr(getattr(r, "to_user", None), "name", ""))
+            or getattr(r, "external_org", None)
+            or ""
+        )
         data.append([
-            fmt_ist(r.requested_at),
-            _safe_str(r.ref_type),
-            _safe_str(r.category),
-            _safe_str(r.priority),
+            fmt_ist(getattr(r, "requested_at", None)),
+            _safe_str(getattr(r, "ref_type", "")),
+            _safe_str(getattr(r, "category", "")),
+            _safe_str(getattr(r, "priority", "")),
             _safe_str(to_txt)[:35],
-            _safe_str(r.status),
+            _safe_str(getattr(r, "status", "")),
         ])
     story.append(simple_table(data, col_widths=[mm * 35, mm * 18, mm * 25, mm * 20, None, mm * 22]))
     return story
@@ -816,7 +884,13 @@ def _sec_procedures(d: IpdCaseSheetData, show_empty: bool) -> List[Any]:
     if d.dressings:
         data = [["Performed At", "Wound Site", "Type", "Pain Score", "Next Due"]]
         for x in d.dressings[:10]:
-            data.append([fmt_ist(x.performed_at), _safe_str(x.wound_site), _safe_str(x.dressing_type), _safe_str(x.pain_score), fmt_ist(x.next_dressing_due)])
+            data.append([
+                fmt_ist(getattr(x, "performed_at", None)),
+                _safe_str(getattr(x, "wound_site", "")),
+                _safe_str(getattr(x, "dressing_type", "")),
+                _safe_str(getattr(x, "pain_score", "")),
+                fmt_ist(getattr(x, "next_dressing_due", None)),
+            ])
         story.append(Paragraph("<b>Dressing</b>", STYLES["Small"]))
         story.append(simple_table(data, col_widths=[mm * 35, None, mm * 30, mm * 20, mm * 30]))
         story.append(Spacer(1, 4))
@@ -824,7 +898,13 @@ def _sec_procedures(d: IpdCaseSheetData, show_empty: bool) -> List[Any]:
     if d.transfusions:
         data = [["Created At", "Status", "Indication", "Consent", "Notes"]]
         for x in d.transfusions[:10]:
-            data.append([fmt_ist(x.created_at), _safe_str(x.status), _safe_str(x.indication)[:30], "Yes" if x.consent_taken else "No", _safe_str(x.edit_reason)[:40]])
+            data.append([
+                fmt_ist(getattr(x, "created_at", None)),
+                _safe_str(getattr(x, "status", "")),
+                _safe_str(getattr(x, "indication", ""))[:30],
+                "Yes" if getattr(x, "consent_taken", False) else "No",
+                _safe_str(getattr(x, "edit_reason", ""))[:40],
+            ])
         story.append(Paragraph("<b>Blood Transfusion</b>", STYLES["Small"]))
         story.append(simple_table(data, col_widths=[mm * 35, mm * 25, None, mm * 18, mm * 40]))
         story.append(Spacer(1, 4))
@@ -832,7 +912,13 @@ def _sec_procedures(d: IpdCaseSheetData, show_empty: bool) -> List[Any]:
     if d.restraints:
         data = [["Started At", "Status", "Type", "Device/Site", "Reason"]]
         for x in d.restraints[:10]:
-            data.append([fmt_ist(x.started_at), _safe_str(x.status), _safe_str(x.restraint_type), f"{_safe_str(x.device)}/{_safe_str(x.site)}", _safe_str(x.reason)[:50]])
+            data.append([
+                fmt_ist(getattr(x, "started_at", None)),
+                _safe_str(getattr(x, "status", "")),
+                _safe_str(getattr(x, "restraint_type", "")),
+                f"{_safe_str(getattr(x, 'device', ''))}/{_safe_str(getattr(x, 'site', ''))}",
+                _safe_str(getattr(x, "reason", ""))[:50],
+            ])
         story.append(Paragraph("<b>Restraints</b>", STYLES["Small"]))
         story.append(simple_table(data, col_widths=[mm * 35, mm * 22, mm * 22, mm * 35, None]))
         story.append(Spacer(1, 4))
@@ -840,7 +926,13 @@ def _sec_procedures(d: IpdCaseSheetData, show_empty: bool) -> List[Any]:
     if d.isolations:
         data = [["Started At", "Status", "Type", "Indication", "Review Due"]]
         for x in d.isolations[:10]:
-            data.append([fmt_ist(x.started_at), _safe_str(x.status), _safe_str(x.precaution_type), _safe_str(x.indication)[:40], fmt_ist(x.review_due_at)])
+            data.append([
+                fmt_ist(getattr(x, "started_at", None)),
+                _safe_str(getattr(x, "status", "")),
+                _safe_str(getattr(x, "precaution_type", "")),
+                _safe_str(getattr(x, "indication", ""))[:40],
+                fmt_ist(getattr(x, "review_due_at", None)),
+            ])
         story.append(Paragraph("<b>Isolation Precautions</b>", STYLES["Small"]))
         story.append(simple_table(data, col_widths=[mm * 35, mm * 22, mm * 30, None, mm * 30]))
         story.append(Spacer(1, 4))
@@ -848,11 +940,61 @@ def _sec_procedures(d: IpdCaseSheetData, show_empty: bool) -> List[Any]:
     if d.icu_flows:
         data = [["Recorded At", "Shift", "GCS", "Urine (ml)", "Notes"]]
         for x in d.icu_flows[:10]:
-            data.append([fmt_ist(x.recorded_at), _safe_str(x.shift), _safe_str(x.gcs_score), _safe_str(x.urine_output_ml), _safe_str(x.notes)[:50]])
+            data.append([
+                fmt_ist(getattr(x, "recorded_at", None)),
+                _safe_str(getattr(x, "shift", "")),
+                _safe_str(getattr(x, "gcs_score", "")),
+                _safe_str(getattr(x, "urine_output_ml", "")),
+                _safe_str(getattr(x, "notes", ""))[:50],
+            ])
         story.append(Paragraph("<b>ICU Flow Sheet</b>", STYLES["Small"]))
         story.append(simple_table(data, col_widths=[mm * 35, mm * 20, mm * 15, mm * 25, None]))
 
     return story
+
+
+def _discharge_meds_table(meds: List[Any]) -> Optional[Table]:
+    if not meds:
+        return None
+    try:
+        s = STYLES["Small"].clone("MedWrap")
+        s.wordWrap = "CJK"
+    except Exception:
+        s = STYLES["Small"]
+
+    header = ["Drug", "Dose", "Route", "Frequency", "Days", "Advice"]
+    data = [[Paragraph(f"<b>{h}</b>", s) for h in header]]
+
+    for m in meds:
+        dose = f"{_safe_str(getattr(m, 'dose', ''))} {_safe_str(getattr(m, 'dose_unit', ''))}".strip()
+        advice = _safe_str(getattr(m, "advice_text", "")).replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br/>")
+
+        data.append([
+            Paragraph(_safe_str(getattr(m, "drug_name", "")) or "—", s),
+            Paragraph(dose or "—", s),
+            Paragraph(_safe_str(getattr(m, "route", "")) or "—", s),
+            Paragraph(_safe_str(getattr(m, "frequency", "")) or "—", s),
+            Paragraph(_safe_str(getattr(m, "duration_days", "")) or "—", s),
+            Paragraph(advice or "—", s),
+        ])
+
+    t = Table(
+        data,
+        colWidths=[None, 26 * mm, 18 * mm, 24 * mm, 14 * mm, None],
+        repeatRows=1,
+        splitByRow=1,
+        hAlign="LEFT",
+    )
+    t.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("BOX", (0, 0), (-1, -1), 0.6, colors.black),
+        ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.lightgrey),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]))
+    return t
 
 
 def _sec_discharge_and_counseling(d: IpdCaseSheetData, show_empty: bool) -> List[Any]:
@@ -870,7 +1012,6 @@ def _sec_discharge_and_counseling(d: IpdCaseSheetData, show_empty: bool) -> List
         if always or v.strip() or show_empty:
             rows.append([label, v or "—"])
 
-    # MUST-HAVE / core
     add("Final Dx (Primary)", ds.final_diagnosis_primary, always=True)
     add("Final Dx (Secondary)", ds.final_diagnosis_secondary)
     add("ICD-10 Codes", ds.icd10_codes)
@@ -879,13 +1020,10 @@ def _sec_discharge_and_counseling(d: IpdCaseSheetData, show_empty: bool) -> List
     add("Discharge Type", ds.discharge_type)
     add("Allergies", ds.allergies)
 
-    # Clinical narrative
     add("Demographics", ds.demographics)
     add("Medical History", ds.medical_history)
     add("Treatment Summary", ds.treatment_summary)
-    add("Medications", ds.medications)
 
-    # Recommended / counseling
     add("Procedures", ds.procedures)
     add("Investigations", ds.investigations)
     add("Diet Instructions", ds.diet_instructions)
@@ -894,17 +1032,14 @@ def _sec_discharge_and_counseling(d: IpdCaseSheetData, show_empty: bool) -> List
     add("Referral Details", ds.referral_details)
     add("Patient Education", ds.patient_education)
 
-    # Operational / billing
     add("Insurance Details", ds.insurance_details)
     add("Stay Summary", ds.stay_summary)
     add("Follow-up", ds.follow_up)
     add("Follow-up Appointment Ref", ds.followup_appointment_ref)
 
-    # Safety & quality
     add("Implants", ds.implants)
     add("Pending Reports", ds.pending_reports)
 
-    # Doctor/system validation
     add("Discharge Date & Time", fmt_ist(ds.discharge_datetime))
     add("Prepared By", ds.prepared_by_name)
     reviewed = (ds.reviewed_by_name or "").strip()
@@ -914,6 +1049,14 @@ def _sec_discharge_and_counseling(d: IpdCaseSheetData, show_empty: bool) -> List
     add("Finalized At", fmt_ist(ds.finalized_at))
 
     story.append(kv_table_fullwidth(rows, label_w=52 * mm))
+
+    # ✅ Discharge medications table (20+ rows will auto expand & split)
+    meds_tbl = _discharge_meds_table(d.discharge_meds or [])
+    if meds_tbl is not None:
+        story.append(Spacer(1, 4))
+        story.append(Paragraph("<b>Discharge Medications</b>", STYLES["Small"]))
+        story.append(meds_tbl)
+
     return story
 
 
@@ -921,16 +1064,20 @@ def _sec_signatures(d: IpdCaseSheetData) -> List[Any]:
     story = [section_title("Signatures & Acknowledgement")]
     ds = d.discharge
 
-    prepared_by = _safe_str(ds.prepared_by_name) if ds else ""
-    reviewed_by = _safe_str(ds.reviewed_by_name) if ds else ""
-    regno = _safe_str(ds.reviewed_by_regno) if ds else ""
-    ack = _safe_str(ds.patient_ack_name) if ds else ""
+    prepared_by = _safe_str(getattr(ds, "prepared_by_name", "")) if ds else ""
+    reviewed_by = _safe_str(getattr(ds, "reviewed_by_name", "")) if ds else ""
+    regno = _safe_str(getattr(ds, "reviewed_by_regno", "")) if ds else ""
+    ack = _safe_str(getattr(ds, "patient_ack_name", "")) if ds else ""
+    ack_dt = fmt_ist(getattr(ds, "patient_ack_datetime", None)) if ds else ""
 
-    data = [
+    rows = [
         ["Prepared By", prepared_by or "_________________________"],
-        ["Reviewed By (Doctor)", (reviewed_by or "_________________________") + (f"  Reg No: {regno}" if regno else "")],
-        ["Patient / Attendant Acknowledgement", ack or "_________________________"],
-        ["Date & Time", fmt_ist(ds.patient_ack_datetime) if ds else ""],
+        ["Reviewed By (Doctor)", (reviewed_by or "_________________________") + (f"\nReg No: {regno}" if regno else "")],
+        ["Patient / Attendant\nAcknowledgement", ack or "_________________________"],
+        ["Date & Time", ack_dt or "_________________________"],
     ]
-    story.append(kv_table(data))
+
+    # ✅ Increase label column width to avoid overflow
+    # Try 72mm. If still tight, increase to 78mm/80mm.
+    story.append(kv_table_fullwidth(rows, label_w=72 * mm))
     return story

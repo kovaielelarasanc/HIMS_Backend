@@ -61,100 +61,103 @@ def seed_permissions(db: Session) -> None:
         # -------------------------------------------------------------------
         # IPD – Core
         # -------------------------------------------------------------------
-        ("ipd", ["view", "manage", "doctor","nursing"]),
+        ("ipd", ["view", "manage", "doctor", "nursing"]),
 
         # -------------------------------------------------------------------
-        # IPD Masters (Ward / Room / Bed / Bed-rates)
-        # Used in: routes_ipd_master.py  → ipd.masters.manage, ipd.view
+        # IPD Masters
         # -------------------------------------------------------------------
         ("ipd.masters", ["manage"]),
-
-        # Specific helpers for UI (optional but nice)
         ("ipd.beds", ["view", "manage", "reserve", "release"]),
         ("ipd.bedrates", ["view", "manage"]),
         ("ipd.packages", ["view", "manage"]),
-        ("ipd.nursing", ["create","view","update"]),
+
+        # ✅ FIX: Your routes use ipd.nursing.manage, so add "manage" here
+        ("ipd.nursing", ["view", "create", "update", "manage"]),
+
+        # -------------------------------------------------------------------
+        # ✅ NEW: IPD Newborn (Resuscitation / Examination / Vaccination / PDF)
+        # Matches your router checks: ipd.newborn.view/create/update/verify/finalize/void/print/manage
+        # -------------------------------------------------------------------
+        ("ipd.newborn",["view", "create", "update", "verify", "finalize", "void", "print", "manage"]),
+
         # -------------------------------------------------------------------
         # IPD Admissions / Tracking
-        # (these are mostly for frontend gating + future-proofing)
         # -------------------------------------------------------------------
-        ("ipd.admissions",
-         ["view", "create", "update", "cancel", "transfer", "discharge"]),
+        ("ipd.admissions", ["view", "create", "update", "cancel", "transfer", "discharge"]),
         ("ipd.tracking", ["view"]),
         ("ipd.my", ["view"]),
         ("ipd.discharged", ["view"]),
         ("ipd.bedboard", ["view"]),
 
         # -------------------------------------------------------------------
-        # IPD Clinical – Nursing, Vitals, Intake/Output, Assessments
-        # (these codes are mainly for FE; backend mostly uses ipd.view/ipd.nursing)
+        # IPD Clinical – Vitals / Nursing Notes / IO / Assessments
         # -------------------------------------------------------------------
         ("ipd.vitals", ["view", "create", "update"]),
-        (
-            "ipd.nursing_notes",
-            [
-                "view",
-                "create",
-                "update",
-            ],
-        ),
-        (
-            "ipd.io",  # Intake / Output chart
-            [
-                "view",
-                "create",
-                "update",
-            ],
-        ),
-        (
-            "ipd.assessments",
-            [
-                "view",
-                "create",
-                "update",
-            ],
-        ),
+        ("ipd.nursing_notes", ["view", "create", "update"]),
+        ("ipd.io", ["view", "create", "update"]),
+        ("ipd.assessments", ["view", "create", "update"]),
 
         # -------------------------------------------------------------------
         # IPD Medications / Drug Chart
-        # Backend uses: ipd.view, ipd.doctor, ipd.nursing, ipd.manage
-        # (routes_ipd_medications.py)
         # -------------------------------------------------------------------
         (
             "ipd.meds",
-            [
-                "view",  # list med orders, drug chart, IV fluids, etc.
-                "order",  # create medication order
-                "update",  # update medication order
-                "regenerate",  # regenerate admin grid
-                "mark",  # mark given/missed/refused/held in drug chart
-                "meta",  # edit drug chart meta header (allergies, diagnosis, diet)
-                "iv",  # create/update IV fluid rows
-                "nurse_rows",  # manage nurse signature rows
-                "doctor_auth",  # manage doctor daily authorisation rows
-                "pdf",  # download drug chart PDF
-            ],
+            ["view", "order", "update", "regenerate", "mark", "meta", "iv", "nurse_rows", "doctor_auth", "pdf"],
         ),
 
         # -------------------------------------------------------------------
-        # IPD Discharge (Summary, Checklist, Medications, Special Status, ABHA)
-        # Backend uses: ipd.view, ipd.doctor, ipd.nursing, ipd.manage
-        # (routes_ipd_discharge.py)
+        # IPD Discharge
         # -------------------------------------------------------------------
         (
             "ipd.discharges",
+            ["view", "summary", "checklist", "medications", "queue", "mark_status", "push_abha", "pdf"],
+        ),
+        # -------------------------------------------------------------------
+        # IPD Referrals (Doctor-to-Doctor / Dept referrals)
+        # -------------------------------------------------------------------
+        (
+            "ipd.referrals",
             [
-                "view",  # view discharge tabs / data
-                "summary",  # create/update discharge summary
-                "checklist",  # create/update discharge checklist
-                "medications",  # manage discharge medications
-                "queue",  # view "due discharges" queue
-                "mark_status",  # mark LAMA / DAMA / disappeared
-                "push_abha",  # push discharge to ABHA (stubbed now)
-                "pdf",  # download discharge summary PDF
+                "view",     # ipd.referrals.view
+                "create",   # ipd.referrals.create
+                "accept",   # ipd.referrals.accept
+                "decline",  # ipd.referrals.decline
+                "respond",  # ipd.referrals.respond
+                "close",    # ipd.referrals.close
+                "cancel",   # ipd.referrals.cancel
+                "edit",     # ipd.referrals.edit (optional)
+                "manage",   # admin wildcard for this module
             ],
         ),
 
+        # Optional: if you want audit as a separate restricted permission
+        ("ipd.referrals.audit", ["view"]),  # ipd.referrals.audit.view
+
+        # -------------------------------------------------------------------
+        # IPD Bed / Ward Transfers
+        # -------------------------------------------------------------------
+        (
+            "ipd.transfers",
+            [
+                "view",      # ipd.transfers.view
+                "create",    # ipd.transfers.create
+                "approve",   # ipd.transfers.approve
+                "complete",  # ipd.transfers.complete
+                "cancel",    # ipd.transfers.cancel
+                "manage",    # optional admin wildcard for this module
+            ],
+        )
+
+        # -------------------------------------------------------------------
+        # IPD Clinical Permissions (module -> actions)
+        # -------------------------------------------------------------------
+
+        ("ipd.dressing",   ["create", "view", "update"]),
+        ("ipd.icu",        ["create", "view", "update"]),
+        ("ipd.isolation",  ["create", "view", "update", "stop"]),
+        ("ipd.restraints", ["create", "view", "update", "monitor", "stop"]),
+        ("ipd.transfusion",["create", "view", "update"]),
+        
         # -------- Pharmacy Inventory ----------
         ("pharmacy.inventory.locations", ["view", "manage"]),
         ("pharmacy.inventory.suppliers", ["view", "manage"]),
