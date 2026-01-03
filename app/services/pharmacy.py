@@ -3,11 +3,13 @@ from __future__ import annotations
 
 from datetime import datetime, date as dt_date
 from decimal import Decimal, ROUND_HALF_UP
-from typing import List, Tuple, Any, Optional
+from typing import List, Any, Optional
 
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import func, case, or_
+
+from app.services.drug_schedules import get_schedule_meta
 
 from app.models.user import User
 
@@ -118,6 +120,27 @@ def _generate_sale_number(db: Session, context_type: str) -> str:
 
 
 # ============================================================
+# InventoryItem snapshot helpers (IMPORTANT FIX)
+# Your InventoryItem has dosage_form (NOT form)
+# ============================================================
+
+def _item_form(item: InventoryItem) -> str:
+    return (getattr(item, "dosage_form", "") or "").strip()
+
+
+def _item_strength(item: InventoryItem) -> str:
+    return (getattr(item, "strength", "") or "").strip()
+
+
+def _item_type(item: InventoryItem) -> str:
+    # InventoryItem.item_type = DRUG | CONSUMABLE | EQUIPMENT
+    t = (getattr(item, "item_type", "") or "").strip().upper()
+    if t == "CONSUMABLE" or bool(getattr(item, "is_consumable", False)):
+        return "consumable"
+    return "drug"
+
+
+# ============================================================
 # Stock helpers
 # ============================================================
 
@@ -153,7 +176,6 @@ def _validate_batch_for_line(batch: ItemBatch, *, item_id: int, location_id: int
     if _d(batch.current_qty) <= 0:
         raise HTTPException(status_code=400, detail="Selected batch has no stock.")
 
-    # expiry check (FEFO-safe)
     today = dt_date.today()
     if batch.expiry_date is not None and batch.expiry_date < today:
         raise HTTPException(status_code=400, detail="Selected batch is expired.")
@@ -218,7 +240,6 @@ def _allocate_from_selected_batch(
             ),
         )
 
-    # ✅ STRICT pricing from selected batch ONLY
     mrp = _d(batch.mrp)
     if mrp <= 0:
         raise HTTPException(
@@ -226,10 +247,9 @@ def _allocate_from_selected_batch(
             detail=f"MRP is missing/zero for batch {batch.batch_no}. Please fix batch MRP.",
         )
 
-    tax_percent = _d(batch.tax_percent)  # can be 0
+    tax_percent = _d(batch.tax_percent)
     unit_cost = _d(batch.unit_cost)
 
-    # reduce stock
     batch.current_qty = available - qty
 
     stock_txn = create_stock_transaction(
@@ -292,7 +312,6 @@ def _allocate_stock_fefo(
         )
     )
 
-    # MySQL-safe NULLS LAST emulation
     nulls_last_expr = case(
         (ItemBatch.expiry_date.is_(None), 1),
         else_=0,
@@ -323,7 +342,6 @@ def _allocate_stock_fefo(
         if use_qty <= 0:
             continue
 
-        # ✅ STRICT: batch must have MRP for accuracy
         mrp = _d(batch.mrp)
         if mrp <= 0:
             raise HTTPException(
@@ -331,10 +349,9 @@ def _allocate_stock_fefo(
                 detail=f"MRP is missing/zero for batch {batch.batch_no}. Please fix batch MRP.",
             )
 
-        tax_percent = _d(batch.tax_percent)  # can be 0
+        tax_percent = _d(batch.tax_percent)
         unit_cost = _d(batch.unit_cost)
 
-        # Reduce batch stock
         batch.current_qty = available - use_qty
 
         stock_txn = create_stock_transaction(
@@ -427,19 +444,12 @@ def _total_available_qty(db: Session, item_id: int, location_id: int) -> Decimal
 
 
 def assign_batches_on_send(db: Session, rx: PharmacyPrescription) -> None:
-    """
-    ✅ Called when Rx is "sent/issued/signed".
-    Locks best FEFO batch_id on each line (if not already chosen)
-    and stores snapshot fields if columns exist.
-    """
     if not getattr(rx, "location_id", None):
         return
 
     for ln in (rx.lines or []):
         if not getattr(ln, "item_id", None):
             continue
-
-        # keep existing selection
         if getattr(ln, "batch_id", None):
             continue
 
@@ -456,7 +466,6 @@ def assign_batches_on_send(db: Session, rx: PharmacyPrescription) -> None:
         if hasattr(ln, "expiry_date_snapshot"):
             ln.expiry_date_snapshot = b.expiry_date
 
-        # Optional: snapshot available qty at send time
         try:
             ln.available_qty_snapshot = _total_available_qty(db, int(ln.item_id), int(rx.location_id))
             need = _d(getattr(ln, "requested_qty", 0))
@@ -543,9 +552,9 @@ def _add_rx_line_internal(db: Session, rx: PharmacyPrescription, line_data: RxLi
         available_qty_snapshot=snap,
         is_out_of_stock=is_ooo,
         item_name=item.name,
-        item_form=item.form,
-        item_strength=item.strength,
-        item_type="consumable" if getattr(item, "is_consumable", False) else "drug",
+        item_form=_item_form(item),
+        item_strength=_item_strength(item),
+        item_type=_item_type(item),
     )
     db.add(line)
     return line
@@ -704,7 +713,6 @@ def sign_prescription(db: Session, rx_id: int, current_user: User) -> PharmacyPr
             detail="Cannot sign an empty prescription.",
         )
 
-    # ✅ lock FEFO batch_ids on send/issue (your requirement)
     assign_batches_on_send(db, rx)
 
     rx.status = "ISSUED"
@@ -784,9 +792,6 @@ def _update_payment_status(db: Session, sale: PharmacySale) -> None:
 
 
 def _generate_invoice_number(db: Session) -> str | None:
-    """
-    Generate INV-YYYYMMDD-0001 if Invoice has invoice_number column.
-    """
     if not hasattr(Invoice, "invoice_number"):
         return None
 
@@ -810,21 +815,11 @@ def _generate_invoice_number(db: Session) -> str | None:
 
 
 def _create_billing_invoice_for_sale(db: Session, sale: PharmacySale, current_user: User) -> Invoice:
-    """
-    Create (or reuse) a Billing.Invoice for a PharmacySale.
-
-    - 1 PharmacySale -> 1 Invoice (no duplicates)
-    - Invoice status starts as 'draft'
-    - billing_type='pharmacy' if column exists
-    - context_type='pharmacy_sale', context_id = sale.id
-    """
-    # 1) reuse via FK on sale
     if hasattr(sale, "billing_invoice_id") and getattr(sale, "billing_invoice_id", None):
         existing = db.get(Invoice, int(sale.billing_invoice_id))
         if existing:
             return existing
 
-    # 2) reuse via context_type/context_id
     existing = (
         db.query(Invoice)
         .filter(Invoice.context_type == "pharmacy_sale", Invoice.context_id == sale.id)
@@ -866,12 +861,11 @@ def _create_billing_invoice_for_sale(db: Session, sale: PharmacySale, current_us
         inv.invoice_number = inv_no
 
     db.add(inv)
-    db.flush()  # inv.id
+    db.flush()
 
     if hasattr(sale, "billing_invoice_id"):
         sale.billing_invoice_id = inv.id
 
-    # Create InvoiceItems from PharmacySaleItems
     sale_items: List[PharmacySaleItem] = (
         db.query(PharmacySaleItem)
         .filter(PharmacySaleItem.sale_id == sale.id)
@@ -915,8 +909,71 @@ def _create_billing_invoice_for_sale(db: Session, sale: PharmacySale, current_us
 
 
 # ============================================================
-# Dispense from Rx (Batch-wise MRP strict)
+# Dispense from Rx (Batch-wise MRP strict) + Schedule enforcement
 # ============================================================
+
+def _enforce_item_schedule_for_dispense(*, item: InventoryItem, rx: PharmacyPrescription) -> None:
+    item_type = (getattr(item, "item_type", "") or "").upper()
+    if item_type not in ("DRUG", "MEDICINE", ""):
+        return
+
+    system = getattr(item, "schedule_system", None)
+    code = getattr(item, "schedule_code", None)
+    meta = get_schedule_meta(system, code)
+
+    sch_code = (meta.get("code") or "").strip()
+    if not sch_code:
+        return
+
+    sch_system = (meta.get("system") or "").strip()
+
+    doctor_id = getattr(rx, "doctor_user_id", None)
+    patient_id = getattr(rx, "patient_id", None)
+
+    if sch_system == "IN_DCA":
+        if sch_code in ("H",):
+            if not doctor_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Item '{item.name}' is Schedule {sch_code} and requires a doctor prescription.",
+                )
+        elif sch_code in ("H1", "X"):
+            if not doctor_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Item '{item.name}' is Schedule {sch_code} and requires a doctor prescription.",
+                )
+            if not patient_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Item '{item.name}' is Schedule {sch_code} and requires a patient record (register compliance).",
+                )
+        return
+
+    if sch_system == "US_CSA":
+        if sch_code == "I":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Item '{item.name}' is US Schedule I and cannot be dispensed.",
+            )
+
+        requires_prescription = bool(meta.get("requires_prescription", False))
+        requires_register = bool(meta.get("requires_register", False))
+
+        if requires_prescription and not doctor_id:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Item '{item.name}' is US Schedule {sch_code} and requires a doctor prescription.",
+            )
+        if requires_register and not patient_id:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Item '{item.name}' is US Schedule {sch_code} and requires a patient record (register compliance).",
+            )
+        return
+
+    return
+
 
 def dispense_from_rx(
     db: Session,
@@ -940,18 +997,15 @@ def dispense_from_rx(
             detail="Only DRAFT, ISSUED or PARTIALLY_DISPENSED prescriptions can be dispensed.",
         )
 
-    # auto-upgrade DRAFT to ISSUED on first dispense
     if rx.status == "DRAFT":
         rx.status = "ISSUED"
 
-    # location: use payload first, else rx.location_id
     location_id = getattr(payload, "location_id", None) or getattr(rx, "location_id", None)
 
     line_map = {int(l.id): l for l in (rx.lines or [])}
     lines_to_process: List[tuple[PharmacyPrescriptionLine, Decimal, Optional[int]]] = []
 
     for entry in (payload.lines or []):
-        # support pydantic object or dict
         line_id = getattr(entry, "line_id", None)
         if line_id is None and isinstance(entry, dict):
             line_id = entry.get("line_id")
@@ -966,36 +1020,25 @@ def dispense_from_rx(
 
         line = line_map.get(int(line_id or 0))
         if not line:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Rx line {line_id} not found in prescription.",
-            )
+            raise HTTPException(status_code=400, detail=f"Rx line {line_id} not found in prescription.")
 
         if line.status in ("DISPENSED", "CANCELLED"):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Rx line {line.id} is {line.status} and cannot be dispensed.",
-            )
+            raise HTTPException(status_code=400, detail=f"Rx line {line.id} is {line.status} and cannot be dispensed.")
 
         remaining = _d(line.requested_qty) - _d(line.dispensed_qty)
         disp_qty_dec = _d(disp_qty)
 
         if disp_qty_dec > remaining:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Dispense quantity {disp_qty_dec} exceeds remaining {remaining} for line {line.id}.",
-            )
+            raise HTTPException(status_code=400, detail=f"Dispense quantity {disp_qty_dec} exceeds remaining {remaining} for line {line.id}.")
         if disp_qty_dec <= 0:
             continue
 
-        # prefer payload batch_id, else line.batch_id (locked on send), else None
         chosen_batch_id = int(batch_id) if batch_id else (int(getattr(line, "batch_id", 0) or 0) or None)
         lines_to_process.append((line, disp_qty_dec, chosen_batch_id))
 
     if not lines_to_process:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No valid lines to dispense.")
+        raise HTTPException(status_code=400, detail="No valid lines to dispense.")
 
-    # Create sale header if required
     sale: PharmacySale | None = None
     context_type = (getattr(payload, "context_type", None) or getattr(rx, "type", None) or "COUNTER").upper()
 
@@ -1016,61 +1059,50 @@ def dispense_from_rx(
         db.add(sale)
         db.flush()
 
-    # Dispense each line
     for line, disp_qty, chosen_batch_id in lines_to_process:
         item: InventoryItem | None = db.get(InventoryItem, int(line.item_id))
         if not item:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Inventory item {line.item_id} not found.",
-            )
+            raise HTTPException(status_code=404, detail=f"Inventory item {line.item_id} not found.")
 
-        # STOCK allocation
-        if location_id:
-            # ✅ If user/line has a selected batch -> allocate STRICTLY from that batch
-            if chosen_batch_id:
-                allocations = _allocate_from_selected_batch(
-                    db=db,
-                    location_id=int(location_id),
-                    item=item,
-                    batch_id=int(chosen_batch_id),
-                    qty=disp_qty,
-                    patient_id=rx.patient_id,
-                    visit_id=rx.visit_id,
-                    ipd_admission_id=rx.ipd_admission_id,
-                    ref_type="PHARMACY_RX",
-                    ref_id=int(line.id),
-                    user=current_user,
-                )
-            else:
-                # no selected batch -> FEFO allocation (still batch-wise MRP accurate)
-                allocations = _allocate_stock_fefo(
-                    db=db,
-                    location_id=int(location_id),
-                    item=item,
-                    qty=disp_qty,
-                    patient_id=rx.patient_id,
-                    visit_id=rx.visit_id,
-                    ipd_admission_id=rx.ipd_admission_id,
-                    ref_type="PHARMACY_RX",
-                    ref_id=int(line.id),
-                    user=current_user,
-                )
+        _enforce_item_schedule_for_dispense(item=item, rx=rx)
+
+        if not location_id:
+            raise HTTPException(status_code=400, detail="location_id is required to dispense with batch-wise MRP accuracy.")
+
+        if chosen_batch_id:
+            allocations = _allocate_from_selected_batch(
+                db=db,
+                location_id=int(location_id),
+                item=item,
+                batch_id=int(chosen_batch_id),
+                qty=disp_qty,
+                patient_id=rx.patient_id,
+                visit_id=rx.visit_id,
+                ipd_admission_id=rx.ipd_admission_id,
+                ref_type="PHARMACY_RX",
+                ref_id=int(line.id),
+                user=current_user,
+            )
         else:
-            # Not linked to inventory – cannot pick batch; block for accuracy
-            raise HTTPException(
-                status_code=400,
-                detail="location_id is required to dispense with batch-wise MRP accuracy.",
+            allocations = _allocate_stock_fefo(
+                db=db,
+                location_id=int(location_id),
+                item=item,
+                qty=disp_qty,
+                patient_id=rx.patient_id,
+                visit_id=rx.visit_id,
+                ipd_admission_id=rx.ipd_admission_id,
+                ref_type="PHARMACY_RX",
+                ref_id=int(line.id),
+                user=current_user,
             )
 
-        # Update dispensed qty & line status
         line.dispensed_qty = _d(line.dispensed_qty) + disp_qty
         if _d(line.dispensed_qty) >= _d(line.requested_qty):
             line.status = "DISPENSED"
         else:
             line.status = "PARTIAL"
 
-        # Build sale items
         if sale:
             for alloc in allocations:
                 line_amount = _round_money(alloc.qty * alloc.mrp)
@@ -1089,8 +1121,8 @@ def dispense_from_rx(
                     batch_no=batch.batch_no if batch else None,
                     expiry_date=batch.expiry_date if batch else None,
                     quantity=alloc.qty,
-                    unit_price=alloc.mrp,          # ✅ batch MRP saved
-                    tax_percent=alloc.tax_percent, # ✅ batch tax saved
+                    unit_price=alloc.mrp,
+                    tax_percent=alloc.tax_percent,
                     line_amount=line_amount,
                     tax_amount=tax_amount,
                     discount_amount=Decimal("0.00"),
@@ -1099,15 +1131,12 @@ def dispense_from_rx(
                 )
                 db.add(sale_item)
 
-    # Rx header status
     if all(l.status in ("DISPENSED", "CANCELLED") for l in (rx.lines or [])):
         rx.status = "DISPENSED"
     else:
         rx.status = "PARTIALLY_DISPENSED"
 
-    # Sale totals + billing invoice
     if sale:
-        # ensure items are available for totals
         db.flush()
         sale = (
             db.query(PharmacySale)
@@ -1192,10 +1221,10 @@ def finalize_sale(db: Session, sale_id: int, current_user: User) -> PharmacySale
         .first()
     )
     if not sale:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pharmacy sale not found.")
+        raise HTTPException(status_code=404, detail="Pharmacy sale not found.")
 
     if sale.invoice_status == "CANCELLED":
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cancelled sale cannot be finalized.")
+        raise HTTPException(status_code=400, detail="Cancelled sale cannot be finalized.")
 
     if sale.invoice_status == "FINALIZED":
         return sale
@@ -1216,7 +1245,7 @@ def cancel_sale(db: Session, sale_id: int, reason: str, current_user: User) -> P
         .first()
     )
     if not sale:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pharmacy sale not found.")
+        raise HTTPException(status_code=404, detail="Pharmacy sale not found.")
 
     if sale.invoice_status == "CANCELLED":
         return sale
@@ -1225,10 +1254,7 @@ def cancel_sale(db: Session, sale_id: int, reason: str, current_user: User) -> P
     _update_payment_status(db, sale)
 
     if sale.payment_status == "PAID":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot cancel fully paid sale without supervisor override.",
-        )
+        raise HTTPException(status_code=400, detail="Cannot cancel fully paid sale without supervisor override.")
 
     sale.invoice_status = "CANCELLED"
     sale.cancel_reason = reason
@@ -1243,13 +1269,10 @@ def cancel_sale(db: Session, sale_id: int, reason: str, current_user: User) -> P
 def add_payment_to_sale(db: Session, sale_id: int, payload: PaymentCreate, current_user: User) -> PharmacyPayment:
     sale = db.get(PharmacySale, int(sale_id))
     if not sale:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pharmacy sale not found.")
+        raise HTTPException(status_code=404, detail="Pharmacy sale not found.")
 
     if sale.invoice_status != "FINALIZED":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Payments can only be added to FINALIZED sales.",
-        )
+        raise HTTPException(status_code=400, detail="Payments can only be added to FINALIZED sales.")
 
     paid_on = payload.paid_on or datetime.utcnow()
     payment = PharmacyPayment(

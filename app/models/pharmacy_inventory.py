@@ -8,9 +8,10 @@ from sqlalchemy import (
     Column, Integer, String, Boolean, Date, DateTime, Numeric,
     ForeignKey, Text, Enum, CheckConstraint, Index, UniqueConstraint
 )
-from sqlalchemy.orm import relationship
-
+from sqlalchemy.orm import relationship, synonym
+from sqlalchemy.types import JSON
 from app.db.base import Base
+
 
 Money = Numeric(14, 2)
 Qty = Numeric(14, 4)
@@ -65,14 +66,31 @@ class Supplier(Base):
     __tablename__ = "inv_suppliers"
 
     id = Column(Integer, primary_key=True, index=True)
+
     code = Column(String(50), unique=True, nullable=False, index=True)
-    name = Column(String(255), nullable=False)
+    name = Column(String(255), nullable=False, index=True)
+
     contact_person = Column(String(255), default="")
-    phone = Column(String(50), default="")
-    email = Column(String(255), default="")
+    phone = Column(String(50), default="", index=True)
+    email = Column(String(255), default="", index=True)
     address = Column(String(1000), default="")
-    gstin = Column(String(50), default="")
-    payment_terms = Column(String(255), default="")  # ✅ helpful for PO UX
+
+    # ✅ Store in DB as gstin (standard), but expose gst_number too for frontend compatibility
+    gstin = Column(String(50), default="", index=True)
+    gst_number = synonym("gstin")  # ✅ allows getattr/setattr via gst_number
+
+    payment_terms = Column(String(255), default="")
+   
+    # ✅ Payment details
+    payment_method = Column(String(30), default="UPI")  # UPI / BANK_TRANSFER / CASH / CHEQUE / OTHER
+    upi_id = Column(String(120), nullable=True)
+
+    bank_account_name = Column(String(255), nullable=True)
+    bank_account_number = Column(String(50), nullable=True)
+    bank_ifsc = Column(String(20), nullable=True)
+    bank_name = Column(String(255), nullable=True)
+    bank_branch = Column(String(255), nullable=True)
+
     is_active = Column(Boolean, default=True, nullable=False)
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -88,36 +106,85 @@ class InventoryItem(Base):
     __tablename__ = "inv_items"
 
     id = Column(Integer, primary_key=True, index=True)
+
+    # Core identity
     code = Column(String(100), unique=True, nullable=False, index=True)
-    name = Column(String(255), nullable=False)
-    generic_name = Column(String(255), default="")
+    name = Column(String(255), nullable=False)  # display name (brand or common)
     qr_number = Column(String(50), unique=True, index=True, nullable=True)
 
-    form = Column(String(100), default="")
-    strength = Column(String(100), default="")
-    unit = Column(String(50), default="unit")
+    # Core classification
+    # DRUG | CONSUMABLE | EQUIPMENT (future)
+    item_type = Column(String(20), nullable=False, default="DRUG", index=True)
+
+    # Backward compatibility (your old logic uses this)
+    is_consumable = Column(Boolean, default=False, nullable=False, index=True)
+
+    # Flags
+    lasa_flag = Column(Boolean, default=False, nullable=False, index=True)
+
+    # Core stock metadata (quantity_on_hand is computed, not stored here)
+    unit = Column(String(50), default="unit")            # unit of measurement
     pack_size = Column(String(50), default="1")
-    manufacturer = Column(String(255), default="")
-    class_name = Column(String(255), default="")
-    atc_code = Column(String(50), default="")
-    hsn_code = Column(String(50), default="")
-
-    lasa_flag = Column(Boolean, default=False, nullable=False)
-    is_consumable = Column(Boolean, default=False, nullable=False)
-
-    # Defaults = suggestions only (real price comes from GRN batches)
-    default_tax_percent = Column(Numeric(5, 2), default=0)
-    default_price = Column(Numeric(14, 4), default=0)
-    default_mrp = Column(Numeric(14, 4), default=0)
-
     reorder_level = Column(Numeric(14, 4), default=0)
     max_level = Column(Numeric(14, 4), default=0)
 
-    is_active = Column(Boolean, default=True, nullable=False)
+    # Supplier / procurement
+    manufacturer = Column(String(255), default="")
+    default_supplier_id = Column(Integer, ForeignKey("inv_suppliers.id"), nullable=True, index=True)
+    procurement_date = Column(Date, nullable=True)
+
+    # Storage
+    # ROOM_TEMP | REFRIGERATED | AWAY_FROM_LIGHT | FROZEN | OTHER
+    storage_condition = Column(String(30), default="ROOM_TEMP")
+
+    # Defaults (suggestions only)
+    default_tax_percent = Column(Numeric(5, 2), default=0)
+    default_price = Column(Numeric(14, 4), default=0)
+    default_mrp = Column(Numeric(14, 4), default=0)
+    
+     # ---------------------------
+    # ✅ NEW: Regulatory schedule (India/US)
+    # ---------------------------
+    # IN_DCA (India alphabet schedules) | US_CSA (US roman schedules)
+    schedule_system = Column(String(20), default="IN_DCA", nullable=False, index=True)
+    # Examples: H, H1, X, G, C1 ... OR II, III ...
+    schedule_code = Column(String(10), default="", nullable=False, index=True)
+    schedule_notes = Column(String(255), default="")  # optional internal notes
+
+
+    # ---------------------------
+    # DRUG FIELDS
+    # ---------------------------
+    generic_name = Column(String(255), default="")
+    brand_name = Column(String(255), default="")  # optional separate brand
+    dosage_form = Column(String(100), default="")  # tablet/capsule/injection
+    strength = Column(String(100), default="")     # 500 mg / 10 ml
+    active_ingredients = Column(JSON, nullable=True)  # ["Paracetamol", "Caffeine"]
+    route = Column(String(50), default="")  # oral/IV/topical
+    therapeutic_class = Column(String(255), default="")
+    prescription_status = Column(String(20), default="RX")  # OTC | RX | SCHEDULED
+    side_effects = Column(Text, default="")
+    drug_interactions = Column(Text, default="")
+
+    # ---------------------------
+    # CONSUMABLE FIELDS
+    # ---------------------------
+    material_type = Column(String(100), default="")       # latex/cotton/plastic
+    sterility_status = Column(String(20), default="")     # STERILE / NON_STERILE
+    size_dimensions = Column(String(120), default="")     # size/dimensions
+    intended_use = Column(Text, default="")               # brief description
+    reusable_status = Column(String(20), default="")      # DISPOSABLE / REUSABLE
+
+    # Other codes
+    atc_code = Column(String(50), default="")
+    hsn_code = Column(String(50), default="")
+
+    is_active = Column(Boolean, default=True, nullable=False, index=True)
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
+    # relationships (keep your existing)
     batches = relationship("ItemBatch", back_populates="item")
     po_items = relationship("PurchaseOrderItem", back_populates="item")
     grn_items = relationship("GRNItem", back_populates="item")
@@ -125,6 +192,12 @@ class InventoryItem(Base):
     transactions = relationship("StockTransaction", back_populates="item")
     stock = relationship("ItemLocationStock", back_populates="item")
     price_history = relationship("ItemPriceHistory", back_populates="item")
+
+    supplier = relationship("Supplier", foreign_keys=[default_supplier_id])
+
+    __table_args__ = (
+        Index("ix_inv_items_type_consumable", "item_type", "is_consumable"),
+    )
 
 
 # -------------------------
@@ -448,9 +521,6 @@ class GRNItem(Base):
     batch = relationship("ItemBatch")
 
 
-# -------------------------
-# Stock Transactions
-# -------------------------
 class StockTransaction(Base):
     __tablename__ = "inv_stock_txns"
     __table_args__ = (
@@ -476,9 +546,12 @@ class StockTransaction(Base):
     remark = Column(String(1000), default="")
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
 
-    # ✅ NEW (NO FK to avoid guessing your table names)
+    # ✅ existing
     patient_id = Column(Integer, nullable=True, index=True)
     visit_id = Column(Integer, nullable=True, index=True)
+
+    # ✅ NEW: who prescribed / responsible doctor
+    doctor_id = Column(Integer, nullable=True, index=True)
 
     location = relationship("InventoryLocation", back_populates="transactions")
     item = relationship("InventoryItem", back_populates="transactions")

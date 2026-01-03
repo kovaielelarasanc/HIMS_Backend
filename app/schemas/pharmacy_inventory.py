@@ -4,8 +4,9 @@ from __future__ import annotations
 from datetime import date, datetime
 from decimal import Decimal
 from typing import List, Optional, Literal
-
-from pydantic import BaseModel, Field, ConfigDict, condecimal, field_validator
+import re
+from enum import Enum
+from pydantic import BaseModel, Field, ConfigDict, condecimal, field_validator, EmailStr, model_validator
 from app.models.pharmacy_inventory import GRNStatus  # ✅ import your model Enum
 # ---------- Locations ----------
 
@@ -39,74 +40,286 @@ class LocationOut(LocationBase):
     model_config = ConfigDict(from_attributes=True)
 
 
-# ---------- Suppliers ----------
+PaymentMethod = Literal["UPI", "BANK_TRANSFER", "CASH", "CHEQUE", "OTHER"]
+Quantity = condecimal(max_digits=14, decimal_places=4)
+Money = condecimal(max_digits=14, decimal_places=4)
+Percent = condecimal(max_digits=5, decimal_places=2)
+UPI_RE = re.compile(r"^[a-zA-Z0-9.\-_]{2,}@[a-zA-Z]{2,}$")
+IFSC_RE = re.compile(r"^[A-Z]{4}0[A-Z0-9]{6}$")
+CODE_RE = re.compile(r"^[A-Z0-9/_\.\-]{2,50}$")
 
 
-class SupplierBase(BaseModel):
+def _none_if_blank(v: Optional[str]) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return None if s == "" else s
+
+
+class SupplierBaseOut(BaseModel):
+    # ✅ tolerant output (won't crash for old data)
     code: str
     name: str
-    contact_person: str | None = ""
-    phone: str | None = ""
-    email: str | None = ""
-    address: str | None = ""
-    gstin: str | None = ""
-    is_active: bool = True
-
-
-class SupplierCreate(SupplierBase):
-    pass
-
-
-class SupplierUpdate(BaseModel):
-    name: Optional[str] = None
     contact_person: Optional[str] = None
     phone: Optional[str] = None
     email: Optional[str] = None
     address: Optional[str] = None
     gstin: Optional[str] = None
-    is_active: Optional[bool] = None
+    payment_terms: Optional[str] = None
+    is_active: bool = True
 
+    payment_method: Optional[str] = "UPI"
+    upi_id: Optional[str] = None
+    bank_account_name: Optional[str] = None
+    bank_account_number: Optional[str] = None
+    bank_ifsc: Optional[str] = None
+    bank_name: Optional[str] = None
+    bank_branch: Optional[str] = None
 
-class SupplierOut(SupplierBase):
-    id: int
-    created_at: datetime
-    updated_at: datetime
+    @field_validator("email", mode="before")
+    @classmethod
+    def _email_blank_to_none(cls, v):
+        return _none_if_blank(v)
 
     model_config = ConfigDict(from_attributes=True)
 
 
-# ---------- Items ----------
+class SupplierOut(SupplierBaseOut):
+    id: int
+    created_at: datetime
+    updated_at: datetime
 
-Quantity = condecimal(max_digits=14, decimal_places=4)
-Money = condecimal(max_digits=14, decimal_places=4)
-Percent = condecimal(max_digits=5, decimal_places=2)
+
+# ✅ strict input (create)
+class SupplierCreate(BaseModel):
+    code: str
+    name: str
+    contact_person: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[EmailStr] = None
+    address: Optional[str] = None
+    gstin: Optional[str] = None
+    payment_terms: Optional[str] = None
+    is_active: bool = True
+
+    payment_method: PaymentMethod = "UPI"
+    upi_id: Optional[str] = None
+
+    bank_account_name: Optional[str] = None
+    bank_account_number: Optional[str] = None
+    bank_ifsc: Optional[str] = None
+    bank_name: Optional[str] = None
+    bank_branch: Optional[str] = None
+
+    @field_validator("code", mode="before")
+    @classmethod
+    def _code_norm(cls, v):
+        s = str(v or "").strip().upper().replace(" ", "_")
+        if not CODE_RE.match(s):
+            raise ValueError("Invalid supplier code (use A-Z, 0-9, -, _, /, .)")
+        return s
+
+    @field_validator("upi_id", mode="before")
+    @classmethod
+    def _upi_norm(cls, v):
+        return _none_if_blank(v)
+
+    @field_validator("bank_ifsc", mode="before")
+    @classmethod
+    def _ifsc_norm(cls, v):
+        vv = _none_if_blank(v)
+        return vv.upper() if vv else None
+
+    @field_validator("bank_account_number", mode="before")
+    @classmethod
+    def _acc_norm(cls, v):
+        vv = _none_if_blank(v)
+        return re.sub(r"\s+", "", vv) if vv else None
+
+    @model_validator(mode="after")
+    def _validate_payment(self):
+        pm = self.payment_method
+
+        if pm == "UPI":
+            if not self.upi_id:
+                raise ValueError("UPI ID is required when payment_method is UPI")
+            if not UPI_RE.match(self.upi_id):
+                raise ValueError("Invalid UPI ID (example: name@bank)")
+
+        if pm == "BANK_TRANSFER":
+            if not self.bank_account_name:
+                raise ValueError("Account name is required for bank transfer")
+            if not self.bank_account_number or not re.match(r"^\d{6,20}$", self.bank_account_number):
+                raise ValueError("Account number must be 6–20 digits")
+            if not self.bank_ifsc or not IFSC_RE.match(self.bank_ifsc):
+                raise ValueError("Invalid IFSC (example: HDFC0001234)")
+
+        return self
+
+
+# ✅ strict-ish update (no code change)
+class SupplierUpdate(BaseModel):
+    code: Optional[str] = None
+    name: Optional[str] = None
+    contact_person: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[EmailStr] = None
+    address: Optional[str] = None
+    gstin: Optional[str] = None
+    payment_terms: Optional[str] = None
+    is_active: Optional[bool] = None
+
+    payment_method: Optional[PaymentMethod] = None
+    upi_id: Optional[str] = None
+
+    bank_account_name: Optional[str] = None
+    bank_account_number: Optional[str] = None
+    bank_ifsc: Optional[str] = None
+    bank_name: Optional[str] = None
+    bank_branch: Optional[str] = None
+
+    @field_validator("upi_id", mode="before")
+    @classmethod
+    def _upi_norm_u(cls, v):
+        return _none_if_blank(v)
+
+    @field_validator("bank_ifsc", mode="before")
+    @classmethod
+    def _ifsc_norm_u(cls, v):
+        vv = _none_if_blank(v)
+        return vv.upper() if vv else None
+
+    @field_validator("bank_account_number", mode="before")
+    @classmethod
+    def _acc_norm_u(cls, v):
+        vv = _none_if_blank(v)
+        return re.sub(r"\s+", "", vv) if vv else None
+
+
+SCHEDULE_RE = re.compile(r"^[A-Z0-9]{1,6}$")
+
+def _norm_schedule(v: Optional[str]) -> Optional[str]:
+    """
+    Accepts: "H", "H1", "X", "Schedule H", "SCHEDULE-H", "schedule h1", "rx", "otc"
+    Returns normalized: "H" / "H1" / "X" / "RX" / "OTC" or None
+    """
+    if v is None:
+        return None
+    s = str(v).strip().upper()
+    if not s:
+        return None
+
+    # remove common prefixes like "SCHEDULE", "SCHEDULE-"
+    s = s.replace("SCHEDULE", "").replace(" ", "").replace("-", "").replace("_", "")
+    # after removing, examples:
+    # "SCHEDULEH" -> "H"
+    # "H1" -> "H1"
+
+    if s in ("RX", "OTC"):
+        return s
+
+    # allow schedule codes like H / H1 / X etc.
+    if not SCHEDULE_RE.match(s):
+        raise ValueError("Invalid schedule_code. Use H/H1/X (or RX/OTC).")
+    return s
+
+
+class SupplierMini(BaseModel):
+    id: int
+    name: str
 
 
 class ItemBase(BaseModel):
     code: str
     name: str
-    generic_name: str | None = ""
-    form: str | None = ""
-    strength: str | None = ""
-    unit: str | None = "unit"
-    pack_size: str | None = "1"
-    manufacturer: str | None = ""
-    class_name: str | None = ""
-    atc_code: str | None = ""
-    hsn_code: str | None = ""
 
+    item_type: str = Field(default="DRUG")  # DRUG | CONSUMABLE | EQUIPMENT
     lasa_flag: bool = False
-    is_consumable: bool = False
+    is_consumable: bool = False  # kept for compatibility
 
-    default_tax_percent: Percent = 0
-    default_price: Money = 0
-    default_mrp: Money = 0
+    unit: str = "unit"
+    pack_size: str = "1"
+    reorder_level: float = 0
+    max_level: float = 0
 
-    reorder_level: Quantity = 0
-    max_level: Quantity = 0
+    manufacturer: Optional[str] = ""
+    default_supplier_id: Optional[int] = None
+    procurement_date: Optional[date] = None
+
+    storage_condition: str = "ROOM_TEMP"
+
+    default_tax_percent: float = 0
+    default_price: float = 0
+    default_mrp: float = 0
+
+    # drug
+    generic_name: Optional[str] = ""
+    brand_name: Optional[str] = ""
+    dosage_form: Optional[str] = ""
+    strength: Optional[str] = ""
+    active_ingredients: Optional[List[str]] = None
+    route: Optional[str] = ""
+    therapeutic_class: Optional[str] = ""
+
+    # ✅ main status (your existing)
+    # OTC | RX | SCHEDULED
+    prescription_status: str = "RX"
+
+    # ✅ NEW: schedule code for scheduled drugs (H/H1/X)
+    # You can also send RX/OTC, we normalize it.
+    schedule_code: Optional[str] = Field(default=None, description="H/H1/X or RX/OTC")
+
+    side_effects: Optional[str] = ""
+    drug_interactions: Optional[str] = ""
+
+    # consumable
+    material_type: Optional[str] = ""
+    sterility_status: Optional[str] = ""
+    size_dimensions: Optional[str] = ""
+    intended_use: Optional[str] = ""
+    reusable_status: Optional[str] = ""
+
+    atc_code: Optional[str] = ""
+    hsn_code: Optional[str] = ""
     qr_number: Optional[str] = None
-
     is_active: bool = True
+
+    @field_validator("schedule_code", mode="before")
+    @classmethod
+    def _schedule_norm(cls, v):
+        return _norm_schedule(v)
+
+    @field_validator("prescription_status", mode="before")
+    @classmethod
+    def _ps_norm(cls, v):
+        s = str(v or "").strip().upper()
+        return s or "RX"
+
+    @model_validator(mode="after")
+    def _sync_schedule_and_status(self):
+        """
+        Rules:
+        - If schedule_code is H/H1/X -> prescription_status becomes SCHEDULED
+        - If schedule_code is RX/OTC -> prescription_status becomes RX/OTC and schedule_code cleared (optional)
+        - If prescription_status is SCHEDULED and schedule_code is empty -> raise (force schedule)
+        """
+        sc = (self.schedule_code or "").strip().upper() if self.schedule_code else None
+        ps = (self.prescription_status or "RX").strip().upper()
+
+        if sc in ("RX", "OTC"):
+            self.prescription_status = sc
+            # if you want schedule column blank for RX/OTC, uncomment next line:
+            # self.schedule_code = None
+            return self
+
+        if sc:  # H/H1/X etc
+            self.prescription_status = "SCHEDULED"
+            return self
+
+        # if status says scheduled, schedule_code must be provided
+        if ps in ("SCHEDULED", "SCHEDULE"):
+            raise ValueError("schedule_code is required when prescription_status is SCHEDULED")
+        return self
 
 
 class ItemCreate(ItemBase):
@@ -114,33 +327,74 @@ class ItemCreate(ItemBase):
 
 
 class ItemUpdate(BaseModel):
+    # all optional
+    code: Optional[str] = None
     name: Optional[str] = None
-    generic_name: Optional[str] = None
-    form: Optional[str] = None
-    strength: Optional[str] = None
-    unit: Optional[str] = None
-    pack_size: Optional[str] = None
-    manufacturer: Optional[str] = None
-    class_name: Optional[str] = None
-    atc_code: Optional[str] = None
-    hsn_code: Optional[str] = None
-
+    item_type: Optional[str] = None
     lasa_flag: Optional[bool] = None
     is_consumable: Optional[bool] = None
 
-    default_tax_percent: Optional[Percent] = None
-    default_price: Optional[Money] = None
-    default_mrp: Optional[Money] = None
+    unit: Optional[str] = None
+    pack_size: Optional[str] = None
+    reorder_level: Optional[float] = None
+    max_level: Optional[float] = None
 
-    reorder_level: Optional[Quantity] = None
-    max_level: Optional[Quantity] = None
+    manufacturer: Optional[str] = None
+    default_supplier_id: Optional[int] = None
+    procurement_date: Optional[date] = None
+
+    storage_condition: Optional[str] = None
+
+    default_tax_percent: Optional[float] = None
+    default_price: Optional[float] = None
+    default_mrp: Optional[float] = None
+
+    generic_name: Optional[str] = None
+    brand_name: Optional[str] = None
+    dosage_form: Optional[str] = None
+    strength: Optional[str] = None
+    active_ingredients: Optional[List[str]] = None
+    route: Optional[str] = None
+    therapeutic_class: Optional[str] = None
+
+    prescription_status: Optional[str] = None
+
+    # ✅ NEW (update)
+    schedule_code: Optional[str] = None
+
+    side_effects: Optional[str] = None
+    drug_interactions: Optional[str] = None
+
+    material_type: Optional[str] = None
+    sterility_status: Optional[str] = None
+    size_dimensions: Optional[str] = None
+    intended_use: Optional[str] = None
+    reusable_status: Optional[str] = None
+
+    atc_code: Optional[str] = None
+    hsn_code: Optional[str] = None
     qr_number: Optional[str] = None
-
     is_active: Optional[bool] = None
+
+    @field_validator("schedule_code", mode="before")
+    @classmethod
+    def _schedule_norm_u(cls, v):
+        return _norm_schedule(v)
+
+    @field_validator("prescription_status", mode="before")
+    @classmethod
+    def _ps_norm_u(cls, v):
+        if v is None:
+            return None
+        s = str(v or "").strip().upper()
+        return s or None
 
 
 class ItemOut(ItemBase):
     id: int
+    qty_on_hand: float = 0
+    supplier: Optional[SupplierMini] = None
+
     created_at: datetime
     updated_at: datetime
 
@@ -547,30 +801,39 @@ class ReturnOut(BaseModel):
 
 
 class StockTransactionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
+    txn_time: Optional[datetime] = None
+
     location_id: Optional[int] = None
     item_id: Optional[int] = None
     batch_id: Optional[int] = None
-    txn_time: Optional[datetime] = None
+
+    quantity_change: Optional[float] = None
     txn_type: Optional[str] = None
+
     ref_type: Optional[str] = None
     ref_id: Optional[int] = None
-    quantity_change: Optional[Decimal] = None
-    unit_cost: Optional[Decimal] = None
-    mrp: Optional[Decimal] = None
-    remark: Optional[str] = None
-    user_id: Optional[int] = None
+
+    unit_cost: Optional[float] = None
+    mrp: Optional[float] = None
+
     patient_id: Optional[int] = None
     visit_id: Optional[int] = None
-    
+
+    user_id: Optional[int] = None
+    doctor_id: Optional[int] = None
+
     item_name: Optional[str] = None
     item_code: Optional[str] = None
     batch_no: Optional[str] = None
     location_name: Optional[str] = None
-    user_name: Optional[str] = None
-    ref_display: Optional[str] = None
 
-    model_config = ConfigDict(from_attributes=True)
+    user_name: Optional[str] = None
+    doctor_name: Optional[str] = None
+
+    ref_display: Optional[str] = None
 
 
 

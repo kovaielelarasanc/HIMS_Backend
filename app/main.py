@@ -11,7 +11,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import HTTPException
 from starlette.status import HTTP_500_INTERNAL_SERVER_ERROR
-
+from app.api.exception_handlers import register_exception_handlers
 from app.db.session import MasterSessionLocal
 from app.services.error_logger import log_error, format_exception
 from app.utils.jwt import extract_tenant_from_request
@@ -24,6 +24,7 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
+register_exception_handlers(app)
 
 # CORS
 app.add_middleware(

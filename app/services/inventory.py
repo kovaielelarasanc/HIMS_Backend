@@ -67,8 +67,11 @@ def create_stock_transaction(
     unit_cost: Any | None = None,
     mrp: Any | None = None,
     remark: str = "",
-    patient_id: int | None = None,  # kept for callers; only used if column exists
-    visit_id: int | None = None,    # kept for callers; only used if column exists
+    patient_id: int | None = None,  # only set if column exists
+    visit_id: int | None = None,    # only set if column exists
+    doctor_id: int | None = None,   # ✅ NEW: only set if column exists
+    txn_time: datetime | None = None,  # ✅ allow override
+    flush: bool = True,  # ✅ helpful when caller needs st.id immediately
 ) -> StockTransaction:
     """
     Central creator for StockTransaction.
@@ -77,6 +80,10 @@ def create_stock_transaction(
     - Will NOT pass unknown kwargs to StockTransaction
       (prevents invalid keyword argument errors).
     - Supports different schema column names (quantity_change vs qty_change etc.)
+
+    ✅ Doctor behavior:
+    - If doctor_id is provided and column exists -> saved
+    - Else if user.is_doctor == True and doctor_id column exists -> uses user.id
     """
     cols = _model_columns(StockTransaction)
     data: Dict[str, Any] = {}
@@ -88,6 +95,12 @@ def create_stock_transaction(
         data["item_id"] = item_id
     if "batch_id" in cols:
         data["batch_id"] = batch_id
+
+    # --- txn time ---
+    # your model uses txn_time; keep variants safe
+    time_field = _pick_first(cols, "txn_time", "transaction_time", "time", "created_at")
+    if time_field:
+        data[time_field] = txn_time or datetime.utcnow()
 
     # --- quantity delta field variants ---
     qty_field = _pick_first(cols, "quantity_change", "qty_change", "qty_delta", "quantity")
@@ -118,11 +131,11 @@ def create_stock_transaction(
 
     # --- remark/notes ---
     if "remark" in cols:
-        data["remark"] = remark or ""
+        data["remark"] = (remark or "")[:1000]
     elif "remarks" in cols:
-        data["remarks"] = remark or ""
+        data["remarks"] = (remark or "")[:1000]
     elif "note" in cols:
-        data["note"] = remark or ""
+        data["note"] = (remark or "")[:1000]
 
     # --- audit ---
     uid = getattr(user, "id", None) if user else None
@@ -131,20 +144,27 @@ def create_stock_transaction(
     elif "created_by" in cols:
         data["created_by"] = uid
 
-    now = datetime.utcnow()
-    if "created_at" in cols:
-        data["created_at"] = now
-    elif "created_on" in cols:
-        data["created_on"] = now
-
     # --- optional patient/visit links (ONLY if columns exist) ---
     if patient_id is not None and "patient_id" in cols:
         data["patient_id"] = patient_id
     if visit_id is not None and "visit_id" in cols:
         data["visit_id"] = visit_id
 
+    # --- ✅ doctor link (ONLY if column exists) ---
+    if "doctor_id" in cols:
+        did = doctor_id
+        # fallback: if current user is doctor, set them as doctor_id
+        if did is None and user and bool(getattr(user, "is_doctor", False)):
+            did = int(user.id)
+        data["doctor_id"] = did
+
     st = StockTransaction(**data)
     db.add(st)
+
+    # ✅ ensure st.id is available immediately (safe; does not commit)
+    if flush:
+        db.flush()
+
     return st
 
 
@@ -193,9 +213,9 @@ def allocate_batches_fefo(
 
     q = (
         q.order_by(
-            nulls_last_expr.asc(),      # non-null first, null last
-            ItemBatch.expiry_date.asc(),# earliest expiry first
-            ItemBatch.id.asc(),         # tie breaker
+            nulls_last_expr.asc(),       # non-null first, null last
+            ItemBatch.expiry_date.asc(), # earliest expiry first
+            ItemBatch.id.asc(),          # tie breaker
         )
         .with_for_update()
     )

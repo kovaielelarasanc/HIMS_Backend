@@ -61,6 +61,7 @@ from app.api import (
     routes_ipd_drug_chart_form_pdf,
     routes_ipd_newborn,
     routes_ipd_admissions,
+    routes_pharmacy_stock_alerts,
 )
 from app.api.routes_lis_device import connector_router as lis_connector_router
 
@@ -182,6 +183,7 @@ api_router.include_router(routes_ui_branding.router)
 api_router.include_router(routes_inventory.router)
 api_router.include_router(routes_pharmacy.router)
 api_router.include_router(routes_pharmacy_accounts.router)
+api_router.include_router(routes_pharmacy_stock_alerts.router)
 # Master database migrations
 api_router.include_router(routes_master_migrations.router)
 
