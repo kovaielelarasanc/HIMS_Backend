@@ -4,9 +4,11 @@ from __future__ import annotations
 from typing import Optional, Tuple, Generator, Dict, Any, Set
 import re
 from urllib.parse import quote_plus
-
+from datetime import datetime
 from fastapi import Depends, Header, HTTPException, Request
 from jose import jwt, JWTError
+
+
 from sqlalchemy.orm import Session, joinedload, sessionmaker
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
@@ -14,19 +16,11 @@ from sqlalchemy.engine import Engine
 from app.core.config import settings
 from app.db.session import MasterSessionLocal, create_tenant_session
 from app.models.tenant import Tenant
-from app.models.user import User
+from app.models.user import User, UserSession
 from app.models.role import Role
 
 
-# =========================================================
-# MASTER DB
-# =========================================================
-def get_master_db() -> Generator[Session, None, None]:
-    db = MasterSessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+
 
 
 # =========================================================
@@ -46,12 +40,18 @@ def _decode_token(raw_token: str) -> dict:
         return jwt.decode(raw_token, settings.JWT_SECRET, algorithms=[settings.JWT_ALG])
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
+    
+def get_master_db() -> Generator[Session, None, None]:
+    db = MasterSessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 
 def _load_tenant_from_claims(payload: dict, master_db: Session) -> Tenant:
     tid = payload.get("tid")
     tcode = payload.get("tcode")
-
     if not tid and not tcode:
         raise HTTPException(status_code=401, detail="Missing tenant in token")
 
@@ -68,6 +68,28 @@ def _load_tenant_from_claims(payload: dict, master_db: Session) -> Tenant:
         raise HTTPException(status_code=403, detail="Tenant inactive")
     return tenant
 
+def _validate_session_and_version(tenant_db: Session, user: User, payload: dict) -> None:
+    tv = payload.get("tv")
+    if tv is None or int(tv) != int(user.token_version):
+        raise HTTPException(status_code=401, detail="Session expired. Please login again.")
+
+    sid = payload.get("sid")
+    if not sid:
+        raise HTTPException(status_code=401, detail="Missing session")
+
+    # enforce session active
+    now = datetime.utcnow()
+    sess = (
+        tenant_db.query(UserSession)
+        .filter(
+            UserSession.session_id == str(sid),
+            UserSession.user_id == user.id,
+            UserSession.revoked_at.is_(None),
+        )
+        .first()
+    )
+    if not sess:
+        raise HTTPException(status_code=401, detail="Session revoked. Please login again.")
 
 # =========================================================
 # DB URL BUILDERS (PROD SAFE)
@@ -145,30 +167,36 @@ def get_current_user_and_tenant_from_token(raw_token: str, master_db: Session) -
         raise HTTPException(status_code=401, detail="Missing token")
 
     payload = _decode_token(raw_token)
-    email = payload.get("sub")
-    if not email:
-        raise HTTPException(status_code=401, detail="Invalid token payload")
-
     tenant = _load_tenant_from_claims(payload, master_db)
-    db_uri = _resolve_tenant_db_uri(tenant)
 
-    db = create_tenant_session(db_uri)
+    uid = payload.get("uid")
+    if uid is None:
+        # backward fallback: sub might be user_id
+        sub = payload.get("sub")
+        if not sub:
+            raise HTTPException(status_code=401, detail="Invalid token payload")
+        try:
+            uid = int(sub)
+        except ValueError:
+            raise HTTPException(status_code=401, detail="Invalid token payload")
+
+    tenant_db = create_tenant_session(tenant.db_uri)
     try:
         user: Optional[User] = (
-            db.query(User)
+            tenant_db.query(User)
             .options(joinedload(User.roles).joinedload(Role.permissions))
-            .filter(User.email == email)
+            .filter(User.id == int(uid))
             .first()
         )
-
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
         if not user.is_active:
             raise HTTPException(status_code=403, detail="User inactive")
 
+        _validate_session_and_version(tenant_db, user, payload)
         return user, tenant
     finally:
-        db.close()
+        tenant_db.close()
 
 
 def current_user(

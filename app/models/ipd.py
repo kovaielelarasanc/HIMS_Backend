@@ -526,11 +526,11 @@ class IpdNursingNote(Base):
         index=True,
     )
 
-    wound_status = Column(String(255), nullable=False, default="")
-    oxygen_support = Column(String(255), nullable=False, default="")
-    urine_output = Column(String(255), nullable=False, default="")
-    drains_tubes = Column(String(255), nullable=False, default="")
-    pain_score = Column(String(50), nullable=False, default="")
+    # wound_status = Column(String(255), nullable=False, default="")
+    # oxygen_support = Column(String(255), nullable=False, default="")
+    # urine_output = Column(String(255), nullable=False, default="")
+    # drains_tubes = Column(String(255), nullable=False, default="")
+    # pain_score = Column(String(50), nullable=False, default="")
     other_findings = Column(Text, nullable=False, default="")
 
     note_type = Column(String(20), nullable=False, default="routine")
@@ -551,7 +551,7 @@ class IpdNursingNote(Base):
         server_default=func.now(),
         index=True,
     )
-    patient_condition = Column(Text, nullable=False, default="")
+    # patient_condition = Column(Text, nullable=False, default="")
     significant_events = Column(Text, nullable=False, default="")
     nursing_interventions = Column(Text, nullable=False, default="")
     response_progress = Column(Text, nullable=False, default="")
@@ -604,7 +604,7 @@ class IpdShiftHandover(Base):
     nurse_id = Column(Integer, ForeignKey("users.id"))
     created_at = Column(DateTime, default=datetime.utcnow)
 
-    vital_signs = Column(Text, default="")
+    # vital_signs = Column(Text, default="")
     procedure_undergone = Column(Text, default="")
     todays_diagnostics = Column(Text, default="")
     current_condition = Column(Text, default="")

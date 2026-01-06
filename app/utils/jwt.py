@@ -1,4 +1,5 @@
 # app/utils/jwt.py
+from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Tuple
 from fastapi import Request
@@ -26,37 +27,60 @@ def _create_token(
     return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALG)
 
 
+def _now() -> datetime:
+    return datetime.utcnow()
+
+
 def create_access_refresh(
-    subject: str,
+    *,
+    user_id: int,
     tenant_id: int,
     tenant_code: str,
-) -> Tuple[str, str]:
+    session_id: str,
+    token_version: int,
+):
     """
-    Create access + refresh tokens WITH tenant info inside.
+    Access token: short lived
+    Refresh token: long lived (stored in HttpOnly cookie)
+    Both contain:
+      uid, tid, tcode, sid, tv
     """
-    access_delta = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    refresh_delta = timedelta(minutes=settings.REFRESH_TOKEN_EXPIRE_MINUTES)
+    now = _now()
 
-    access_token = _create_token(
-        subject=subject,
-        tenant_id=tenant_id,
-        tenant_code=tenant_code,
-        expires_delta=access_delta,
-    )
-    refresh_token = _create_token(
-        subject=subject,
-        tenant_id=tenant_id,
-        tenant_code=tenant_code,
-        expires_delta=refresh_delta,
-    )
-    return access_token, refresh_token
+    access_exp = now + timedelta(minutes=getattr(settings, "ACCESS_TOKEN_EXPIRE_MINUTES", 60))
+    refresh_exp = now + timedelta(minutes=settings.REFRESH_TOKEN_EXPIRE_MINUTES)
+
+    access_payload = {
+        "type": "access",
+        "sub": str(user_id),
+        "uid": int(user_id),
+        "tid": int(tenant_id),
+        "tcode": str(tenant_code),
+        "sid": str(session_id),
+        "tv": int(token_version),
+        "iat": int(now.timestamp()),
+        "exp": int(access_exp.timestamp()),
+    }
+
+    refresh_payload = {
+        "type": "refresh",
+        "sub": str(user_id),
+        "uid": int(user_id),
+        "tid": int(tenant_id),
+        "tcode": str(tenant_code),
+        "sid": str(session_id),
+        "tv": int(token_version),
+        "iat": int(now.timestamp()),
+        "exp": int(refresh_exp.timestamp()),
+    }
+
+    access = jwt.encode(access_payload, settings.JWT_SECRET, algorithm=settings.JWT_ALG)
+    refresh = jwt.encode(refresh_payload, settings.JWT_SECRET, algorithm=settings.JWT_ALG)
+    return access, refresh
 
 
 
 def extract_tenant_from_request(request: Request) -> Optional[str]:
-    """
-    Try to read tenant_code from Authorization Bearer token.
-    """
     auth = request.headers.get("Authorization")
     if not auth or not auth.lower().startswith("bearer "):
         return None
@@ -65,4 +89,5 @@ def extract_tenant_from_request(request: Request) -> Optional[str]:
         payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALG])
     except JWTError:
         return None
-    return payload.get("tenant_code")
+    # ✅ correct key
+    return payload.get("tcode")

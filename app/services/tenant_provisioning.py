@@ -1,12 +1,14 @@
-# app/services/tenant_provisioning.py
+# FILE: app/services/tenant_provisioning.py
 from __future__ import annotations
 
+import re
+import random
 from typing import Optional
 
 from sqlalchemy import text
-from sqlalchemy.exc import ProgrammingError
-from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import ProgrammingError, SQLAlchemyError, IntegrityError
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import settings
 from app.core.security import hash_password
@@ -15,22 +17,88 @@ from app.db.session import master_engine, get_or_create_tenant_engine
 from app.models.tenant import Tenant
 from app.models.user import User
 
+# If you have this model/table (you do in your tables list), we use it for 6-digit login_id
+try:
+    from app.models.user import UserLoginSeq  # type: ignore
+except Exception:  # pragma: no cover
+    UserLoginSeq = None  # fallback handled below
+
+
+def _sanitize_db_name(db_name: str) -> str:
+    """
+    Ensure db_name is safe for CREATE DATABASE.
+    Allows letters, digits, underscore only.
+    """
+    s = (db_name or "").strip()
+    s = s.replace("`", "")
+    s = re.sub(r"[^a-zA-Z0-9_]", "_", s)
+    s = s.strip("_")
+    if not s:
+        raise ValueError("Invalid tenant db_name")
+    return s
+
 
 def _create_physical_tenant_database(db_name: str) -> None:
-    safe_name = db_name.replace("`", "").strip()
-    if not safe_name:
-        raise ValueError("Invalid tenant db_name")
+    safe_name = _sanitize_db_name(db_name)
 
     stmt = text(
         f"CREATE DATABASE IF NOT EXISTS `{safe_name}` "
         "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
     )
-    with master_engine.begin() as conn:
-        conn.execute(stmt)
+
+    try:
+        with master_engine.begin() as conn:
+            conn.execute(stmt)
+    except SQLAlchemyError as e:
+        raise RuntimeError(f"Failed to create tenant database '{safe_name}'. Check MySQL privileges.") from e
 
 
 def _tenant_sessionmaker(engine: Engine) -> sessionmaker:
-    return sessionmaker(bind=engine, autocommit=False, autoflush=False, future=True)
+    return sessionmaker(
+        bind=engine,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
+        future=True,
+    )
+
+
+def _unwrap_engine(maybe_engine):
+    """
+    Some implementations return (engine, created_bool) etc.
+    We accept both.
+    """
+    if isinstance(maybe_engine, tuple) and maybe_engine:
+        return maybe_engine[0]
+    return maybe_engine
+
+
+def _norm_email(s: str) -> str:
+    return (s or "").strip().lower()
+
+
+def _generate_login_id(tenant_db: Session) -> str:
+    """
+    Prefer user_login_seq for guaranteed unique 6-digit IDs.
+    Fallback to random unique if seq table/model not available.
+    """
+    if UserLoginSeq is not None:
+        try:
+            seq = UserLoginSeq()
+            tenant_db.add(seq)
+            tenant_db.flush()  # seq.id available without commit
+            return f"{int(seq.id):06d}"
+        except Exception:
+            tenant_db.rollback()
+
+    # fallback: random 6-digit unique
+    for _ in range(50):
+        cand = f"{random.randint(0, 999999):06d}"
+        exists = tenant_db.query(User).filter(User.login_id == cand).first()
+        if not exists:
+            return cand
+
+    raise RuntimeError("Failed to generate unique 6-digit login_id")
 
 
 def provision_tenant_with_admin(
@@ -51,73 +119,151 @@ def provision_tenant_with_admin(
     if not tenant_code:
         raise ValueError("Tenant code is required")
 
-    # ✅ If master tables are missing, raise a clear error
+    if not (tenant_name or "").strip():
+        raise ValueError("Tenant name is required")
+
+    admin_email = _norm_email(admin_email)
+    if not admin_email:
+        raise ValueError("Admin email is required")
+
+    # ✅ If master tables missing / wrong MASTER_DATABASE_URI, raise clearly
     try:
         existing = master_db.query(Tenant).filter(Tenant.code == tenant_code).first()
     except ProgrammingError as e:
         raise RuntimeError(
-            "MASTER DB tables missing. Your MASTER_DATABASE_URI is pointing to the wrong DB "
-            "or you haven't created master tables. Expected table: tenants."
+            "MASTER DB tables missing or wrong MASTER_DATABASE_URI. "
+            "Expected table: tenants."
         ) from e
 
     if existing:
         raise ValueError("Tenant code already exists")
 
+    # Build tenant db name + uri
     db_name = f"{settings.TENANT_DB_NAME_PREFIX}{tenant_code.lower()}"
+    db_name = _sanitize_db_name(db_name)
     db_uri = settings.make_tenant_db_uri(db_name)
 
+    # 1) Create physical database
     _create_physical_tenant_database(db_name)
 
+    # 2) Create tenant row in master DB (provisioning)
     tenant = Tenant(
         code=tenant_code,
-        name=tenant_name,
+        name=tenant_name.strip(),
         db_name=db_name,
         db_uri=db_uri,
-        contact_person=contact_person,
+        contact_person=contact_person.strip(),
         contact_email=admin_email,
-        contact_phone=contact_phone,
-        subscription_plan=subscription_plan,
+        contact_phone=(contact_phone.strip() if contact_phone else None),
+        subscription_plan=(subscription_plan.strip() if subscription_plan else None),
         amc_percent=amc_percent,
         onboarding_status="provisioning",
-        meta={"hospital_address": hospital_address},
+        meta={"hospital_address": hospital_address} if hospital_address else {"hospital_address": None},
     )
 
+    master_db.add(tenant)
     try:
-        master_db.add(tenant)
         master_db.commit()
         master_db.refresh(tenant)
+    except IntegrityError as e:
+        master_db.rollback()
+        raise ValueError("Tenant code already exists") from e
+    except SQLAlchemyError as e:
+        master_db.rollback()
+        raise RuntimeError("Failed to create tenant in master DB") from e
 
+    # 3) Init tenant schema + seed
+    try:
         init_tenant_db(db_uri)
-
-        eng = get_or_create_tenant_engine(db_uri)
-        if isinstance(eng, tuple):
-            raise RuntimeError("get_or_create_tenant_engine returned tuple. Fix app/db/session.py")
-
-        TenantSessionLocal = _tenant_sessionmaker(eng)
-        tenant_db = TenantSessionLocal()
+    except Exception as e:
+        # mark failed (do not hide root issue)
         try:
-            found = tenant_db.query(User).filter(User.email == admin_email).first()
-            if not found:
-                admin_user = User(
-                    name=admin_name,
-                    email=admin_email,
-                    password_hash=hash_password(admin_password),
-                    is_admin=True,
-                    is_active=True,
-                )
-                tenant_db.add(admin_user)
-                tenant_db.commit()
+            tenant.onboarding_status = "failed"
+            if hasattr(tenant, "meta") and isinstance(getattr(tenant, "meta", None), dict):
+                tenant.meta["provision_error"] = repr(e)
+            master_db.commit()
         except Exception:
-            tenant_db.rollback()
-            raise
-        finally:
-            tenant_db.close()
+            master_db.rollback()
+        raise
 
+    # 4) Create admin in tenant DB (with YOUR concept)
+    eng = _unwrap_engine(get_or_create_tenant_engine(db_uri))
+    if eng is None or not hasattr(eng, "connect"):
+        # engine not valid
+        try:
+            tenant.onboarding_status = "failed"
+            if hasattr(tenant, "meta") and isinstance(getattr(tenant, "meta", None), dict):
+                tenant.meta["provision_error"] = "Invalid tenant engine from get_or_create_tenant_engine"
+            master_db.commit()
+        except Exception:
+            master_db.rollback()
+        raise RuntimeError("Invalid tenant engine. Fix app/db/session.py get_or_create_tenant_engine().")
+
+    TenantSessionLocal = _tenant_sessionmaker(eng)
+    tenant_db = TenantSessionLocal()
+    try:
+        # If already exists, do not duplicate
+        found = tenant_db.query(User).filter(User.email == admin_email).first()
+
+        if not found:
+            login_id = _generate_login_id(tenant_db)
+
+            admin_user = User(
+                login_id=login_id,                 # ✅ 6-digit
+                name=admin_name.strip(),
+                email=admin_email,
+                email_verified=False,              # ✅ must verify
+                password_hash=hash_password(admin_password),
+                is_admin=True,
+                is_active=True,
+                is_doctor=False,
+                department_id=None,
+                token_version=1,
+                # ✅ your required defaults
+                two_fa_enabled=True,               # ✅ ALWAYS true
+                multi_login_enabled=False,         # ✅ ALWAYS false
+            )
+
+            tenant_db.add(admin_user)
+            tenant_db.commit()
+        else:
+            # Ensure your defaults are enforced even if user exists
+            changed = False
+            if getattr(found, "two_fa_enabled", None) is not True:
+                found.two_fa_enabled = True
+                changed = True
+            if getattr(found, "multi_login_enabled", None) is not False:
+                found.multi_login_enabled = False
+                changed = True
+            if getattr(found, "is_admin", None) is not True:
+                found.is_admin = True
+                changed = True
+            if getattr(found, "is_active", None) is not True:
+                found.is_active = True
+                changed = True
+            if changed:
+                tenant_db.commit()
+
+    except Exception:
+        tenant_db.rollback()
+        # mark failed in master
+        try:
+            tenant.onboarding_status = "failed"
+            master_db.commit()
+        except Exception:
+            master_db.rollback()
+        raise
+    finally:
+        tenant_db.close()
+
+    # 5) Mark tenant active
+    try:
         tenant.onboarding_status = "active"
         master_db.commit()
         master_db.refresh(tenant)
-        return tenant
-
     except Exception:
         master_db.rollback()
-        raise
+        # still return tenant object (db is provisioned), but status not updated
+        return tenant
+
+    return tenant

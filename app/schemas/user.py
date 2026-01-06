@@ -1,31 +1,84 @@
 # app/schemas/user.py
-from pydantic import BaseModel, EmailStr
-from typing import Optional, List
+from __future__ import annotations
+
+from typing import List, Optional
+from pydantic import BaseModel, Field, EmailStr
 
 
-class UserBase(BaseModel):
-    name: str
-    email: EmailStr
-    is_active: bool = True
-    # NEW FIELD (read/write)
-    is_doctor: bool = False
-
-
-class UserCreate(UserBase):
-    password: str
-    department_id: Optional[int] = None
-    role_ids: List[int] = []
-
-
-class UserOut(UserBase):
+class UserOut(BaseModel):
     id: int
+    login_id: str
+    name: str
+    email: Optional[str] = None
+    email_verified: bool
+    two_fa_enabled: bool
+    multi_login_enabled: bool
+
+    is_active: bool
     is_admin: bool
-    department_id: Optional[int]
-    role_ids: List[int]
+    is_doctor: bool
+    department_id: Optional[int] = None
+
+    role_ids: List[int] = []
 
     class Config:
         from_attributes = True
 
+
+class UserCreate(BaseModel):
+    # ✅ per requirement: only name + password mandatory
+    name: str = Field(..., min_length=2, max_length=120)
+    password: str = Field(..., min_length=6, max_length=128)
+
+    # optional admin inputs
+    email: Optional[str] = None
+    is_active: bool = True
+
+    is_doctor: bool = False
+    two_fa_enabled: bool = False
+    multi_login_enabled: bool = True
+    department_id: Optional[int] = None
+    role_ids: Optional[List[int]] = None
+
+
+class UserUpdate(BaseModel):
+    name: str = Field(..., min_length=2, max_length=120)
+    email: Optional[str] = None
+
+    is_active: bool = True
+    is_doctor: bool = False
+    department_id: Optional[int] = None
+
+    # toggles
+    two_fa_enabled: bool = False
+    multi_login_enabled: bool = True
+
+    # password change (admin)
+    password: Optional[str] = None
+
+    # roles behavior:
+    # None => keep existing
+    # []   => clear then default role
+    # [..] => set roles
+    role_ids: Optional[List[int]] = None
+
+class UserSaveResponse(BaseModel):
+    user: UserOut
+    needs_email_verify: bool = False
+    otp_sent_to: Optional[str] = None
+    otp_purpose: Optional[str] = None
+
+
+class VerifyEmailOtpIn(BaseModel):
+    otp: str = Field(..., min_length=6, max_length=6)
+
+class UserMiniOut(BaseModel):
+    id: int
+    name: Optional[str] = None
+    email: Optional[str] = None
+
+    class Config:
+        from_attributes = True
 
 class UserLite(BaseModel):
     id: int
@@ -36,25 +89,3 @@ class UserLite(BaseModel):
 
     class Config:
         from_attributes = True
-
-
-class UserMiniOut(BaseModel):
-    id: int
-    name: Optional[str] = None
-    email: Optional[str] = None
-
-    class Config:
-        from_attributes = True
-
-
-class UserUpdate(BaseModel):
-    name: str
-    email: EmailStr
-    department_id: Optional[int] = None
-    is_active: bool = True
-    is_doctor: bool = False
-    password: Optional[str] = None
-
-    # IMPORTANT: optional for old users; if None => keep existing roles
-    # if [] => auto-assign default role
-    role_ids: Optional[List[int]] = None

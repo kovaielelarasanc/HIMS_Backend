@@ -6,7 +6,7 @@ from datetime import date as dt_date, datetime
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, func
@@ -39,14 +39,14 @@ from app.services.pharmacy_stock_alerts import (
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
-
+import logging
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 
 
 router = APIRouter(prefix="/pharmacy/stock", tags=["Pharmacy Stock & Alerts"])
 
-
+logger = logging.getLogger("app.api.stock_alerts")
 # -------------------------
 # Permission helper (robust)
 # -------------------------
@@ -148,6 +148,20 @@ def stock_alerts_summary(
     high_value_expiry_threshold: Decimal = Query(Decimal("0")),
     preview_limit: int = Query(25, ge=5, le=200),
 ):
+    params = {
+        "location_id": location_id,
+        "item_type": item_type,
+        "schedule_code": schedule_code,
+        "supplier_id": supplier_id,
+        "days_near_expiry": days_near_expiry,
+        "non_moving_days": non_moving_days,
+        "fast_moving_days": fast_moving_days,
+        "consumption_days": consumption_days,
+        "lead_time_days": lead_time_days,
+        "high_value_expiry_threshold": str(high_value_expiry_threshold),
+        "preview_limit": preview_limit,
+    }
+
     try:
         _need_any(user, ["pharmacy.stock.view", "pharmacy.inventory.view", "pharmacy.view"])
 
@@ -167,8 +181,30 @@ def stock_alerts_summary(
         )
         return ok(data)
 
-    except Exception as e:
-        return err(f"Failed to load stock alerts summary: {str(e)}", status_code=500)
+    except HTTPException as e:
+        # permission / validation from FastAPI
+        logger.warning(
+            "HTTPException in /alerts/summary status=%s detail=%s params=%s",
+            e.status_code,
+            getattr(e, "detail", None),
+            params,
+        )
+        raise
+
+    except (OperationalError, DBAPIError) as e:
+        # DB unreachable / connection dropped
+        logger.exception("DB unreachable in /alerts/summary params=%s", params)
+        return err("Database unavailable. Try again.", status_code=503)
+
+    except SQLAlchemyError:
+        # other DB errors
+        logger.exception("DB error in /alerts/summary params=%s", params)
+        return err("Database error while loading summary.", status_code=500)
+
+    except Exception:
+        # unknown
+        logger.exception("Unexpected error in /alerts/summary params=%s", params)
+        return err("Failed to load stock alerts summary.", status_code=500)
 
 
 # ============================================================

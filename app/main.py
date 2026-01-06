@@ -17,6 +17,7 @@ from app.services.error_logger import log_error, format_exception
 from app.utils.jwt import extract_tenant_from_request
 from fastapi.responses import JSONResponse
 from fastapi import Request
+
 # from app.api.routes_lis_device import public_router as lis_public_router
 
 app = FastAPI(
@@ -46,6 +47,7 @@ def setup_logging():
     )
 
 setup_logging()
+
 
 logger = logging.getLogger("app")
 logger.info("✅ App starting...")

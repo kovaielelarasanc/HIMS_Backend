@@ -1,6 +1,8 @@
 # app/schemas/auth.py
-from pydantic import BaseModel, EmailStr
-from typing import Optional
+from __future__ import annotations
+
+from pydantic import BaseModel, EmailStr, Field
+from typing import Optional, Literal
 
 
 class RegisterAdminIn(BaseModel):
@@ -23,16 +25,22 @@ class RegisterAdminIn(BaseModel):
 
 
 class LoginIn(BaseModel):
-    tenant_code: str
-    email: EmailStr
-    password: str
+    tenant_code: str = Field(..., min_length=2, max_length=50)
+    login_id: str = Field(..., min_length=6, max_length=6)
+    password: str = Field(..., min_length=6, max_length=128)
 
 
 class OtpVerifyIn(BaseModel):
-    tenant_code: str
-    email: EmailStr
-    otp: str
+    tenant_code: str = Field(..., min_length=2, max_length=50)
+    login_id: str = Field(..., min_length=6, max_length=6)
+    otp: str = Field(..., alias="otp_code") 
 
+    # ✅ allows login flow to verify either login OTP or email_verify OTP
+    purpose: Optional[Literal["login", "email_verify"]] = "login"
+
+    class Config:
+        allow_population_by_field_name = True
+        allow_population_by_alias = True
 
 class TokenOut(BaseModel):
     access_token: str

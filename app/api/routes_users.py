@@ -1,221 +1,418 @@
-# app/api/routes_user.py
 from __future__ import annotations
 
+from datetime import datetime
+import random
+from typing import List, Optional
+
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import func
 
 from app.api.deps import get_db, current_user, require_perm
 from app.core.security import hash_password
-from app.models.user import User
+from app.models.user import User, UserLoginSeq, UserSession
 from app.models.role import Role
-from app.schemas.user import UserCreate, UserOut, UserUpdate
-from app.services.rbac_helpers import (
-    ensure_admin_has_all_permissions,
-    ensure_user_has_atleast_one_role,
-)
+from app.schemas.user import UserCreate, UserOut, UserUpdate, UserSaveResponse
+from app.services.otp_service import send_email_verify_otp
+from app.utils.otp_tokens import verify_otp
 
 router = APIRouter()
 
 
-@router.get("/", response_model=list[UserOut])
-def list_users(
-        db: Session = Depends(get_db),
-        me: User = Depends(current_user),
-):
-    require_perm(me, "users.view")
-
-    users = (db.query(User).options(joinedload(User.roles)).all())
-
-    out: list[UserOut] = []
-    for u in users:
-        out.append(
-            UserOut(
-                id=u.id,
-                name=u.name,
-                email=u.email,
-                is_active=u.is_active,
-                is_admin=u.is_admin,
-                is_doctor=u.is_doctor,
-                department_id=u.department_id,
-                role_ids=[r.id for r in (u.roles or [])],
-            ))
-    return out
+# -------------------------
+# helpers
+# -------------------------
+def _utcnow() -> datetime:
+    return datetime.utcnow()
 
 
-@router.get("/doctors", response_model=list[UserOut])
-def list_doctors(
-        db: Session = Depends(get_db),
-        me: User = Depends(current_user),
-):
-    require_perm(me, "users.view")
-
-    users = (db.query(User).options(joinedload(User.roles)).filter(
-        User.is_doctor.is_(True)).all())
-
-    out: list[UserOut] = []
-    for u in users:
-        out.append(
-            UserOut(
-                id=u.id,
-                name=u.name,
-                email=u.email,
-                is_active=u.is_active,
-                is_admin=u.is_admin,
-                is_doctor=u.is_doctor,
-                department_id=u.department_id,
-                role_ids=[r.id for r in (u.roles or [])],
-            ))
-    return out
+def _norm_email(s: Optional[str]) -> Optional[str]:
+    if not s:
+        return None
+    s = s.strip()
+    return s if s else None
 
 
-@router.post("/", response_model=UserOut)
-def create_user(
-        payload: UserCreate,
-        db: Session = Depends(get_db),
-        me: User = Depends(current_user),
-):
-    require_perm(me, "users.create")
+def _enforce_doctor_department(is_doctor: bool, department_id: Optional[int]) -> None:
+    if bool(is_doctor) and not department_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Department is mandatory when Mark as Doctor is enabled",
+        )
 
-    # Email uniqueness within tenant DB
-    if db.query(User).filter(User.email == payload.email).first():
-        raise HTTPException(status_code=400, detail="Email exists")
 
-    u = User(
-        name=payload.name,
-        email=payload.email,
-        password_hash=hash_password(payload.password),
-        department_id=payload.department_id,
-        is_active=payload.is_active,
-        is_doctor=payload.is_doctor,
+def _enforce_2fa_email(two_fa_enabled: bool, email: Optional[str]) -> None:
+    if bool(two_fa_enabled) and not email:
+        raise HTTPException(status_code=400, detail="Email is mandatory when 2FA is enabled")
+
+
+def _revoke_all_sessions(db: Session, user_id: int, reason: str) -> None:
+    now = _utcnow().isoformat()
+    rows = (
+        db.query(UserSession)
+        .filter(UserSession.user_id == int(user_id), UserSession.revoked_at.is_(None))
+        .all()
     )
-    db.add(u)
-    db.flush()  # get u.id
+    for s in rows:
+        s.revoked_at = now
+        s.revoke_reason = reason
 
-    # Roles: validate if provided
-    if payload.role_ids is not None and len(payload.role_ids) > 0:
-        roles = db.query(Role).filter(Role.id.in_(payload.role_ids)).all()
-        if len(roles) != len(set(payload.role_ids)):
-            raise HTTPException(status_code=400, detail="Invalid role_ids")
-        u.roles = roles
 
-    # Ensure at least one role (fixes old-style creates too)
-    ensure_user_has_atleast_one_role(db, u)
-
-    # Admin role always has all permissions
-    ensure_admin_has_all_permissions(db)
-
-    try:
-        db.commit()
-    except IntegrityError:
-        db.rollback()
-        raise HTTPException(status_code=400, detail="Create failed")
-    db.refresh(u)
-
+def _build_user_out(u: User) -> UserOut:
     return UserOut(
         id=u.id,
+        login_id=u.login_id,
         name=u.name,
         email=u.email,
-        is_active=u.is_active,
-        is_admin=u.is_admin,
-        is_doctor=u.is_doctor,
-        department_id=u.department_id,
+        email_verified=bool(getattr(u, "email_verified", False)),
+        two_fa_enabled=bool(getattr(u, "two_fa_enabled", False)),
+        multi_login_enabled=bool(getattr(u, "multi_login_enabled", True)),
+        is_active=bool(getattr(u, "is_active", True)),
+        is_admin=bool(getattr(u, "is_admin", False)),
+        is_doctor=bool(getattr(u, "is_doctor", False)),
+        department_id=getattr(u, "department_id", None),
         role_ids=[r.id for r in (u.roles or [])],
     )
 
 
-@router.put("/{user_id}", response_model=UserOut)
+def _email_exists(db: Session, email: str, *, exclude_user_id: Optional[int] = None) -> bool:
+    q = db.query(User.id).filter(func.lower(User.email) == email.lower())
+    if exclude_user_id:
+        q = q.filter(User.id != int(exclude_user_id))
+    return db.query(q.exists()).scalar() is True
+
+
+def _load_roles(db: Session, role_ids: List[int]) -> List[Role]:
+    uniq = sorted({int(x) for x in (role_ids or [])})
+    if not uniq:
+        return []
+    roles = db.query(Role).filter(Role.id.in_(uniq)).all()
+    if len(roles) != len(uniq):
+        raise HTTPException(status_code=400, detail="Invalid role_ids")
+    return roles
+
+
+def _gen_random_login_id() -> str:
+    # 6 digits, allows leading zeros
+    return f"{random.randint(0, 999999):06d}"
+
+
+def _generate_login_id(db: Session) -> str:
+    """
+    Prefer UserLoginSeq if table exists; fallback to random+unique check.
+    Robust even if UserLoginSeq table is missing in some tenants.
+    """
+    # 1) try sequence table
+    try:
+        with db.begin_nested():
+            seq = UserLoginSeq()
+            db.add(seq)
+            db.flush()
+            lid = f"{int(seq.id):06d}"
+        # ensure not used (very rare, but safe)
+        exists = db.query(User.id).filter(User.login_id == lid).first()
+        if not exists:
+            return lid
+    except (OperationalError, Exception):
+        # table missing or any issue -> fallback
+        db.rollback()
+
+    # 2) fallback random with retry
+    for _ in range(30):
+        lid = _gen_random_login_id()
+        if not db.query(User.id).filter(User.login_id == lid).first():
+            return lid
+
+    raise HTTPException(status_code=500, detail="Unable to generate unique Login ID. Try again.")
+
+
+def _integrity_to_http(e: IntegrityError) -> HTTPException:
+    msg = str(getattr(e, "orig", e)).lower()
+
+    # Try to classify common unique violations
+    if "duplicate" in msg or "unique" in msg:
+        if "email" in msg:
+            return HTTPException(status_code=409, detail="Email already exists")
+        if "login_id" in msg or "login id" in msg:
+            return HTTPException(status_code=409, detail="Login ID conflict. Please retry create.")
+        return HTTPException(status_code=409, detail="Duplicate value conflict")
+
+    return HTTPException(status_code=400, detail="Request rejected by database constraints")
+
+
+def _safe_send_verify_otp(db: Session, user: User) -> None:
+    """
+    Never fail the whole API response if SMTP fails.
+    User is already created/updated; OTP can be resent.
+    """
+    try:
+        send_email_verify_otp(db, user, ttl_minutes=10)
+    except Exception:
+        # Do not raise: UI can use resend OTP
+        pass
+
+
+# -------------------------
+# routes
+# -------------------------
+@router.get("/", response_model=List[UserOut])
+def list_users(db: Session = Depends(get_db), me: User = Depends(current_user)):
+    require_perm(me, "users.view")
+
+    users = db.query(User).options(joinedload(User.roles)).order_by(User.id.desc()).all()
+    return [_build_user_out(u) for u in users]
+
+
+@router.get("/doctors", response_model=List[UserOut])
+def list_doctors(db: Session = Depends(get_db), me: User = Depends(current_user)):
+    require_perm(me, "users.view")
+
+    users = (
+        db.query(User)
+        .options(joinedload(User.roles))
+        .filter(User.is_doctor.is_(True))
+        .order_by(User.id.desc())
+        .all()
+    )
+    return [_build_user_out(u) for u in users]
+
+
+@router.post("/", response_model=UserSaveResponse)
+def create_user(payload: UserCreate, db: Session = Depends(get_db), me: User = Depends(current_user)):
+    require_perm(me, "users.create")
+
+    name = (payload.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name is required")
+
+    email = _norm_email(payload.email)
+    _enforce_doctor_department(bool(payload.is_doctor), payload.department_id)
+    _enforce_2fa_email(bool(payload.two_fa_enabled), email)
+
+    if email and _email_exists(db, email):
+        raise HTTPException(status_code=409, detail="Email already exists")
+
+    if not (payload.password or "").strip():
+        raise HTTPException(status_code=400, detail="Password is required")
+
+    roles = _load_roles(db, payload.role_ids or [])
+
+    # retry create if login_id conflict happens
+    last_err: Optional[Exception] = None
+    for _ in range(5):
+        try:
+            login_id = _generate_login_id(db)
+
+            u = User(
+                login_id=login_id,
+                name=name,
+                email=email,
+                email_verified=False,
+                password_hash=hash_password(payload.password),
+                two_fa_enabled=bool(payload.two_fa_enabled),
+                multi_login_enabled=bool(payload.multi_login_enabled),
+                token_version=int(getattr(payload, "token_version", 1) or 1),
+                is_active=bool(payload.is_active),
+                is_admin=False,
+                is_doctor=bool(payload.is_doctor),
+                department_id=(payload.department_id if payload.is_doctor else None),
+            )
+            u.roles = roles
+
+            db.add(u)
+            db.commit()
+            db.refresh(u)
+
+            needs_email_verify = False
+            if u.two_fa_enabled:
+                needs_email_verify = True
+                u.email_verified = False
+                db.commit()
+                _safe_send_verify_otp(db, u)
+
+            return UserSaveResponse(
+                user=_build_user_out(u),
+                needs_email_verify=needs_email_verify,
+                otp_sent_to=u.email if needs_email_verify else None,
+                otp_purpose="email_verify" if needs_email_verify else None,
+            )
+
+        except IntegrityError as e:
+            db.rollback()
+            last_err = e
+            # if email conflict or other -> raise immediately
+            raise _integrity_to_http(e) from e
+
+        except Exception as e:
+            db.rollback()
+            last_err = e
+
+    raise HTTPException(status_code=400, detail=f"Create failed: {str(last_err)}")
+
+
+@router.put("/{user_id}", response_model=UserSaveResponse)
 def update_user(
-        user_id: int,
-        payload: UserUpdate,
-        db: Session = Depends(get_db),
-        me: User = Depends(current_user),
+    user_id: int,
+    payload: UserUpdate,
+    db: Session = Depends(get_db),
+    me: User = Depends(current_user),
 ):
     require_perm(me, "users.update")
 
-    u = db.get(User, user_id)
+    u = db.query(User).options(joinedload(User.roles)).filter(User.id == int(user_id)).first()
     if not u:
-        raise HTTPException(status_code=404, detail="Not found")
+        raise HTTPException(status_code=404, detail="User not found")
 
-    # Email uniqueness
-    if payload.email != u.email:
-        exists = db.query(User).filter(User.email == payload.email).first()
-        if exists:
-            raise HTTPException(status_code=409, detail="Email already exists")
+    name = (payload.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name is required")
 
-    # Update fields
-    u.name = payload.name
-    u.email = payload.email
-    u.department_id = payload.department_id
-    u.is_active = payload.is_active
-    u.is_doctor = payload.is_doctor
+    new_email = _norm_email(payload.email)
+    _enforce_doctor_department(bool(payload.is_doctor), payload.department_id)
+    _enforce_2fa_email(bool(payload.two_fa_enabled), new_email)
 
-    if payload.password:
-        u.password_hash = hash_password(payload.password)
+    email_changed = (new_email or None) != (u.email or None)
 
-    # ✅ Role-safe logic (prevents old users losing roles)
-    # None  => keep existing roles
-    # []    => clear + assign default role
-    # [..]  => set these roles
-    if payload.role_ids is None:
-        pass
-    elif len(payload.role_ids) == 0:
-        u.roles = []
-        ensure_user_has_atleast_one_role(db, u)
-    else:
-        roles = db.query(Role).filter(Role.id.in_(payload.role_ids)).all()
-        if len(roles) != len(set(payload.role_ids)):
-            raise HTTPException(status_code=400, detail="Invalid role_ids")
+    if new_email and email_changed and _email_exists(db, new_email, exclude_user_id=u.id):
+        raise HTTPException(status_code=409, detail="Email already exists")
+
+    prev_two_fa = bool(getattr(u, "two_fa_enabled", False))
+    prev_multi = bool(getattr(u, "multi_login_enabled", True))
+
+    # apply updates
+    u.name = name
+    u.email = new_email
+    u.is_active = bool(payload.is_active)
+    u.is_doctor = bool(payload.is_doctor)
+    u.department_id = (payload.department_id if payload.is_doctor else None)
+    u.two_fa_enabled = bool(payload.two_fa_enabled)
+    u.multi_login_enabled = bool(payload.multi_login_enabled)
+
+    # password update (optional)
+    if payload.password and payload.password.strip():
+        u.password_hash = hash_password(payload.password.strip())
+        u.token_version = int(getattr(u, "token_version", 1) or 1) + 1
+        _revoke_all_sessions(db, u.id, reason="password_changed_by_admin")
+
+    # roles update (optional)
+    if payload.role_ids is not None:
+        roles = _load_roles(db, payload.role_ids or [])
         u.roles = roles
 
-    # If user has no roles (old data), repair it
-    ensure_user_has_atleast_one_role(db, u)
+    needs_email_verify = False
 
-    # Ensure admin role always gets new permissions
-    ensure_admin_has_all_permissions(db)
+    # 2FA rules
+    if u.two_fa_enabled:
+        # If turning ON or email changed -> verify again
+        if (not prev_two_fa) or email_changed:
+            u.email_verified = False
+            needs_email_verify = True
+
+    # multi-login turned OFF -> revoke all sessions (so it won't block wrongly)
+    if prev_multi and (u.multi_login_enabled is False):
+        _revoke_all_sessions(db, u.id, reason="multi_login_disabled")
 
     try:
         db.commit()
-    except IntegrityError:
+        db.refresh(u)
+    except IntegrityError as e:
         db.rollback()
-        raise HTTPException(status_code=400, detail="Update failed")
-    db.refresh(u)
+        raise _integrity_to_http(e) from e
 
-    return UserOut(
-        id=u.id,
-        name=u.name,
-        email=u.email,
-        is_active=u.is_active,
-        is_admin=u.is_admin,
-        is_doctor=u.is_doctor,
-        department_id=u.department_id,
-        role_ids=[r.id for r in (u.roles or [])],
+    if needs_email_verify and u.email:
+        _safe_send_verify_otp(db, u)
+
+    return UserSaveResponse(
+        user=_build_user_out(u),
+        needs_email_verify=needs_email_verify,
+        otp_sent_to=u.email if needs_email_verify else None,
+        otp_purpose="email_verify" if needs_email_verify else None,
     )
 
 
 @router.delete("/{user_id}")
-def delete_user(
-        user_id: int,
-        db: Session = Depends(get_db),
-        me: User = Depends(current_user),
-):
-    # In HMIS: never hard delete users (FK audit trails). Deactivate instead.
+def deactivate_user(user_id: int, db: Session = Depends(get_db), me: User = Depends(current_user)):
     require_perm(me, "users.delete")
 
-    u = db.get(User, user_id)
+    u = db.query(User).filter(User.id == int(user_id)).first()
     if not u:
-        raise HTTPException(status_code=404, detail="Not found")
+        raise HTTPException(status_code=404, detail="User not found")
 
-    if u.is_admin:
-        raise HTTPException(status_code=400,
-                            detail="Cannot deactivate Admin user")
-
+    # soft deactivate
     u.is_active = False
+    _revoke_all_sessions(db, u.id, reason="deactivated_by_admin")
 
     try:
         db.commit()
-    except IntegrityError:
+    except IntegrityError as e:
         db.rollback()
-        raise HTTPException(status_code=400, detail="Deactivate failed")
+        raise HTTPException(status_code=400, detail="Failed to deactivate user") from e
 
-    return {"message": "Deactivated"}
+    return {"ok": True}
+
+
+# -------------------------
+# OTP endpoints for Admin UI
+# -------------------------
+class OtpBody(BaseModel):
+    otp_code: Optional[str] = None
+    otp: Optional[str] = None
+
+
+@router.post("/{user_id}/email/verify-otp", response_model=UserOut)
+def admin_verify_email_otp(
+    user_id: int,
+    payload: OtpBody,
+    db: Session = Depends(get_db),
+    me: User = Depends(current_user),
+):
+    require_perm(me, "users.update")
+
+    u = db.query(User).filter(User.id == int(user_id)).first()
+    if not u:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not u.email:
+        raise HTTPException(status_code=400, detail="Email not set")
+
+    code = (payload.otp_code or payload.otp or "").strip()
+    code = "".join([c for c in code if c.isdigit()])[:6]
+    if len(code) != 6:
+        raise HTTPException(status_code=400, detail="Enter 6-digit OTP")
+
+    ok = verify_otp(db, user_id=u.id, purpose="email_verify", otp_code=code)
+    if not ok:
+        raise HTTPException(status_code=400, detail="Invalid or expired OTP")
+
+    u.email_verified = True
+    db.commit()
+    db.refresh(u)
+    return _build_user_out(u)
+
+
+@router.post("/{user_id}/email/resend-otp")
+def admin_resend_email_otp(user_id: int, db: Session = Depends(get_db), me: User = Depends(current_user)):
+    require_perm(me, "users.update")
+
+    u = db.query(User).filter(User.id == int(user_id)).first()
+    if not u:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not u.email:
+        raise HTTPException(status_code=400, detail="Email not set")
+    if not bool(getattr(u, "two_fa_enabled", False)):
+        raise HTTPException(status_code=400, detail="2FA is disabled for this user")
+
+    _safe_send_verify_otp(db, u)
+    return {"ok": True, "message": "OTP sent"}
+
+
+# Backward compatible alias (if any old UI calls /email/verify)
+@router.post("/{user_id}/email/verify", response_model=UserOut)
+def admin_verify_email_alias(
+    user_id: int,
+    payload: OtpBody,
+    db: Session = Depends(get_db),
+    me: User = Depends(current_user),
+):
+    return admin_verify_email_otp(user_id, payload, db, me)

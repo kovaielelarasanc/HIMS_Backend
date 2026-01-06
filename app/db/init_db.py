@@ -31,22 +31,14 @@ def seed_permissions(db: Session) -> None:
         ("users", ["view", "create", "update", "delete"]),
 
         # -------- PATIENTS ----------
-        ("patients", [
-            "view",
-            "create",
-            "update",
-            "deactivate",
-            "addresses.view",
-            "addresses.create",
-            "addresses.update",
-            "addresses.delete",
-            "consents.view",
-            "consents.create",
-            "attachments.manage",
-            "masters.view",
-            "masters.manage",
-        ]),
-
+        ("patients", ["view", "create", "update", "deactivate",]),
+        ("patients.addresses", ["view", "create", "update", "delete",]),
+        ("patients.consents", ["view", "create"]),
+        ("patients.attachments", ["manage"]),
+        ("patients.masters", ["view", "manage"]),
+            
+            
+      
         # -------- OPD ----------
         ("schedules", ["manage"]),
         ("appointments", ["view", "create", "update", "cancel"]),
@@ -146,7 +138,7 @@ def seed_permissions(db: Session) -> None:
                 "cancel",    # ipd.transfers.cancel
                 "manage",    # optional admin wildcard for this module
             ],
-        )
+        ),
 
         # -------------------------------------------------------------------
         # IPD Clinical Permissions (module -> actions)
