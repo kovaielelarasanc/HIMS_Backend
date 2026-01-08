@@ -1,5 +1,6 @@
 # backend/app/main.py
-from fastapi import FastAPI
+import os
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
@@ -7,7 +8,7 @@ import logging
 import sys
 from app.core.config import settings
 from app.api.router import api_router
-from fastapi import Request
+
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import HTTPException
 from starlette.status import HTTP_500_INTERNAL_SERVER_ERROR
@@ -15,9 +16,7 @@ from app.api.exception_handlers import register_exception_handlers
 from app.db.session import MasterSessionLocal
 from app.services.error_logger import log_error, format_exception
 from app.utils.jwt import extract_tenant_from_request
-from fastapi.responses import JSONResponse
-from fastapi import Request
-
+from app.lab_integration.mllp_server import MLLPServer, should_start_mllp
 # from app.api.routes_lis_device import public_router as lis_public_router
 
 app = FastAPI(
@@ -37,6 +36,21 @@ app.add_middleware(
     expose_headers=["Content-Disposition"],
 )
 
+@app.on_event("startup")
+async def startup():
+    global _mllp
+    if should_start_mllp():
+        host = os.getenv("LAB_MLLP_HOST", "0.0.0.0")
+        port = int(os.getenv("LAB_MLLP_PORT", "2575"))
+        _mllp = MLLPServer(host, port)
+        await _mllp.start()
+
+@app.on_event("shutdown")
+async def shutdown():
+    global _mllp
+    if _mllp:
+        await _mllp.stop()
+        _mllp = None
 
 def setup_logging():
     logging.basicConfig(

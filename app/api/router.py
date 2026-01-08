@@ -52,7 +52,6 @@ from app.api import (
     routes_inventory,
     routes_audit_logs,
     routes_lis_masters,
-    routes_lis_device,
     routes_billing_advances,
     routes_billing_invoice_wallet,
     routes_billing_wallet,
@@ -62,8 +61,9 @@ from app.api import (
     routes_ipd_newborn,
     routes_ipd_admissions,
     routes_pharmacy_stock_alerts,
+    routes_lab_integration,
 )
-from app.api.routes_lis_device import connector_router as lis_connector_router
+
 
 api_router = APIRouter()
 
@@ -141,8 +141,9 @@ api_router.include_router(routes_masters.router,
 # ---- LIS / RIS / OT / Billing
 api_router.include_router(routes_lis.router, prefix="/lab", tags=["LIS Orders"])
 api_router.include_router(routes_lis_masters.router)
-api_router.include_router(routes_lis_device.router)  # UI routes only
-api_router.include_router(lis_connector_router) 
+api_router.include_router(routes_lab_integration.router)
+
+ 
 
 api_router.include_router(routes_ris.router)
 
