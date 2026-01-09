@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, date
 from decimal import Decimal
-
+from sqlalchemy import Column, BigInteger, ForeignKey
 from sqlalchemy import (
     Column,
     Integer,
@@ -16,7 +16,7 @@ from sqlalchemy import (
     ForeignKey,
     func,
 )
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, backref
 
 from app.db.base import Base
 
@@ -145,12 +145,12 @@ class PharmacyPrescriptionLine(Base):
     item_form = Column(String(64), nullable=True)
     item_strength = Column(String(64), nullable=True)
     item_type = Column(String(32), nullable=True)  # drug / consumable
-     # ✅ NEW: batch lock + snapshots for UI
-    batch_id = Column(Integer, ForeignKey("inv_item_batches.id"), nullable=True)
+    # ✅ NEW: batch lock + snapshots for UI
+    batch_id = Column(Integer,
+                      ForeignKey("inv_item_batches.id"),
+                      nullable=True)
     batch_no_snapshot = Column(String(100), nullable=True)
     expiry_date_snapshot = Column(Date, nullable=True)
-
-    
 
     created_at = Column(DateTime,
                         nullable=False,
@@ -238,14 +238,14 @@ class PharmacySale(Base):
     ipd_admission = relationship("IpdAdmission")
     location = relationship("InventoryLocation")
     billing_invoice_id = Column(
-        Integer,
-        ForeignKey("billing_invoices.id"),
+        BigInteger,  # ✅ match BillingInvoice.id (BigInteger)
+        ForeignKey("billing_invoices.id", ondelete="SET NULL"),
         nullable=True,
         index=True,
     )
 
     billing_invoice = relationship(
-        "Invoice",
+        "BillingInvoice",
         back_populates="pharmacy_sales",
         lazy="joined",
     )

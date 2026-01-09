@@ -84,6 +84,7 @@ class PackageOut(PackageIn):
 
 class BedRateIn(BaseModel):
     room_type: str  # e.g., "General", "Private", "ICU"
+    rate_basis: str = Field("daily", description="daily|hourly")
     daily_rate: float = Field(..., ge=0)
     effective_from: date
     effective_to: Optional[date] = None  # inclusive; null = open-ended

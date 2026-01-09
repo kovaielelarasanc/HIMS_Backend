@@ -1,13 +1,14 @@
 # FILE: app/schemas/ot.py
 from __future__ import annotations
-
 from datetime import date, time, datetime, timezone
 from typing import Any, Dict, List, Optional, Union
 from sqlalchemy import Boolean, Text, JSON, Column
-from pydantic import BaseModel, ConfigDict, Field, field_serializer
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
+from decimal import Decimal
 from .user import UserOut, UserMiniOut
 from .patient import PatientOut
 from zoneinfo import ZoneInfo
+
 JsonDict = Dict[str, Any]
 JsonValue = Union[JsonDict, List[Any], None]
 
@@ -18,6 +19,8 @@ JsonValue = Union[JsonDict, List[Any], None]
 # ---------- OtSpeciality ----------
 
 IST = ZoneInfo("Asia/Kolkata")
+
+
 # -------------------------
 # Speciality
 # -------------------------
@@ -331,7 +334,7 @@ class OtScheduleOut(OtScheduleBase):
 
     primary_procedure: Optional["OtProcedureOut"] = None
     procedures: List[OtScheduleProcedureLinkOut] = []
-    
+
     op_no: Optional[str] = None
 
     created_at: datetime
@@ -689,24 +692,98 @@ class AnaesthesiaRecordUpdate(BaseModel):
 
 # FILE: app/schemas/ot.py
 
-# FILE: app/schemas/ot.py
+
+def _blank(v: Any) -> bool:
+    return v is None or (isinstance(v, str) and v.strip() == "")
+
+
+def _to_int_or_none(v: Any) -> Optional[int]:
+    if _blank(v):
+        return None
+    if isinstance(v, bool):
+        return int(v)
+    if isinstance(v, (int, )):
+        return v
+    s = str(v).strip()
+    try:
+        return int(float(s))  # handles "12", "12.0"
+    except Exception:
+        return None
+
+
+def _to_float_or_none(v: Any) -> Optional[float]:
+    if _blank(v):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip()
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _to_bool(v: Any) -> bool:
+    if isinstance(v, bool):
+        return v
+    if _blank(v):
+        return False
+    s = str(v).strip().lower()
+    return s in ("1", "true", "yes", "y", "on")
+
+
+def _to_list_int(v: Any) -> List[int]:
+    if v is None:
+        return []
+    if isinstance(v, list):
+        out: List[int] = []
+        seen = set()
+        for x in v:
+            n = _to_int_or_none(x)
+            if n is None:
+                continue
+            if n not in seen:
+                seen.add(n)
+                out.append(n)
+        return out
+    # single value
+    n = _to_int_or_none(v)
+    return [n] if n is not None else []
 
 
 class OtAnaesthesiaRecordIn(BaseModel):
-    # ============================================================
-    # PRE-OP RECORD (from pre-anaesthetic sheet)
-    # ============================================================
+    """
+    ✅ Accepts your frontend payload safely:
+    - ignores extra keys like id/case_id/created_at if they accidentally come
+    - converts "" -> None for int/float fields
+    - accepts asa_grade as "1"/1/"I"/etc (stored as string)
+    """
+    model_config = ConfigDict(extra="allow")
 
-    # General assessment
-    anaesthesia_type: Optional[str] = None  # GA / Spinal / Epidural / MAC etc.
-    asa_grade: Optional[str] = None  # I / II / III / IV / V / E
+    # ============================================================
+    # PRE-OP RECORD
+    # ============================================================
+    anaesthesia_type: Optional[str] = None
+
+    asa_grade: Optional[Union[str, int]] = None  # accepts "1"/1/"I" etc.
+    asa_emergency: bool = False  # ✅ added
     airway_assessment: Optional[str] = None
     comorbidities: Optional[str] = None
     allergies: Optional[str] = None
 
-    # Baseline vitals + systems exam
+    patient_prefix: Optional[str] = None
+    diagnosis: Optional[str] = None
+    proposed_operation: Optional[str] = None
+
+    weight: Optional[str] = None
+    height: Optional[str] = None
+    hb: Optional[str] = None
+    blood_group: Optional[str] = None
+    investigation_reports: Optional[str] = None
+    history: Optional[str] = None
+
     preop_pulse: Optional[int] = None
-    preop_bp: Optional[str] = None  # "120/80"
+    preop_bp: Optional[str] = None
     preop_rr: Optional[int] = None
     preop_temp_c: Optional[float] = None
     preop_cvs: Optional[str] = None
@@ -716,83 +793,61 @@ class OtAnaesthesiaRecordIn(BaseModel):
     preop_veins: Optional[str] = None
     preop_spine: Optional[str] = None
 
-    # Airway examination details
-    airway_teeth_status: Optional[
-        str] = None  # "Intact" / "Loose" / "Partially edentulous"
-    airway_denture: Optional[str] = None  # "Present" / "Absent"
+    airway_teeth_status: Optional[str] = None
+    airway_denture: Optional[str] = None
     airway_neck_movements: Optional[str] = None
-    airway_mallampati_class: Optional[str] = None  # "Class 1/2/3/4"
+    airway_mallampati_class: Optional[str] = None
     difficult_airway_anticipated: Optional[bool] = None
 
-    # Risk & plan
     risk_factors: Optional[str] = None
-    anaesthetic_plan_detail: Optional[str] = None  # free text plan
+    anaesthetic_plan_detail: Optional[str] = None
     preop_instructions: Optional[str] = None
 
-    # ============================================================
-    # INTRA-OP SETTINGS (from yellow sheet)
-    # ============================================================
+    # ✅ checklist coming from UI
+    preop_checklist: Dict[str, bool] = Field(default_factory=dict)
 
-    # Airway / induction / intubation
+    # ============================================================
+    # INTRA-OP SETTINGS
+    # ============================================================
     preoxygenation: Optional[bool] = None
     cricoid_pressure: Optional[bool] = None
-    induction_route: Optional[
-        str] = None  # "Intravenous" / "Inhalational" / "Rapid sequence"
+    induction_route: Optional[str] = None
 
     intubation_done: Optional[bool] = None
-    intubation_route: Optional[str] = None  # Oral / Nasal
-    intubation_state: Optional[str] = None  # "Awake" / "Anaesthetised"
-    intubation_technique: Optional[
-        str] = None  # "Visual" / "Blind" / "Fibreoptic" / "Retrograde"
+    intubation_route: Optional[str] = None
+    intubation_state: Optional[str] = None
+    intubation_technique: Optional[str] = None
 
-    tube_type: Optional[str] = None  # ETT, LMA, Tracheostomy, etc.
-    tube_size: Optional[str] = None  # e.g. "7.0"
-    tube_fixed_at: Optional[str] = None  # e.g. "20 cm"
+    tube_type: Optional[str] = None
+    tube_size: Optional[str] = None
+    tube_fixed_at: Optional[str] = None
     cuff_used: Optional[bool] = None
-    cuff_medium: Optional[str] = None  # Air / Saline / Not inflated
+    cuff_medium: Optional[str] = None
     bilateral_breath_sounds: Optional[str] = None
     added_sounds: Optional[str] = None
-    laryngoscopy_grade: Optional[str] = None  # Grade I/II/III/IV
+    laryngoscopy_grade: Optional[str] = None
 
-    airway_devices: Optional[list[str]] = None
-    # eg: ["Face mask", "LMA/ILMA", "Oral airway", "Throat pack", "NG tube", "Other"]
+    airway_devices: List[str] = Field(default_factory=list)
 
-    # Ventilation + breathing system (static settings)
-    ventilation_mode_baseline: Optional[
-        str] = None  # Spontaneous / Controlled / Manual / Ventilator
-    ventilator_vt: Optional[int] = None  # Vt
-    ventilator_rate: Optional[int] = None  # f
-    ventilator_peep: Optional[int] = None  # PEEP
-    breathing_system: Optional[str] = None  # Mapleson A/D/F, Circle, Other
+    ventilation_mode_baseline: Optional[str] = None
+    ventilator_vt: Optional[int] = None
+    ventilator_rate: Optional[int] = None
+    ventilator_peep: Optional[int] = None
+    breathing_system: Optional[str] = None
 
-    # Monitors (checklist)
-    monitors: Optional[dict] = None
-    # {
-    #   "ecg": true, "nibp": true, "pulse_oximeter": true, "capnograph": true,
-    #   "agent_monitor": false, "pns": false, "temperature": true,
-    #   "urinary_catheter": false, "ibp": false, "cvp": false,
-    #   "precordial_steth": false, "oesophageal_steth": false
-    # }
-
-    # Lines & tourniquet
-    lines: Optional[dict] = None
-    # e.g. {"peripheral_iv": true, "central_line": false, "arterial_line": false}
+    monitors: Dict[str, Any] = Field(default_factory=dict)
+    lines: Dict[str, Any] = Field(default_factory=dict)
     tourniquet_used: Optional[bool] = None
 
-    # Position & eye care
-    patient_position: Optional[
-        str] = None  # Supine / Lateral / Prone / Lithotomy / Other
+    patient_position: Optional[str] = None
     eyes_taped: Optional[bool] = None
     eyes_covered_with_foil: Optional[bool] = None
     pressure_points_padded: Optional[bool] = None
 
-    # Fluids + blood components (plan / summary)
-    iv_fluids_plan: Optional[str] = None  # RL / NS etc.
-    blood_components_plan: Optional[str] = None  # PRBC / FFP, etc.
+    iv_fluids_plan: Optional[str] = None
+    blood_components_plan: Optional[str] = None
 
-    # Regional technique / block details
-    regional_block_type: Optional[
-        str] = None  # Spinal / Epidural / Nerve block / None
+    regional_block_type: Optional[str] = None
     regional_position: Optional[str] = None
     regional_approach: Optional[str] = None
     regional_space_depth: Optional[str] = None
@@ -801,16 +856,144 @@ class OtAnaesthesiaRecordIn(BaseModel):
     regional_level: Optional[str] = None
     regional_complications: Optional[str] = None
 
-    # Adequacy of block section
-    block_adequacy: Optional[str] = None  # Excellent / Adequate / Poor
+    block_adequacy: Optional[str] = None
     sedation_needed: Optional[bool] = None
     conversion_to_ga: Optional[bool] = None
-    
+
     airway_device_ids: List[int] = Field(default_factory=list)
     monitor_device_ids: List[int] = Field(default_factory=list)
 
-    # Free-form notes (used for intra-op summary)
     notes: Optional[str] = None
+
+    # ---------------- validators (accept frontend strings safely) ----------------
+    @field_validator(
+        "preop_pulse",
+        "preop_rr",
+        "ventilator_vt",
+        "ventilator_rate",
+        "ventilator_peep",
+        mode="before",
+    )
+    @classmethod
+    def _v_ints(cls, v):
+        return _to_int_or_none(v)
+
+    @field_validator("preop_temp_c", mode="before")
+    @classmethod
+    def _v_float(cls, v):
+        return _to_float_or_none(v)
+
+    @field_validator("airway_device_ids", "monitor_device_ids", mode="before")
+    @classmethod
+    def _v_ids(cls, v):
+        return _to_list_int(v)
+
+    @field_validator("asa_emergency", mode="before")
+    @classmethod
+    def _v_asa_e(cls, v):
+        return _to_bool(v)
+
+    @field_validator("asa_grade", mode="before")
+    @classmethod
+    def _v_asa_grade(cls, v):
+        if _blank(v):
+            return None
+        # keep as string in storage/output
+        return str(v).strip()
+
+    @field_validator("preop_checklist", mode="before")
+    @classmethod
+    def _v_checklist(cls, v):
+        if v is None:
+            return {}
+        if isinstance(v, dict):
+            return {str(k): _to_bool(val) for k, val in v.items()}
+        return {}
+
+
+class OtAnaesthesiaRecordOut(OtAnaesthesiaRecordIn):
+    model_config = ConfigDict(from_attributes=True, extra="allow")
+    id: int
+    case_id: int
+    anaesthetist_user_id: Optional[int] = None
+    airway_device_ids: List[int] = Field(default_factory=list)
+    monitor_device_ids: List[int] = Field(default_factory=list)
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    raw_json: Dict[str, Any] = Field(default_factory=dict)
+
+
+class OtAnaesthesiaRecordDefaultsOut(BaseModel):
+    intra_date: str = ""
+    intra_anaesthesiologist: str = ""
+    intra_surgeon: str = ""
+    intra_or_no: str = ""
+    intra_case_type: str = ""  # Elective/Emergency
+    intra_surgical_procedure: str = ""
+    intra_anaesthesia_type: str = ""
+
+
+# -----------------------
+# VITALS
+# -----------------------
+
+
+class OtAnaesthesiaVitalIn(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    time: str  # HH:MM
+
+    hr: Optional[float] = None
+    bp: Optional[str] = None
+    spo2: Optional[float] = None
+    rr: Optional[float] = None
+    temp_c: Optional[float] = None
+    etco2: Optional[float] = None
+
+    ventilation_mode: Optional[str] = None
+    peak_airway_pressure: Optional[float] = None
+    cvp_pcwp: Optional[float] = None
+    st_segment: Optional[str] = None
+    urine_output_ml: Optional[float] = None
+    blood_loss_ml: Optional[float] = None
+    comments: Optional[str] = None
+
+    # ✅ NEW paper gas row
+    oxygen_fio2: Optional[str] = None
+    n2o: Optional[str] = None
+    air: Optional[str] = None
+    agent: Optional[str] = None
+    iv_fluids: Optional[str] = None
+
+
+class OtAnaesthesiaVitalOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    record_id: int
+    time: str
+
+    hr: Optional[int] = None
+    bp: Optional[str] = None
+    spo2: Optional[int] = None
+    rr: Optional[int] = None
+    temp_c: Optional[float] = None
+    etco2: Optional[float] = None
+    comments: Optional[str] = None
+
+    ventilation_mode: Optional[str] = None
+    peak_airway_pressure: Optional[float] = None
+    cvp_pcwp: Optional[float] = None
+    st_segment: Optional[str] = None
+    urine_output_ml: Optional[int] = None
+    blood_loss_ml: Optional[int] = None
+
+    # ✅ NEW
+    oxygen_fio2: Optional[str] = None
+    n2o: Optional[str] = None
+    air: Optional[str] = None
+    agent: Optional[str] = None
+    iv_fluids: Optional[str] = None
 
 
 class OtCaseCloseBody(BaseModel):
@@ -833,52 +1016,6 @@ class OtCaseCloseBody(BaseModel):
         description=
         "If sent, will override or set the actual end time of the surgery.",
     )
-
-
-class OtAnaesthesiaRecordOut(OtAnaesthesiaRecordIn):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    case_id: int
-    anaesthetist_user_id: Optional[int] = None
-    airway_device_ids: List[int] = Field(default_factory=list)
-    monitor_device_ids: List[int] = Field(default_factory=list)
-    created_at: datetime
-    # we don’t have updated_at column; just expose created_at as “last updated”
-    updated_at: Optional[datetime] = None
-
-
-# FILE: app/schemas/ot.py
-
-
-class OtAnaesthesiaVitalIn(BaseModel):
-    # "HH:MM" from the UI; we convert to datetime in the route
-    time: Optional[str] = None
-    hr: Optional[int] = None  # maps to pulse
-    bp: Optional[str] = None  # e.g. "120/80"
-    spo2: Optional[int] = None
-    rr: Optional[int] = None
-    temp_c: Optional[float] = None
-    etco2: Optional[float] = None  # <<--- NEW
-    comments: Optional[str] = None
-
-    # 🔸 NEW intra-op rows
-    ventilation_mode: Optional[
-        str] = None  # 'Spont', 'Assist', 'Control', 'Manual', 'Vent'
-    peak_airway_pressure: Optional[float] = None
-    cvp_pcwp: Optional[float] = None
-    st_segment: Optional[str] = None  # eg. 'Normal', 'ST↑', 'ST↓'
-    urine_output_ml: Optional[int] = None
-    blood_loss_ml: Optional[int] = None
-
-
-class OtAnaesthesiaVitalOut(OtAnaesthesiaVitalIn):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    record_id: int
-    # keep time as "HH:MM" string for the UI
-    time: Optional[str] = None
 
 
 class OtAnaesthesiaDrugIn(BaseModel):
@@ -1032,6 +1169,57 @@ class OtNursingRecordOut(OtNursingRecordBase):
 
 
 # ---------- OtSpongeInstrumentCount ----------
+class OtCountItemLineIn(BaseModel):
+    id: Optional[int] = None
+    instrument_id: Optional[int] = None
+
+    initial_qty: int = Field(default=0, ge=0)
+    added_qty: int = Field(default=0, ge=0)
+    final_qty: int = Field(default=0, ge=0)
+
+    remarks: str = ""
+
+
+class OtCountItemLineOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    case_id: int
+    instrument_id: Optional[int] = None
+    instrument_code: str = ""
+    instrument_name: str = ""
+    uom: str = "Nos"
+
+    initial_qty: int
+    added_qty: int
+    final_qty: int
+
+    expected_final: int
+    variance: int
+    has_discrepancy: bool
+
+    remarks: str = ""
+    updated_at: Optional[datetime] = None
+
+
+class OtInstrumentMasterOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    code: str
+    name: str
+    available_qty: int
+    cost_per_qty: Decimal
+    uom: str
+    description: str = ""
+    is_active: bool = True
+
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class OtCountItemsUpsertIn(BaseModel):
+    lines: List[OtCountItemLineIn] = Field(default_factory=list)
 
 
 class OtSpongeInstrumentCountBase(BaseModel):
@@ -1211,34 +1399,47 @@ class OtCountsOut(OtCountsIn):
     updated_at: Optional[datetime] = None
 
 
-class PacuUiBase(BaseModel):
-    # string "HH:MM" coming from <input type="time">
-    arrival_time: Optional[str] = None
-    departure_time: Optional[str] = None
+class PacuVitalsEntry(BaseModel):
+    time: Optional[str] = None  # "HH:MM"
+    spo2: Optional[str] = None
+    hr: Optional[str] = None
+    bp: Optional[str] = None  # "120/80"
+    cvp: Optional[str] = None
+    rbs: Optional[str] = None  # blood glucose
+    remarks: Optional[str] = None
 
-    pain_score: Optional[str] = None
-    nausea_vomiting: Optional[str] = None
-    airway_status: Optional[str] = None
-    vitals_summary: Optional[str] = None
-    complications: Optional[str] = None
-    discharge_criteria_met: Optional[bool] = False
+
+class PacuUiBase(BaseModel):
+    time_to_recovery: Optional[str] = None
+    time_to_ward_icu: Optional[str] = None
+    disposition: Optional[str] = None
+
+    anaesthesia_methods: Optional[List[str]] = None
+    airway_support: Optional[List[str]] = None
+    monitoring: Optional[List[str]] = None
+
+    post_op_charts: Optional[List[str]] = None
+    tubes_drains: Optional[List[str]] = None
+
+    vitals_log: Optional[List[PacuVitalsEntry]] = None
+
+    post_op_instructions: Optional[str] = None
+    iv_fluids_orders: Optional[str] = None
     notes: Optional[str] = None
 
 
 class PacuUiIn(PacuUiBase):
-    """Payload from PACU tab."""
     pass
 
 
 class PacuUiOut(PacuUiBase):
-    """Response back to PACU tab."""
     id: int
     case_id: int
     nurse_user_id: int
     created_at: datetime
     updated_at: Optional[datetime] = None
 
-    model_config = ConfigDict(from_attributes=False)
+    model_config = ConfigDict(from_attributes=True)
 
 
 # ============================================================

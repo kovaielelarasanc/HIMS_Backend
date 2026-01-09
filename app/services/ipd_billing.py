@@ -9,7 +9,7 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.models.ipd import IpdAdmission, IpdBedAssignment, IpdBed, IpdRoom, IpdBedRate, IpdDischargeSummary
-from app.models.billing import Invoice
+from app.models.billing import BillingInvoice
 
 from datetime import datetime, date
 from decimal import Decimal
@@ -17,7 +17,7 @@ from typing import Any, Dict, Optional
 
 from sqlalchemy.orm import Session
 
-from app.models.billing import Invoice, InvoiceItem
+from app.models.billing import BillingInvoiceLine
 from app.models.ipd import IpdAdmission
 
 # ... keep your existing imports + functions (compute_ipd_bed_charges_daily, ensure_invoice_for_context, etc.) ...

@@ -2019,10 +2019,7 @@ from app.schemas.opd import (
     DoctorFeeOut,
 )
 from app.schemas.opd import FollowUpListItem
-from app.services.billing_auto import (
-    auto_add_item_for_event,
-    maybe_finalize_visit_invoice,
-)
+from app.services.billing_hooks import autobill_opd_consultation
 from app.services.pdf_opd_summary import build_visit_summary_pdf
 from app.schemas.opd import VitalsLatestResponse, VitalsOut
 
@@ -2783,7 +2780,8 @@ def update_appointment_status(
             ap.status]:
         raise HTTPException(
             status_code=400,
-            detail=f"Cannot move from {ap.status} to {new_status}")
+            detail=f"Cannot move from {ap.status} to {new_status}",
+        )
 
     visit = db.query(Visit).filter(Visit.appointment_id == ap.id).first()
 
@@ -2814,21 +2812,18 @@ def update_appointment_status(
         if getattr(v, "visit_at", None) is None:
             v.visit_at = now_local().replace(tzinfo=None)
 
-        auto_add_item_for_event(
-            db,
-            service_type="opd_consult",
-            ref_id=v.id,
-            patient_id=v.patient_id,
-            context_type="opd",
-            context_id=v.id,
-            user_id=user.id,
-        )
-        maybe_finalize_visit_invoice(db, v.id)
+        # ✅ NEW: Auto-bill OPD consultation into BillingCase/Invoice (idempotent)
+        try:
+            autobill_opd_consultation(db, appointment=ap, visit=v, user=user)
+        except Exception:
+            # billing should never break appointment workflow
+            pass
 
     try:
         db.commit()
     except IntegrityError:
         db.rollback()
+        # keep your old fallback if needed
         if visit:
             visit.episode_id = episode_id_for_month(db)
             db.commit()
@@ -2836,7 +2831,7 @@ def update_appointment_status(
     return {
         "message": "Updated",
         "status": ap.status,
-        "visit_id": visit.id if visit else None
+        "visit_id": visit.id if visit else None,
     }
 
 

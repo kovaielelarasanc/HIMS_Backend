@@ -107,6 +107,24 @@ ROOM_TYPE_ALIAS: Dict[str, str] = {
     "isolation ward": "Isolation",
 }
 
+# ---------------------------------------------------------------------
+# Bed Rate helpers (room_type + rate_basis)
+# ---------------------------------------------------------------------
+RATE_BASIS_ALIAS: Dict[str, str] = {
+    "daily": "daily",
+    "day": "daily",
+    "per day": "daily",
+    "perday": "daily",
+    "d": "daily",
+    "hourly": "hourly",
+    "hour": "hourly",
+    "per hour": "hourly",
+    "perhour": "hourly",
+    "hr": "hourly",
+    "hrs": "hourly",
+    "h": "hourly",
+}
+
 
 def norm_room_type(x: Optional[str]) -> str:
     s = (x or "General").strip()
@@ -146,55 +164,64 @@ def norm_room_type(x: Optional[str]) -> str:
 # --------------------------
 def _parse_rate_basis(raw: Optional[str]) -> Tuple[str, Optional[str]]:
     """
-    Input examples:
-      "General (Daily)" -> ("General", "Daily")
-      "General Ward (Hourly)" -> ("General Ward", "Hourly")
-      "ICU" -> ("ICU", None)
+    Backward compatible parser:
+      "General (Daily)" -> ("General", "daily")
+      "ICU (Hourly)" -> ("ICU", "hourly")
+      "Private" -> ("Private", None)
     """
     s = (raw or "").strip()
     if not s:
         return ("General", None)
 
-    lower = s.lower()
+    lower = s.lower().strip()
     if lower.endswith("(daily)"):
-        return (s[:-7].strip(), "Daily")
+        return (s[:-7].strip(), "daily")
     if lower.endswith("(hourly)"):
-        return (s[:-8].strip(), "Hourly")
-
+        return (s[:-8].strip(), "hourly")
     return (s, None)
 
 
-def norm_bed_rate_room_type(x: Optional[str]) -> str:
-    base, basis = _parse_rate_basis(x)
-    base_norm = norm_room_type(base)
-    if basis:
-        return f"{base_norm} ({basis})"
-    return base_norm
+def norm_rate_basis(x: Optional[str], default: str = "daily") -> str:
+    s = (x or "").strip().lower()
+    if not s:
+        return default
+    s = " ".join(s.replace("_", " ").replace("-", " ").split())
+    mapped = RATE_BASIS_ALIAS.get(s)
+    if mapped:
+        return mapped
+    raise HTTPException(400, "Invalid rate_basis. Use 'daily' or 'hourly'.")
 
 
-def _load_rate_map(db: Session, on_date: date) -> Dict[str, float]:
+def split_room_type_basis(room_type_raw: Optional[str],
+                          basis_raw: Optional[str]) -> Tuple[str, str]:
+    base, suffix_basis = _parse_rate_basis(room_type_raw)
+    rt = norm_room_type(base)
+    rb = norm_rate_basis(basis_raw or suffix_basis or "daily")
+    return rt, rb
+
+
+def _load_rate_map(db: Session,
+                   on_date: date,
+                   rate_basis: str = "daily") -> Dict[str, float]:
     """
-    Returns: { normalized_base_room_type: daily_rate }
-    - If DB stores "General (Daily)" it maps to "General".
-    - It ignores "(Hourly)" rows for the daily map.
+    Returns: { normalized_room_type: rate_amount }
+    Filters by rate_basis.
     """
+    rb = norm_rate_basis(rate_basis)
+
     rows = (db.query(IpdBedRate).filter(IpdBedRate.is_active.is_(True)).filter(
-        IpdBedRate.effective_from <= on_date).filter(
-            or_(IpdBedRate.effective_to.is_(None), IpdBedRate.effective_to
-                >= on_date)).order_by(IpdBedRate.room_type.asc(),
-                                      IpdBedRate.effective_from.desc()).all())
+        IpdBedRate.rate_basis == rb).filter(
+            IpdBedRate.effective_from <= on_date).filter(
+                or_(IpdBedRate.effective_to.is_(None),
+                    IpdBedRate.effective_to >= on_date)).order_by(
+                        IpdBedRate.room_type.asc(),
+                        IpdBedRate.effective_from.desc()).all())
 
     rate_map: Dict[str, float] = {}
     for r in rows:
-        base, basis = _parse_rate_basis(r.room_type)
-        base_norm = norm_room_type(base)
-
-        # daily map only
-        if basis and basis.lower() == "hourly":
-            continue
-
-        if base_norm not in rate_map:
-            rate_map[base_norm] = float(r.daily_rate)
+        rt = norm_room_type(r.room_type)
+        if rt not in rate_map:
+            rate_map[rt] = float(r.daily_rate)
     return rate_map
 
 
@@ -733,7 +760,7 @@ def bedboard_snapshot(
 
     rows = q.add_columns(IpdRoom.number, IpdRoom.type, IpdWard.name).all()
 
-    rate_map = _load_rate_map(db, on_date) if include_rates else {}
+    rate_map = _load_rate_map(db, on_date, rate_basis="daily")
     room_types_seen: List[str] = []
 
     counts: Dict[str, int] = {
@@ -964,14 +991,33 @@ def delete_package(package_id: int,
 # ---------------------------------------------------------------------
 # BED RATES (CRUD)
 # ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# BED RATES (CRUD)
+# ---------------------------------------------------------------------
 @router.post("/bed-rates", response_model=BedRateOut)
-def create_bed_rate(payload: BedRateIn,
-                    db: Session = Depends(get_db),
-                    user: User = Depends(auth_current_user)):
+def create_bed_rate(
+        payload: BedRateIn,
+        db: Session = Depends(get_db),
+        user: User = Depends(auth_current_user),
+):
     _require_manage(user, "ipd.masters.manage")
 
     data = _dump(payload)
-    data["room_type"] = norm_bed_rate_room_type(data.get("room_type"))
+
+    # ✅ accept both:
+    # - new: room_type="Private", rate_basis="daily"
+    # - old: room_type="Private (Daily)" without rate_basis
+    rt, rb = split_room_type_basis(data.get("room_type"),
+                                   data.get("rate_basis"))
+    data["room_type"] = rt
+    data["rate_basis"] = rb
+
+    ef = data.get("effective_from")
+    et = data.get("effective_to")
+    if et and ef and et < ef:
+        raise HTTPException(400,
+                            "effective_to cannot be before effective_from")
+
     r = IpdBedRate(**data)
     db.add(r)
     try:
@@ -987,6 +1033,7 @@ def create_bed_rate(payload: BedRateIn,
 @router.get("/bed-rates", response_model=List[BedRateOut])
 def list_bed_rates(
         room_type: Optional[str] = None,
+        rate_basis: Optional[str] = None,
         db: Session = Depends(get_db),
         user: User = Depends(auth_current_user),
 ):
@@ -994,18 +1041,30 @@ def list_bed_rates(
         raise HTTPException(403, "Not permitted")
 
     q = db.query(IpdBedRate).filter(IpdBedRate.is_active.is_(True))
+
+    # filter by room_type (supports old "Private (Daily)" input)
+    suffix_basis = None
     if room_type:
-        q = q.filter(
-            IpdBedRate.room_type == norm_bed_rate_room_type(room_type))
+        base, suffix_basis = _parse_rate_basis(room_type)
+        rt = norm_room_type(base)
+        q = q.filter(IpdBedRate.room_type == rt)
+
+    # filter by basis if explicitly provided OR if suffix had it
+    basis_to_use = rate_basis or suffix_basis
+    if basis_to_use:
+        rb = norm_rate_basis(basis_to_use)
+        q = q.filter(IpdBedRate.rate_basis == rb)
 
     return q.order_by(IpdBedRate.room_type.asc(),
                       IpdBedRate.effective_from.desc()).all()
 
 
 @router.get("/bed-rates/{rate_id}", response_model=BedRateOut)
-def get_bed_rate(rate_id: int,
-                 db: Session = Depends(get_db),
-                 user: User = Depends(auth_current_user)):
+def get_bed_rate(
+        rate_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(auth_current_user),
+):
     if not has_perm(user, "ipd.view"):
         raise HTTPException(403, "Not permitted")
     r = db.get(IpdBedRate, rate_id)
@@ -1028,8 +1087,22 @@ def update_bed_rate(
         raise HTTPException(404, "Bed rate not found")
 
     data = _dump(payload)
+
+    # normalize fields
     if "room_type" in data and data["room_type"] is not None:
-        data["room_type"] = norm_bed_rate_room_type(data["room_type"])
+        base, suffix_basis = _parse_rate_basis(data["room_type"])
+        data["room_type"] = norm_room_type(base)
+        if suffix_basis and not data.get("rate_basis"):
+            data["rate_basis"] = suffix_basis
+
+    if "rate_basis" in data and data["rate_basis"] is not None:
+        data["rate_basis"] = norm_rate_basis(data["rate_basis"])
+
+    ef = data.get("effective_from", r.effective_from)
+    et = data.get("effective_to", r.effective_to)
+    if et and ef and et < ef:
+        raise HTTPException(400,
+                            "effective_to cannot be before effective_from")
 
     for k, v in data.items():
         setattr(r, k, v)
@@ -1044,9 +1117,11 @@ def update_bed_rate(
 
 
 @router.delete("/bed-rates/{rate_id}")
-def delete_bed_rate(rate_id: int,
-                    db: Session = Depends(get_db),
-                    user: User = Depends(auth_current_user)):
+def delete_bed_rate(
+        rate_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(auth_current_user),
+):
     _require_manage(user, "ipd.masters.manage")
 
     r = db.get(IpdBedRate, rate_id)
@@ -1062,16 +1137,19 @@ def delete_bed_rate(rate_id: int,
 def resolve_bed_rate(
         room_type: str = Query(...),
         on_date: date = Query(...),
+        rate_basis: str = Query("daily"),
         db: Session = Depends(get_db),
         user: User = Depends(auth_current_user),
 ):
     if not has_perm(user, "ipd.view"):
         raise HTTPException(403, "Not permitted")
 
-    rt = norm_bed_rate_room_type(room_type)
+    base, suffix_basis = _parse_rate_basis(room_type)
+    rt = norm_room_type(base)
+    rb = norm_rate_basis(rate_basis or suffix_basis or "daily")
 
     r = (db.query(IpdBedRate).filter(IpdBedRate.is_active.is_(True)).filter(
-        IpdBedRate.room_type == rt).filter(
+        IpdBedRate.room_type == rt).filter(IpdBedRate.rate_basis == rb).filter(
             IpdBedRate.effective_from <= on_date).filter(
                 or_(IpdBedRate.effective_to.is_(None), IpdBedRate.effective_to
                     >= on_date)).order_by(
@@ -1081,19 +1159,23 @@ def resolve_bed_rate(
         return {
             "room_type":
             rt,
+            "rate_basis":
+            rb,
             "on_date":
             on_date,
             "daily_rate":
             None,
             "warning":
-            f"No active bed rate found for room_type '{rt}' on {on_date.isoformat()}",
+            f"No active bed rate found for room_type '{rt}' ({rb}) on {on_date.isoformat()}",
         }
 
     return {
         "room_type": rt,
+        "rate_basis": rb,
         "on_date": on_date,
-        "daily_rate": float(r.daily_rate)
+        "daily_rate": float(r.daily_rate),
     }
+
 
 
 # ---------------------------------------------------------------------
@@ -1139,7 +1221,7 @@ def list_beds_with_rate(
     rows = q.add_columns(IpdRoom.number, IpdRoom.type,
                          IpdWard.name).order_by(IpdBed.code.asc()).all()
 
-    rate_map = _load_rate_map(db, on_date)
+    rate_map = _load_rate_map(db, on_date, rate_basis="daily")
     room_types_seen: List[str] = []
 
     out: List[Dict[str, Any]] = []

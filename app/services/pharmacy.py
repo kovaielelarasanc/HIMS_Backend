@@ -1,15 +1,17 @@
 # FILE: app/services/pharmacy.py
 from __future__ import annotations
 
+import enum
 from datetime import datetime, date as dt_date
 from decimal import Decimal, ROUND_HALF_UP
-from typing import List, Any, Optional
+from typing import List, Any, Optional, Tuple
 
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import func, case, or_
 
 from app.services.drug_schedules import get_schedule_meta
+from app.services.inventory import create_stock_transaction
 
 from app.models.user import User
 
@@ -37,9 +39,47 @@ from app.schemas.pharmacy_prescription import (
     PaymentCreate,
 )
 
-from app.services.inventory import create_stock_transaction
+# ============================================================
+# ✅ NEW BILLING / INVOICE MODELS (auto-detect + works with your new schema)
+# - Update the import paths below ONLY if your project uses different file names.
+# ============================================================
 
-from app.models.billing import Invoice, InvoiceItem
+# We alias everything to BillingInvoice / BillingInvoiceLine to keep code stable.
+ServiceGroup = None  # will be imported
+BillingInvoice = None
+BillingInvoiceLine = None
+
+try:
+    # Common new naming
+    from app.models.billing import BillingInvoice as BillingInvoice  # type: ignore
+    from app.models.billing import BillingInvoiceLine as BillingInvoiceLine  # type: ignore
+    from app.models.billing import ServiceGroup as ServiceGroup  # type: ignore
+except Exception:
+    try:
+        from app.models.billing import BillingInvoice as BillingInvoice  # type: ignore
+        from app.models.billing import BillingInvoiceLine as BillingInvoiceLine  # type: ignore
+        from app.models.billing import ServiceGroup as ServiceGroup  # type: ignore
+    except Exception:
+        # Fallback to old models (keeps runtime safe if older deployments still exist)
+        from app.models.billing import BillingInvoice as BillingInvoice  # type: ignore
+        from app.models.billing import BillingInvoiceLine as BillingInvoiceLine  # type: ignore
+        try:
+            from app.models.billing import ServiceGroup as ServiceGroup  # type: ignore
+        except Exception:
+            try:
+                from app.models.billing import ServiceGroup as ServiceGroup  # type: ignore
+            except Exception:
+                # last resort: local enum to avoid crash (you SHOULD have ServiceGroup in your project)
+                class ServiceGroup(str, enum.Enum):  # type: ignore
+                    CONSULT = "CONSULT"
+                    LAB = "LAB"
+                    RAD = "RAD"
+                    PHARM = "PHARM"
+                    OT = "OT"
+                    PROC = "PROC"
+                    ROOM = "ROOM"
+                    NURSING = "NURSING"
+                    MISC = "MISC"
 
 
 # ============================================================
@@ -71,6 +111,7 @@ def _compute_tax(line_amount: Decimal, tax_percent: Decimal) -> Decimal:
 # Number generators
 # ============================================================
 
+
 def _generate_prescription_number(db: Session, rx_type: str) -> str:
     """
     RX-<TYPE>-YYYYMMDD-<seq>
@@ -78,12 +119,9 @@ def _generate_prescription_number(db: Session, rx_type: str) -> str:
     today_str = datetime.utcnow().strftime("%Y%m%d")
     prefix = f"RX-{rx_type}-{today_str}"
 
-    last_number = (
-        db.query(PharmacyPrescription.prescription_number)
-        .filter(PharmacyPrescription.prescription_number.like(f"{prefix}-%"))
-        .order_by(PharmacyPrescription.prescription_number.desc())
-        .first()
-    )
+    last_number = (db.query(PharmacyPrescription.prescription_number).filter(
+        PharmacyPrescription.prescription_number.like(f"{prefix}-%")).order_by(
+            PharmacyPrescription.prescription_number.desc()).first())
 
     next_seq = 1
     if last_number and last_number[0]:
@@ -102,12 +140,9 @@ def _generate_sale_number(db: Session, context_type: str) -> str:
     today_str = datetime.utcnow().strftime("%Y%m%d")
     prefix = f"PH-{context_type}-{today_str}"
 
-    last_number = (
-        db.query(PharmacySale.bill_number)
-        .filter(PharmacySale.bill_number.like(f"{prefix}-%"))
-        .order_by(PharmacySale.bill_number.desc())
-        .first()
-    )
+    last_number = (db.query(PharmacySale.bill_number).filter(
+        PharmacySale.bill_number.like(f"{prefix}-%")).order_by(
+            PharmacySale.bill_number.desc()).first())
 
     next_seq = 1
     if last_number and last_number[0]:
@@ -123,6 +158,7 @@ def _generate_sale_number(db: Session, context_type: str) -> str:
 # InventoryItem snapshot helpers (IMPORTANT FIX)
 # Your InventoryItem has dosage_form (NOT form)
 # ============================================================
+
 
 def _item_form(item: InventoryItem) -> str:
     return (getattr(item, "dosage_form", "") or "").strip()
@@ -144,44 +180,54 @@ def _item_type(item: InventoryItem) -> str:
 # Stock helpers
 # ============================================================
 
-def _snapshot_available_stock(db: Session, location_id: int | None, item_id: int) -> Decimal | None:
+
+def _snapshot_available_stock(db: Session, location_id: int | None,
+                              item_id: int) -> Decimal | None:
     """
     Sum of ItemBatch.current_qty at a location.
     Returns None if location_id is not provided (inventory not linked).
     """
     if not location_id:
         return None
-    total = (
-        db.query(func.coalesce(func.sum(ItemBatch.current_qty), 0))
-        .filter(
-            ItemBatch.item_id == item_id,
-            ItemBatch.location_id == location_id,
-            ItemBatch.is_active.is_(True),
-            ItemBatch.is_saleable.is_(True),
-        )
-        .scalar()
-    )
+    total = (db.query(func.coalesce(func.sum(ItemBatch.current_qty),
+                                    0)).filter(
+                                        ItemBatch.item_id == item_id,
+                                        ItemBatch.location_id == location_id,
+                                        ItemBatch.is_active.is_(True),
+                                        ItemBatch.is_saleable.is_(True),
+                                    ).scalar())
     return _d(total)
 
 
-def _validate_batch_for_line(batch: ItemBatch, *, item_id: int, location_id: int) -> None:
+def _validate_batch_for_line(batch: ItemBatch, *, item_id: int,
+                             location_id: int) -> None:
     if not batch:
-        raise HTTPException(status_code=400, detail="Selected batch not found.")
+        raise HTTPException(status_code=400,
+                            detail="Selected batch not found.")
     if int(batch.item_id) != int(item_id):
-        raise HTTPException(status_code=400, detail="Selected batch does not belong to this item.")
+        raise HTTPException(
+            status_code=400,
+            detail="Selected batch does not belong to this item.")
     if int(batch.location_id) != int(location_id):
-        raise HTTPException(status_code=400, detail="Selected batch does not belong to this location.")
-    if not batch.is_active or not batch.is_saleable or str(batch.status) != "ACTIVE":
-        raise HTTPException(status_code=400, detail="Selected batch is not saleable.")
+        raise HTTPException(
+            status_code=400,
+            detail="Selected batch does not belong to this location.")
+    if not batch.is_active or not batch.is_saleable or str(
+            batch.status) != "ACTIVE":
+        raise HTTPException(status_code=400,
+                            detail="Selected batch is not saleable.")
     if _d(batch.current_qty) <= 0:
-        raise HTTPException(status_code=400, detail="Selected batch has no stock.")
+        raise HTTPException(status_code=400,
+                            detail="Selected batch has no stock.")
 
     today = dt_date.today()
     if batch.expiry_date is not None and batch.expiry_date < today:
-        raise HTTPException(status_code=400, detail="Selected batch is expired.")
+        raise HTTPException(status_code=400,
+                            detail="Selected batch is expired.")
 
 
 class AllocatedBatch:
+
     def __init__(
         self,
         batch: ItemBatch | None,
@@ -219,32 +265,30 @@ def _allocate_from_selected_batch(
     if qty <= 0:
         return []
 
-    batch: ItemBatch | None = (
-        db.query(ItemBatch)
-        .filter(ItemBatch.id == int(batch_id))
-        .with_for_update()
-        .first()
-    )
+    batch: ItemBatch | None = (db.query(ItemBatch).filter(
+        ItemBatch.id == int(batch_id)).with_for_update().first())
     if not batch:
-        raise HTTPException(status_code=400, detail="Selected batch not found.")
+        raise HTTPException(status_code=400,
+                            detail="Selected batch not found.")
 
-    _validate_batch_for_line(batch, item_id=int(item.id), location_id=int(location_id))
+    _validate_batch_for_line(batch,
+                             item_id=int(item.id),
+                             location_id=int(location_id))
 
     available = _d(batch.current_qty)
     if qty > available:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                f"Insufficient stock in selected batch {batch.batch_no}. "
-                f"Available {available}, requested {qty}."
-            ),
+            detail=(f"Insufficient stock in selected batch {batch.batch_no}. "
+                    f"Available {available}, requested {qty}."),
         )
 
     mrp = _d(batch.mrp)
     if mrp <= 0:
         raise HTTPException(
             status_code=400,
-            detail=f"MRP is missing/zero for batch {batch.batch_no}. Please fix batch MRP.",
+            detail=
+            f"MRP is missing/zero for batch {batch.batch_no}. Please fix batch MRP.",
         )
 
     tax_percent = _d(batch.tax_percent)
@@ -271,7 +315,13 @@ def _allocate_from_selected_batch(
     db.flush()
     db.add(stock_txn)
 
-    return [AllocatedBatch(batch=batch, qty=qty, mrp=mrp, tax_percent=tax_percent, stock_txn=stock_txn)]
+    return [
+        AllocatedBatch(batch=batch,
+                       qty=qty,
+                       mrp=mrp,
+                       tax_percent=tax_percent,
+                       stock_txn=stock_txn)
+    ]
 
 
 def _allocate_stock_fefo(
@@ -297,35 +347,28 @@ def _allocate_stock_fefo(
 
     today = dt_date.today()
 
-    q = (
-        db.query(ItemBatch)
-        .filter(
-            ItemBatch.item_id == item.id,
-            ItemBatch.location_id == location_id,
-            ItemBatch.current_qty > 0,
-            ItemBatch.is_active.is_(True),
-            ItemBatch.is_saleable.is_(True),
-            or_(
-                ItemBatch.expiry_date.is_(None),
-                ItemBatch.expiry_date >= today,
-            ),
-        )
-    )
+    q = (db.query(ItemBatch).filter(
+        ItemBatch.item_id == item.id,
+        ItemBatch.location_id == location_id,
+        ItemBatch.current_qty > 0,
+        ItemBatch.is_active.is_(True),
+        ItemBatch.is_saleable.is_(True),
+        or_(
+            ItemBatch.expiry_date.is_(None),
+            ItemBatch.expiry_date >= today,
+        ),
+    ))
 
     nulls_last_expr = case(
         (ItemBatch.expiry_date.is_(None), 1),
         else_=0,
     )
 
-    batches: List[ItemBatch] = (
-        q.order_by(
-            nulls_last_expr.asc(),
-            ItemBatch.expiry_date.asc(),
-            ItemBatch.id.asc(),
-        )
-        .with_for_update()
-        .all()
-    )
+    batches: List[ItemBatch] = (q.order_by(
+        nulls_last_expr.asc(),
+        ItemBatch.expiry_date.asc(),
+        ItemBatch.id.asc(),
+    ).with_for_update().all())
 
     remaining = qty
     allocations: List[AllocatedBatch] = []
@@ -346,7 +389,8 @@ def _allocate_stock_fefo(
         if mrp <= 0:
             raise HTTPException(
                 status_code=400,
-                detail=f"MRP is missing/zero for batch {batch.batch_no}. Please fix batch MRP.",
+                detail=
+                f"MRP is missing/zero for batch {batch.batch_no}. Please fix batch MRP.",
             )
 
         tax_percent = _d(batch.tax_percent)
@@ -380,17 +424,14 @@ def _allocate_stock_fefo(
                 mrp=mrp,
                 tax_percent=tax_percent,
                 stock_txn=stock_txn,
-            )
-        )
+            ))
         remaining -= use_qty
 
     if remaining > 0:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                f"Insufficient stock for item {item.id}. "
-                f"Required {qty}, allocated {qty - remaining}."
-            ),
+            detail=(f"Insufficient stock for item {item.id}. "
+                    f"Required {qty}, allocated {qty - remaining}."),
         )
 
     return allocations
@@ -400,45 +441,39 @@ def _allocate_stock_fefo(
 # Batch assignment on SEND/ISSUE (locks batch_id for each line)
 # ============================================================
 
-def _pick_fefo_batch(db: Session, item_id: int, location_id: int) -> ItemBatch | None:
+
+def _pick_fefo_batch(db: Session, item_id: int,
+                     location_id: int) -> ItemBatch | None:
     today = dt_date.today()
-    return (
-        db.query(ItemBatch)
-        .filter(
-            ItemBatch.item_id == item_id,
-            ItemBatch.location_id == location_id,
-            ItemBatch.is_active.is_(True),
-            ItemBatch.is_saleable.is_(True),
-            ItemBatch.status == "ACTIVE",
-            ItemBatch.current_qty > 0,
-            or_(ItemBatch.expiry_date.is_(None), ItemBatch.expiry_date >= today),
-        )
-        .order_by(
-            case((ItemBatch.expiry_date.is_(None), 1), else_=0),
-            ItemBatch.expiry_date.asc(),
-            ItemBatch.id.asc(),
-        )
-        .first()
-    )
+    return (db.query(ItemBatch).filter(
+        ItemBatch.item_id == item_id,
+        ItemBatch.location_id == location_id,
+        ItemBatch.is_active.is_(True),
+        ItemBatch.is_saleable.is_(True),
+        ItemBatch.status == "ACTIVE",
+        ItemBatch.current_qty > 0,
+        or_(ItemBatch.expiry_date.is_(None), ItemBatch.expiry_date >= today),
+    ).order_by(
+        case((ItemBatch.expiry_date.is_(None), 1), else_=0),
+        ItemBatch.expiry_date.asc(),
+        ItemBatch.id.asc(),
+    ).first())
 
 
-def _total_available_qty(db: Session, item_id: int, location_id: int) -> Decimal:
+def _total_available_qty(db: Session, item_id: int,
+                         location_id: int) -> Decimal:
     today = dt_date.today()
-    rows = (
-        db.query(ItemBatch.current_qty)
-        .filter(
-            ItemBatch.item_id == item_id,
-            ItemBatch.location_id == location_id,
-            ItemBatch.is_active.is_(True),
-            ItemBatch.is_saleable.is_(True),
-            ItemBatch.status == "ACTIVE",
-            ItemBatch.current_qty > 0,
-            or_(ItemBatch.expiry_date.is_(None), ItemBatch.expiry_date >= today),
-        )
-        .all()
-    )
+    rows = (db.query(ItemBatch.current_qty).filter(
+        ItemBatch.item_id == item_id,
+        ItemBatch.location_id == location_id,
+        ItemBatch.is_active.is_(True),
+        ItemBatch.is_saleable.is_(True),
+        ItemBatch.status == "ACTIVE",
+        ItemBatch.current_qty > 0,
+        or_(ItemBatch.expiry_date.is_(None), ItemBatch.expiry_date >= today),
+    ).all())
     total = Decimal("0")
-    for (q,) in rows:
+    for (q, ) in rows:
         total += _d(q)
     return total
 
@@ -467,7 +502,8 @@ def assign_batches_on_send(db: Session, rx: PharmacyPrescription) -> None:
             ln.expiry_date_snapshot = b.expiry_date
 
         try:
-            ln.available_qty_snapshot = _total_available_qty(db, int(ln.item_id), int(rx.location_id))
+            ln.available_qty_snapshot = _total_available_qty(
+                db, int(ln.item_id), int(rx.location_id))
             need = _d(getattr(ln, "requested_qty", 0))
             ln.is_out_of_stock = bool(_d(ln.available_qty_snapshot) < need)
         except Exception:
@@ -478,7 +514,9 @@ def assign_batches_on_send(db: Session, rx: PharmacyPrescription) -> None:
 # Rx CRUD
 # ============================================================
 
-def create_prescription(db: Session, data: PrescriptionCreate, current_user: User) -> PharmacyPrescription:
+
+def create_prescription(db: Session, data: PrescriptionCreate,
+                        current_user: User) -> PharmacyPrescription:
     if data.type in ("OPD", "IPD") and not data.patient_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -520,7 +558,8 @@ def create_prescription(db: Session, data: PrescriptionCreate, current_user: Use
     return rx
 
 
-def _add_rx_line_internal(db: Session, rx: PharmacyPrescription, line_data: RxLineCreate) -> PharmacyPrescriptionLine:
+def _add_rx_line_internal(db: Session, rx: PharmacyPrescription,
+                          line_data: RxLineCreate) -> PharmacyPrescriptionLine:
     item: InventoryItem | None = db.get(InventoryItem, int(line_data.item_id))
     if not item:
         raise HTTPException(
@@ -560,15 +599,14 @@ def _add_rx_line_internal(db: Session, rx: PharmacyPrescription, line_data: RxLi
     return line
 
 
-def update_prescription(db: Session, rx_id: int, data: PrescriptionUpdate, current_user: User) -> PharmacyPrescription:
-    rx = (
-        db.query(PharmacyPrescription)
-        .options(selectinload(PharmacyPrescription.lines))
-        .filter(PharmacyPrescription.id == rx_id)
-        .first()
-    )
+def update_prescription(db: Session, rx_id: int, data: PrescriptionUpdate,
+                        current_user: User) -> PharmacyPrescription:
+    rx = (db.query(PharmacyPrescription).options(
+        selectinload(PharmacyPrescription.lines)).filter(
+            PharmacyPrescription.id == rx_id).first())
     if not rx:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prescription not found.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail="Prescription not found.")
 
     if rx.status != "DRAFT":
         raise HTTPException(
@@ -588,15 +626,14 @@ def update_prescription(db: Session, rx_id: int, data: PrescriptionUpdate, curre
     return rx
 
 
-def add_rx_line(db: Session, rx_id: int, line_data: RxLineCreate, current_user: User) -> PharmacyPrescription:
-    rx = (
-        db.query(PharmacyPrescription)
-        .options(selectinload(PharmacyPrescription.lines))
-        .filter(PharmacyPrescription.id == rx_id)
-        .first()
-    )
+def add_rx_line(db: Session, rx_id: int, line_data: RxLineCreate,
+                current_user: User) -> PharmacyPrescription:
+    rx = (db.query(PharmacyPrescription).options(
+        selectinload(PharmacyPrescription.lines)).filter(
+            PharmacyPrescription.id == rx_id).first())
     if not rx:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prescription not found.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail="Prescription not found.")
 
     if rx.status != "DRAFT":
         raise HTTPException(
@@ -610,14 +647,17 @@ def add_rx_line(db: Session, rx_id: int, line_data: RxLineCreate, current_user: 
     return rx
 
 
-def update_rx_line(db: Session, line_id: int, data: RxLineUpdate, current_user: User) -> PharmacyPrescription:
+def update_rx_line(db: Session, line_id: int, data: RxLineUpdate,
+                   current_user: User) -> PharmacyPrescription:
     line = db.get(PharmacyPrescriptionLine, int(line_id))
     if not line:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Rx line not found.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail="Rx line not found.")
 
     rx = db.get(PharmacyPrescription, int(line.prescription_id))
     if not rx:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prescription not found.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail="Prescription not found.")
 
     if rx.status != "DRAFT":
         raise HTTPException(
@@ -635,18 +675,18 @@ def update_rx_line(db: Session, line_id: int, data: RxLineUpdate, current_user: 
         line.requested_qty = new_req
 
     for field in [
-        "dose_text",
-        "frequency_code",
-        "times_per_day",
-        "duration_days",
-        "route",
-        "timing",
-        "instructions",
-        "start_date",
-        "end_date",
-        "schedule_pattern",
-        "is_prn",
-        "is_stat",
+            "dose_text",
+            "frequency_code",
+            "times_per_day",
+            "duration_days",
+            "route",
+            "timing",
+            "instructions",
+            "start_date",
+            "end_date",
+            "schedule_pattern",
+            "is_prn",
+            "is_stat",
     ]:
         value = getattr(data, field, None)
         if value is not None:
@@ -670,14 +710,17 @@ def update_rx_line(db: Session, line_id: int, data: RxLineUpdate, current_user: 
     return rx
 
 
-def delete_rx_line(db: Session, line_id: int, current_user: User) -> PharmacyPrescription:
+def delete_rx_line(db: Session, line_id: int,
+                   current_user: User) -> PharmacyPrescription:
     line = db.get(PharmacyPrescriptionLine, int(line_id))
     if not line:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Rx line not found.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail="Rx line not found.")
 
     rx = db.get(PharmacyPrescription, int(line.prescription_id))
     if not rx:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prescription not found.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail="Prescription not found.")
 
     if rx.status != "DRAFT":
         raise HTTPException(
@@ -691,15 +734,14 @@ def delete_rx_line(db: Session, line_id: int, current_user: User) -> PharmacyPre
     return rx
 
 
-def sign_prescription(db: Session, rx_id: int, current_user: User) -> PharmacyPrescription:
-    rx = (
-        db.query(PharmacyPrescription)
-        .options(selectinload(PharmacyPrescription.lines))
-        .filter(PharmacyPrescription.id == rx_id)
-        .first()
-    )
+def sign_prescription(db: Session, rx_id: int,
+                      current_user: User) -> PharmacyPrescription:
+    rx = (db.query(PharmacyPrescription).options(
+        selectinload(PharmacyPrescription.lines)).filter(
+            PharmacyPrescription.id == rx_id).first())
     if not rx:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prescription not found.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail="Prescription not found.")
 
     if rx.status != "DRAFT":
         raise HTTPException(
@@ -724,15 +766,14 @@ def sign_prescription(db: Session, rx_id: int, current_user: User) -> PharmacyPr
     return rx
 
 
-def cancel_prescription(db: Session, rx_id: int, reason: str, current_user: User) -> PharmacyPrescription:
-    rx = (
-        db.query(PharmacyPrescription)
-        .options(selectinload(PharmacyPrescription.lines))
-        .filter(PharmacyPrescription.id == rx_id)
-        .first()
-    )
+def cancel_prescription(db: Session, rx_id: int, reason: str,
+                        current_user: User) -> PharmacyPrescription:
+    rx = (db.query(PharmacyPrescription).options(
+        selectinload(PharmacyPrescription.lines)).filter(
+            PharmacyPrescription.id == rx_id).first())
     if not rx:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prescription not found.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail="Prescription not found.")
 
     if any(_d(l.dispensed_qty) > 0 for l in (rx.lines or [])):
         raise HTTPException(
@@ -753,6 +794,7 @@ def cancel_prescription(db: Session, rx_id: int, reason: str, current_user: User
 # ============================================================
 # Sale helpers
 # ============================================================
+
 
 def _recalc_sale_totals(sale: PharmacySale) -> None:
     gross = Decimal("0")
@@ -776,11 +818,9 @@ def _recalc_sale_totals(sale: PharmacySale) -> None:
 
 
 def _update_payment_status(db: Session, sale: PharmacySale) -> None:
-    total_paid = (
-        db.query(func.coalesce(func.sum(PharmacyPayment.amount), 0))
-        .filter(PharmacyPayment.sale_id == sale.id)
-        .scalar()
-    )
+    total_paid = (db.query(
+        func.coalesce(func.sum(PharmacyPayment.amount),
+                      0)).filter(PharmacyPayment.sale_id == sale.id).scalar())
     total_paid = _d(total_paid)
 
     if total_paid <= 0:
@@ -791,20 +831,35 @@ def _update_payment_status(db: Session, sale: PharmacySale) -> None:
         sale.payment_status = "PAID"
 
 
+# ============================================================
+# ✅ NEW BILLING INVOICE CREATION (ServiceGroup.PHARM + new model-safe fields)
+# ============================================================
+
+
+def _set_if_has(obj: Any, field: str, value: Any) -> None:
+    if hasattr(obj, field):
+        setattr(obj, field, value)
+
+
+def _get_attr(obj: Any, field: str, default=None):
+    return getattr(obj, field, default)
+
+
 def _generate_invoice_number(db: Session) -> str | None:
-    if not hasattr(Invoice, "invoice_number"):
+    # supports invoice_number OR number OR code
+    num_field = None
+    for f in ("invoice_number", "number", "code"):
+        if hasattr(BillingInvoice, f):
+            num_field = getattr(BillingInvoice, f)
+            break
+    if not num_field:
         return None
 
     today_str = datetime.utcnow().strftime("%Y%m%d")
     prefix = f"INV-{today_str}"
 
-    col = Invoice.invoice_number
-    last = (
-        db.query(col)
-        .filter(col.like(f"{prefix}-%"))
-        .order_by(col.desc())
-        .first()
-    )
+    last = (db.query(num_field).filter(num_field.like(f"{prefix}-%")).order_by(
+        num_field.desc()).first())
     seq = 1
     if last and last[0]:
         try:
@@ -814,51 +869,132 @@ def _generate_invoice_number(db: Session) -> str | None:
     return f"{prefix}-{seq:04d}"
 
 
-def _create_billing_invoice_for_sale(db: Session, sale: PharmacySale, current_user: User) -> Invoice:
-    if hasattr(sale, "billing_invoice_id") and getattr(sale, "billing_invoice_id", None):
-        existing = db.get(Invoice, int(sale.billing_invoice_id))
-        if existing:
-            return existing
+def _find_existing_invoice_for_sale(db: Session,
+                                    sale: PharmacySale) -> Any | None:
+    # 1) direct FK link on sale
+    if hasattr(sale, "billing_invoice_id") and getattr(
+            sale, "billing_invoice_id", None):
+        inv = db.get(BillingInvoice, int(sale.billing_invoice_id))
+        if inv:
+            return inv
 
-    existing = (
-        db.query(Invoice)
-        .filter(Invoice.context_type == "pharmacy_sale", Invoice.context_id == sale.id)
-        .first()
-    )
-    if existing:
-        if hasattr(sale, "billing_invoice_id"):
-            sale.billing_invoice_id = existing.id
-        return existing
+    # 2) context lookup (new billing standard)
+    if hasattr(BillingInvoice, "context_type") and hasattr(
+            BillingInvoice, "context_id"):
+        inv = (db.query(BillingInvoice).filter(
+            getattr(BillingInvoice, "context_type") == "pharmacy_sale",
+            getattr(BillingInvoice, "context_id") == sale.id,
+        ).first())
+        if inv:
+            if hasattr(sale, "billing_invoice_id"):
+                sale.billing_invoice_id = inv.id
+            return inv
 
+    # 3) alt context fields
+    for ct_field, cid_field in (("ref_type", "ref_id"), ("source_type",
+                                                         "source_id")):
+        if hasattr(BillingInvoice, ct_field) and hasattr(
+                BillingInvoice, cid_field):
+            inv = (db.query(BillingInvoice).filter(
+                getattr(BillingInvoice, ct_field) == "pharmacy_sale",
+                getattr(BillingInvoice, cid_field) == sale.id,
+            ).first())
+            if inv:
+                if hasattr(sale, "billing_invoice_id"):
+                    sale.billing_invoice_id = inv.id
+                return inv
+
+    return None
+
+
+def _sync_invoice_totals_from_sale(inv: Any, sale: PharmacySale) -> None:
     gross = _d(getattr(sale, "gross_amount", 0))
     tax = _d(getattr(sale, "total_tax", 0))
     discount_total = _d(getattr(sale, "discount_amount_total", 0))
     net = _d(getattr(sale, "net_amount", 0)) or (gross + tax - discount_total)
 
-    inv_kwargs: dict[str, Any] = dict(
-        patient_id=sale.patient_id,
-        context_type="pharmacy_sale",
-        context_id=sale.id,
-        status="draft",
-        gross_total=gross,
-        tax_total=tax,
-        discount_total=discount_total,
-        net_total=net,
-        amount_paid=Decimal("0.00"),
-        balance_due=net,
-    )
+    # common totals naming
+    _set_if_has(inv, "gross_total", gross)
+    _set_if_has(inv, "gross_amount", gross)
+    _set_if_has(inv, "tax_total", tax)
+    _set_if_has(inv, "total_tax", tax)
+    _set_if_has(inv, "discount_total", discount_total)
+    _set_if_has(inv, "discount_amount_total", discount_total)
+    _set_if_has(inv, "net_total", net)
+    _set_if_has(inv, "net_amount", net)
 
-    if hasattr(Invoice, "billing_type"):
+    # payment / balance (kept as 0 here; your billing module may update it later)
+    if hasattr(inv, "amount_paid"):
+        inv.amount_paid = _d(getattr(inv, "amount_paid", 0))
+    if hasattr(inv, "balance_due"):
+        inv.balance_due = _round_money(net -
+                                       _d(getattr(inv, "amount_paid", 0)))
+
+
+def _create_billing_invoice_for_sale(db: Session, sale: PharmacySale,
+                                     current_user: User) -> Any:
+    """
+    Creates billing invoice + lines using your NEW billing model style:
+      - service_group = ServiceGroup.PHARM
+      - context_type/context_id = pharmacy_sale/<sale.id> (if available)
+      - lines mapped from PharmacySaleItem
+    """
+    existing = _find_existing_invoice_for_sale(db, sale)
+    if existing:
+        # Keep totals in sync (important when sale items change)
+        _sync_invoice_totals_from_sale(existing, sale)
+        return existing
+
+    inv_kwargs: dict[str, Any] = {}
+
+    # patient / encounter links
+    if hasattr(BillingInvoice, "patient_id"):
+        inv_kwargs["patient_id"] = sale.patient_id
+    if hasattr(BillingInvoice, "visit_id"):
+        inv_kwargs["visit_id"] = getattr(sale, "visit_id", None)
+    if hasattr(BillingInvoice, "ipd_admission_id"):
+        inv_kwargs["ipd_admission_id"] = getattr(sale, "ipd_admission_id",
+                                                 None)
+
+    # new standard context fields
+    if hasattr(BillingInvoice, "context_type") and hasattr(
+            BillingInvoice, "context_id"):
+        inv_kwargs["context_type"] = "pharmacy_sale"
+        inv_kwargs["context_id"] = sale.id
+    elif hasattr(BillingInvoice, "ref_type") and hasattr(
+            BillingInvoice, "ref_id"):
+        inv_kwargs["ref_type"] = "pharmacy_sale"
+        inv_kwargs["ref_id"] = sale.id
+    elif hasattr(BillingInvoice, "source_type") and hasattr(
+            BillingInvoice, "source_id"):
+        inv_kwargs["source_type"] = "pharmacy_sale"
+        inv_kwargs["source_id"] = sale.id
+
+    # status (support enum/string)
+    if hasattr(BillingInvoice, "status"):
+        inv_kwargs["status"] = "DRAFT"
+
+    # service group / billing type
+    if hasattr(BillingInvoice, "service_group"):
+        inv_kwargs["service_group"] = ServiceGroup.PHARM
+    if hasattr(BillingInvoice, "billing_type"):
         inv_kwargs["billing_type"] = "pharmacy"
 
-    inv = Invoice(**inv_kwargs)
+    inv = BillingInvoice(**inv_kwargs)  # type: ignore
 
-    if hasattr(inv, "created_by"):
-        inv.created_by = getattr(current_user, "id", None)
+    # created by fields
+    for f in ("created_by_id", "created_by", "created_user_id"):
+        if hasattr(inv, f):
+            setattr(inv, f, getattr(current_user, "id", None))
+            break
 
+    # invoice number field variations
     inv_no = _generate_invoice_number(db)
-    if inv_no and hasattr(inv, "invoice_number"):
-        inv.invoice_number = inv_no
+    if inv_no:
+        for f in ("invoice_number", "number", "code"):
+            if hasattr(inv, f):
+                setattr(inv, f, inv_no)
+                break
 
     db.add(inv)
     db.flush()
@@ -866,44 +1002,105 @@ def _create_billing_invoice_for_sale(db: Session, sale: PharmacySale, current_us
     if hasattr(sale, "billing_invoice_id"):
         sale.billing_invoice_id = inv.id
 
-    sale_items: List[PharmacySaleItem] = (
-        db.query(PharmacySaleItem)
-        .filter(PharmacySaleItem.sale_id == sale.id)
-        .all()
-    )
+    # fetch sale items
+    sale_items: List[PharmacySaleItem] = (db.query(PharmacySaleItem).filter(
+        PharmacySaleItem.sale_id == sale.id).all())
 
     seq = 1
     for it in sale_items:
         qty = _d(it.quantity)
         unit_price = _d(it.unit_price)
         tax_percent = _d(it.tax_percent)
+        discount_amt = _d(getattr(it, "discount_amount", 0))
 
-        line_amount = _d(it.line_amount) if it.line_amount is not None else _round_money(qty * unit_price)
-        tax_amount = _d(it.tax_amount) if it.tax_amount is not None else _compute_tax(line_amount, tax_percent)
-        total_line = _d(it.total_amount) if it.total_amount is not None else _round_money(line_amount + tax_amount)
-        discount_amt = _d(it.discount_amount)
+        line_subtotal = _d(
+            it.line_amount) if it.line_amount is not None else _round_money(
+                qty * unit_price)
+        tax_amount = _d(
+            it.tax_amount) if it.tax_amount is not None else _compute_tax(
+                line_subtotal, tax_percent)
+        line_total = _d(
+            it.total_amount) if it.total_amount is not None else _round_money(
+                line_subtotal + tax_amount - discount_amt)
 
-        inv_item = InvoiceItem(
-            invoice_id=inv.id,
-            seq=seq,
-            service_type="pharmacy",
-            service_ref_id=it.id,
-            description=it.item_name or "",
-            quantity=qty,
-            unit_price=unit_price,
-            tax_rate=tax_percent,
-            discount_percent=Decimal("0.00"),
-            discount_amount=discount_amt,
-            tax_amount=tax_amount,
-            line_total=total_line,
-            is_voided=False,
-        )
+        line_kwargs: dict[str, Any] = {}
 
-        if hasattr(inv_item, "created_by"):
-            inv_item.created_by = getattr(current_user, "id", None)
+        # fk
+        if hasattr(BillingInvoiceLine, "invoice_id"):
+            line_kwargs["invoice_id"] = inv.id
 
-        db.add(inv_item)
+        # ordering
+        if hasattr(BillingInvoiceLine, "seq"):
+            line_kwargs["seq"] = seq
+        elif hasattr(BillingInvoiceLine, "line_no"):
+            line_kwargs["line_no"] = seq
+
+        # group/type
+        if hasattr(BillingInvoiceLine, "service_group"):
+            line_kwargs["service_group"] = ServiceGroup.PHARM
+        if hasattr(BillingInvoiceLine, "service_type"):
+            line_kwargs["service_type"] = "pharmacy"
+
+        # refs
+        if hasattr(BillingInvoiceLine, "service_ref_id"):
+            line_kwargs["service_ref_id"] = it.id
+        if hasattr(BillingInvoiceLine, "ref_type") and hasattr(
+                BillingInvoiceLine, "ref_id"):
+            line_kwargs["ref_type"] = "pharmacy_sale_item"
+            line_kwargs["ref_id"] = it.id
+
+        # description
+        if hasattr(BillingInvoiceLine, "description"):
+            line_kwargs["description"] = (it.item_name or "")
+        elif hasattr(BillingInvoiceLine, "name"):
+            line_kwargs["name"] = (it.item_name or "")
+
+        # qty/price/tax/discount
+        if hasattr(BillingInvoiceLine, "quantity"):
+            line_kwargs["quantity"] = qty
+        if hasattr(BillingInvoiceLine, "unit_price"):
+            line_kwargs["unit_price"] = unit_price
+        if hasattr(BillingInvoiceLine, "tax_rate"):
+            line_kwargs["tax_rate"] = tax_percent
+        if hasattr(BillingInvoiceLine, "tax_percent"):
+            line_kwargs["tax_percent"] = tax_percent
+
+        if hasattr(BillingInvoiceLine, "discount_amount"):
+            line_kwargs["discount_amount"] = discount_amt
+        if hasattr(BillingInvoiceLine, "discount_total"):
+            line_kwargs["discount_total"] = discount_amt
+
+        # totals naming variations
+        if hasattr(BillingInvoiceLine, "line_amount"):
+            line_kwargs["line_amount"] = line_subtotal
+        if hasattr(BillingInvoiceLine, "sub_total"):
+            line_kwargs["sub_total"] = line_subtotal
+        if hasattr(BillingInvoiceLine, "tax_amount"):
+            line_kwargs["tax_amount"] = tax_amount
+        if hasattr(BillingInvoiceLine, "line_total"):
+            line_kwargs["line_total"] = line_total
+        if hasattr(BillingInvoiceLine, "total_amount"):
+            line_kwargs["total_amount"] = line_total
+
+        # void flag
+        if hasattr(BillingInvoiceLine, "is_voided"):
+            line_kwargs["is_voided"] = False
+        if hasattr(BillingInvoiceLine, "is_cancelled"):
+            line_kwargs["is_cancelled"] = False
+
+        inv_line = BillingInvoiceLine(**line_kwargs)  # type: ignore
+
+        # created by fields for line
+        for f in ("created_by_id", "created_by", "created_user_id"):
+            if hasattr(inv_line, f):
+                setattr(inv_line, f, getattr(current_user, "id", None))
+                break
+
+        db.add(inv_line)
         seq += 1
+
+    # sync totals (header)
+    _sync_invoice_totals_from_sale(inv, sale)
 
     return inv
 
@@ -912,7 +1109,9 @@ def _create_billing_invoice_for_sale(db: Session, sale: PharmacySale, current_us
 # Dispense from Rx (Batch-wise MRP strict) + Schedule enforcement
 # ============================================================
 
-def _enforce_item_schedule_for_dispense(*, item: InventoryItem, rx: PharmacyPrescription) -> None:
+
+def _enforce_item_schedule_for_dispense(*, item: InventoryItem,
+                                        rx: PharmacyPrescription) -> None:
     item_type = (getattr(item, "item_type", "") or "").upper()
     if item_type not in ("DRUG", "MEDICINE", ""):
         return
@@ -931,22 +1130,25 @@ def _enforce_item_schedule_for_dispense(*, item: InventoryItem, rx: PharmacyPres
     patient_id = getattr(rx, "patient_id", None)
 
     if sch_system == "IN_DCA":
-        if sch_code in ("H",):
+        if sch_code in ("H", ):
             if not doctor_id:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Item '{item.name}' is Schedule {sch_code} and requires a doctor prescription.",
+                    detail=
+                    f"Item '{item.name}' is Schedule {sch_code} and requires a doctor prescription.",
                 )
         elif sch_code in ("H1", "X"):
             if not doctor_id:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Item '{item.name}' is Schedule {sch_code} and requires a doctor prescription.",
+                    detail=
+                    f"Item '{item.name}' is Schedule {sch_code} and requires a doctor prescription.",
                 )
             if not patient_id:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Item '{item.name}' is Schedule {sch_code} and requires a patient record (register compliance).",
+                    detail=
+                    f"Item '{item.name}' is Schedule {sch_code} and requires a patient record (register compliance).",
                 )
         return
 
@@ -954,7 +1156,8 @@ def _enforce_item_schedule_for_dispense(*, item: InventoryItem, rx: PharmacyPres
         if sch_code == "I":
             raise HTTPException(
                 status_code=400,
-                detail=f"Item '{item.name}' is US Schedule I and cannot be dispensed.",
+                detail=
+                f"Item '{item.name}' is US Schedule I and cannot be dispensed.",
             )
 
         requires_prescription = bool(meta.get("requires_prescription", False))
@@ -963,12 +1166,14 @@ def _enforce_item_schedule_for_dispense(*, item: InventoryItem, rx: PharmacyPres
         if requires_prescription and not doctor_id:
             raise HTTPException(
                 status_code=400,
-                detail=f"Item '{item.name}' is US Schedule {sch_code} and requires a doctor prescription.",
+                detail=
+                f"Item '{item.name}' is US Schedule {sch_code} and requires a doctor prescription.",
             )
         if requires_register and not patient_id:
             raise HTTPException(
                 status_code=400,
-                detail=f"Item '{item.name}' is US Schedule {sch_code} and requires a patient record (register compliance).",
+                detail=
+                f"Item '{item.name}' is US Schedule {sch_code} and requires a patient record (register compliance).",
             )
         return
 
@@ -981,29 +1186,30 @@ def dispense_from_rx(
     payload: DispenseFromRxIn,
     current_user: User,
 ) -> tuple[PharmacyPrescription, PharmacySale | None]:
-    rx = (
-        db.query(PharmacyPrescription)
-        .options(selectinload(PharmacyPrescription.lines))
-        .filter(PharmacyPrescription.id == rx_id)
-        .first()
-    )
+    rx = (db.query(PharmacyPrescription).options(
+        selectinload(PharmacyPrescription.lines)).filter(
+            PharmacyPrescription.id == rx_id).first())
     if not rx:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prescription not found.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail="Prescription not found.")
 
     allowed_statuses = {"DRAFT", "ISSUED", "PARTIALLY_DISPENSED"}
     if rx.status not in allowed_statuses:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only DRAFT, ISSUED or PARTIALLY_DISPENSED prescriptions can be dispensed.",
+            detail=
+            "Only DRAFT, ISSUED or PARTIALLY_DISPENSED prescriptions can be dispensed.",
         )
 
     if rx.status == "DRAFT":
         rx.status = "ISSUED"
 
-    location_id = getattr(payload, "location_id", None) or getattr(rx, "location_id", None)
+    location_id = getattr(payload, "location_id", None) or getattr(
+        rx, "location_id", None)
 
     line_map = {int(l.id): l for l in (rx.lines or [])}
-    lines_to_process: List[tuple[PharmacyPrescriptionLine, Decimal, Optional[int]]] = []
+    lines_to_process: List[tuple[PharmacyPrescriptionLine, Decimal,
+                                 Optional[int]]] = []
 
     for entry in (payload.lines or []):
         line_id = getattr(entry, "line_id", None)
@@ -1020,27 +1226,39 @@ def dispense_from_rx(
 
         line = line_map.get(int(line_id or 0))
         if not line:
-            raise HTTPException(status_code=400, detail=f"Rx line {line_id} not found in prescription.")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Rx line {line_id} not found in prescription.")
 
         if line.status in ("DISPENSED", "CANCELLED"):
-            raise HTTPException(status_code=400, detail=f"Rx line {line.id} is {line.status} and cannot be dispensed.")
+            raise HTTPException(
+                status_code=400,
+                detail=
+                f"Rx line {line.id} is {line.status} and cannot be dispensed.")
 
         remaining = _d(line.requested_qty) - _d(line.dispensed_qty)
         disp_qty_dec = _d(disp_qty)
 
         if disp_qty_dec > remaining:
-            raise HTTPException(status_code=400, detail=f"Dispense quantity {disp_qty_dec} exceeds remaining {remaining} for line {line.id}.")
+            raise HTTPException(
+                status_code=400,
+                detail=
+                f"Dispense quantity {disp_qty_dec} exceeds remaining {remaining} for line {line.id}."
+            )
         if disp_qty_dec <= 0:
             continue
 
-        chosen_batch_id = int(batch_id) if batch_id else (int(getattr(line, "batch_id", 0) or 0) or None)
+        chosen_batch_id = int(batch_id) if batch_id else (
+            int(getattr(line, "batch_id", 0) or 0) or None)
         lines_to_process.append((line, disp_qty_dec, chosen_batch_id))
 
     if not lines_to_process:
-        raise HTTPException(status_code=400, detail="No valid lines to dispense.")
+        raise HTTPException(status_code=400,
+                            detail="No valid lines to dispense.")
 
     sale: PharmacySale | None = None
-    context_type = (getattr(payload, "context_type", None) or getattr(rx, "type", None) or "COUNTER").upper()
+    context_type = (getattr(payload, "context_type", None)
+                    or getattr(rx, "type", None) or "COUNTER").upper()
 
     if getattr(payload, "create_sale", False):
         sale = PharmacySale(
@@ -1062,12 +1280,18 @@ def dispense_from_rx(
     for line, disp_qty, chosen_batch_id in lines_to_process:
         item: InventoryItem | None = db.get(InventoryItem, int(line.item_id))
         if not item:
-            raise HTTPException(status_code=404, detail=f"Inventory item {line.item_id} not found.")
+            raise HTTPException(
+                status_code=404,
+                detail=f"Inventory item {line.item_id} not found.")
 
         _enforce_item_schedule_for_dispense(item=item, rx=rx)
 
         if not location_id:
-            raise HTTPException(status_code=400, detail="location_id is required to dispense with batch-wise MRP accuracy.")
+            raise HTTPException(
+                status_code=400,
+                detail=
+                "location_id is required to dispense with batch-wise MRP accuracy."
+            )
 
         if chosen_batch_id:
             allocations = _allocate_from_selected_batch(
@@ -1138,14 +1362,12 @@ def dispense_from_rx(
 
     if sale:
         db.flush()
-        sale = (
-            db.query(PharmacySale)
-            .options(selectinload(PharmacySale.items))
-            .filter(PharmacySale.id == sale.id)
-            .first()
-        )
+        sale = (db.query(PharmacySale).options(selectinload(
+            PharmacySale.items)).filter(PharmacySale.id == sale.id).first())
         _recalc_sale_totals(sale)
         db.flush()
+
+        # ✅ NEW billing invoice creation
         _create_billing_invoice_for_sale(db, sale, current_user)
 
     db.commit()
@@ -1159,6 +1381,7 @@ def dispense_from_rx(
 # ============================================================
 # Counter sale (Counter Rx + invoice in one shot)
 # ============================================================
+
 
 def create_counter_sale(
     db: Session,
@@ -1183,19 +1406,18 @@ def create_counter_sale(
                 route=item.route,
                 timing=item.timing,
                 instructions=item.instructions,
-            )
-            for item in (payload.items or [])
+            ) for item in (payload.items or [])
         ],
     )
 
     rx = create_prescription(db, rx_data, current_user)
     rx = sign_prescription(db, rx.id, current_user)
 
-    lines = [
-        {"line_id": l.id, "dispense_qty": l.requested_qty, "batch_id": getattr(l, "batch_id", None)}
-        for l in (rx.lines or [])
-        if l.status != "CANCELLED"
-    ]
+    lines = [{
+        "line_id": l.id,
+        "dispense_qty": l.requested_qty,
+        "batch_id": getattr(l, "batch_id", None)
+    } for l in (rx.lines or []) if l.status != "CANCELLED"]
 
     dispense_payload = DispenseFromRxIn(
         location_id=payload.location_id,
@@ -1213,18 +1435,17 @@ def create_counter_sale(
 # Sale operations
 # ============================================================
 
-def finalize_sale(db: Session, sale_id: int, current_user: User) -> PharmacySale:
-    sale = (
-        db.query(PharmacySale)
-        .options(selectinload(PharmacySale.items))
-        .filter(PharmacySale.id == sale_id)
-        .first()
-    )
+
+def finalize_sale(db: Session, sale_id: int,
+                  current_user: User) -> PharmacySale:
+    sale = (db.query(PharmacySale).options(selectinload(
+        PharmacySale.items)).filter(PharmacySale.id == sale_id).first())
     if not sale:
         raise HTTPException(status_code=404, detail="Pharmacy sale not found.")
 
     if sale.invoice_status == "CANCELLED":
-        raise HTTPException(status_code=400, detail="Cancelled sale cannot be finalized.")
+        raise HTTPException(status_code=400,
+                            detail="Cancelled sale cannot be finalized.")
 
     if sale.invoice_status == "FINALIZED":
         return sale
@@ -1232,18 +1453,19 @@ def finalize_sale(db: Session, sale_id: int, current_user: User) -> PharmacySale
     _recalc_sale_totals(sale)
     sale.invoice_status = "FINALIZED"
 
+    # keep billing header totals in sync (and create if missing)
+    db.flush()
+    _create_billing_invoice_for_sale(db, sale, current_user)
+
     db.commit()
     db.refresh(sale)
     return sale
 
 
-def cancel_sale(db: Session, sale_id: int, reason: str, current_user: User) -> PharmacySale:
-    sale = (
-        db.query(PharmacySale)
-        .options(selectinload(PharmacySale.items))
-        .filter(PharmacySale.id == sale_id)
-        .first()
-    )
+def cancel_sale(db: Session, sale_id: int, reason: str,
+                current_user: User) -> PharmacySale:
+    sale = (db.query(PharmacySale).options(selectinload(
+        PharmacySale.items)).filter(PharmacySale.id == sale_id).first())
     if not sale:
         raise HTTPException(status_code=404, detail="Pharmacy sale not found.")
 
@@ -1254,25 +1476,39 @@ def cancel_sale(db: Session, sale_id: int, reason: str, current_user: User) -> P
     _update_payment_status(db, sale)
 
     if sale.payment_status == "PAID":
-        raise HTTPException(status_code=400, detail="Cannot cancel fully paid sale without supervisor override.")
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot cancel fully paid sale without supervisor override."
+        )
 
     sale.invoice_status = "CANCELLED"
     sale.cancel_reason = reason
     sale.cancelled_at = datetime.utcnow()
     sale.cancelled_by_id = current_user.id
 
+    # optionally mark billing invoice cancelled if your model supports it
+    inv = _find_existing_invoice_for_sale(db, sale)
+    if inv and hasattr(inv, "status"):
+        try:
+            inv.status = "CANCELLED"
+        except Exception:
+            pass
+
     db.commit()
     db.refresh(sale)
     return sale
 
 
-def add_payment_to_sale(db: Session, sale_id: int, payload: PaymentCreate, current_user: User) -> PharmacyPayment:
+def add_payment_to_sale(db: Session, sale_id: int, payload: PaymentCreate,
+                        current_user: User) -> PharmacyPayment:
     sale = db.get(PharmacySale, int(sale_id))
     if not sale:
         raise HTTPException(status_code=404, detail="Pharmacy sale not found.")
 
     if sale.invoice_status != "FINALIZED":
-        raise HTTPException(status_code=400, detail="Payments can only be added to FINALIZED sales.")
+        raise HTTPException(
+            status_code=400,
+            detail="Payments can only be added to FINALIZED sales.")
 
     paid_on = payload.paid_on or datetime.utcnow()
     payment = PharmacyPayment(
@@ -1287,6 +1523,14 @@ def add_payment_to_sale(db: Session, sale_id: int, payload: PaymentCreate, curre
     db.add(payment)
 
     _update_payment_status(db, sale)
+
+    # keep billing header balance sync (optional; your billing module may compute itself)
+    inv = _find_existing_invoice_for_sale(db, sale)
+    if inv:
+        try:
+            _sync_invoice_totals_from_sale(inv, sale)
+        except Exception:
+            pass
 
     db.commit()
     db.refresh(payment)

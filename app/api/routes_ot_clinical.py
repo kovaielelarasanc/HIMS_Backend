@@ -1,17 +1,21 @@
 # FILE: app/api/routes_ot_clinical.py
 from __future__ import annotations
 
-from typing import List, Optional
+from io import BytesIO
 from datetime import datetime, date, time, timezone
 from zoneinfo import ZoneInfo
+from typing import Any, Dict, List, Optional, Literal
+from sqlalchemy.orm.attributes import flag_modified
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy.orm import Session
-from sqlalchemy import func  # noqa: F401 (keep if used elsewhere)
-
+from fastapi import APIRouter, Depends, HTTPException, Query, status, Response
+from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import Session, joinedload, selectinload
+from sqlalchemy import desc
 from app.api.deps import get_db, current_user
 from app.models.user import User
+from sqlalchemy import select
 from app.models.ot import (
+    OtSchedule,
     OtCase,
     PreAnaesthesiaEvaluation,
     PreOpChecklist,
@@ -28,8 +32,22 @@ from app.models.ot import (
     OtCleaningLog,
     OtEnvironmentLog,
     AnaesthesiaDeviceUse,
+    OtCaseInstrumentCountLine,
 )
-from app.models.ot_master import OtDeviceMaster
+from app.models.ot_master import OtDeviceMaster, OtInstrumentMaster
+from app.models.ui_branding import UiBranding
+from app.models.ipd import IpdBed, IpdAdmission, IpdRoom
+from app.services.ui_branding import get_ui_branding
+# Optional import - keep if you use it elsewhere in this file
+
+
+from app.services.pdfs.ot_safety_checklist_pdf import build_ot_safety_checklist_pdf_bytes
+from app.services.pdfs.ot_anaesthesia_record_pdf import (
+    build_ot_anaesthesia_record_pdf_bytes,
+    build_ot_preanaesthetic_record_pdf_bytes,
+)
+from app.services.pdfs.ot_pacu_record_pdf import build_ot_pacu_record_pdf_bytes
+
 from app.schemas.ot import (
     # Pre-anaesthesia
     PreAnaesthesiaEvaluationCreate,
@@ -56,6 +74,7 @@ from app.schemas.ot import (
     OtAnaesthesiaVitalOut,
     OtAnaesthesiaDrugIn,
     OtAnaesthesiaDrugOut,
+    OtAnaesthesiaRecordDefaultsOut,
     # Nursing record
     OtNursingRecordCreate,
     OtNursingRecordUpdate,
@@ -63,6 +82,8 @@ from app.schemas.ot import (
     # Sponge & instrument
     OtCountsIn,
     OtCountsOut,
+    OtCountItemsUpsertIn,
+    OtCountItemLineOut,
     # Implants
     OtImplantRecordCreate,
     OtImplantRecordUpdate,
@@ -86,9 +107,6 @@ from app.schemas.ot import (
     OtEnvironmentLogUpdate,
     OtEnvironmentLogOut,
 )
-
-# Optional import - keep if you use it elsewhere in this file
-from app.services.ot_billing import ensure_ot_invoice_and_items  # noqa: F401
 
 router = APIRouter(prefix="/ot", tags=["OT - Clinical Records"])
 
@@ -186,6 +204,23 @@ def _time_str_to_dt(value: Optional[str],
 def _dt_to_time_str(value: Optional[datetime]) -> Optional[str]:
     """Convert stored dt (naive assumed UTC) into 'HH:MM' string in IST."""
     return _to_hhmm(value)
+
+
+def _get_branding(db: Session) -> UiBranding:
+    # ✅ adjust if you have tenant-wise branding
+    branding = db.query(UiBranding).order_by(UiBranding.id.desc()).first()
+    if not branding:
+        branding = UiBranding(
+            org_name="Hospital",
+            org_tagline="",
+            org_address="",
+            org_phone="",
+            org_email="",
+            org_website="",
+            org_gstin="",
+            logo_path="",
+        )
+    return branding
 
 
 # ============================================================
@@ -320,9 +355,19 @@ def _sync_anaesthesia_devices(db: Session, record: AnaesthesiaRecord,
                                      qty=1))
 
 
+def _device_names_by_ids(db: Session, ids: list[int]) -> list[str]:
+    if not ids:
+        return []
+    rows = db.query(OtDeviceMaster).filter(OtDeviceMaster.id.in_(ids)).all()
+    by_id = {
+        int(r.id): (r.name or str(r.id)).strip()
+        for r in rows if r.id is not None
+    }
+    return [by_id[i] for i in ids if by_id.get(i)]
+
+
 # ============================================================
 #  PRE-ANAESTHESIA EVALUATION
-#  ✅ GET returns 200 with null (Optional) on first open
 # ============================================================
 
 
@@ -337,9 +382,7 @@ def get_pre_anaesthesia_for_case(
 
     case = _get_case_or_404(db, case_id)
     record = case.preanaesthesia
-    if not record:
-        return None
-    return record
+    return record or None
 
 
 @router.post(
@@ -411,7 +454,6 @@ def update_pre_anaesthesia_for_case(
 
 # ============================================================
 #  PRE-OP CHECKLIST
-#  ✅ GET returns 200 with null (Optional) on first open
 # ============================================================
 
 
@@ -426,9 +468,7 @@ def get_preop_checklist_for_case(
 
     case = _get_case_or_404(db, case_id)
     record = getattr(case, "preop_checklist", None)
-    if not record:
-        return None
-    return record
+    return record or None
 
 
 @router.post(
@@ -501,80 +541,7 @@ def update_preop_checklist_for_case(
 
 # ============================================================
 #  SURGICAL SAFETY CHECKLIST (WHO)
-#  ✅ GET returns 200 with null (Optional) on first open
-#  ✅ IST HH:MM parsing + formatting
 # ============================================================
-
-
-def _build_anaes_json_from_payload(payload: OtAnaesthesiaRecordIn) -> dict:
-    return {
-        # ---- PRE-OP ----
-        "asa_grade": payload.asa_grade,
-        "airway_assessment": payload.airway_assessment,
-        "comorbidities": payload.comorbidities,
-        "allergies": payload.allergies,
-        "preop_pulse": payload.preop_pulse,
-        "preop_bp": payload.preop_bp,
-        "preop_rr": payload.preop_rr,
-        "preop_temp_c": payload.preop_temp_c,
-        "preop_cvs": payload.preop_cvs,
-        "preop_rs": payload.preop_rs,
-        "preop_cns": payload.preop_cns,
-        "preop_pa": payload.preop_pa,
-        "preop_veins": payload.preop_veins,
-        "preop_spine": payload.preop_spine,
-        "airway_teeth_status": payload.airway_teeth_status,
-        "airway_denture": payload.airway_denture,
-        "airway_neck_movements": payload.airway_neck_movements,
-        "airway_mallampati_class": payload.airway_mallampati_class,
-        "difficult_airway_anticipated": payload.difficult_airway_anticipated,
-        "risk_factors": payload.risk_factors,
-        "anaesthetic_plan_detail": payload.anaesthetic_plan_detail,
-        "preop_instructions": payload.preop_instructions,
-        # ---- INTRA-OP SETTINGS ----
-        "preoxygenation": payload.preoxygenation,
-        "cricoid_pressure": payload.cricoid_pressure,
-        "induction_route": payload.induction_route,
-        "intubation_done": payload.intubation_done,
-        "intubation_route": payload.intubation_route,
-        "intubation_state": payload.intubation_state,
-        "intubation_technique": payload.intubation_technique,
-        "tube_type": payload.tube_type,
-        "tube_size": payload.tube_size,
-        "tube_fixed_at": payload.tube_fixed_at,
-        "cuff_used": payload.cuff_used,
-        "cuff_medium": payload.cuff_medium,
-        "bilateral_breath_sounds": payload.bilateral_breath_sounds,
-        "added_sounds": payload.added_sounds,
-        "laryngoscopy_grade": payload.laryngoscopy_grade,
-        # legacy free-text/arrays (keep if your UI still uses)
-        "airway_devices": getattr(payload, "airway_devices", None),
-        "monitors": getattr(payload, "monitors", None),
-        "ventilation_mode_baseline": payload.ventilation_mode_baseline,
-        "ventilator_vt": payload.ventilator_vt,
-        "ventilator_rate": payload.ventilator_rate,
-        "ventilator_peep": payload.ventilator_peep,
-        "breathing_system": payload.breathing_system,
-        "lines": payload.lines,
-        "tourniquet_used": payload.tourniquet_used,
-        "patient_position": payload.patient_position,
-        "eyes_taped": payload.eyes_taped,
-        "eyes_covered_with_foil": payload.eyes_covered_with_foil,
-        "pressure_points_padded": payload.pressure_points_padded,
-        "iv_fluids_plan": payload.iv_fluids_plan,
-        "blood_components_plan": payload.blood_components_plan,
-        "regional_block_type": payload.regional_block_type,
-        "regional_position": payload.regional_position,
-        "regional_approach": payload.regional_approach,
-        "regional_space_depth": payload.regional_space_depth,
-        "regional_needle_type": payload.regional_needle_type,
-        "regional_drug_dose": payload.regional_drug_dose,
-        "regional_level": payload.regional_level,
-        "regional_complications": payload.regional_complications,
-        "block_adequacy": payload.block_adequacy,
-        "sedation_needed": payload.sedation_needed,
-        "conversion_to_ga": payload.conversion_to_ga,
-    }
 
 
 @router.get("/cases/{case_id}/safety-checklist",
@@ -717,7 +684,6 @@ def update_safety_checklist_for_case(
 
     case = _get_case_or_404(db, case_id)
     record = case.safety_checklist
-
     if not record:
         return create_safety_checklist_for_case(case_id=case_id,
                                                 payload=payload,
@@ -769,113 +735,452 @@ def update_safety_checklist_for_case(
     )
 
 
+def _empty_safety_pdf_payload() -> dict:
+    return {"sign_in": {}, "time_out": {}, "sign_out": {}}
+
+
+@router.get("/cases/{case_id}/safety-checklist/pdf")
+def download_safety_checklist_pdf(
+        case_id: int,
+        download: bool = Query(False),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    _need_any(user, ["ot.safety.view", "ot.cases.view"])
+
+    case = (db.query(OtCase).options(
+        joinedload(OtCase.schedule).joinedload(OtSchedule.patient),
+        joinedload(OtCase.schedule).joinedload(
+            OtSchedule.admission).joinedload(
+                IpdAdmission.current_bed).joinedload(IpdBed.room).joinedload(
+                    IpdRoom.ward),
+        joinedload(OtCase.safety_checklist),
+    ).filter(OtCase.id == case_id).first())
+    if not case:
+        raise HTTPException(status_code=404, detail="OT case not found")
+
+    record = case.safety_checklist
+    data = _empty_safety_pdf_payload()
+
+    if record:
+        sign_in_data = {
+            k: v
+            for k, v in (record.sign_in_data or {}).items() if k != "done"
+        }
+        time_out_data = {
+            k: v
+            for k, v in (record.time_out_data or {}).items() if k != "done"
+        }
+        sign_out_data = {
+            k: v
+            for k, v in (record.sign_out_data or {}).items() if k != "done"
+        }
+        data = {
+            "sign_in": sign_in_data,
+            "time_out": time_out_data,
+            "sign_out": sign_out_data
+        }
+
+    branding = _get_branding(db)
+
+    pdf_bytes = build_ot_safety_checklist_pdf_bytes(
+        branding=branding,
+        case=case,
+        safety_data=data,
+    )
+
+    filename = f"OT_Surgical_Safety_Checklist_Case_{case_id}.pdf"
+    disp = "attachment" if download else "inline"
+
+    return StreamingResponse(
+        BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'{disp}; filename="{filename}"'},
+    )
+
+
 # ============================================================
 #  ANAESTHESIA RECORD + VITALS + DRUG LOGS
-#  ✅ GET returns 200 with null (Optional) on first open
-#  ✅ Device master IDs via AnaesthesiaDeviceUse
 # ============================================================
+
+
+def _safe_str(v) -> str:
+    return "" if v is None else str(v).strip()
+
+
+def _is_blank(v) -> bool:
+    if v is None:
+        return True
+    if isinstance(v, str) and v.strip() == "":
+        return True
+    return False
+
+
+def _calc_age_from_dob(dob) -> Optional[int]:
+    try:
+        if not dob:
+            return None
+        today = datetime.now(tz=IST).date()
+        return today.year - dob.year - (
+            (today.month, today.day) < (dob.month, dob.day))
+    except Exception:
+        return None
+
+
+def _case_for_pacu_pdf(db: Session, case_id: int) -> OtCase:
+
+    def _opt_case(attr: str):
+        return selectinload(getattr(OtCase, attr)) if hasattr(OtCase,
+                                                              attr) else None
+
+    opts = [
+        _opt_case("patient"),
+        _opt_case("procedure"),
+        _opt_case("procedure_master"),
+        _opt_case("theatre"),
+        _opt_case("theatre_master"),
+        _opt_case("ot_room"),
+        _opt_case("or_room"),
+        _opt_case("room"),
+    ]
+    opts = [o for o in opts if o is not None]
+
+    # ✅ IMPORTANT: schedule is where your real data is (patient, theatre, procedure)
+    if hasattr(OtCase, "schedule"):
+        sch_rel = getattr(OtCase, "schedule")
+        opts.append(selectinload(sch_rel))
+
+        # Try nested loads dynamically
+        try:
+            sch_cls = sch_rel.property.mapper.class_
+
+            def _opt_sched(child: str):
+                return selectinload(sch_rel).selectinload(
+                    getattr(sch_cls, child)) if hasattr(sch_cls,
+                                                        child) else None
+
+            nested = [
+                _opt_sched("patient"),
+                _opt_sched("admission"),
+                _opt_sched("theater"),  # your code uses sched.theater
+                _opt_sched("surgeon"),
+                _opt_sched("anaesthetist"),
+            ]
+            opts.extend([o for o in nested if o is not None])
+        except Exception:
+            pass
+
+    case = db.query(OtCase).options(*opts).filter(OtCase.id == case_id).first()
+    if not case:
+        raise HTTPException(status_code=404, detail="OT case not found")
+    return case
+
+
+def _build_patient_fields_for_pdf(case: OtCase) -> dict:
+    """
+    Create a stable dict for PDF, even if you store patient snapshot on case.
+    """
+    p = getattr(case, "patient", None)
+
+    def g(obj, name, default=""):
+        return getattr(obj, name, default) if obj is not None else default
+
+    # name fallback: case snapshot -> patient relation -> composed first/last
+    full_name = (
+        g(case, "patient_name", "") or g(case, "full_name", "")
+        or g(p, "full_name", "") or g(p, "name", "")
+        or (f"{g(p,'first_name','')} {g(p,'last_name','')}".strip())).strip()
+
+    uhid = (g(case, "uhid", "") or g(case, "patient_uhid", "")
+            or g(p, "uhid", "") or g(p, "patient_id", "") or g(p, "uid", ""))
+
+    age = (g(case, "age", "") or g(case, "patient_age", "") or g(p, "age", "")
+           or g(p, "age_years", ""))
+
+    sex = (g(case, "sex", "") or g(case, "gender", "")
+           or g(case, "patient_gender", "") or g(p, "sex", "")
+           or g(p, "gender", ""))
+
+    or_no = (g(case, "or_no", "") or g(case, "ot_room_name", "")
+             or g(case, "theatre_name", "")
+             or g(getattr(case, "ot_room", None), "name", "")
+             or g(getattr(case, "or_room", None), "name", "")
+             or g(getattr(case, "theatre", None), "name", "")
+             or g(getattr(case, "theatre_master", None), "name", ""))
+
+    return {
+        "patient": p,  # ✅ allows PDF to read p.full_name / p.uhid etc.
+        "name": full_name,
+        "uhid": uhid,
+        "age": age,
+        "sex": sex,
+        "case_no": g(case, "case_no", "") or str(getattr(case, "id", "")),
+        "or_no": or_no,
+    }
+
+
+def _build_patient_fields_for_case(db: Session, case: OtCase) -> dict:
+    sched = getattr(case, "schedule", None)
+    patient = getattr(sched, "patient", None) if sched else None
+    admission = getattr(sched, "admission", None) if sched else None
+
+    prefix = _safe_str(getattr(patient, "prefix", None)) if patient else ""
+
+    name = ""
+    if patient:
+        fn = _safe_str(getattr(patient, "first_name", None))
+        ln = _safe_str(getattr(patient, "last_name", None))
+        name = (f"{fn} {ln}").strip() or _safe_str(
+            getattr(patient, "name", None)) or _safe_str(
+                getattr(patient, "full_name", None))
+    if not name:
+        name = _safe_str(getattr(case, "patient_name", None))
+
+    uhid = ""
+    if patient:
+        uhid = _safe_str(
+            getattr(patient, "uhid", None)
+            or getattr(patient, "uhid_number", None)
+            or getattr(patient, "mrn", None))
+    if not uhid:
+        uhid = _safe_str(getattr(case, "uhid", None))
+
+    sex = ""
+    if patient:
+        sex = _safe_str(
+            getattr(patient, "sex", None) or getattr(patient, "gender", None))
+
+    age = None
+    if patient:
+        age = _calc_age_from_dob(getattr(patient, "dob", None)) or getattr(
+            patient, "age", None)
+    age = age if isinstance(age, int) else None
+
+    age_sex = ""
+    if age is not None and sex:
+        age_sex = f"{age} / {sex}"
+    elif age is not None:
+        age_sex = f"{age}"
+    elif sex:
+        age_sex = sex
+
+    op_no = ""
+    try:
+        if patient and getattr(patient, "id", None):
+            from app.models.opd import Visit
+            latest_visit = (db.query(Visit).filter(
+                Visit.patient_id == patient.id).order_by(
+                    Visit.visit_at.desc()).first())
+            if latest_visit:
+                op_no = _safe_str(getattr(latest_visit, "op_no", None))
+    except Exception:
+        op_no = ""
+
+    ip_no = ""
+    if admission:
+        ip_no = _safe_str(
+            getattr(admission, "display_code", None)
+            or getattr(admission, "ip_no", None)
+            or getattr(admission, "admission_no", None))
+
+    diagnosis = _safe_str(
+        getattr(case, "preop_diagnosis", None)
+        or getattr(case, "postop_diagnosis", None))
+
+    proposed_operation = ""
+    if sched:
+        proposed_operation = _safe_str(
+            getattr(sched, "procedure_name", None)
+            or getattr(case, "final_procedure_name", None)
+            or getattr(case, "procedure_name", None))
+
+    ot_date = getattr(sched, "date", None) if sched else None
+    date_str = ot_date.strftime("%d-%m-%Y") if ot_date else ""
+
+    or_no = ""
+    if sched:
+        theater = getattr(sched, "theater", None)
+        or_no = _safe_str(
+            getattr(sched, "or_no", None) or getattr(theater, "name", None)
+            or getattr(theater, "theater_no", None))
+
+    case_no = _safe_str(
+        getattr(case, "case_no", None) or getattr(sched, "case_no", None)
+        or getattr(case, "id", None))
+
+    blood_group = _safe_str(
+        getattr(patient, "blood_group", None) if patient else "")
+    weight = _safe_str(getattr(patient, "weight", None) if patient else "")
+    height = _safe_str(getattr(patient, "height", None) if patient else "")
+
+    return {
+        "patient_prefix": prefix,
+        "name": name,
+        "uhid": uhid,
+        "age_sex": age_sex,
+        "op_no": op_no,
+        "ip_no": ip_no,
+        "diagnosis": diagnosis,
+        "proposed_operation": proposed_operation,
+        "date": date_str,
+        "or_no": or_no,
+        "case_no": case_no,
+        "blood_group": blood_group,
+        "weight": weight,
+        "height": height,
+    }
+
+
+def _user_display(u) -> str:
+    if not u:
+        return ""
+    return (_safe_str(getattr(u, "full_name", None))
+            or _safe_str(getattr(u, "name", None))
+            or _safe_str(getattr(u, "username", None))
+            or (_safe_str(getattr(u, "first_name", None)) + " " +
+                _safe_str(getattr(u, "last_name", None))).strip())
+
+
+def _build_intra_fields_from_schedule(case: OtCase) -> Dict[str, str]:
+    sched = getattr(case, "schedule", None)
+    if not sched:
+        return {}
+
+    theater = getattr(sched, "theater", None)
+    intra_date = ""
+    if getattr(sched, "date", None):
+        intra_date = sched.date.strftime("%d/%m/%Y")  # UI shows DD/MM/YYYY
+
+    intra_or_no = _safe_str(getattr(sched, "or_no", None)) or _safe_str(
+        getattr(theater, "name", None)) or _safe_str(
+            getattr(theater, "theater_no", None))
+
+    intra_anaes = _user_display(getattr(sched, "anaesthetist", None))
+    intra_surgeon = _user_display(getattr(sched, "surgeon", None))
+
+    intra_case_type = _safe_str(getattr(sched, "priority", None))
+    intra_proc = _safe_str(getattr(
+        sched, "procedure_name", None)) or _safe_str(
+            getattr(case, "final_procedure_name", None))
+
+    intra_anaes_type = _safe_str(getattr(
+        sched, "anaesthesia_type", None)) or _safe_str(
+            getattr(sched, "type_of_anaesthesia", None))
+
+    return {
+        "intra_date": intra_date,
+        "intra_or_no": intra_or_no,
+        "intra_anaesthesiologist": intra_anaes,
+        "intra_surgeon": intra_surgeon,
+        "intra_case_type": intra_case_type,
+        "intra_surgical_procedure": intra_proc,
+        "intra_anaesthesia_type": intra_anaes_type,
+    }
+
+
+def _merge_intra_auto_fields(case: OtCase, data: Dict[str,
+                                                      Any]) -> Dict[str, Any]:
+    data = dict(data or {})
+    intra = _build_intra_fields_from_schedule(case)
+    for k, v in intra.items():
+        if _is_blank(data.get(k)) and not _is_blank(v):
+            data[k] = v
+    return data
+
+
+def _merge_preop_auto_fields(db: Session, case: OtCase, data: dict) -> dict:
+    data = dict(data or {})
+    pf = _build_patient_fields_for_case(db, case)
+
+    def _set_if_blank(key: str, value: str):
+        if _is_blank(data.get(key)) and not _is_blank(value):
+            data[key] = value
+
+    _set_if_blank("patient_prefix", pf.get("patient_prefix") or "")
+    _set_if_blank("diagnosis", pf.get("diagnosis") or "")
+    _set_if_blank("proposed_operation", pf.get("proposed_operation") or "")
+    _set_if_blank("blood_group", pf.get("blood_group") or "")
+    _set_if_blank("weight", pf.get("weight") or "")
+    _set_if_blank("height", pf.get("height") or "")
+
+    return data
+
+
+@router.get("/cases/{case_id}/anaesthesia-record/defaults",
+            response_model=OtAnaesthesiaRecordDefaultsOut)
+def get_anaesthesia_record_defaults(
+        case_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    _need_any(user, ["ot.anaesthesia_record.view", "ot.cases.view"])
+    case = _get_case_or_404(db, case_id)
+    intra = _build_intra_fields_from_schedule(case)
+    return OtAnaesthesiaRecordDefaultsOut(
+        **{
+            k: intra.get(k, "")
+            for k in OtAnaesthesiaRecordDefaultsOut.model_fields.keys()
+        })
 
 
 @router.get("/cases/{case_id}/anaesthesia-record",
-            response_model=Optional[OtAnaesthesiaRecordOut])
+            response_model=OtAnaesthesiaRecordOut | None)
 def get_anaesthesia_record_for_case(
         case_id: int,
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.anaesthesia_record.view", "ot.cases.view"])
-
     case = _get_case_or_404(db, case_id)
+
     record = case.anaesthesia_record
     if not record:
         return None
 
-    data = record.preop_vitals or {}
+    data = dict(record.preop_vitals or {})
+    data = _merge_preop_auto_fields(db, case, data)
+    data = _merge_intra_auto_fields(case, data)
+
     airway_ids, monitor_ids = _get_device_ids_for_record(db, record.id)
 
-    return OtAnaesthesiaRecordOut(
-        id=record.id,
-        case_id=case_id,
-        anaesthetist_user_id=record.anaesthetist_user_id,
-        created_at=_to_ist_dt(record.created_at),
-        updated_at=_to_ist_dt(getattr(record, "updated_at", None)),
-        # ✅ device master IDs (make sure schemas include these)
-        airway_device_ids=airway_ids,
-        monitor_device_ids=monitor_ids,
-        # existing fields
-        anaesthesia_type=record.plan or None,
-        notes=record.intraop_summary or None,
-        asa_grade=data.get("asa_grade"),
-        airway_assessment=data.get("airway_assessment"),
-        comorbidities=data.get("comorbidities"),
-        allergies=data.get("allergies"),
-        preop_pulse=data.get("preop_pulse"),
-        preop_bp=data.get("preop_bp"),
-        preop_rr=data.get("preop_rr"),
-        preop_temp_c=data.get("preop_temp_c"),
-        preop_cvs=data.get("preop_cvs"),
-        preop_rs=data.get("preop_rs"),
-        preop_cns=data.get("preop_cns"),
-        preop_pa=data.get("preop_pa"),
-        preop_veins=data.get("preop_veins"),
-        preop_spine=data.get("preop_spine"),
-        airway_teeth_status=data.get("airway_teeth_status"),
-        airway_denture=data.get("airway_denture"),
-        airway_neck_movements=data.get("airway_neck_movements"),
-        airway_mallampati_class=data.get("airway_mallampati_class"),
-        difficult_airway_anticipated=data.get("difficult_airway_anticipated"),
-        risk_factors=data.get("risk_factors"),
-        anaesthetic_plan_detail=data.get("anaesthetic_plan_detail"),
-        preop_instructions=data.get("preop_instructions"),
-        preoxygenation=data.get("preoxygenation"),
-        cricoid_pressure=data.get("cricoid_pressure"),
-        induction_route=data.get("induction_route"),
-        intubation_done=data.get("intubation_done"),
-        intubation_route=data.get("intubation_route"),
-        intubation_state=data.get("intubation_state"),
-        intubation_technique=data.get("intubation_technique"),
-        tube_type=data.get("tube_type"),
-        tube_size=data.get("tube_size"),
-        tube_fixed_at=data.get("tube_fixed_at"),
-        cuff_used=data.get("cuff_used"),
-        cuff_medium=data.get("cuff_medium"),
-        bilateral_breath_sounds=data.get("bilateral_breath_sounds"),
-        added_sounds=data.get("added_sounds"),
-        laryngoscopy_grade=data.get("laryngoscopy_grade"),
-        airway_devices=data.get("airway_devices"),
-        ventilation_mode_baseline=data.get("ventilation_mode_baseline"),
-        ventilator_vt=data.get("ventilator_vt"),
-        ventilator_rate=data.get("ventilator_rate"),
-        ventilator_peep=data.get("ventilator_peep"),
-        breathing_system=data.get("breathing_system"),
-        monitors=data.get("monitors"),
-        lines=data.get("lines"),
-        tourniquet_used=data.get("tourniquet_used"),
-        patient_position=data.get("patient_position"),
-        eyes_taped=data.get("eyes_taped"),
-        eyes_covered_with_foil=data.get("eyes_covered_with_foil"),
-        pressure_points_padded=data.get("pressure_points_padded"),
-        iv_fluids_plan=data.get("iv_fluids_plan"),
-        blood_components_plan=data.get("blood_components_plan"),
-        regional_block_type=data.get("regional_block_type"),
-        regional_position=data.get("regional_position"),
-        regional_approach=data.get("regional_approach"),
-        regional_space_depth=data.get("regional_space_depth"),
-        regional_needle_type=data.get("regional_needle_type"),
-        regional_drug_dose=data.get("regional_drug_dose"),
-        regional_level=data.get("regional_level"),
-        regional_complications=data.get("regional_complications"),
-        block_adequacy=data.get("block_adequacy"),
-        sedation_needed=data.get("sedation_needed"),
-        conversion_to_ga=data.get("conversion_to_ga"),
-    )
+    out = {
+        **data,  # ✅ show saved JSON at top-level for UI
+        "id": record.id,
+        "case_id": case_id,
+        "anaesthetist_user_id": record.anaesthetist_user_id,
+        "created_at": _to_ist_dt(record.created_at),
+        "updated_at": _to_ist_dt(getattr(record, "updated_at", None)),
+        "airway_device_ids": airway_ids,
+        "monitor_device_ids": monitor_ids,
+        "anaesthesia_type": record.plan or None,
+        "notes": record.intraop_summary or None,
+        "raw_json": data,
+    }
+    return OtAnaesthesiaRecordOut(**out)
 
 
-@router.post(
-    "/cases/{case_id}/anaesthesia-record",
-    response_model=OtAnaesthesiaRecordOut,
-    status_code=status.HTTP_201_CREATED,
-)
+def _build_record_json(payload: OtAnaesthesiaRecordIn) -> Dict[str, Any]:
+    d = payload.model_dump()
+    for k in (
+            "id",
+            "case_id",
+            "record_id",
+            "created_at",
+            "updated_at",
+            "anaesthetist_user_id",
+            "raw_json",
+            "anaesthesia_type",
+            "notes",
+            "airway_device_ids",
+            "monitor_device_ids",
+    ):
+        d.pop(k, None)
+    return d
+
+
+@router.post("/cases/{case_id}/anaesthesia-record",
+             response_model=OtAnaesthesiaRecordOut | None,
+             status_code=status.HTTP_201_CREATED)
 def create_anaesthesia_record_for_case(
         case_id: int,
         payload: OtAnaesthesiaRecordIn,
@@ -890,24 +1195,28 @@ def create_anaesthesia_record_for_case(
             status_code=400,
             detail="Anaesthesia record already exists for this case")
 
+    preop = _build_record_json(payload)
+    preop = _merge_preop_auto_fields(db, case, preop)
+    preop = _merge_intra_auto_fields(case, preop)
+
+    sched_anaes_id = getattr(getattr(case, "schedule", None),
+                             "anaesthetist_user_id", None)
+    anaes_user_id = sched_anaes_id or user.id
+
     record = AnaesthesiaRecord(
         case_id=case_id,
-        anaesthetist_user_id=user.id,
-        preop_vitals=_build_anaes_json_from_payload(payload),
+        anaesthetist_user_id=anaes_user_id,
+        preop_vitals=preop,
         plan=payload.anaesthesia_type,
         intraop_summary=payload.notes,
-        airway_plan=None,
-        complications=None,
     )
     db.add(record)
-    db.flush()  # get record.id before commit
+    db.flush()
 
     airway_ids = _validate_device_ids_by_category(
-        db,
-        getattr(payload, "airway_device_ids", []) or [], "AIRWAY")
+        db, payload.airway_device_ids or [], "AIRWAY")
     monitor_ids = _validate_device_ids_by_category(
-        db,
-        getattr(payload, "monitor_device_ids", []) or [], "MONITOR")
+        db, payload.monitor_device_ids or [], "MONITOR")
     _sync_anaesthesia_devices(db, record, airway_ids + monitor_ids)
 
     db.commit()
@@ -916,7 +1225,7 @@ def create_anaesthesia_record_for_case(
 
 
 @router.put("/cases/{case_id}/anaesthesia-record",
-            response_model=OtAnaesthesiaRecordOut)
+            response_model=OtAnaesthesiaRecordOut | None)
 def update_anaesthesia_record_for_case(
         case_id: int,
         payload: OtAnaesthesiaRecordIn,
@@ -930,18 +1239,20 @@ def update_anaesthesia_record_for_case(
     if not record:
         return create_anaesthesia_record_for_case(case_id, payload, db, user)
 
-    record.preop_vitals = _build_anaes_json_from_payload(payload)
+    preop = _build_record_json(payload)
+    preop = _merge_preop_auto_fields(db, case, preop)
+    preop = _merge_intra_auto_fields(case, preop)
+
+    record.preop_vitals = preop
     record.plan = payload.anaesthesia_type
     record.intraop_summary = payload.notes
     db.add(record)
     db.flush()
 
     airway_ids = _validate_device_ids_by_category(
-        db,
-        getattr(payload, "airway_device_ids", []) or [], "AIRWAY")
+        db, payload.airway_device_ids or [], "AIRWAY")
     monitor_ids = _validate_device_ids_by_category(
-        db,
-        getattr(payload, "monitor_device_ids", []) or [], "MONITOR")
+        db, payload.monitor_device_ids or [], "MONITOR")
     _sync_anaesthesia_devices(db, record, airway_ids + monitor_ids)
 
     db.commit()
@@ -949,7 +1260,172 @@ def update_anaesthesia_record_for_case(
     return get_anaesthesia_record_for_case(case_id, db, user)  # type: ignore
 
 
-# ---- Anaesthesia Vitals ----
+@router.get("/cases/{case_id}/anaesthesia-record/pdf")
+def get_anaesthesia_record_pdf(
+        case_id: int,
+        section: str = Query("full", description="full | preop"),
+        download: bool = Query(False),
+        disposition: Optional[Literal["inline", "attachment"]] = Query(None),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    _need_any(user, ["ot.anaesthesia_record.view", "ot.cases.view"])
+
+    case = (db.query(OtCase).options(
+        joinedload(OtCase.schedule).joinedload(OtSchedule.patient),
+        joinedload(OtCase.schedule).joinedload(OtSchedule.admission),
+        joinedload(OtCase.schedule).joinedload(OtSchedule.theater),
+        joinedload(OtCase.anaesthesia_record).joinedload(
+            AnaesthesiaRecord.vitals),
+        joinedload(OtCase.anaesthesia_record).joinedload(
+            AnaesthesiaRecord.drugs),
+    ).filter(OtCase.id == case_id).first())
+    if not case:
+        raise HTTPException(status_code=404, detail="OT case not found")
+
+    record = case.anaesthesia_record
+    if not record:
+        raise HTTPException(status_code=404,
+                            detail="Anaesthesia record not found")
+
+    branding = _get_branding(db)
+    patient_fields = _build_patient_fields_for_case(db, case)
+
+    record_dict = _merge_preop_auto_fields(db, case,
+                                           dict(record.preop_vitals or {}))
+    record_dict = _merge_intra_auto_fields(case, record_dict)
+
+    # ✅ add created_at for "Created Date" on PDF strip
+    record_dict["created_at"] = getattr(record, "created_at", None)
+    record_dict["anaesthesia_type"] = getattr(record, "plan", None)
+    record_dict["notes"] = getattr(record, "intraop_summary", None)
+
+    airway_ids, monitor_ids = _get_device_ids_for_record(db, record.id)
+    airway_names = _device_names_by_ids(db, airway_ids)
+    monitor_names = _device_names_by_ids(db, monitor_ids)
+
+    # vitals list for PDF
+    def _to_float(x):
+        try:
+            return float(x) if x is not None else None
+        except Exception:
+            return None
+
+    vitals: list[dict] = []
+    for v in (getattr(record, "vitals", None) or []):
+        sbp = getattr(v, "bp_systolic", None)
+        dbp = getattr(v, "bp_diastolic", None)
+        bp_str = None
+        if sbp is not None and dbp is not None:
+            bp_str = f"{sbp}/{dbp}"
+        elif sbp is not None:
+            bp_str = str(sbp)
+
+        vitals.append({
+            "time_dt":
+            getattr(v, "time", None),
+            "hr":
+            getattr(v, "pulse", None),
+            "bp":
+            bp_str,
+            "bp_systolic":
+            sbp,
+            "bp_diastolic":
+            dbp,
+            "spo2":
+            getattr(v, "spo2", None),
+            "rr":
+            getattr(v, "rr", None),
+            "temp_c":
+            _to_float(getattr(v, "temperature", None)),
+            "comments":
+            getattr(v, "comments", None),
+            "etco2":
+            _to_float(getattr(v, "etco2", None)),
+            "ventilation_mode":
+            getattr(v, "ventilation_mode", None),
+            "peak_airway_pressure":
+            _to_float(getattr(v, "peak_airway_pressure", None)),
+            "cvp_pcwp":
+            _to_float(getattr(v, "cvp_pcwp", None)),
+            "st_segment":
+            getattr(v, "st_segment", None),
+            "urine_output_ml":
+            getattr(v, "urine_output_ml", None),
+            "blood_loss_ml":
+            getattr(v, "blood_loss_ml", None),
+            "oxygen_fio2":
+            getattr(v, "oxygen_fio2", None),
+            "n2o":
+            getattr(v, "n2o", None),
+            "air":
+            getattr(v, "air", None),
+            "agent":
+            getattr(v, "agent", None),
+            "iv_fluids":
+            getattr(v, "iv_fluids", None),
+        })
+    vitals.sort(key=lambda x: (x.get("time_dt") is None, x.get("time_dt")))
+
+    # drugs list for PDF
+    drugs: list[dict] = []
+    for d in (getattr(record, "drugs", None) or []):
+        drugs.append({
+            "time_dt": getattr(d, "time", None),
+            "drug_name": getattr(d, "drug_name", None) or "",
+            "dose": getattr(d, "dose", None),
+            "route": getattr(d, "route", None),
+            "remarks": getattr(d, "remarks", None),
+        })
+    drugs.sort(key=lambda x: (x.get("time_dt") is None, x.get("time_dt")))
+
+    section_norm = (section or "full").strip().lower().replace("_", "-")
+    preop_aliases = {
+        "preop",
+        "pre-op",
+        "preanaesthesia",
+        "pre-anaesthesia",
+        "preanesthesia",
+        "pre-anesthesia",
+        "preanesthetic",
+        "pre-anesthetic",
+        "pre-anaesthetic",
+    }
+
+    if section_norm in preop_aliases:
+        pdf_bytes = build_ot_preanaesthetic_record_pdf_bytes(
+            branding=branding,
+            case=case,
+            patient_fields=patient_fields,
+            record=record_dict,
+            airway_names=airway_names,
+            monitor_names=monitor_names,
+        )
+        filename = f"OT_PreAnaesthetic_Record_Case_{case_id}.pdf"
+    else:
+        pdf_bytes = build_ot_anaesthesia_record_pdf_bytes(
+            branding=branding,
+            case=case,
+            patient_fields=patient_fields,
+            record=record_dict,
+            airway_names=airway_names,
+            monitor_names=monitor_names,
+            vitals=vitals,
+            drugs=drugs,
+        )
+        filename = f"OT_Anaesthesia_Record_Full_Case_{case_id}.pdf"
+
+    disp = disposition or ("attachment" if download else "inline")
+    return StreamingResponse(
+        BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'{disp}; filename="{filename}"'},
+    )
+
+
+# ---------------------------
+# VITALS
+# ---------------------------
 
 
 @router.get("/anaesthesia-records/{record_id}/vitals",
@@ -992,6 +1468,11 @@ def list_anaesthesia_vitals(
                 st_segment=v.st_segment,
                 urine_output_ml=v.urine_output_ml,
                 blood_loss_ml=v.blood_loss_ml,
+                oxygen_fio2=v.oxygen_fio2,
+                n2o=v.n2o,
+                air=v.air,
+                agent=v.agent,
+                iv_fluids=v.iv_fluids,
             ))
     return out
 
@@ -1045,6 +1526,11 @@ def create_anaesthesia_vital(
         st_segment=payload.st_segment,
         urine_output_ml=payload.urine_output_ml,
         blood_loss_ml=payload.blood_loss_ml,
+        oxygen_fio2=payload.oxygen_fio2,
+        n2o=payload.n2o,
+        air=payload.air,
+        agent=payload.agent,
+        iv_fluids=payload.iv_fluids,
     )
 
     db.add(vital)
@@ -1074,6 +1560,11 @@ def create_anaesthesia_vital(
         st_segment=vital.st_segment,
         urine_output_ml=vital.urine_output_ml,
         blood_loss_ml=vital.blood_loss_ml,
+        oxygen_fio2=vital.oxygen_fio2,
+        n2o=vital.n2o,
+        air=vital.air,
+        agent=vital.agent,
+        iv_fluids=vital.iv_fluids,
     )
 
 
@@ -1095,7 +1586,6 @@ def update_anaesthesia_vital(
     data = payload.model_dump(exclude_unset=True)
     data.pop("record_id", None)
 
-    # ✅ handle time if UI sends HH:MM
     if "time" in data and data["time"] is not None:
         v = data["time"]
         if isinstance(v, str):
@@ -1229,7 +1719,6 @@ def update_anaesthesia_drug(
     data = payload.model_dump(exclude_unset=True)
     data.pop("record_id", None)
 
-    # ✅ handle time if UI sends HH:MM
     if "time" in data and data["time"] is not None:
         v = data["time"]
         if isinstance(v, str):
@@ -1269,7 +1758,6 @@ def delete_anaesthesia_drug(
 
 # ============================================================
 #  INTRA-OP NURSING RECORD
-#  ✅ GET returns 200 with null (Optional) on first open
 # ============================================================
 
 
@@ -1284,9 +1772,7 @@ def get_nursing_record_for_case(
 
     case = _get_case_or_404(db, case_id)
     record = case.nursing_record
-    if not record:
-        return None
-    return record
+    return record or None
 
 
 @router.post("/cases/{case_id}/nursing-record",
@@ -1366,8 +1852,7 @@ def update_nursing_record_for_case(
 
 
 # ============================================================
-#  SPONGE & INSTRUMENT COUNT – flat UI API
-#  ✅ GET returns 200 with null (Optional) on first open
+#  SPONGE & INSTRUMENT COUNT
 # ============================================================
 
 
@@ -1485,8 +1970,9 @@ def update_counts_for_case(
     if not record:
         return create_counts_for_case(case_id, payload, db, user)
 
-    initial = record.initial_count_data or {}
-    final = record.final_count_data or {}
+    # ✅ COPY (avoid in-place mutation on JSON dict)
+    initial = dict(record.initial_count_data or {})
+    final = dict(record.final_count_data or {})
 
     initial.update({
         "sponges_initial": payload.sponges_initial,
@@ -1508,9 +1994,16 @@ def update_counts_for_case(
     record.discrepancy = bool(payload.discrepancy_text)
     record.discrepancy_notes = payload.discrepancy_text
 
+    # ✅ Force SQLAlchemy to persist JSON changes
+    flag_modified(record, "initial_count_data")
+    flag_modified(record, "final_count_data")
+
     db.add(record)
     db.commit()
     db.refresh(record)
+
+    initial = record.initial_count_data or {}
+    final = record.final_count_data or {}
 
     return OtCountsOut(
         id=record.id,
@@ -1529,6 +2022,177 @@ def update_counts_for_case(
         created_at=_to_ist_dt(record.created_at),
         updated_at=_to_ist_dt(getattr(record, "updated_at", None)),
     )
+
+
+# ============================================================
+#  EXTREME: INSTRUMENT COUNT LINES (per case)
+# ============================================================
+
+
+@router.get("/cases/{case_id}/counts/items",
+            response_model=List[OtCountItemLineOut])
+def list_case_count_items(
+        case_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    _need_any(user, ["ot.counts.view", "ot.cases.view"])
+
+    _ = _get_case_or_404(db, case_id)
+
+    rows = db.execute(
+        select(OtCaseInstrumentCountLine).
+        where(OtCaseInstrumentCountLine.case_id == case_id).order_by(
+            OtCaseInstrumentCountLine.instrument_name.asc())).scalars().all()
+
+    out: List[OtCountItemLineOut] = []
+    for r in rows:
+        expected_final = int(r.initial_qty or 0) + int(r.added_qty or 0)
+        variance = int(r.final_qty or 0) - expected_final
+        out.append(
+            OtCountItemLineOut(
+                id=r.id,
+                case_id=r.case_id,
+                instrument_id=r.instrument_id,
+                instrument_code=r.instrument_code or "",
+                instrument_name=r.instrument_name or "",
+                uom=r.uom or "Nos",
+                initial_qty=int(r.initial_qty or 0),
+                added_qty=int(r.added_qty or 0),
+                final_qty=int(r.final_qty or 0),
+                expected_final=expected_final,
+                variance=variance,
+                has_discrepancy=(variance != 0),
+                remarks=r.remarks or "",
+                updated_at=_to_ist_dt(getattr(r, "updated_at", None)),
+            ))
+    return out
+
+
+@router.put("/cases/{case_id}/counts/items",
+            response_model=List[OtCountItemLineOut])
+def upsert_case_count_items(
+        case_id: int,
+        payload: OtCountItemsUpsertIn,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    _need_any(user, ["ot.counts.update", "ot.counts.create"])
+
+    case = _get_case_or_404(db, case_id)
+
+    # Ensure counts_record exists (so your summary can stay in sync)
+    record: Optional[OtSpongeInstrumentCount] = case.counts_record
+    if not record:
+        record = OtSpongeInstrumentCount(
+            case_id=case_id,
+            initial_count_data={},
+            final_count_data={},
+            discrepancy=False,
+            discrepancy_notes=None,
+        )
+        db.add(record)
+        db.flush()
+
+    # Upsert by (case_id, instrument_id)
+    for line in payload.lines:
+        instrument_id = line.instrument_id
+        if instrument_id:
+            m = db.get(OtInstrumentMaster, instrument_id)
+            if not m or not bool(getattr(m, "is_active", True)):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid instrument_id: {instrument_id}")
+
+            existing = db.execute(
+                select(OtCaseInstrumentCountLine).where(
+                    OtCaseInstrumentCountLine.case_id == case_id).where(
+                        OtCaseInstrumentCountLine.instrument_id ==
+                        instrument_id)).scalars().first()
+
+            if existing:
+                existing.initial_qty = int(line.initial_qty or 0)
+                existing.added_qty = int(line.added_qty or 0)
+                existing.final_qty = int(line.final_qty or 0)
+                existing.remarks = (line.remarks or "")[:500]
+                existing.updated_by = user.id
+                db.add(existing)
+            else:
+                row = OtCaseInstrumentCountLine(
+                    case_id=case_id,
+                    instrument_id=instrument_id,
+                    instrument_code=(m.code or "")[:40],
+                    instrument_name=(m.name or "")[:200],
+                    uom=(m.uom or "Nos")[:30],
+                    initial_qty=int(line.initial_qty or 0),
+                    added_qty=int(line.added_qty or 0),
+                    final_qty=int(line.final_qty or 0),
+                    remarks=(line.remarks or "")[:500],
+                    created_by=user.id,
+                    updated_by=user.id,
+                )
+                db.add(row)
+
+        # If you want to allow “free text instruments” later, handle instrument_id=None here.
+
+    db.commit()
+
+    # Sync summary instrument totals into your existing JSON fields
+    # Sync summary instrument totals into your existing JSON fields
+    rows = db.execute(
+        select(OtCaseInstrumentCountLine).where(
+            OtCaseInstrumentCountLine.case_id == case_id)).scalars().all()
+
+    inst_initial = sum(int(r.initial_qty or 0) for r in rows)
+    inst_final = sum(int(r.final_qty or 0) for r in rows)
+
+    # ✅ COPY (avoid in-place mutation on JSON dict)
+    initial = dict(record.initial_count_data or {})
+    final = dict(record.final_count_data or {})
+
+    initial["instruments_initial"] = inst_initial
+    final["instruments_final"] = inst_final
+
+    record.initial_count_data = initial
+    record.final_count_data = final
+
+    # Auto discrepancy flag if any line mismatch
+    any_mismatch = any((int(r.final_qty or 0) -
+                        (int(r.initial_qty or 0) + int(r.added_qty or 0))) != 0
+                       for r in rows)
+    record.discrepancy = bool(record.discrepancy_notes) or any_mismatch
+
+    # ✅ Force SQLAlchemy to persist JSON changes
+    flag_modified(record, "initial_count_data")
+    flag_modified(record, "final_count_data")
+
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+
+    # Return fresh list
+    return list_case_count_items(case_id, db, user)
+
+
+@router.delete("/cases/{case_id}/counts/items/{line_id}",
+               status_code=status.HTTP_204_NO_CONTENT)
+def delete_case_count_item(
+        case_id: int,
+        line_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    _need_any(user, ["ot.counts.update", "ot.counts.create"])
+
+    _ = _get_case_or_404(db, case_id)
+
+    row = db.get(OtCaseInstrumentCountLine, line_id)
+    if not row or row.case_id != case_id:
+        raise HTTPException(status_code=404, detail="Count line not found")
+
+    db.delete(row)
+    db.commit()
+    return
 
 
 # ============================================================
@@ -1624,7 +2288,6 @@ def delete_implant(
 
 # ============================================================
 #  OPERATION NOTE (SURGEON)
-#  ✅ GET returns 200 with null (Optional) on first open
 # ============================================================
 
 
@@ -1639,9 +2302,7 @@ def get_operation_note_for_case(
 
     case = _get_case_or_404(db, case_id)
     record = case.operation_note
-    if not record:
-        return None
-    return record
+    return record or None
 
 
 @router.post("/cases/{case_id}/operation-note",
@@ -1813,51 +2474,27 @@ def delete_blood_transfusion(
 
 
 # ============================================================
-#  PACU / POST-ANAESTHESIA RECOVERY RECORD – UI FLAT
-#  ✅ GET returns 200 with null (Optional) on first open
-#  ✅ IST HH:MM parsing + formatting
+#  PACU / POST-ANAESTHESIA RECOVERY RECORD
 # ============================================================
 
 
 @router.get("/cases/{case_id}/pacu", response_model=Optional[PacuUiOut])
-def get_pacu_for_case(
+def get_pacu_record(
         case_id: int,
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
 ):
     _need_any(user, ["ot.pacu.view", "ot.cases.view"])
-
     case = _get_case_or_404(db, case_id)
-    record = case.pacu_record
-    if not record:
-        return None
 
-    pain_data = record.pain_scores or {}
-    vitals = record.vitals or {}
-
-    return PacuUiOut(
-        id=record.id,
-        case_id=record.case_id,
-        nurse_user_id=record.nurse_user_id,
-        arrival_time=_dt_to_time_str(record.admission_time),
-        departure_time=_dt_to_time_str(record.discharge_time),
-        pain_score=pain_data.get("score"),
-        nausea_vomiting=vitals.get("nausea_vomiting"),
-        airway_status=vitals.get("airway_status"),
-        vitals_summary=vitals.get("vitals_summary"),
-        complications=record.complications,
-        discharge_criteria_met=bool(
-            vitals.get("discharge_criteria_met") or False),
-        notes=vitals.get("notes"),
-        created_at=_to_ist_dt(record.created_at),
-        updated_at=_to_ist_dt(getattr(record, "updated_at", None)),
-    )
+    rec: Optional[PacuRecord] = case.pacu_record
+    return rec or None
 
 
 @router.post("/cases/{case_id}/pacu",
              response_model=PacuUiOut,
              status_code=status.HTTP_201_CREATED)
-def create_pacu_for_case(
+def create_pacu_record(
         case_id: int,
         payload: PacuUiIn,
         db: Session = Depends(get_db),
@@ -1870,59 +2507,21 @@ def create_pacu_for_case(
         raise HTTPException(status_code=400,
                             detail="PACU record already exists for this case")
 
-    pain_scores = {
-        "score": payload.pain_score
-    } if payload.pain_score is not None else None
+    data = payload.model_dump(exclude_unset=True)
 
-    vitals = {
-        "nausea_vomiting": payload.nausea_vomiting,
-        "airway_status": payload.airway_status,
-        "vitals_summary": payload.vitals_summary,
-        "discharge_criteria_met": payload.discharge_criteria_met,
-        "notes": payload.notes,
-    }
-    if all(v is None for v in vitals.values()):
-        vitals = None
-
-    record = PacuRecord(
+    rec = PacuRecord(
         case_id=case_id,
         nurse_user_id=user.id,
-        admission_time=_hhmm_to_utc_naive_for_case(case, payload.arrival_time),
-        discharge_time=_hhmm_to_utc_naive_for_case(case,
-                                                   payload.departure_time),
-        pain_scores=pain_scores,
-        vitals=vitals,
-        complications=payload.complications,
-        disposition=None,
+        **data,
     )
-    db.add(record)
+    db.add(rec)
     db.commit()
-    db.refresh(record)
-
-    pain_data = record.pain_scores or {}
-    vitals = record.vitals or {}
-
-    return PacuUiOut(
-        id=record.id,
-        case_id=record.case_id,
-        nurse_user_id=record.nurse_user_id,
-        arrival_time=_dt_to_time_str(record.admission_time),
-        departure_time=_dt_to_time_str(record.discharge_time),
-        pain_score=pain_data.get("score"),
-        nausea_vomiting=vitals.get("nausea_vomiting"),
-        airway_status=vitals.get("airway_status"),
-        vitals_summary=vitals.get("vitals_summary"),
-        complications=record.complications,
-        discharge_criteria_met=bool(
-            vitals.get("discharge_criteria_met") or False),
-        notes=vitals.get("notes"),
-        created_at=_to_ist_dt(record.created_at),
-        updated_at=_to_ist_dt(getattr(record, "updated_at", None)),
-    )
+    db.refresh(rec)
+    return rec
 
 
 @router.put("/cases/{case_id}/pacu", response_model=PacuUiOut)
-def update_pacu_for_case(
+def update_pacu_record(
         case_id: int,
         payload: PacuUiIn,
         db: Session = Depends(get_db),
@@ -1931,55 +2530,101 @@ def update_pacu_for_case(
     _need_any(user, ["ot.pacu.update"])
 
     case = _get_case_or_404(db, case_id)
-    record = case.pacu_record
-    if not record:
-        return create_pacu_for_case(case_id, payload, db, user)
+    rec: Optional[PacuRecord] = case.pacu_record
 
-    pain_scores = {
-        "score": payload.pain_score
-    } if payload.pain_score is not None else None
+    data = payload.model_dump(exclude_unset=True)
 
-    vitals = {
-        "nausea_vomiting": payload.nausea_vomiting,
-        "airway_status": payload.airway_status,
-        "vitals_summary": payload.vitals_summary,
-        "discharge_criteria_met": payload.discharge_criteria_met,
-        "notes": payload.notes,
-    }
-    if all(v is None for v in vitals.values()):
-        vitals = None
+    if not rec:
+        rec = PacuRecord(case_id=case_id, nurse_user_id=user.id, **data)
+        db.add(rec)
+        db.commit()
+        db.refresh(rec)
+        return rec
 
-    record.admission_time = _hhmm_to_utc_naive_for_case(
-        case, payload.arrival_time)
-    record.discharge_time = _hhmm_to_utc_naive_for_case(
-        case, payload.departure_time)
-    record.pain_scores = pain_scores
-    record.vitals = vitals
-    record.complications = payload.complications
+    for k, v in data.items():
+        setattr(rec, k, v)
 
-    db.add(record)
+    # keep nurse as last editor (optional)
+    rec.nurse_user_id = user.id
+
+    db.add(rec)
     db.commit()
-    db.refresh(record)
+    db.refresh(rec)
+    return rec
 
-    pain_data = record.pain_scores or {}
-    vitals = record.vitals or {}
 
-    return PacuUiOut(
-        id=record.id,
-        case_id=record.case_id,
-        nurse_user_id=record.nurse_user_id,
-        arrival_time=_dt_to_time_str(record.admission_time),
-        departure_time=_dt_to_time_str(record.discharge_time),
-        pain_score=pain_data.get("score"),
-        nausea_vomiting=vitals.get("nausea_vomiting"),
-        airway_status=vitals.get("airway_status"),
-        vitals_summary=vitals.get("vitals_summary"),
-        complications=record.complications,
-        discharge_criteria_met=bool(
-            vitals.get("discharge_criteria_met") or False),
-        notes=vitals.get("notes"),
-        created_at=_to_ist_dt(record.created_at),
-        updated_at=_to_ist_dt(getattr(record, "updated_at", None)),
+def _load_branding_for_pdf(db: Session, user: User):
+    tenant_id = getattr(user, "tenant_id", None) or getattr(
+        user, "hospital_id", None)
+
+    q = db.query(UiBranding)
+
+    # tenant scope
+    if tenant_id is not None and hasattr(UiBranding, "tenant_id"):
+        q = q.filter(UiBranding.tenant_id == tenant_id)
+
+    # active flag (optional)
+    if hasattr(UiBranding, "is_active"):
+        q = q.filter(UiBranding.is_active == True)  # noqa: E712
+
+    return q.order_by(desc(UiBranding.id)).first()
+
+
+@router.get("/cases/{case_id}/pacu/pdf")
+def get_pacu_pdf(
+        case_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    _need_any(user, ["ot.pacu.view", "ot.cases.view"])
+
+    case = _case_for_pacu_pdf(db, case_id)
+
+    pacu_record = getattr(case, "pacu_record", None) or getattr(
+        case, "pacu", None)
+    anaesthesia_record = getattr(case, "anaesthesia_record", None) or getattr(
+        case, "anaesthesia", None)
+
+    if not pacu_record:
+        raise HTTPException(status_code=404,
+                            detail="PACU record not found for this case")
+
+    # ✅ Use your working patient builder (same as other OT PDFs)
+    patient_fields = _build_patient_fields_for_case(db, case)
+
+    # ✅ Branding fix (NO MORE branding=None)
+    branding = _load_branding_for_pdf(db, user)
+
+    print(
+        "PACU PDF patient_fields:", {
+            k: patient_fields.get(k)
+            for k in [
+                "name", "uhid", "age_sex", "case_no", "or_no", "date",
+                "proposed_operation"
+            ]
+        })
+    print(
+        "PACU PDF branding:", {
+            "org_name":
+            getattr(branding, "org_name", None) if branding else None,
+            "logo_path":
+            getattr(branding, "logo_path", None) if branding else None,
+        })
+
+    pdf_bytes = build_ot_pacu_record_pdf_bytes(
+        branding=branding,
+        case=case,
+        patient_fields=patient_fields,
+        anaesthesia_record=anaesthesia_record,
+        pacu_record=pacu_record,
+    )
+
+    return StreamingResponse(
+        BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'inline; filename="PACU_{case_id}.pdf"'
+        },
     )
 
 

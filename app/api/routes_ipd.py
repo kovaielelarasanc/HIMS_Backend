@@ -26,17 +26,17 @@ from app.models.ipd import (
     IpdRoom,
     IpdBedRate,
     IpdWard,
+    IpdAdmissionFeedback,
     # NEW models
     IpdPainAssessment,
     IpdFallRiskAssessment,
     IpdPressureUlcerAssessment,
     IpdNutritionAssessment,
     IpdOrder,
-
     IpdDischargeMedication,
     IpdFeedback,
     IpdMedication,
-  )
+)
 from app.models.patient import Patient
 from app.models.user import User
 from app.schemas.ipd import (
@@ -96,13 +96,13 @@ from app.schemas.ipd import (
     IpdAdmissionFeedbackOut,
     IpdAdmissionFeedbackCreate,
     VitalSnapshot)
-from app.models.billing import Invoice
-from app.services.ipd_billing import apply_ipd_bed_charges_to_invoice
+
 # adjust if your model path differs
-from app.services.ipd_billing import ensure_invoice_for_context  # we will create this
+# we will create this
 from app.services.ipd_billing import compute_ipd_bed_charges_daily
 from app.models.ipd import IpdBed, IpdBedAssignment, IpdAdmission
 from app.services.id_gen import make_ip_admission_code
+from app.services.billing_ipd_room import sync_ipd_room_charges
 from zoneinfo import ZoneInfo
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -114,13 +114,15 @@ def as_aware(dt: datetime | None, assume_tz=IST) -> datetime | None:
     if dt is None:
         return None
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=assume_tz)   # ✅ assume incoming naive = IST
+        return dt.replace(tzinfo=assume_tz)  # ✅ assume incoming naive = IST
     return dt
+
 
 def to_utc(dt: datetime | None) -> datetime:
     if dt is None:
         return datetime.now(timezone.utc)
     return as_aware(dt).astimezone(timezone.utc)
+
 
 def to_ist(dt: datetime | None) -> datetime | None:
     if dt is None:
@@ -130,13 +132,17 @@ def to_ist(dt: datetime | None) -> datetime | None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(IST)
 
+
 def _intake_total(payload: IOIn) -> int:
-    split = (payload.intake_oral_ml or 0) + (payload.intake_iv_ml or 0) + (payload.intake_blood_ml or 0)
+    split = (payload.intake_oral_ml or
+             0) + (payload.intake_iv_ml or 0) + (payload.intake_blood_ml or 0)
     return split if split > 0 else (payload.intake_ml or 0)
+
 
 def _urine_total(payload: IOIn) -> int:
     split = (payload.urine_foley_ml or 0) + (payload.urine_voided_ml or 0)
     return split if split > 0 else (payload.urine_ml or 0)
+
 
 def _get_admission_or_404(db: Session, admission_id: int) -> IpdAdmission:
     adm = db.query(IpdAdmission).get(admission_id)
@@ -280,9 +286,11 @@ def create_admission(
         raise HTTPException(404, "Bed not found")
     if bed.state not in ("vacant", "reserved"):
         raise HTTPException(400, "Bed not available")
-    
+
     admitted_at_utc = to_utc(payload.admitted_at)
-    expected_discharge_utc = to_utc(payload.expected_discharge_at) if payload.expected_discharge_at else None
+    expected_discharge_utc = to_utc(
+        payload.expected_discharge_at
+    ) if payload.expected_discharge_at else None
 
     adm = IpdAdmission(
         patient_id=payload.patient_id,
@@ -290,8 +298,8 @@ def create_admission(
         practitioner_user_id=payload.practitioner_user_id,
         primary_nurse_user_id=payload.primary_nurse_user_id,
         admission_type=payload.admission_type,
-        admitted_at=admitted_at_utc,                 # ✅ store UTC (aware)
-        expected_discharge_at=expected_discharge_utc, # ✅ if you want consistent
+        admitted_at=admitted_at_utc,  # ✅ store UTC (aware)
+        expected_discharge_at=expected_discharge_utc,  # ✅ if you want consistent
         package_id=payload.package_id,
         payor_type=payload.payor_type,
         insurer_name=payload.insurer_name,
@@ -317,14 +325,6 @@ def create_admission(
         if hasattr(adm, attr) and not getattr(adm, attr, None):
             setattr(adm, attr, ip_code)
             break
-    ensure_invoice_for_context(
-        db=db,
-        patient_id=adm.patient_id,
-        billing_type="ip_billing",
-        context_type="ipd",
-        context_id=adm.id,
-    )
-
     bed.state = "occupied"
     bed.reserved_until = None
     db.add(
@@ -335,10 +335,18 @@ def create_admission(
             from_ts=admitted_at_utc,
             to_ts=None,
         ))
+    try:
+        sync_ipd_room_charges(db,
+                              admission_id=adm.id,
+                              upto_dt=admitted_at_utc,
+                              user=user)
+    except Exception:
+        pass
     db.commit()
     db.refresh(adm)
     dto = AdmissionOut.model_validate(adm, from_attributes=True)
     return dto.model_copy(update={"display_code": _adm_display_code(db, adm)})
+
 
 @router.get("/admissions", response_model=List[AdmissionOut])
 def list_admissions(
@@ -444,61 +452,24 @@ def discharge_admission(
     _mark_admission_status_and_release_bed(db, adm, "discharged", stop_ts)
 
     # 2) Ensure invoice exists for this admission context (IPD)
-    inv = ensure_invoice_for_context(
-        db=db,
-        patient_id=adm.patient_id,
-        billing_type="ip_billing",
-        context_type="ipd",
-        context_id=adm.id,
-    )
+    result = None
+    try:
+        result = sync_ipd_room_charges(db,
+                                       admission_id=adm.id,
+                                       upto_dt=stop_ts,
+                                       user=user)
+    except Exception:
+        result = None
 
-    # 3) IMPORTANT: Generate bed charges up to discharge date (SERVICE level)
-    # If you already implemented a service that creates/updates invoice items, call it here.
-    # Example (recommended):
-    #
-    # create_or_update_ipd_bed_charge_items(
-    #     db=db,
-    #     invoice_id=inv.id,
-    #     admission_id=adm.id,
-    #     upto_date=stop_ts.date(),
-    #     created_by=user.id,
-    # )
-    #
-    # If you don't have this service yet, stop here and I will give it as a ready file.
-
-    # 4) Recalc totals (and persist)
-    apply_ipd_bed_charges_to_invoice(
-        db=db,
-        admission_id=adm.id,
-        upto_date=stop_ts.date(),
-        user_id=user.id,
-        tax_rate=0.0,
-        invoice_id=inv.id,
-        skip_if_already_billed=
-        False,  # keep false so updates happen if rates/room change
-    )
-
-    # 4) Recalc totals (and persist)
-    inv.recalc()
-    db.add(inv)
-
-    # 5) Optionally finalize invoice (recommended at discharge)
-    if finalize_invoice:
-        # keep status string consistent with billing module
-        inv.status = "finalized"
-        inv.finalized_at = datetime.utcnow()
-        inv.finalized_by = user.id
-
-    # 6) Now lock billing at admission level (AFTER charges + recalc + optional finalize)
+    # then lock billing, finalize invoice if needed (your new billing finalize route can do it)
     adm.billing_locked = True
-    adm.discharge_at = stop_ts  # make sure discharge_at is set
-
+    adm.discharge_at = stop_ts
     db.commit()
+
     return {
         "message": "Discharged successfully",
         "admission_id": adm.id,
-        "invoice_id": inv.id,
-        "invoice_status": inv.status,
+        "billing": result,
         "billing_locked": adm.billing_locked,
         "discharge_at": adm.discharge_at,
     }
@@ -593,7 +564,6 @@ def cancel_admission(
 #     db.commit()
 #     db.refresh(tr)
 #     return tr
-
 
 LOCK_AFTER_HOURS = 24
 
@@ -954,10 +924,10 @@ def get_latest_vitals(
 )
 @router.post("/admissions/{admission_id}/io", response_model=IOOut)
 def record_io(
-    admission_id: int,
-    payload: IOIn,
-    db: Session = Depends(get_db),
-    user: User = Depends(auth_current_user),
+        admission_id: int,
+        payload: IOIn,
+        db: Session = Depends(get_db),
+        user: User = Depends(auth_current_user),
 ):
     if not has_perm(user, "ipd.nursing"):
         raise HTTPException(403, "Not permitted")
@@ -978,10 +948,8 @@ def record_io(
         intake_oral_ml=payload.intake_oral_ml or 0,
         intake_iv_ml=payload.intake_iv_ml or 0,
         intake_blood_ml=payload.intake_blood_ml or 0,
-
         urine_foley_ml=payload.urine_foley_ml or 0,
         urine_voided_ml=payload.urine_voided_ml or 0,
-
         drains_ml=payload.drains_ml or 0,
         stools_count=payload.stools_count or 0,
         remarks=payload.remarks or "",
@@ -1095,7 +1063,6 @@ def list_progress(
     return (db.query(IpdProgressNote).filter(
         IpdProgressNote.admission_id == admission_id).order_by(
             IpdProgressNote.id.desc()).all())
-
 
 
 # ---------------- OT & Anaesthesia ----------------
@@ -1624,9 +1591,6 @@ def list_orders(
     return q.order_by(IpdOrder.ordered_at.desc(), IpdOrder.id.desc()).all()
 
 
-
-
-
 # =====================================================================
 # NEW: Discharge Medications (structured)
 # =====================================================================
@@ -1888,10 +1852,6 @@ def update_ipd_medication(
     db.commit()
     db.refresh(obj)
     return obj
-
-
-
-
 
 
 # ------------------------------

@@ -326,7 +326,7 @@ def delete_ot_theater(
 # ============================================================
 #  OT INSTRUMENTS
 # ============================================================
-@router.get("/instruments", response_model=List[OtInstrumentMasterOut])
+@router.get("/instrument-masters", response_model=List[OtInstrumentMasterOut])
 def list_ot_instruments(
         search: Optional[str] = Query(None),
         active: Optional[bool] = Query(None),

@@ -16,8 +16,9 @@ from app.schemas.ris import (RisOrderCreate, RisScheduleIn, RisReportIn,
                              RadiologyTestOut)
 from app.models.opd import Visit
 from app.models.ipd import IpdAdmission
-from app.services.ris_billing import bill_ris_order
 
+from app.services.billing_hooks import autobill_ris_order
+from app.services.billing_service import BillingError
 from app.utils.files import save_upload
 
 router = APIRouter(prefix="/ris", tags=["RIS"])
@@ -404,32 +405,28 @@ async def add_report(
     o = db.query(RisOrder).get(order_id)
     if not o:
         raise HTTPException(404, "Order not found")
-    if (getattr(o, "billing_status", None) or "not_billed") != "billed":
-        inv = bill_ris_order(db, order=o, created_by=user.id)
-        o.billing_invoice_id = inv.id
-        o.billing_status = "billed"
+
+    # ✅ NEW BILLING (idempotent)
+    try:
+        if (getattr(o, "billing_status", None) or "not_billed") != "billed":
+            res = autobill_ris_order(db, ris_order_id=o.id, user=user)
+            o.billing_invoice_id = res.get("invoice_id")
+            o.billing_status = "billed"
+    except BillingError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Billing failed: {e}")
+
     o.report_text = payload.report_text
     o.status = "reported"
     o.reported_at = datetime.utcnow()
     o.primary_signoff_by = user.id
     o.updated_by = user.id
     o.updated_at = datetime.utcnow()
+
     db.commit()
-
-    # Optional billing hook — never break API if billing service missing
-    try:
-        from app.services.billing_auto import auto_add_item_for_event
-        auto_add_item_for_event(db,
-                                service_type="radiology",
-                                ref_id=o.id,
-                                patient_id=o.patient_id,
-                                context_type=o.context_type,
-                                context_id=o.context_id,
-                                user_id=user.id)
-        db.commit()
-    except Exception:
-        pass
-
     await _notify("reported", order_id=o.id)
     return {"message": "Report saved", "id": o.id}
 
@@ -469,32 +466,27 @@ async def approve_report(
         raise HTTPException(404, "Order not found")
     if o.status != "reported":
         raise HTTPException(400, "Report not ready for approval")
-        # ✅ Billing: on approve (idempotent)
-    if (getattr(o, "billing_status", None) or "not_billed") != "billed":
-        inv = bill_ris_order(db, order=o, created_by=user.id)
-        o.billing_invoice_id = inv.id
-        o.billing_status = "billed"
+
+    # ✅ NEW BILLING (idempotent)
+    try:
+        if (getattr(o, "billing_status", None) or "not_billed") != "billed":
+            res = autobill_ris_order(db, ris_order_id=o.id, user=user)
+            o.billing_invoice_id = res.get("invoice_id")
+            o.billing_status = "billed"
+    except BillingError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Billing failed: {e}")
+
     o.status = "approved"
     o.secondary_signoff_by = user.id
     o.approved_at = datetime.utcnow()
     o.updated_by = user.id
     o.updated_at = datetime.utcnow()
+
     db.commit()
-
-    # Optional billing hook — safe
-    try:
-        from app.services.billing_auto import auto_add_item_for_event
-        auto_add_item_for_event(db,
-                                service_type="radiology",
-                                ref_id=o.id,
-                                patient_id=o.patient_id,
-                                context_type=o.context_type,
-                                context_id=o.context_id,
-                                user_id=user.id)
-        db.commit()
-    except Exception:
-        pass
-
     await _notify("approved", order_id=o.id)
     return {"message": "Approved", "id": o.id}
 
@@ -708,7 +700,6 @@ def finalize_order(
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
 ):
-    # ✅ permission
     require_any(user, [
         "orders.ris.finalize", "radiology.orders.finalize",
         "billing.invoices.create"
@@ -718,7 +709,6 @@ def finalize_order(
     if not o:
         raise HTTPException(404, "Order not found")
 
-    # ✅ idempotent
     if (o.status or "").lower() == "finalized":
         return {
             "message": "Already finalized",
@@ -727,13 +717,19 @@ def finalize_order(
             "invoice_id": getattr(o, "billing_invoice_id", None),
         }
 
-    # ✅ auto billing if not billed
-    if (getattr(o, "billing_status", None) or "not_billed") != "billed":
-        inv = bill_ris_order(db, order=o, created_by=user.id)
-        o.billing_invoice_id = inv.id
-        o.billing_status = "billed"
+    # ✅ NEW BILLING (idempotent)
+    try:
+        if (getattr(o, "billing_status", None) or "not_billed") != "billed":
+            res = autobill_ris_order(db, ris_order_id=o.id, user=user)
+            o.billing_invoice_id = res.get("invoice_id")
+            o.billing_status = "billed"
+    except BillingError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Billing failed: {e}")
 
-    # ✅ manual finalize status
     o.status = "finalized"
     if hasattr(o, "finalized_at"):
         o.finalized_at = datetime.utcnow()

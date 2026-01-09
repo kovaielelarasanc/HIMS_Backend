@@ -52,9 +52,9 @@ from app.api import (
     routes_inventory,
     routes_audit_logs,
     routes_lis_masters,
-    routes_billing_advances,
-    routes_billing_invoice_wallet,
-    routes_billing_wallet,
+    # routes_billing_advances,
+    # routes_billing_invoice_wallet,
+    # routes_billing_wallet,
     routes_pdf_templates,
     routes_ipd_pdfs,
     routes_ipd_drug_chart_form_pdf,
@@ -147,12 +147,10 @@ api_router.include_router(routes_lab_integration.router)
 
 api_router.include_router(routes_ris.router)
 
-api_router.include_router(routes_billing.router,
-                          prefix="/billing",
-                          tags=["billing"])
-api_router.include_router(routes_billing_advances.router)
-api_router.include_router(routes_billing_wallet.router )
-api_router.include_router(routes_billing_invoice_wallet.router)
+api_router.include_router(routes_billing.router)
+# api_router.include_router(routes_billing_advances.router)
+# api_router.include_router(routes_billing_wallet.router )
+# api_router.include_router(routes_billing_invoice_wallet.router)
 
 api_router.include_router(routes_ot_masters.router)
 api_router.include_router(routes_ot_schedule_cases.router)

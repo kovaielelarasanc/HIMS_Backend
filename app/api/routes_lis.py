@@ -37,10 +37,12 @@ from app.schemas.lis import (
     LisPanelResultSaveIn,
     LisResultLineOut,
 )
-from app.services.lis_billing import bill_lis_order
+
 from app.services.ui_branding import get_ui_branding
 from app.services.lab_pdf_branding import draw_clean_brand_header
 from app.services.pdf_lab_report_weasy import build_lab_report_pdf_bytes
+from app.services.billing_hooks import autobill_lis_order
+from app.services.billing_service import BillingError
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -733,19 +735,28 @@ async def finalize(
     o.updated_by = user.id
     o.updated_at = now
 
-    if (getattr(o, "billing_status", None) or "not_billed") != "billed":
-        inv = bill_lis_order(db, order=o, created_by=user.id)
-        o.billing_invoice_id = inv.id
-        o.billing_status = "billed"
+    # ✅ NEW BILLING (idempotent)
+    try:
+        if (getattr(o, "billing_status", None) or "not_billed") != "billed":
+            res = autobill_lis_order(db, lis_order_id=o.id, user=user)
+            o.billing_invoice_id = res.get("invoice_id")
+            o.billing_status = "billed"
+    except BillingError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Billing failed: {e}")
 
     db.commit()
     await _notify("finalized",
                   order_id=o.id,
                   billing_invoice_id=o.billing_invoice_id)
+
     return {
         "message": "Finalized",
         "billing_invoice_id": o.billing_invoice_id,
-        "billing_status": o.billing_status
+        "billing_status": o.billing_status,
     }
 
 

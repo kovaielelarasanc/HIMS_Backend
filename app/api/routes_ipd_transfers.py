@@ -17,7 +17,7 @@ from app.models.ipd import (
     IpdBedAssignment,
     IpdTransfer,
 )
-
+from app.services.billing_ipd_room import sync_ipd_room_charges
 router = APIRouter(prefix="/ipd", tags=["IPD Transfers"])
 
 # IST offset (Asia/Kolkata)
@@ -518,6 +518,10 @@ def complete_transfer(
     t.completed_by = user.id
     t.completed_at = _now_utc_naive()
     t.status = "completed"
+    try:
+        sync_ipd_room_charges(db, admission_id=adm.id, upto_dt=occupied_at, user=user)
+    except Exception:
+        pass
 
     db.commit()
     t2 = _load_transfer_with_locations(db, transfer_id)

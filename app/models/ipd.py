@@ -102,13 +102,13 @@ class IpdBed(Base):
     def room_name(self) -> str | None:
         return self.room.number if self.room else None
 
-
 class IpdBedRate(Base):
     __tablename__ = "ipd_bed_rates"
     __table_args__ = (
         Index(
             "ix_ipd_bed_rates_lookup",
             "room_type",
+            "rate_basis",
             "effective_from",
             "effective_to",
             "is_active",
@@ -122,10 +122,16 @@ class IpdBedRate(Base):
 
     id = Column(Integer, primary_key=True)
     room_type = Column(String(30), nullable=False, index=True)
+    rate_basis = Column(String(10), nullable=False, default="daily", index=True)
     daily_rate = Column(Numeric(12, 2), nullable=False)
     effective_from = Column(Date, nullable=False)
     effective_to = Column(Date, nullable=True)
     is_active = Column(Boolean, default=True)
+    @property
+    def room_type_display(self) -> str:
+        b = (self.rate_basis or "daily").strip().title()
+        return f"{self.room_type} ({b})"
+
 
 
 class IpdBedAssignment(Base):

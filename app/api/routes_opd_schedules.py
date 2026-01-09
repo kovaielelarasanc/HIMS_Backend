@@ -12,6 +12,7 @@ from app.models.user import User
 from app.models.opd import OpdSchedule, Appointment
 from app.schemas.opd import OpdScheduleCreate, OpdScheduleUpdate, OpdScheduleOut
 
+
 router = APIRouter()
 
 

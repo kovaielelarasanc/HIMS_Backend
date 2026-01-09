@@ -42,6 +42,8 @@ from app.services.billing_ot import create_ot_invoice_items_for_case
 from app.services.ot_history_pdf import build_patient_ot_history_pdf
 from app.services.ot_case_pdf import build_ot_case_pdf
 
+from app.services.pdfs.ot_preop_checklist_pdf import build_ot_preop_checklist_pdf_bytes
+
 router = APIRouter(prefix="/ot", tags=["OT - Schedule & Cases"])
 logger = logging.getLogger(__name__)
 
@@ -865,6 +867,12 @@ def close_ot_case(
     if schedule:
         schedule.status = "completed"
         db.add(schedule)
+    try:
+        _ = create_ot_invoice_items_for_case(db=db, case_id=case.id, user=user)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.exception("OT billing failed for case_id=%s: %s", case.id, str(e))
 
     db.commit()
     db.refresh(case)
@@ -1054,6 +1062,61 @@ def update_preop_checklist(
         updated_at=updated_at,
         completed=checklist.completed,
         **data,
+    )
+
+
+def _get_branding(db: Session) -> UiBranding:
+    # ✅ adjust if you have tenant-wise branding
+    branding = db.query(UiBranding).order_by(UiBranding.id.desc()).first()
+    if not branding:
+        # If your UiBranding has required fields, create a safe fallback object
+        branding = UiBranding(
+            org_name="Hospital",
+            org_tagline="",
+            org_address="",
+            org_phone="",
+            org_email="",
+            org_website="",
+            org_gstin="",
+            logo_path="",
+        )
+    return branding
+
+
+@router.get("/cases/{case_id}/preop-checklist/pdf")
+def download_preop_checklist_pdf(
+        case_id: int,
+        download: bool = Query(False),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    _need_any(user,
+              ["ot.preop_checklist.view", "ot.cases.view", "ot.cases.update"])
+
+    case = _get_case_or_404(db, case_id)
+
+    # Load checklist data exactly like your GET does (same merge strategy)
+    checklist = (db.query(PreOpChecklistModel).filter(
+        PreOpChecklistModel.case_id == case_id).first())
+
+    base = _empty_preop_payload()
+    data = {**base, **(checklist.data or {})} if checklist else base
+
+    branding = _get_branding(db)
+
+    pdf_bytes = build_ot_preop_checklist_pdf_bytes(
+        branding=branding,
+        case=case,
+        preop_data=data,
+    )
+
+    filename = f"OT_PreOp_Checklist_Case_{case_id}.pdf"
+    disp = "attachment" if download else "inline"
+
+    return StreamingResponse(
+        BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'{disp}; filename="{filename}"'},
     )
 
 

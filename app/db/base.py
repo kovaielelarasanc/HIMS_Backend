@@ -28,4 +28,5 @@ from app.models import (  # noqa: F401
     pharmacy_inventory,
     pharmacy_prescription,
     audit,
+    pharmacy_inventory_new
 )

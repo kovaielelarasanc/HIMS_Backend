@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from sqlalchemy import or_
+from sqlalchemy import or_, func
 
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
@@ -18,15 +18,23 @@ from reportlab.pdfgen import canvas
 from app.api.deps import get_db, current_user as auth_current_user
 from app.models.user import User
 from app.models.patient import Patient
+
+# ✅ Your existing pharmacy models (keep as-is from your project)
 from app.models.pharmacy_prescription import (
     PharmacySale,
     PharmacySaleItem,
     PharmacyPrescription,
 )
+
 from app.models.pharmacy_inventory import ItemBatch
 from app.services.inventory import adjust_batch_qty, create_stock_transaction
 from app.core.emailer import send_email
-from app.models.billing import Invoice, InvoiceItem, Payment
+
+# ✅ NEW Billing models (NO old Invoice/InvoiceItem/Payment imports)
+from app.models.billing import BillingInvoice, BillingInvoiceLine, BillingPayment, PayMode
+
+# ✅ NEW Billing hooks (encounter-based billing)
+from app.services.billing_hooks import autobill_pharmacy_sale, add_pharmacy_payment_for_sale
 
 router = APIRouter()
 
@@ -101,7 +109,7 @@ class PharmacySaleSummaryOut(BaseModel):
     visit_id: Optional[int] = None
     admission_id: Optional[int] = None
 
-    # Linked Billing.Invoice + payment summary
+    # Linked Billing.Invoice summary (NEW billing)
     invoice_id: Optional[int] = None
     paid_amount: float = 0.0
     balance_amount: float = 0.0
@@ -189,15 +197,70 @@ def _sale_bill_datetime_value(sale: PharmacySale) -> datetime:
     return dt or datetime.utcnow()
 
 
+# ============================================================
+# NEW BILLING INTEGRATION (NO old Invoice/InvoiceItem/Payment)
+# ============================================================
+def _billing_invoice_id_for_sale(db: Session,
+                                 sale: PharmacySale) -> Optional[int]:
+    row = (db.query(BillingInvoiceLine.invoice_id).filter(
+        BillingInvoiceLine.source_module.in_(["PHM", "PHC"]),
+        BillingInvoiceLine.source_ref_id == int(sale.id),
+    ).order_by(BillingInvoiceLine.invoice_id.asc()).first())
+    return int(row[0]) if row else None
+
+
+def _sale_paid_amount_from_billing(db: Session, sale: PharmacySale) -> float:
+    """
+    We record payments from this pharmacy bill with txn_ref:
+      txn_ref = f"PHARM:{sale.bill_number}"
+
+    This avoids mixing payments from other modules in the same encounter invoice.
+    """
+    inv_id = _billing_invoice_id_for_sale(db, sale)
+    if not inv_id:
+        return 0.0
+
+    ref = f"PHARM:{getattr(sale, 'bill_number', sale.id)}"
+    inv = db.query(BillingInvoice).get(inv_id)
+    case_id = int(inv.billing_case_id) if inv else None
+    amt = (db.query(func.coalesce(func.sum(BillingPayment.amount), 0)).filter(
+        BillingPayment.billing_case_id == case_id,
+        BillingPayment.txn_ref == ref).scalar()) if case_id else 0
+
+    return float(amt or 0)
+
+
+def _ensure_billing_lines_for_sale(db: Session, sale: PharmacySale,
+                                   user: User) -> Optional[int]:
+    """
+    Lazily ensure the sale is mapped into the NEW billing system.
+    Safe: never breaks listing if billing cannot be mapped.
+    """
+    inv_id = _billing_invoice_id_for_sale(db, sale)
+    if inv_id:
+        return inv_id
+
+    # Try to auto-bill into encounter invoice (OP/IP)
+    try:
+        res = autobill_pharmacy_sale(db, sale_id=int(sale.id), user=user)
+        return int(
+            res.get("invoice_id")) if res and res.get("invoice_id") else None
+    except Exception:
+        # Counter sales (no visit/admission), missing patient, etc. should not break UI
+        return None
+
+
 def _sale_summary_from_row(
+    db: Session,
     sale: PharmacySale,
     patient: Patient,
+    user: User,
     admission_id: Optional[int] = None,
-    invoice: Optional[Invoice] = None,
 ) -> PharmacySaleSummaryOut:
     """
-    Build a summary row for PharmacySale, enriched with Billing.Invoice data
-    (invoice_id, paid_amount, balance_amount) when available.
+    Summary row enriched with NEW billing:
+      - invoice_id: encounter invoice id that contains PHARM lines
+      - paid_amount/balance_amount: sale-level via txn_ref PHARM:<bill_number>
     """
     created_at = _sale_bill_datetime_value(sale)
 
@@ -208,29 +271,18 @@ def _sale_summary_from_row(
     total_tax = getattr(sale, "total_tax", None)
     net_amount = getattr(sale, "net_amount", None)
 
-    # ---- invoice-derived fields ----
-    invoice_id: Optional[int] = None
-    paid_amount: float = 0.0
-    balance_amount: float = 0.0
+    # Ensure billing lines exist when possible
+    invoice_id = _ensure_billing_lines_for_sale(db, sale, user)
 
-    if invoice is not None:
-        invoice_id = getattr(invoice, "id", None)
-        paid_amount = _safe_float(getattr(invoice, "amount_paid", None))
+    paid_amount = _sale_paid_amount_from_billing(db,
+                                                 sale) if invoice_id else 0.0
+    balance_amount = _safe_float(net_amount) - paid_amount
 
-        if getattr(invoice, "balance_due", None) is not None:
-            balance_amount = _safe_float(getattr(invoice, "balance_due", None))
-        else:
-            balance_amount = _safe_float(net_amount) - paid_amount
-    else:
-        balance_amount = _safe_float(net_amount) - paid_amount
-
-    # ---- status: derive from invoice if possible ----
+    # ---- status: derive primarily from sale flags, fallback to payment math ----
     sale_payment_status = (getattr(sale, "payment_status", None) or "").upper()
     sale_invoice_status = (getattr(sale, "invoice_status", None) or "").upper()
-    inv_status = (getattr(invoice, "status", None)
-                  or "").upper() if invoice else ""
 
-    if sale_invoice_status == "CANCELLED" or inv_status == "CANCELLED":
+    if sale_invoice_status == "CANCELLED":
         status_val = "CANCELLED"
     else:
         n = _safe_float(net_amount)
@@ -244,9 +296,10 @@ def _sale_summary_from_row(
         else:
             status_val = "PAID"
 
-        # fallback if everything is zero
-        if not status_val and sale_payment_status:
-            status_val = sale_payment_status
+        # fallback if billing payment isn't used
+        if sale_payment_status in ("UNPAID", "PARTIALLY_PAID",
+                                   "PAID") and invoice_id is None:
+            status_val = "PARTIAL" if sale_payment_status == "PARTIALLY_PAID" else sale_payment_status
 
     return PharmacySaleSummaryOut(
         id=sale.id,
@@ -258,7 +311,7 @@ def _sale_summary_from_row(
         total_amount=_safe_float(gross_amount),
         total_tax=_safe_float(total_tax),
         net_amount=_safe_float(net_amount),
-        payment_mode=None,  # not tracked on PharmacySale model
+        payment_mode=None,
         created_at=created_at,
         context_type=getattr(sale, "context_type", None),
         visit_id=getattr(sale, "visit_id", None),
@@ -269,11 +322,8 @@ def _sale_summary_from_row(
     )
 
 
-def _sale_detail(
-    db: Session,
-    sale: PharmacySale,
-    patient: Patient,
-) -> PharmacySaleDetailOut:
+def _sale_detail(db: Session, sale: PharmacySale, patient: Patient,
+                 user: User) -> PharmacySaleDetailOut:
     items = (db.query(PharmacySaleItem).filter(
         PharmacySaleItem.sale_id == sale.id).all())
 
@@ -291,30 +341,21 @@ def _sale_detail(
                     or getattr(it, "line_amount", None)),
             ))
 
-    # Ensure linked Billing.Invoice exists so we have invoice_id / paid / balance
-    inv = (db.query(Invoice).filter(
-        Invoice.context_type == "pharmacy_sale",
-        Invoice.context_id == sale.id,
-    ).first())
-    if inv is None:
-        inv = _ensure_billing_invoice_for_sale(db, sale)
-        db.flush()
-        db.refresh(inv)
+    # Ensure billing lines exist (best-effort)
+    _ensure_billing_lines_for_sale(db, sale, user)
 
     summary = _sale_summary_from_row(
+        db,
         sale,
         patient,
+        user,
         admission_id=getattr(sale, "ipd_admission_id", None),
-        invoice=inv,
     )
     return PharmacySaleDetailOut(**summary.model_dump(), items=out_items)
 
 
-def _build_sale_pdf(
-    sale: PharmacySale,
-    patient: Patient,
-    items: List[PharmacySaleItem],
-) -> bytes:
+def _build_sale_pdf(sale: PharmacySale, patient: Patient,
+                    items: List[PharmacySaleItem]) -> bytes:
     """
     Basic A4 pharmacy invoice for printing/email.
     """
@@ -379,11 +420,8 @@ def _build_sale_pdf(
                                           qty * unit_price)))
         tax_amount = Decimal(
             str(
-                getattr(
-                    it,
-                    "tax_amount",
-                    (line_amount * tax_percent / Decimal("100")),
-                )))
+                getattr(it, "tax_amount",
+                        (line_amount * tax_percent / Decimal("100")))))
         total_line = Decimal(
             str(getattr(it, "total_amount", line_amount + tax_amount)))
 
@@ -416,229 +454,6 @@ def _build_sale_pdf(
     return buf.getvalue()
 
 
-# ---------------- Billing integration helpers ----------------
-def _ensure_billing_invoice_for_sale(
-    db: Session,
-    sale: PharmacySale,
-) -> Invoice:
-    """
-    Ensure there is a Billing.Invoice + InvoiceItems representing this PharmacySale.
-
-    Idempotent behaviour:
-    - If an Invoice already exists with context_type='pharmacy_sale' and context_id = sale.id,
-      reuse it.
-    - If not, but there are existing InvoiceItems with service_type='pharmacy' pointing to
-      this sale's PharmacySaleItem rows, reuse that Invoice (older data style) and, if needed,
-      stamp context_type/context_id for future lookups.
-    - Only if nothing exists, create a new Invoice and corresponding InvoiceItems.
-    """
-
-    # 1) New-style lookup via context_type/context_id
-    inv = (db.query(Invoice).filter(
-        Invoice.context_type == "pharmacy_sale",
-        Invoice.context_id == sale.id,
-    ).first())
-    if inv:
-        return inv
-
-    # 2) Fallback: older invoices found via InvoiceItem.service_ref_id
-    sale_item_ids = [
-        row[0] for row in db.query(PharmacySaleItem.id).filter(
-            PharmacySaleItem.sale_id == sale.id).all()
-    ]
-
-    if sale_item_ids:
-        existing_item = (db.query(InvoiceItem).filter(
-            InvoiceItem.service_type == "pharmacy",
-            InvoiceItem.service_ref_id.in_(sale_item_ids),
-        ).first())
-
-        if existing_item:
-            inv = db.query(Invoice).get(existing_item.invoice_id)
-            if inv:
-                if not getattr(inv, "context_type", None):
-                    inv.context_type = "pharmacy_sale"
-                    inv.context_id = sale.id
-                elif (inv.context_type == "pharmacy"
-                      and getattr(inv, "context_id", None) is None):
-                    inv.context_type = "pharmacy_sale"
-                    inv.context_id = sale.id
-                return inv
-
-    # 3) No existing invoice/items found -> create fresh Invoice + items
-    rx: Optional[PharmacyPrescription] = None
-    if getattr(sale, "prescription_id", None):
-        rx = db.query(PharmacyPrescription).get(sale.prescription_id)
-
-    billing_type = "pharmacy"
-    context_type = "pharmacy_sale"
-    context_id: Optional[int] = sale.id
-
-    if rx is not None:
-        rxtype = (getattr(rx, "type", "") or "").upper()
-        if rxtype == "OPD":
-            context_type = "OPD"
-            context_id = getattr(sale, "visit_id", None) or sale.id
-        elif rxtype == "IPD":
-            context_type = "IPD"
-            context_id = (getattr(rx, "ipd_admission_id", None)
-                          or getattr(sale, "visit_id", None) or sale.id)
-        elif rxtype == "COUNTER":
-            context_type = "PHARM_COUNTER"
-
-    invoice_status_upper = (getattr(sale, "invoice_status", None)
-                            or "").upper()
-    if invoice_status_upper == "CANCELLED":
-        inv_status = "cancelled"
-    else:
-        inv_status = "finalized"
-
-    net = _safe_float(getattr(sale, "net_amount", None))
-    gross = _safe_float(
-        getattr(sale, "gross_amount", None)
-        or getattr(sale, "total_amount", None))
-    tax = _safe_float(getattr(sale, "total_tax", None))
-
-    inv = Invoice(
-        patient_id=sale.patient_id,
-        context_type=context_type,
-        context_id=context_id,
-        status=inv_status,
-        gross_total=gross,
-        tax_total=tax,
-        discount_total=0.0,
-        net_total=net,
-        amount_paid=0.0,
-        balance_due=net,
-    )
-
-    if hasattr(inv, "billing_type"):
-        setattr(inv, "billing_type", billing_type)
-    if hasattr(inv, "created_by"):
-        setattr(inv, "created_by", getattr(sale, "created_by_id", None))
-
-    db.add(inv)
-    db.flush()
-    db.refresh(inv)
-
-    items = (db.query(PharmacySaleItem).filter(
-        PharmacySaleItem.sale_id == sale.id).all())
-    seq_no = 1
-    for it in items:
-        qty = _safe_float(getattr(it, "quantity", None))
-        unit_price = _safe_float(getattr(it, "unit_price", None))
-        tax_percent = _safe_float(getattr(it, "tax_percent", None))
-        line_amount = _safe_float(
-            getattr(it, "line_amount", None) or (qty * unit_price))
-        tax_amount = _safe_float(
-            getattr(it, "tax_amount", None)
-            or (line_amount * tax_percent / 100.0))
-        total_line = _safe_float(
-            getattr(it, "total_amount", None) or (line_amount + tax_amount))
-
-        inv_item = InvoiceItem(
-            invoice_id=inv.id,
-            seq=seq_no,
-            service_type="pharmacy",
-            service_ref_id=it.id,
-            description=getattr(it, "item_name", "") or "",
-            quantity=qty,
-            unit_price=unit_price,
-            tax_rate=tax_percent,
-            discount_percent=0.0,
-            discount_amount=0.0,
-            tax_amount=tax_amount,
-            line_total=total_line,
-            is_voided=False,
-            created_by=getattr(sale, "created_by_id", None),
-        )
-        db.add(inv_item)
-        seq_no += 1
-
-    return inv
-
-
-def _sync_billing_invoice_with_sale(
-    db: Session,
-    sale: PharmacySale,
-    new_paid_amount: Optional[float] = None,
-) -> Invoice:
-    """
-    Keep Billing.Invoice in sync with PharmacySale:
-    - Align totals from sale.gross_amount / total_tax / net_amount
-    - Optionally add a Payment row when status update carries paid_amount
-    - If sale.payment_status=PAID, ensure balance_due hits 0 (creates top-up payment if needed)
-    """
-    inv = (db.query(Invoice).filter(
-        Invoice.context_type == "pharmacy_sale",
-        Invoice.context_id == sale.id,
-    ).first())
-    if inv is None:
-        inv = _ensure_billing_invoice_for_sale(db, sale)
-
-    net = _safe_float(getattr(sale, "net_amount", None))
-    gross = _safe_float(
-        getattr(sale, "gross_amount", None)
-        or getattr(sale, "total_amount", None))
-    tax = _safe_float(getattr(sale, "total_tax", None))
-
-    inv.gross_total = gross
-    inv.tax_total = tax
-    inv.net_total = net
-
-    existing_paid = 0.0
-    for p in getattr(inv, "payments", []) or []:
-        existing_paid += _safe_float(getattr(p, "amount", None))
-
-    if new_paid_amount and new_paid_amount != 0 and net > 0:
-        pay = Payment(
-            invoice_id=inv.id,
-            amount=float(new_paid_amount),
-            mode="pharmacy_rx",
-            reference_no=f"PHARM_{sale.bill_number}",
-            notes=None,
-            created_by=getattr(sale, "created_by_id", None),
-        )
-        db.add(pay)
-        existing_paid += float(new_paid_amount)
-
-    payment_status_upper = (getattr(sale, "payment_status", None)
-                            or "").upper()
-    invoice_status_upper = (getattr(sale, "invoice_status", None)
-                            or "").upper()
-
-    if net >= 0:
-        if payment_status_upper == "PAID" and existing_paid < net:
-            delta = net - existing_paid
-            if delta > 0.01:
-                pay = Payment(
-                    invoice_id=inv.id,
-                    amount=delta,
-                    mode="pharmacy_rx",
-                    reference_no=f"PHARM_{sale.bill_number}",
-                    notes="Auto-sync full payment from pharmacy sale",
-                    created_by=getattr(sale, "created_by_id", None),
-                )
-                db.add(pay)
-                existing_paid += delta
-
-        inv.amount_paid = existing_paid
-        inv.balance_due = max(net - existing_paid, 0.0)
-    else:
-        inv.amount_paid = existing_paid
-        inv.balance_due = net - existing_paid
-
-    if invoice_status_upper == "CANCELLED":
-        inv.status = "cancelled"
-    else:
-        inv.status = "finalized"
-
-    if getattr(inv, "finalized_at", None) is None:
-        inv.finalized_at = _sale_bill_datetime_value(sale)
-
-    return inv
-
-
 # ---------------- API: List Pharmacy bills ----------------
 @router.get("", response_model=List[PharmacySaleSummaryOut])
 @router.get("/", response_model=List[PharmacySaleSummaryOut])
@@ -654,21 +469,19 @@ def list_pharmacy_bills(
             None, description="YYYY-MM-DD on bill date/time"),
         date_to: Optional[str] = Query(
             None, description="YYYY-MM-DD on bill date/time"),
-        status:
-    Optional[str] = Query(
-        None,
-        description=
-        ("Filter by status: UNPAID | PARTIAL | PAID | CANCELLED | DRAFT | FINALIZED"
-         ),
-    ),
+        status: Optional[str] = Query(
+            None,
+            description=(
+                "Filter by status: UNPAID | PARTIAL | PAID | CANCELLED"),
+        ),
         limit: int = Query(100, ge=1, le=300),
         db: Session = Depends(get_db),
         user: User = Depends(auth_current_user),
 ):
     """
     Pharmacy Billing Console:
-    - Shows PharmacySale bills created by the inventory-based module.
-    - Lazily ensures each sale has a linked Billing.Invoice.
+    - Shows PharmacySale bills created by the pharmacy module.
+    - Lazily maps each sale into NEW encounter-based Billing (OP/IP) when possible.
     """
     _need_any(user, ["pharmacy.billing.view", "pharmacy.sales.view"])
 
@@ -677,8 +490,7 @@ def list_pharmacy_bills(
     q_sales = (db.query(PharmacySale, Patient, PharmacyPrescription).join(
         Patient, PharmacySale.patient_id == Patient.id).outerjoin(
             PharmacyPrescription,
-            PharmacySale.prescription_id == PharmacyPrescription.id,
-        ))
+            PharmacySale.prescription_id == PharmacyPrescription.id))
 
     if date_from:
         df = datetime.fromisoformat(date_from + "T00:00:00")
@@ -708,37 +520,34 @@ def list_pharmacy_bills(
 
     if status:
         status_upper = status.strip().upper()
-        if status_upper in ("UNPAID", "PARTIAL", "PARTIALLY_PAID", "PAID"):
-            mapped = "PARTIALLY_PAID" if status_upper == "PARTIAL" else status_upper
-            q_sales = q_sales.filter(
-                getattr(PharmacySale, "payment_status") == mapped)
+        if status_upper in ("UNPAID", "PARTIAL", "PAID"):
+            # Use PharmacySale flags for initial filtering
+            if status_upper == "PARTIAL":
+                q_sales = q_sales.filter(
+                    getattr(PharmacySale, "payment_status") ==
+                    "PARTIALLY_PAID")
+            else:
+                q_sales = q_sales.filter(
+                    getattr(PharmacySale, "payment_status") == status_upper)
         elif status_upper == "CANCELLED":
             q_sales = q_sales.filter(
                 getattr(PharmacySale, "invoice_status") == "CANCELLED")
-        else:
-            q_sales = q_sales.filter(
-                getattr(PharmacySale, "invoice_status") == status_upper)
 
-    rows = (q_sales.order_by(
-        bill_dt_col.desc(),
-        PharmacySale.id.desc(),
-    ).limit(limit).all())
+    rows = (q_sales.order_by(bill_dt_col.desc(),
+                             PharmacySale.id.desc()).limit(limit).all())
 
     out: List[PharmacySaleSummaryOut] = []
     for sale, patient, rx in rows:
-        inv = _ensure_billing_invoice_for_sale(db, sale)
-
         admission_id = None
-        if rx and rx.type == "IPD":
+        if rx and (getattr(rx, "type", "") or "").upper() == "IPD":
             admission_id = getattr(rx, "ipd_admission_id", None)
 
         out.append(
-            _sale_summary_from_row(
-                sale,
-                patient,
-                admission_id=admission_id,
-                invoice=inv,
-            ))
+            _sale_summary_from_row(db,
+                                   sale,
+                                   patient,
+                                   user,
+                                   admission_id=admission_id))
 
     db.commit()
     return out
@@ -759,15 +568,14 @@ def get_pharmacy_bill(
 
     patient: Optional[Patient] = db.query(Patient).get(sale.patient_id)
     if not patient:
-        raise HTTPException(
-            status_code=400,
-            detail="Patient not found for this bill",
-        )
+        raise HTTPException(status_code=400,
+                            detail="Patient not found for this bill")
 
-    _ensure_billing_invoice_for_sale(db, sale)
+    # Best-effort NEW billing mapping
+    _ensure_billing_lines_for_sale(db, sale, user)
     db.commit()
 
-    return _sale_detail(db, sale, patient)
+    return _sale_detail(db, sale, patient, user)
 
 
 # ---------------- API: Update bill status ----------------
@@ -782,15 +590,13 @@ def update_pharmacy_bill_status(
     Update PharmacySale payment/invoice status:
 
     payment_status:
-        - UNPAID
-        - PARTIALLY_PAID
-        - PAID
+      - UNPAID
+      - PARTIAL
+      - PAID
+      - CANCELLED
 
-    Special keyword:
-        - CANCELLED -> sets invoice_status = CANCELLED
-
-    Also keeps Billing.Invoice in sync.
-    - paid_amount is treated as *incremental* payment for this update.
+    Also records payment into NEW Billing engine using:
+      add_pharmacy_payment_for_sale(..., txn_ref="PHARM:<bill_number>")
     """
     _need_any(user, ["pharmacy.billing.manage", "pharmacy.sales.manage"])
 
@@ -802,8 +608,8 @@ def update_pharmacy_bill_status(
     if key not in {"UNPAID", "PAID", "PARTIAL", "CANCELLED"}:
         raise HTTPException(
             status_code=400,
-            detail=("Invalid payment_status "
-                    "(use: unpaid / partial / paid / cancelled)"),
+            detail=
+            "Invalid payment_status (use: unpaid / partial / paid / cancelled)",
         )
 
     if key == "CANCELLED":
@@ -818,7 +624,23 @@ def update_pharmacy_bill_status(
 
     sale.updated_at = datetime.utcnow()
 
-    _sync_billing_invoice_with_sale(db, sale, payload.paid_amount)
+    # ✅ Record payment into NEW Billing (sale-scoped via txn_ref)
+    if key != "CANCELLED" and payload.paid_amount and float(
+            payload.paid_amount) > 0:
+        try:
+            add_pharmacy_payment_for_sale(
+                db,
+                sale_id=int(sale.id),
+                paid_amount=Decimal(str(payload.paid_amount)),
+                user=user,
+                mode=PayMode.CASH,  # map UI -> PayMode later if needed
+            )
+        except Exception:
+            # Never break API due to billing payments
+            pass
+
+    # Ensure billing lines exist (best-effort)
+    _ensure_billing_lines_for_sale(db, sale, user)
 
     db.commit()
     db.refresh(sale)
@@ -826,7 +648,8 @@ def update_pharmacy_bill_status(
     patient: Optional[Patient] = db.query(Patient).get(sale.patient_id)
     if not patient:
         raise HTTPException(status_code=400, detail="Patient not found")
-    return _sale_detail(db, sale, patient)
+
+    return _sale_detail(db, sale, patient, user)
 
 
 # ---------------- API: Bill PDF download ----------------
@@ -849,8 +672,8 @@ def download_pharmacy_bill_pdf(
     if not patient:
         raise HTTPException(status_code=400, detail="Patient not found")
 
-    items = (db.query(PharmacySaleItem).filter(
-        PharmacySaleItem.sale_id == sale.id).all())
+    items = db.query(PharmacySaleItem).filter(
+        PharmacySaleItem.sale_id == sale.id).all()
 
     pdf_bytes = _build_sale_pdf(sale, patient, items)
     filename = f"PHARM_{sale.bill_number}.pdf"
@@ -879,13 +702,13 @@ def email_pharmacy_bill_pdf(
     if not patient:
         raise HTTPException(status_code=400, detail="Patient not found")
 
-    items = (db.query(PharmacySaleItem).filter(
-        PharmacySaleItem.sale_id == sale.id).all())
+    items = db.query(PharmacySaleItem).filter(
+        PharmacySaleItem.sale_id == sale.id).all()
     pdf_bytes = _build_sale_pdf(sale, patient, items)
     filename = f"PHARM_{sale.bill_number}.pdf"
 
     body_text = (
-        f"Dear { _full_name(patient) },\n\n"
+        f"Dear {_full_name(patient)},\n\n"
         f"Please find attached your pharmacy invoice {sale.bill_number}.\n\n"
         "Regards,\n"
         f"{_user_display_name(user)}")
@@ -906,7 +729,7 @@ def email_pharmacy_bill_pdf(
     db.commit()
     db.refresh(sale)
 
-    return _sale_detail(db, sale, patient)
+    return _sale_detail(db, sale, patient, user)
 
 
 # ---------------- API: Returns view ----------------
@@ -921,7 +744,7 @@ def list_pharmacy_returns(
     """
     Returns view:
     - Any PharmacySale with net_amount < 0 is considered a return.
-    - Also ensures a negative Billing.Invoice exists (credit note effect).
+    - Also maps into NEW Billing as negative lines (best-effort).
     """
     _need_any(user, ["pharmacy.returns.view", "pharmacy.sales.return"])
 
@@ -930,8 +753,8 @@ def list_pharmacy_returns(
     q_sales = (db.query(PharmacySale, Patient, PharmacyPrescription).join(
         Patient, PharmacySale.patient_id == Patient.id).outerjoin(
             PharmacyPrescription,
-            PharmacySale.prescription_id == PharmacyPrescription.id,
-        ).filter(PharmacySale.net_amount < 0))
+            PharmacySale.prescription_id == PharmacyPrescription.id).filter(
+                PharmacySale.net_amount < 0))
 
     if date_from:
         df = datetime.fromisoformat(date_from + "T00:00:00")
@@ -950,25 +773,21 @@ def list_pharmacy_returns(
                 Patient.phone.ilike(ql),
             ))
 
-    rows = (q_sales.order_by(
-        bill_dt_col.desc(),
-        PharmacySale.id.desc(),
-    ).limit(200).all())
+    rows = (q_sales.order_by(bill_dt_col.desc(),
+                             PharmacySale.id.desc()).limit(200).all())
 
     out: List[PharmacySaleSummaryOut] = []
     for sale, patient, rx in rows:
-        inv = _ensure_billing_invoice_for_sale(db, sale)
-
         admission_id = None
-        if rx and rx.type == "IPD":
+        if rx and (getattr(rx, "type", "") or "").upper() == "IPD":
             admission_id = getattr(rx, "ipd_admission_id", None)
+
         out.append(
-            _sale_summary_from_row(
-                sale,
-                patient,
-                admission_id=admission_id,
-                invoice=inv,
-            ))
+            _sale_summary_from_row(db,
+                                   sale,
+                                   patient,
+                                   user,
+                                   admission_id=admission_id))
 
     db.commit()
     return out
@@ -993,13 +812,12 @@ def create_consolidated_ipd_invoice(
 
     q_sales = (db.query(PharmacySale, PharmacyPrescription).join(
         PharmacyPrescription,
-        PharmacySale.prescription_id == PharmacyPrescription.id,
-    ).filter(
-        PharmacySale.patient_id == payload.patient_id,
-        PharmacyPrescription.type == "IPD",
-        getattr(PharmacySale,
-                "payment_status").in_(["UNPAID", "PARTIALLY_PAID"]),
-    ))
+        PharmacySale.prescription_id == PharmacyPrescription.id).filter(
+            PharmacySale.patient_id == payload.patient_id,
+            PharmacyPrescription.type == "IPD",
+            getattr(PharmacySale,
+                    "payment_status").in_(["UNPAID", "PARTIALLY_PAID"]),
+        ))
 
     if payload.admission_id is not None:
         q_sales = q_sales.filter(
@@ -1009,9 +827,8 @@ def create_consolidated_ipd_invoice(
     if not rows:
         raise HTTPException(
             status_code=404,
-            detail=(
-                "No unpaid IPD pharmacy bills found for this patient/admission"
-            ),
+            detail=
+            "No unpaid IPD pharmacy bills found for this patient/admission",
         )
 
     sale_ids: List[int] = []
@@ -1029,8 +846,8 @@ def create_consolidated_ipd_invoice(
         total_tax += Decimal(str(getattr(sale, "total_tax", None) or 0))
         net_amount += Decimal(str(getattr(sale, "net_amount", None) or 0))
 
-        sis = (db.query(PharmacySaleItem).filter(
-            PharmacySaleItem.sale_id == sale.id).all())
+        sis = db.query(PharmacySaleItem).filter(
+            PharmacySaleItem.sale_id == sale.id).all()
         for it in sis:
             key = getattr(it, "item_name", "") or f"Item#{it.item_id}"
             rec = items_map.setdefault(key, {"qty": 0.0, "amount": 0.0})
@@ -1042,11 +859,9 @@ def create_consolidated_ipd_invoice(
     lines: List[ConsolidatedLineOut] = []
     for name, vals in items_map.items():
         lines.append(
-            ConsolidatedLineOut(
-                medicine_name=name,
-                qty=vals["qty"],
-                amount=vals["amount"],
-            ))
+            ConsolidatedLineOut(medicine_name=name,
+                                qty=vals["qty"],
+                                amount=vals["amount"]))
 
     return ConsolidatedIpdInvoiceOut(
         patient_id=payload.patient_id,
@@ -1061,7 +876,7 @@ def create_consolidated_ipd_invoice(
     )
 
 
-# ---------------- API: Create pharmacy return (negative invoice) ----------------
+# ---------------- API: Create pharmacy return (negative sale + stock adjust) ----------------
 @router.post("/returns", response_model=PharmacySaleDetailOut)
 def create_pharmacy_return(
         payload: PharmacyReturnCreateIn,
@@ -1069,10 +884,10 @@ def create_pharmacy_return(
         user: User = Depends(auth_current_user),
 ):
     """
-    Create a negative pharmacy invoice as a return against an earlier invoice.
+    Create a negative PharmacySale as a return against an earlier invoice.
     - Adjusts stock back to the relevant batch.
     - Uses txn_type = RETURN_FROM_CUSTOMER in StockTransaction.
-    - Also creates a negative Billing.Invoice (credit note style).
+    - Also maps into NEW Billing as negative invoice lines (best-effort).
     """
     _need_any(user, ["pharmacy.returns.manage", "pharmacy.sales.return"])
 
@@ -1085,8 +900,7 @@ def create_pharmacy_return(
     if getattr(source_sale, "net_amount", 0) <= 0:
         raise HTTPException(
             status_code=400,
-            detail="Cannot create a return from a negative/zero invoice",
-        )
+            detail="Cannot create a return from a negative/zero invoice")
 
     patient: Optional[Patient] = db.query(Patient).get(source_sale.patient_id)
     if not patient:
@@ -1135,8 +949,8 @@ def create_pharmacy_return(
         if not src:
             raise HTTPException(
                 status_code=400,
-                detail=(f"Source bill line {line.bill_line_id} "
-                        "not found for this invoice"),
+                detail=
+                f"Source bill line {line.bill_line_id} not found for this invoice",
             )
 
         qty_ret = Decimal(str(line.qty_to_return))
@@ -1147,19 +961,19 @@ def create_pharmacy_return(
         if qty_ret > sold_qty:
             raise HTTPException(
                 status_code=400,
-                detail=(f"Return qty {qty_ret} exceeds sold qty {sold_qty} "
-                        f"for item {getattr(src, 'item_name', None)}"),
+                detail=
+                f"Return qty {qty_ret} exceeds sold qty {sold_qty} for item {getattr(src, 'item_name', None)}",
             )
 
-        batch = (db.query(ItemBatch).get(src.batch_id) if getattr(
-            src, "batch_id", None) else None)
+        batch = db.query(ItemBatch).get(src.batch_id) if getattr(
+            src, "batch_id", None) else None
         if batch:
             if getattr(batch, "expiry_date",
                        None) and batch.expiry_date < today:
                 raise HTTPException(
                     status_code=400,
-                    detail=(f"Batch {batch.batch_no} is already expired "
-                            "and cannot be returned to active stock."),
+                    detail=
+                    f"Batch {batch.batch_no} is already expired and cannot be returned to active stock.",
                 )
 
             adjust_batch_qty(batch=batch, delta=qty_ret)
@@ -1212,12 +1026,13 @@ def create_pharmacy_return(
     return_sale.net_amount = total_amount + total_tax
     return_sale.updated_at = datetime.utcnow()
 
-    _ensure_billing_invoice_for_sale(db, return_sale)
+    # ✅ NEW billing mapping (negative lines, best-effort)
+    _ensure_billing_lines_for_sale(db, return_sale, user)
 
     db.commit()
     db.refresh(return_sale)
 
-    return _sale_detail(db, return_sale, patient)
+    return _sale_detail(db, return_sale, patient, user)
 
 
 # ---------------- API: Get return invoice detail ----------------
@@ -1228,7 +1043,7 @@ def get_pharmacy_return(
         user: User = Depends(auth_current_user),
 ):
     """
-    Returns are just PharmacySale rows with net_amount < 0.
+    Returns are PharmacySale rows with net_amount < 0.
     """
     _need_any(user, ["pharmacy.returns.view", "pharmacy.sales.return"])
 
@@ -1240,7 +1055,7 @@ def get_pharmacy_return(
     if not patient:
         raise HTTPException(status_code=400, detail="Patient not found")
 
-    _ensure_billing_invoice_for_sale(db, sale)
+    _ensure_billing_lines_for_sale(db, sale, user)
     db.commit()
 
-    return _sale_detail(db, sale, patient)
+    return _sale_detail(db, sale, patient, user)

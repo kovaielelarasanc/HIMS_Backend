@@ -554,6 +554,10 @@ class AnaesthesiaRecord(Base):
     complications = Column(Text, nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime,
+                        default=datetime.utcnow,
+                        onupdate=datetime.utcnow,
+                        nullable=False)  # ✅ NEW
 
     case = relationship("OtCase", back_populates="anaesthesia_record")
     anaesthetist = relationship("User")
@@ -640,6 +644,12 @@ class AnaesthesiaVitalLog(Base):
     urine_output_ml = Column(Integer, nullable=True)
     blood_loss_ml = Column(Integer, nullable=True)
 
+    oxygen_fio2 = Column(String(50), nullable=True)
+    n2o = Column(String(50), nullable=True)
+    air = Column(String(50), nullable=True)
+    agent = Column(String(50), nullable=True)
+    iv_fluids = Column(String(100), nullable=True)
+
     record = relationship("AnaesthesiaRecord", back_populates="vitals")
 
 
@@ -714,6 +724,50 @@ class OtNursingRecord(Base):
 
     case = relationship("OtCase", back_populates="nursing_record")
     primary_nurse = relationship("User")
+
+
+MYSQL_ARGS = {
+    "mysql_engine": "InnoDB",
+    "mysql_charset": "utf8mb4",
+    "mysql_collate": "utf8mb4_unicode_ci",
+}
+
+
+class OtCaseInstrumentCountLine(Base):
+    __tablename__ = "ot_case_instrument_count_lines"
+    __table_args__ = (
+        UniqueConstraint("case_id",
+                         "instrument_id",
+                         name="uq_ot_case_instrument_line"),
+        Index("ix_ot_case_instrument_case", "case_id"),
+        MYSQL_ARGS,
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    case_id = Column(Integer,
+                     ForeignKey("ot_cases.id", ondelete="CASCADE"),
+                     nullable=False)
+
+    instrument_id = Column(Integer,
+                           ForeignKey("ot_instrument_masters.id"),
+                           nullable=True)
+    instrument_code = Column(String(40), nullable=False, default="")
+    instrument_name = Column(String(200), nullable=False, default="")
+    uom = Column(String(30), nullable=False, default="Nos")
+
+    initial_qty = Column(Integer, nullable=False, default=0)
+    added_qty = Column(Integer, nullable=False, default=0)
+    final_qty = Column(Integer, nullable=False, default=0)
+
+    remarks = Column(String(500), default="")
+
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    updated_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime,
+                        default=datetime.utcnow,
+                        onupdate=datetime.utcnow)
 
 
 class OtSpongeInstrumentCount(Base):
@@ -844,9 +898,13 @@ class OtBloodTransfusionRecord(Base):
     case = relationship("OtCase", back_populates="blood_records")
 
 
+
+
+
 class PacuRecord(Base):
     """
     Post-Anaesthesia Care Unit (Recovery) record.
+    Matches: POST OPERATIVE RECOVERY RECORD sheet
     """
     __tablename__ = "ot_pacu_records"
     __table_args__ = (
@@ -856,22 +914,58 @@ class PacuRecord(Base):
     )
 
     id = Column(Integer, primary_key=True)
-    case_id = Column(Integer,
-                     ForeignKey("ot_cases.id", ondelete="CASCADE"),
-                     nullable=False,
-                     unique=True)
-    nurse_user_id = Column(Integer,
-                           ForeignKey("users.id", ondelete="RESTRICT"),
-                           nullable=False)
 
-    admission_time = Column(DateTime, nullable=True)
-    discharge_time = Column(DateTime, nullable=True)
-    pain_scores = Column(JSON, nullable=True)  # {time: score}
-    vitals = Column(JSON, nullable=True)  # time-series or summary
-    complications = Column(Text, nullable=True)
-    disposition = Column(String(100), nullable=True)  # ward / ICU / home etc.
+    case_id = Column(
+        Integer,
+        ForeignKey("ot_cases.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    nurse_user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+
+    # ---- Times (Sheet: Time to RECOVERY / Time to WARD/ICU)
+    time_to_recovery = Column(String(5), nullable=True)  # "HH:MM"
+    time_to_ward_icu = Column(String(5), nullable=True)  # "HH:MM"
+    disposition = Column(String(50), nullable=True)  # Ward / ICU / Home etc.
+
+    # ---- Sheet checkbox groups (stored as string arrays)
+    # Anaesthesia type is fetched from Anaesthesia record for PDF header,
+    # but you may store PACU-selected types if you want (optional).
+    anaesthesia_methods = Column(
+        JSON,
+        nullable=True)  # ["GA/MAC", "Spinal/Epidural", "Nerve/Plexus Block"]
+    airway_support = Column(
+        JSON, nullable=True
+    )  # ["None", "Face Mask/Airway", "LMA", "Intubated", "O2"]
+    monitoring = Column(JSON, nullable=True)  # ["SpO2", "NIBP", "ECG", "CVP"]
+
+    # ---- Sheet right column items
+    post_op_charts = Column(
+        JSON, nullable=True
+    )  # ["Diabetic Chart", "I.V. Fluids", "Analgesia", "PCA Chart"]
+    tubes_drains = Column(
+        JSON, nullable=True
+    )  # ["Wound Drains", "Urinary Catheter", "NG Tube", "Irrigation"]
+
+    # ---- Vitals / Chart entries (time-series)
+    # Each row example:
+    # {"time":"10:15","spo2":"98","hr":"86","bp":"120/80","cvp":"8","rbs":"142","remarks":"Stable"}
+    vitals_log = Column(JSON, nullable=True)
+
+    # ---- Notes / Instructions (Sheet bottom)
+    post_op_instructions = Column(Text, nullable=True)
+    iv_fluids_orders = Column(Text, nullable=True)
+    notes = Column(Text, nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime,
+                        default=datetime.utcnow,
+                        onupdate=datetime.utcnow,
+                        nullable=True)
 
     case = relationship("OtCase", back_populates="pacu_record")
     nurse = relationship("User")
