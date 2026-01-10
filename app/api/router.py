@@ -30,7 +30,12 @@ from app.api import (
     routes_inventory_po,
     routes_lis,
     routes_ris,
+    charge_item_master,
+    
     routes_billing,
+    routes_billing_edits,
+    
+    
     routes_pharmacy_accounts,
     routes_ot_masters,
     routes_ot_schedule_cases,
@@ -148,6 +153,8 @@ api_router.include_router(routes_lab_integration.router)
 api_router.include_router(routes_ris.router)
 
 api_router.include_router(routes_billing.router)
+api_router.include_router(charge_item_master.router)
+api_router.include_router(routes_billing_edits .router)
 # api_router.include_router(routes_billing_advances.router)
 # api_router.include_router(routes_billing_wallet.router )
 # api_router.include_router(routes_billing_invoice_wallet.router)

@@ -33,9 +33,11 @@ from app.schemas.ipd import (
 
 from app.services.pdf_discharge import generate_discharge_summary_pdf
 from app.services.ipd_billing import (
-    apply_ipd_bed_charges_to_invoice,
     ensure_invoice_for_context,
+    sync_ipd_room_charges,
+    recalc_invoice_totals,
 )
+from app.models.billing import DocStatus
 
 router = APIRouter(prefix="/ipd", tags=["IPD – Discharge"])
 
@@ -234,19 +236,24 @@ def _finalize_discharge_and_billing(
     - mark admission discharged
     - release bed + close assignment at exact stop_ts
     - ensure invoice exists
-    - create/update bed charge invoice items up to stop date
-    - recalc + optionally finalize invoice
+    - sync room charges up to discharge date (idempotent lines)
+    - recalc totals
+    - optionally approve invoice
     - lock billing at admission level
-    Idempotent if already discharged.
+
+    NOTE:
+    - No db.commit() here. Caller commits.
     """
+
+    # idempotent: if already discharged/locked, just return invoice info
     if adm.status == "discharged" or getattr(adm, "billing_locked", False):
-        # idempotent response
         inv = ensure_invoice_for_context(
             db=db,
             patient_id=adm.patient_id,
             billing_type="ip_billing",
             context_type="ipd",
             context_id=adm.id,
+            user_id=user.id,
         )
         return {
             "message": "Already discharged",
@@ -257,44 +264,68 @@ def _finalize_discharge_and_billing(
             "discharge_at": getattr(adm, "discharge_at", None),
         }
 
+    # safety: do not discharge before admitted_at (if present)
+    if getattr(adm, "admitted_at", None) and stop_ts < adm.admitted_at:
+        raise HTTPException(400, "discharge_at cannot be before admitted_at")
+
     # 1) discharge + bed release
     _mark_admission_status_and_release_bed(db, adm, "discharged", stop_ts)
 
-    # 2) invoice
+    # 2) ensure invoice (IPD module invoice under IP billing case)
     inv = ensure_invoice_for_context(
         db=db,
         patient_id=adm.patient_id,
         billing_type="ip_billing",
         context_type="ipd",
         context_id=adm.id,
+        user_id=user.id,
     )
 
-    # 3) apply bed charges (creates/updates InvoiceItem rows)
-    apply_ipd_bed_charges_to_invoice(
+    # block mutation if posted/void
+    if inv.status == DocStatus.POSTED:
+        raise HTTPException(
+            400,
+            "Invoice is POSTED; cannot auto-sync room charges. Use edit-request / credit-debit note flow.",
+        )
+    if inv.status == DocStatus.VOID:
+        raise HTTPException(400, "Invoice is VOID; cannot sync.")
+
+    # 3) sync room charges up to discharge date (creates/updates BillingInvoiceLine)
+    sync_ipd_room_charges(
         db=db,
         admission_id=adm.id,
-        upto_date=stop_ts.date(),
+        upto_dt=stop_ts,
         user_id=user.id,
-        tax_rate=0.0,
+        gst_rate=0.0,
         invoice_id=inv.id,
-        skip_if_already_billed=False,  # keep false so corrections re-sync
+        range_only=
+        True,  # don’t delete “future” lines automatically in discharge call
     )
 
-    # 4) recalc totals
-    inv.recalc()
-    db.add(inv)
+    # 4) totals (sync already recalcs, but keep explicit for clarity)
+    recalc_invoice_totals(db, inv.id)
 
-    # 5) finalize invoice (optional)
+    inv.updated_by = user.id
+    db.add(inv)
+    db.flush()
+
+    # 5) finalize invoice (optional) -> recommend APPROVED (not POSTED)
     if finalize_invoice:
-        inv.status = inv.status or "draft"
-        inv.finalized_at = datetime.utcnow()
-        inv.finalized_by = user.id
+        if inv.status == DocStatus.DRAFT:
+            inv.status = DocStatus.APPROVED
+            inv.approved_at = datetime.utcnow()
+            inv.approved_by = user.id
+        db.add(inv)
+        db.flush()
 
     # 6) lock admission billing
     adm.billing_locked = True
     adm.billing_locked_at = datetime.utcnow()
     adm.billing_locked_by = user.id
     adm.discharge_at = stop_ts
+
+    db.add(adm)
+    db.flush()
 
     return {
         "message": "Discharged successfully",

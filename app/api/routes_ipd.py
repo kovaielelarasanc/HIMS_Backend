@@ -99,7 +99,7 @@ from app.schemas.ipd import (
 
 # adjust if your model path differs
 # we will create this
-from app.services.ipd_billing import compute_ipd_bed_charges_daily
+from app.services.ipd_billing import compute_ipd_room_charges_daily
 from app.models.ipd import IpdBed, IpdBedAssignment, IpdAdmission
 from app.services.id_gen import make_ip_admission_code
 from app.services.billing_ipd_room import sync_ipd_room_charges
@@ -1224,7 +1224,7 @@ def _preview_bed_charges_core(admission_id: int, from_date: date,
     if not has_perm(user, "ipd.view"):
         raise HTTPException(403, "Not permitted")
 
-    data = compute_ipd_bed_charges_daily(db, admission_id, from_date, to_date)
+    data = compute_ipd_room_charges_daily(db, admission_id, from_date, to_date)
     if to_date < from_date:
         raise HTTPException(400, "to_date must be >= from_date")
 

@@ -1,14 +1,16 @@
-# FILE: app/services/billing_particulars.py
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, date
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
+import hashlib
+from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_
 
+from app.core.config import settings
 from app.models.billing import (
     BillingCase,
     DocStatus,
@@ -37,7 +39,6 @@ from app.services.billing_service import (
 # Department options (robust import + fallback)
 # -----------------------------
 def _get_department_model():
-    # Try common model locations; adjust if your project uses a different path
     try:
         from app.models.masters import Department  # type: ignore
         return Department
@@ -55,10 +56,12 @@ def _get_department_model():
         return None
 
 
-def department_options(db: Session,
-                       *,
-                       search: str = "",
-                       limit: int = 200) -> List[Dict[str, Any]]:
+def department_options(
+    db: Session,
+    *,
+    search: str = "",
+    limit: int = 200,
+) -> List[Dict[str, Any]]:
     limit = min(max(int(limit or 200), 1), 500)
     s = (search or "").strip().lower()
 
@@ -66,11 +69,9 @@ def department_options(db: Session,
     if Dept is not None:
         q = db.query(Dept)
 
-        # Optional flags if your model has them
         if hasattr(Dept, "is_active"):
             q = q.filter(getattr(Dept, "is_active").is_(True))
 
-        # Optional search
         if s:
             conds = []
             if hasattr(Dept, "name"):
@@ -84,7 +85,6 @@ def department_options(db: Session,
             if conds:
                 q = q.filter(or_(*conds))
 
-        # Sort
         if hasattr(Dept, "name"):
             q = q.order_by(getattr(Dept, "name").asc())
         else:
@@ -101,7 +101,6 @@ def department_options(db: Session,
             out.append({"id": did, "label": label})
         return out
 
-    # Fallback: build from users.department_id distinct (label will be generic)
     rows = (db.query(User.department_id).filter(
         User.department_id.isnot(None)).distinct().order_by(
             User.department_id.asc()).all())
@@ -176,18 +175,24 @@ def _parse_date(dt: Optional[str]) -> Optional[datetime]:
     if not s:
         return None
     try:
-        # support Z
         if s.endswith("Z"):
             s = s[:-1] + "+00:00"
-        # support plain YYYY-MM-DD
         if len(s) == 10:
             return datetime.fromisoformat(s + "T00:00:00")
-        # support "YYYY-MM-DD HH:MM"
         if " " in s and "T" not in s:
             s = s.replace(" ", "T", 1)
         return datetime.fromisoformat(s)
     except Exception:
         return None
+
+
+def _to_local_naive(dt: Optional[datetime]) -> Optional[datetime]:
+    if not dt:
+        return None
+    if dt.tzinfo is None:
+        return dt
+    tz = ZoneInfo(getattr(settings, "TIMEZONE", "Asia/Kolkata"))
+    return dt.astimezone(tz).replace(tzinfo=None)
 
 
 def _d(x) -> Decimal:
@@ -207,6 +212,29 @@ def _line_get(line: Dict[str, Any], key: str, default=None):
     return line.get(key, default) if isinstance(line, dict) else default
 
 
+def _enum_str(x: Any) -> str:
+    if hasattr(x, "value"):
+        return str(x.value or "")
+    return str(x or "")
+
+
+def _case_ref(case: BillingCase) -> int:
+    return int(getattr(case, "id", 0) or 0)
+
+
+def _mk_idem(case: BillingCase,
+             prefix: str,
+             item_id: Any,
+             key_dt: str,
+             suffix: str = "") -> (int, str):
+    # DB uniqueness is global: source_module + source_ref_id + source_line_key
+    # So: source_ref_id = case.id (unique per case)
+    ref = _case_ref(case)
+    base = f"CASE:{ref}:{prefix}:{item_id}:{key_dt}"
+    k = f"{base}:{suffix}" if suffix else base
+    return ref, k[:64]
+
+
 # -----------------------------
 # BED: suggested rate via IpdBedRate using room.type (case-insensitive)
 # -----------------------------
@@ -216,15 +244,13 @@ def _bed_rate_for_room_type(db: Session, room_type: str,
     if not rt:
         return Decimal("0")
 
-    q = (
-        db.query(IpdBedRate).filter(
-            IpdBedRate.is_active.is_(True),
-            func.upper(func.coalesce(IpdBedRate.room_type,
-                                     "")) == rt.upper(),  # ✅ case-insensitive
-            IpdBedRate.effective_from <= on_date,
-            or_(IpdBedRate.effective_to.is_(None), IpdBedRate.effective_to
-                >= on_date),
-        ).order_by(IpdBedRate.effective_from.desc(), IpdBedRate.id.desc()))
+    q = (db.query(IpdBedRate).filter(
+        IpdBedRate.is_active.is_(True),
+        func.upper(func.coalesce(IpdBedRate.room_type, "")) == rt.upper(),
+        IpdBedRate.effective_from <= on_date,
+        or_(IpdBedRate.effective_to.is_(None), IpdBedRate.effective_to
+            >= on_date),
+    ).order_by(IpdBedRate.effective_from.desc(), IpdBedRate.id.desc()))
     row = q.first()
     return _d(getattr(row, "daily_rate", 0)) if row else Decimal("0")
 
@@ -232,7 +258,7 @@ def _bed_rate_for_room_type(db: Session, room_type: str,
 def bed_options(
     db: Session,
     *,
-    case: BillingCase,  # ✅ need case for tariff_plan_id
+    case: BillingCase,
     ward_id: Optional[int],
     room_id: Optional[int],
     search: str = "",
@@ -243,8 +269,8 @@ def bed_options(
     s = (search or "").strip().lower()
     on_date = on_date or date.today()
 
-    wards = (db.query(IpdWard).filter(IpdWard.is_active.is_(True)).order_by(
-        IpdWard.name.asc()).all())
+    wards = db.query(IpdWard).filter(IpdWard.is_active.is_(True)).order_by(
+        IpdWard.name.asc()).all()
     ward_items = [{
         "id": int(w.id),
         "label": f"{w.name} ({w.code})"
@@ -289,7 +315,7 @@ def bed_options(
         suggested_gst = Decimal("0")
         rate_source = ""
 
-        # ✅ 1) Tariff rate (best) if configured
+        # 1) Tariff
         try:
             if getattr(case, "tariff_plan_id", None):
                 tr, tg = get_tariff_rate(
@@ -305,14 +331,14 @@ def bed_options(
         except Exception:
             pass
 
-        # ✅ 2) BedRate by room_type
+        # 2) BedRate by room_type
         if suggested <= 0:
             br = _bed_rate_for_room_type(db, room_type, on_date)
             if br > 0:
                 suggested = br
                 rate_source = "BED_RATE"
 
-        # ✅ 3) Room's own daily rate (if you store it there)
+        # 3) Room field fallback
         if suggested <= 0:
             for fld in ("daily_rate", "bed_rate", "rate_per_day",
                         "price_per_day"):
@@ -353,8 +379,7 @@ def lab_test_options(db: Session, *, search: str = "", limit: int = 80):
         q = q.filter(
             or_(
                 func.lower(LabTest.code).like(f"%{s}%"),
-                func.lower(LabTest.name).like(f"%{s}%"),
-            ))
+                func.lower(LabTest.name).like(f"%{s}%")))
     rows = q.order_by(LabTest.name.asc()).limit(limit).all()
 
     return {
@@ -400,7 +425,7 @@ def radiology_test_options(db: Session,
             "code": x.code,
             "name": x.name,
             "modality": x.modality,
-            "price": str(_d(x.price)),
+            "price": str(_d(x.price))
         } for x in rows]
     }
 
@@ -417,8 +442,7 @@ def ot_procedure_options(db: Session, *, search: str = "", limit: int = 80):
         q = q.filter(
             or_(
                 func.lower(OtProcedure.code).like(f"%{s}%"),
-                func.lower(OtProcedure.name).like(f"%{s}%"),
-            ))
+                func.lower(OtProcedure.name).like(f"%{s}%")))
     rows = q.order_by(OtProcedure.name.asc()).limit(limit).all()
 
     out = []
@@ -497,8 +521,7 @@ def charge_item_options(db: Session,
         q = q.filter(
             or_(
                 func.lower(ChargeItemMaster.code).like(f"%{s}%"),
-                func.lower(ChargeItemMaster.name).like(f"%{s}%"),
-            ))
+                func.lower(ChargeItemMaster.name).like(f"%{s}%")))
     rows = q.order_by(ChargeItemMaster.name.asc()).limit(limit).all()
 
     return {
@@ -513,7 +536,7 @@ def charge_item_options(db: Session,
 
 
 # -----------------------------
-# Doctor options (FIXED: users.is_doctor as primary, optional DoctorFee enrichment)
+# Doctor options
 # -----------------------------
 def doctor_fee_options(
     db: Session,
@@ -525,13 +548,11 @@ def doctor_fee_options(
     limit = min(max(int(limit or 80), 1), 200)
     s = (search or "").strip().lower()
 
-    # ✅ return departments list always (for dropdown)
     dept_items = department_options(db, limit=300)
 
     q = db.query(User).filter(User.is_active.is_(True),
                               User.is_doctor.is_(True))
 
-    # ✅ Filter by selected department
     if department_id:
         q = q.filter(User.department_id == int(department_id))
 
@@ -584,7 +605,7 @@ def doctor_fee_options(
 
 
 # -----------------------------
-# Options API (FIXED: accepts department_id)
+# Options API
 # -----------------------------
 def get_particular_options(
     db: Session,
@@ -593,7 +614,7 @@ def get_particular_options(
     code: str,
     ward_id: Optional[int] = None,
     room_id: Optional[int] = None,
-    department_id: Optional[int] = None,  # ✅ IMPORTANT (routes sends this)
+    department_id: Optional[int] = None,
     search: str = "",
     modality: str = "",
     limit: int = 80,
@@ -603,15 +624,20 @@ def get_particular_options(
     if not p:
         raise BillingError(f"Invalid particular '{code}'")
 
-    svc_dt = _parse_date(service_date_str)
+    svc_dt = _to_local_naive(_parse_date(service_date_str))
     on_date = svc_dt.date() if svc_dt else date.today()
 
     if p.kind == "BED":
         return {
-            "particular": {"code": p.code, "label": p.label, "kind": p.kind},
-            "options": bed_options(
+            "particular": {
+                "code": p.code,
+                "label": p.label,
+                "kind": p.kind
+            },
+            "options":
+            bed_options(
                 db,
-                case=case,  # ✅ added
+                case=case,
                 ward_id=ward_id,
                 room_id=room_id,
                 search=search,
@@ -620,7 +646,6 @@ def get_particular_options(
             ),
         }
 
-
     if p.kind == "LAB_TEST":
         return {
             "particular": {
@@ -628,7 +653,7 @@ def get_particular_options(
                 "label": p.label,
                 "kind": p.kind
             },
-            "options": lab_test_options(db, search=search, limit=limit),
+            "options": lab_test_options(db, search=search, limit=limit)
         }
 
     if p.kind == "RAD_TEST":
@@ -652,7 +677,7 @@ def get_particular_options(
                 "label": p.label,
                 "kind": p.kind
             },
-            "options": ot_procedure_options(db, search=search, limit=limit),
+            "options": ot_procedure_options(db, search=search, limit=limit)
         }
 
     if p.kind == "OT_SURGERY":
@@ -662,7 +687,7 @@ def get_particular_options(
                 "label": p.label,
                 "kind": p.kind
             },
-            "options": ot_surgery_options(db, search=search, limit=limit),
+            "options": ot_surgery_options(db, search=search, limit=limit)
         }
 
     if p.kind == "DOCTOR":
@@ -704,39 +729,40 @@ def get_particular_options(
 
 
 # -----------------------------
-# Add Lines (FULL)
+# Add Lines (FINAL)
 # -----------------------------
 def add_particular_lines(
-        db: Session,
-        *,
-        case: BillingCase,
-        user: Any,
-        code: str,
-        payer_type: PayerType = PayerType.PATIENT,
-        payer_id: Optional[int] = None,
-        invoice_type: Optional[InvoiceType] = None,
-        service_date_str: Optional[str] = None,
-        qty: Decimal = Decimal("1"),
-        gst_rate: Decimal = Decimal("0"),
-        discount_percent: Decimal = Decimal("0"),
-        discount_amount: Decimal = Decimal("0"),
-        item_ids: Optional[List[int]] = None,
-        doctor_id: Optional[int] = None,
-        unit_price: Optional[Decimal] = None,
-        description: Optional[str] = None,
-        ward_id: Optional[int] = None,
-        room_id: Optional[int] = None,
-        modality: Optional[str] = None,
-        duration_min: Optional[int] = None,
-        split_costs: bool = False,
-        hours: Optional[Decimal] = None,
-        lines: Optional[List[Dict[str, Any]]] = None,  # ✅ NEW
+    db: Session,
+    *,
+    case: BillingCase,
+    user: Any,
+    code: str,
+    payer_type: PayerType = PayerType.PATIENT,
+    payer_id: Optional[int] = None,
+    invoice_type: Optional[InvoiceType] = None,
+    service_date_str: Optional[str] = None,
+    qty: Decimal = Decimal("1"),
+    gst_rate: Decimal = Decimal("0"),
+    discount_percent: Decimal = Decimal("0"),
+    discount_amount: Decimal = Decimal("0"),
+    item_ids: Optional[List[int]] = None,
+    doctor_id: Optional[int] = None,
+    unit_price: Optional[Decimal] = None,
+    description: Optional[str] = None,
+    ward_id: Optional[int] = None,
+    room_id: Optional[int] = None,
+    modality: Optional[str] = None,
+    duration_min: Optional[int] = None,
+    split_costs: bool = False,
+    hours: Optional[Decimal] = None,
+    lines: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     p = _PART_MAP.get(code)
     if not p:
         raise BillingError(f"Invalid particular '{code}'")
 
-    if case.status.value in ("CLOSED", "CANCELLED"):
+    st = _enum_str(getattr(case, "status", None)).upper()
+    if st in ("CLOSED", "CANCELLED", "CANCELED"):
         raise BillingStateError("Cannot add items to CLOSED/CANCELLED case")
 
     inv_type = invoice_type or p.default_invoice_type
@@ -755,27 +781,26 @@ def add_particular_lines(
         raise BillingStateError(
             "Invoice is not editable (POSTED/VOID). Open a new invoice first.")
 
-    # ✅ Normalize work lines
     work: List[Dict[str, Any]] = []
     if lines:
         for ln in lines:
             if isinstance(ln, dict):
                 work.append(ln)
     else:
-        # backward compatible behavior
         if item_ids:
             for iid in item_ids:
                 work.append({"item_id": int(iid)})
         elif doctor_id:
             work.append({"doctor_id": int(doctor_id)})
         else:
-            work.append({})  # manual single
+            work.append({})
 
     added: List[int] = []
 
     def eff_dt(line: Dict[str, Any]) -> Optional[datetime]:
-        return _parse_date(_line_get(
+        dt = _parse_date(_line_get(
             line, "service_date")) or _parse_date(service_date_str)
+        return _to_local_naive(dt)
 
     def eff_qty(line: Dict[str, Any]) -> Decimal:
         return _d(_line_get(line, "qty", qty))
@@ -806,8 +831,7 @@ def add_particular_lines(
         return d0 or fallback
 
     def line_key_suffix(line: Dict[str, Any]) -> str:
-        s = (_line_get(line, "line_key") or "").strip()
-        return s
+        return (_line_get(line, "line_key") or "").strip()
 
     # ---------------- BED ----------------
     if p.kind == "BED":
@@ -839,10 +863,10 @@ def add_particular_lines(
                                          tariff_plan_id=case.tariff_plan_id,
                                          item_type="BED",
                                          item_id=bid)
-                if tr > 0:
-                    rate = tr
+                if _d(tr) > 0:
+                    rate = _d(tr)
                     if gst <= 0:
-                        gst = tg
+                        gst = _d(tg)
 
             if rate <= 0:
                 rate = _bed_rate_for_room_type(
@@ -853,9 +877,9 @@ def add_particular_lines(
                     f"No rate found for bed {bed.code}. Configure IpdBedRate or Tariff."
                 )
 
-            base_key = f"BED:{bid}:{key_dt}"
             suffix = line_key_suffix(ln_in)
-            source_line_key = f"{base_key}:{suffix}" if suffix else base_key
+            source_ref_id, source_line_key = _mk_idem(case, "BED", bid, key_dt,
+                                                      suffix)
 
             ln = upsert_auto_line(
                 db,
@@ -874,7 +898,7 @@ def add_particular_lines(
                 discount_percent=eff_disc_pct(ln_in),
                 discount_amount=eff_disc_amt(ln_in),
                 source_module=p.module,
-                source_ref_id=int(case.encounter_id),
+                source_ref_id=source_ref_id,
                 source_line_key=source_line_key,
                 service_date=svc_dt,
                 meta_patch={
@@ -895,7 +919,7 @@ def add_particular_lines(
 
         return {"invoice_id": int(inv.id), "added_line_ids": added}
 
-    # ---------------- LAB (multi) ----------------
+    # ---------------- LAB ----------------
     if p.kind == "LAB_TEST":
         for ln_in in work:
             tid = _safe_int(_line_get(ln_in, "item_id"))
@@ -915,9 +939,9 @@ def add_particular_lines(
             if rate <= 0:
                 raise BillingError(f"Lab test price missing: {t.name}")
 
-            base_key = f"LAB:{tid}:{key_dt}"
             suffix = line_key_suffix(ln_in)
-            source_line_key = f"{base_key}:{suffix}" if suffix else base_key
+            source_ref_id, source_line_key = _mk_idem(case, "LAB", tid, key_dt,
+                                                      suffix)
 
             ln = upsert_auto_line(
                 db,
@@ -935,7 +959,7 @@ def add_particular_lines(
                 discount_percent=eff_disc_pct(ln_in),
                 discount_amount=eff_disc_amt(ln_in),
                 source_module=p.module,
-                source_ref_id=tid,
+                source_ref_id=source_ref_id,
                 source_line_key=source_line_key,
                 service_date=svc_dt,
                 meta_patch={
@@ -950,7 +974,7 @@ def add_particular_lines(
 
         return {"invoice_id": int(inv.id), "added_line_ids": added}
 
-    # ---------------- RAD (multi) ----------------
+    # ---------------- RAD ----------------
     if p.kind == "RAD_TEST":
         for ln_in in work:
             rid = _safe_int(_line_get(ln_in, "item_id"))
@@ -970,9 +994,9 @@ def add_particular_lines(
             if rate <= 0:
                 raise BillingError(f"Radiology test price missing: {r.name}")
 
-            base_key = f"RAD:{rid}:{key_dt}"
             suffix = line_key_suffix(ln_in)
-            source_line_key = f"{base_key}:{suffix}" if suffix else base_key
+            source_ref_id, source_line_key = _mk_idem(case, "RAD", rid, key_dt,
+                                                      suffix)
 
             ln = upsert_auto_line(
                 db,
@@ -990,7 +1014,7 @@ def add_particular_lines(
                 discount_percent=eff_disc_pct(ln_in),
                 discount_amount=eff_disc_amt(ln_in),
                 source_module=p.module,
-                source_ref_id=rid,
+                source_ref_id=source_ref_id,
                 source_line_key=source_line_key,
                 service_date=svc_dt,
                 meta_patch={
@@ -998,7 +1022,7 @@ def add_particular_lines(
                         "test_id": rid,
                         "code": r.code,
                         "name": r.name,
-                        "modality": getattr(r, "modality", None),
+                        "modality": getattr(r, "modality", None)
                     }
                 },
             )
@@ -1015,9 +1039,9 @@ def add_particular_lines(
             if did <= 0:
                 raise BillingError("Select a doctor")
 
-            df = (db.query(DoctorFee).filter(
+            df = db.query(DoctorFee).filter(
                 DoctorFee.doctor_user_id == did,
-                DoctorFee.is_active.is_(True)).first())
+                DoctorFee.is_active.is_(True)).first()
 
             svc_dt = eff_dt(ln_in)
             key_dt = (svc_dt.date().isoformat()
@@ -1035,9 +1059,9 @@ def add_particular_lines(
             doc_name = (getattr(doc, "full_name", None)
                         or getattr(doc, "name", None) or f"Doctor #{did}")
 
-            base_key = f"DOC:{did}:{key_dt}"
             suffix = line_key_suffix(ln_in)
-            source_line_key = f"{base_key}:{suffix}" if suffix else base_key
+            source_ref_id, source_line_key = _mk_idem(case, "DOC", did, key_dt,
+                                                      suffix)
 
             ln = upsert_auto_line(
                 db,
@@ -1055,7 +1079,7 @@ def add_particular_lines(
                 discount_percent=eff_disc_pct(ln_in),
                 discount_amount=eff_disc_amt(ln_in),
                 source_module=p.module,
-                source_ref_id=did,
+                source_ref_id=source_ref_id,
                 source_line_key=source_line_key,
                 doctor_id=did,
                 service_date=svc_dt,
@@ -1077,7 +1101,7 @@ def add_particular_lines(
 
         return {"invoice_id": int(inv.id), "added_line_ids": added}
 
-    # ---------------- CHARGE ITEM (multi) ----------------
+    # ---------------- CHARGE ITEM ----------------
     if p.kind == "CHARGE_ITEM":
         for ln_in in work:
             iid = _safe_int(_line_get(ln_in, "item_id"))
@@ -1085,7 +1109,7 @@ def add_particular_lines(
                 raise BillingError("Each charge item line must have item_id")
 
             it = db.get(ChargeItemMaster, iid)
-            if not it or not it.is_active:
+            if not it or not getattr(it, "is_active", False):
                 raise BillingError(f"Invalid charge_item_id {iid}")
 
             if (getattr(it, "category", "") or "").upper() != p.code:
@@ -1106,9 +1130,9 @@ def add_particular_lines(
             if rate <= 0:
                 raise BillingError(f"Price missing for: {it.name}")
 
-            base_key = f"CHG:{iid}:{key_dt}"
             suffix = line_key_suffix(ln_in)
-            source_line_key = f"{base_key}:{suffix}" if suffix else base_key
+            source_ref_id, source_line_key = _mk_idem(case, "CHG", iid, key_dt,
+                                                      suffix)
 
             ln = upsert_auto_line(
                 db,
@@ -1126,7 +1150,7 @@ def add_particular_lines(
                 discount_percent=eff_disc_pct(ln_in),
                 discount_amount=eff_disc_amt(ln_in),
                 source_module=p.module,
-                source_ref_id=iid,
+                source_ref_id=source_ref_id,
                 source_line_key=source_line_key,
                 service_date=svc_dt,
                 meta_patch={
@@ -1134,7 +1158,7 @@ def add_particular_lines(
                         "id": iid,
                         "category": it.category,
                         "code": it.code,
-                        "name": it.name,
+                        "name": it.name
                     }
                 },
             )
@@ -1150,7 +1174,7 @@ def add_particular_lines(
                 raise BillingError("Each procedure line must have item_id")
 
             proc = db.get(OtProcedure, pid)
-            if not proc or not proc.is_active:
+            if not proc or not getattr(proc, "is_active", False):
                 raise BillingError("Invalid procedure")
 
             svc_dt = eff_dt(ln_in)
@@ -1159,10 +1183,8 @@ def add_particular_lines(
 
             mins = _safe_int(
                 _line_get(
-                    ln_in,
-                    "duration_min",
-                    duration_min or getattr(proc, "default_duration_min", 0),
-                ))
+                    ln_in, "duration_min", duration_min
+                    or getattr(proc, "default_duration_min", 0)))
             split = bool(_line_get(ln_in, "split_costs", split_costs))
 
             rate = eff_price_override(ln_in)
@@ -1178,9 +1200,9 @@ def add_particular_lines(
                         )
                     rate = (hr * Decimal(str(mins))) / Decimal("60")
 
-            base_key = f"PROC:{pid}:{key_dt}"
             suffix = line_key_suffix(ln_in)
-            source_line_key = f"{base_key}:{suffix}" if suffix else base_key
+            source_ref_id, source_line_key = _mk_idem(case, "PROC", pid,
+                                                      key_dt, suffix)
 
             if not split:
                 ln = upsert_auto_line(
@@ -1199,7 +1221,7 @@ def add_particular_lines(
                     discount_percent=eff_disc_pct(ln_in),
                     discount_amount=eff_disc_amt(ln_in),
                     source_module=p.module,
-                    source_ref_id=pid,
+                    source_ref_id=source_ref_id,
                     source_line_key=source_line_key,
                     service_date=svc_dt,
                     meta_patch={
@@ -1207,7 +1229,7 @@ def add_particular_lines(
                             "id": pid,
                             "code": proc.code,
                             "name": proc.name,
-                            "duration_min": mins,
+                            "duration_min": mins
                         }
                     },
                 )
@@ -1224,7 +1246,9 @@ def add_particular_lines(
                 for tag, amt in parts:
                     if amt <= 0:
                         continue
-                    k = f"{source_line_key}:{tag}"
+                    # tag is part of idempotency key
+                    _, k = _mk_idem(case, "PROC", pid, key_dt,
+                                    f"{suffix}:{tag}" if suffix else tag)
                     ln = upsert_auto_line(
                         db,
                         invoice_id=int(inv.id),
@@ -1242,7 +1266,7 @@ def add_particular_lines(
                         discount_percent=Decimal("0"),
                         discount_amount=Decimal("0"),
                         source_module=p.module,
-                        source_ref_id=pid,
+                        source_ref_id=source_ref_id,
                         source_line_key=k,
                         service_date=svc_dt,
                         meta_patch={
@@ -1250,7 +1274,7 @@ def add_particular_lines(
                                 "id": pid,
                                 "code": proc.code,
                                 "name": proc.name,
-                                "split": True,
+                                "split": True
                             }
                         },
                     )
@@ -1270,7 +1294,7 @@ def add_particular_lines(
                 raise BillingError("Each surgery line must have item_id")
 
             srg = db.get(OtSurgeryMaster, sid)
-            if not srg or not srg.active:
+            if not srg or not getattr(srg, "active", False):
                 raise BillingError("Invalid surgery")
 
             svc_dt = eff_dt(ln_in)
@@ -1288,9 +1312,9 @@ def add_particular_lines(
             if rate <= 0:
                 raise BillingError("Surgery price missing")
 
-            base_key = f"SURG:{sid}:{key_dt}"
             suffix = line_key_suffix(ln_in)
-            source_line_key = f"{base_key}:{suffix}" if suffix else base_key
+            source_ref_id, source_line_key = _mk_idem(case, "SURG", sid,
+                                                      key_dt, suffix)
 
             ln = upsert_auto_line(
                 db,
@@ -1308,7 +1332,7 @@ def add_particular_lines(
                 discount_percent=eff_disc_pct(ln_in),
                 discount_amount=eff_disc_amt(ln_in),
                 source_module=p.module,
-                source_ref_id=sid,
+                source_ref_id=source_ref_id,
                 source_line_key=source_line_key,
                 service_date=svc_dt,
                 meta_patch={
@@ -1323,7 +1347,7 @@ def add_particular_lines(
 
         return {"invoice_id": int(inv.id), "added_line_ids": added}
 
-    # ---------------- MANUAL fallback (supports multiple lines now) ----------------
+    # ---------------- MANUAL fallback ----------------
     for ln_in in work:
         svc_dt = eff_dt(ln_in)
         key_dt = (svc_dt.date().isoformat()
@@ -1334,7 +1358,9 @@ def add_particular_lines(
         if rate <= 0:
             raise BillingError("Amount is required")
 
-        base_key = f"SVC:{code}:{key_dt}:{desc[:20]}"
+        # safer than desc[:20]
+        h = hashlib.sha1(desc.encode("utf-8")).hexdigest()[:10]
+        base_key = f"SVC:{code}:{key_dt}:{h}"
         suffix = line_key_suffix(ln_in)
         source_line_key = f"{base_key}:{suffix}" if suffix else base_key
 
@@ -1355,7 +1381,7 @@ def add_particular_lines(
             discount_amount=eff_disc_amt(ln_in),
             source_module=p.module,
             source_ref_id=int(inv.id),
-            source_line_key=source_line_key,
+            source_line_key=source_line_key[:64],
             service_date=svc_dt,
             meta_patch={"particular": {
                 "code": p.code,

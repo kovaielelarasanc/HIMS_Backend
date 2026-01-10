@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import enum
 from enum import Enum as PyEnum
+
 from sqlalchemy import (
     Column,
     Integer,
@@ -19,7 +20,6 @@ from sqlalchemy import (
     JSON,
 )
 from sqlalchemy.orm import relationship
-from sqlalchemy.types import JSON
 from sqlalchemy.sql import func
 
 from app.db.base import Base
@@ -196,6 +196,8 @@ class BillingNumberSeries(Base):
     """
     DB-level counter row.
 
+    Tenant DB only => NO tenant_id.
+
     Use service layer:
       SELECT ... FOR UPDATE on this row -> increment next_number -> commit.
 
@@ -206,22 +208,21 @@ class BillingNumberSeries(Base):
     """
     __tablename__ = "billing_number_series"
     __table_args__ = (
-        UniqueConstraint("tenant_id",
-                         "doc_type",
-                         "reset_period",
-                         "prefix",
-                         name="uq_billing_number_series"),
+        UniqueConstraint(
+            "doc_type",
+            "reset_period",
+            "prefix",
+            name="uq_billing_number_series",
+        ),
         Index("idx_billing_number_series_doc", "doc_type"),
-        Index("idx_billing_number_series_tenant", "tenant_id"),
         MYSQL_ARGS,
     )
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
 
-    tenant_id = Column(Integer, nullable=True, index=True)
     doc_type = Column(Enum(NumberDocType), nullable=False)
 
-    # IMPORTANT: keep wider length because your prefix can be long (ORG + encounter + ddmmyyyy)
+    # prefix can be ORG + encounter + ddmmyyyy, keep length wide
     prefix = Column(String(64), nullable=False, default="")
     reset_period = Column(
         Enum(NumberResetPeriod),
@@ -388,8 +389,6 @@ class BillingCase(Base):
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
 
-    tenant_id = Column(Integer, nullable=True, index=True)
-
     patient_id = Column(
         Integer,
         ForeignKey("patients.id", ondelete="RESTRICT"),
@@ -468,9 +467,6 @@ class BillingCase(Base):
                          back_populates="billing_case",
                          cascade="all, delete-orphan")
 
-    # optional convenience: all lines through invoices (query-based)
-    # (keep it out as relationship to avoid heavy cascade)
-
 
 class BillingCaseLink(Base):
     """
@@ -535,7 +531,6 @@ class BillingInvoice(Base):
                             unique=True,
                             index=True)
 
-    # NEW (important for your multi-invoice dashboard): which module invoice is this?
     # LAB / RIS / PHARM / OT / ROOM / OPD / IPD / MISC / etc.
     module = Column(String(16), nullable=True, index=True)
 
@@ -597,8 +592,10 @@ class BillingInvoice(Base):
     notes = relationship("BillingNote",
                          back_populates="ref_invoice",
                          cascade="all, delete-orphan")
-    service_date = Column(DateTime, nullable=True)  # ✅ date shown in print
+
+    service_date = Column(DateTime, nullable=True)  # date shown in print
     meta_json = Column(JSON, nullable=True)
+
     pharmacy_sales = relationship(
         "PharmacySale",
         back_populates="billing_invoice",
@@ -615,13 +612,13 @@ class BillingInvoice(Base):
 class BillingInvoiceLine(Base):
     __tablename__ = "billing_invoice_lines"
     __table_args__ = (
-        # idempotency for AUTO lines (LAB/RIS/PHARM/OT/IPD etc)
-        # (manual lines should set source_module="MANUAL" and source_line_key unique)
-        UniqueConstraint("billing_case_id",
-                         "source_module",
-                         "source_ref_id",
-                         "source_line_key",
-                         name="uq_billing_lines_idempotent"),
+        UniqueConstraint(
+            "billing_case_id",
+            "source_module",
+            "source_ref_id",
+            "source_line_key",
+            name="uq_billing_lines_idempotent",
+        ),
         Index("idx_billing_lines_invoice", "invoice_id"),
         Index("idx_billing_lines_source", "source_module", "source_ref_id"),
         Index("idx_billing_lines_item", "item_type", "item_id"),
@@ -651,7 +648,6 @@ class BillingInvoiceLine(Base):
                            nullable=False,
                            default=ServiceGroup.MISC)
 
-    # LAB_TEST / RAD_TEST / DRUG / OT_PROC / SERVICE / ROOM / PACKAGE
     item_type = Column(String(32), nullable=True)
     item_id = Column(Integer, nullable=True)
     item_code = Column(String(64), nullable=True)
@@ -670,27 +666,21 @@ class BillingInvoiceLine(Base):
     line_total = Column(Money, nullable=False, default=0)
     net_amount = Column(Money, nullable=False, default=0)
 
-    revenue_head_id = Column(
-        Integer,
-        ForeignKey("billing_revenue_heads.id", ondelete="RESTRICT"),
-        nullable=True,
-    )
+    revenue_head_id = Column(Integer,
+                             ForeignKey("billing_revenue_heads.id",
+                                        ondelete="RESTRICT"),
+                             nullable=True)
+    cost_center_id = Column(Integer,
+                            ForeignKey("billing_cost_centers.id",
+                                       ondelete="RESTRICT"),
+                            nullable=True)
 
-    cost_center_id = Column(
-        Integer,
-        ForeignKey("billing_cost_centers.id", ondelete="RESTRICT"),
-        nullable=True,
-    )
-
-    doctor_id = Column(
-        Integer,
-        ForeignKey("users.id", ondelete="SET NULL"),
-        nullable=True,
-        index=True,
-    )
+    doctor_id = Column(Integer,
+                       ForeignKey("users.id", ondelete="SET NULL"),
+                       nullable=True,
+                       index=True)
 
     # AUTO sync references
-    # LAB/RIS/PHARM/OT/IPD/OPD etc
     source_module = Column(String(16), nullable=True)
     source_ref_id = Column(
         BigInteger,
@@ -778,7 +768,6 @@ class BillingPayment(Base):
                          ForeignKey("users.id", ondelete="SET NULL"),
                          nullable=True)
 
-    # store receipt no / remark in notes (or you can create separate receipt table later)
     notes = Column(String(255), nullable=True)
 
     created_at = Column(DateTime, nullable=False, server_default=func.now())
@@ -851,7 +840,6 @@ class BillingInsuranceCase(Base):
                         nullable=False,
                         default=InsurancePayerKind.INSURANCE)
 
-    # You can later FK these to your TPA/Insurance master tables
     insurance_company_id = Column(Integer, nullable=True)
     tpa_id = Column(Integer, nullable=True)
     corporate_id = Column(Integer, nullable=True)
@@ -1080,17 +1068,14 @@ class BillingNoteLine(Base):
     line_total = Column(Money, nullable=False, default=0)
     net_amount = Column(Money, nullable=False, default=0)
 
-    revenue_head_id = Column(
-        Integer,
-        ForeignKey("billing_revenue_heads.id", ondelete="RESTRICT"),
-        nullable=True,
-    )
-
-    cost_center_id = Column(
-        Integer,
-        ForeignKey("billing_cost_centers.id", ondelete="RESTRICT"),
-        nullable=True,
-    )
+    revenue_head_id = Column(Integer,
+                             ForeignKey("billing_revenue_heads.id",
+                                        ondelete="RESTRICT"),
+                             nullable=True)
+    cost_center_id = Column(Integer,
+                            ForeignKey("billing_cost_centers.id",
+                                       ondelete="RESTRICT"),
+                            nullable=True)
 
     created_at = Column(DateTime, nullable=False, server_default=func.now())
 
@@ -1110,50 +1095,56 @@ class BillingInvoiceEditRequest(Base):
     __table_args__ = (
         Index("ix_bier_invoice_status", "invoice_id", "status"),
         Index("ix_bier_status_requested_at", "status", "requested_at"),
-        {
-            "mysql_engine": "InnoDB",
-            "mysql_charset": "utf8mb4",
-            "mysql_collate": "utf8mb4_unicode_ci",
-        },
+        MYSQL_ARGS,
     )
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
 
-    invoice_id = Column(Integer,
-                        ForeignKey("billing_invoices.id", ondelete="CASCADE"),
-                        index=True,
-                        nullable=False)
-    billing_case_id = Column(Integer,
-                             ForeignKey("billing_cases.id",
-                                        ondelete="CASCADE"),
-                             index=True,
-                             nullable=False)
+    invoice_id = Column(
+        BigInteger,
+        ForeignKey("billing_invoices.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+    billing_case_id = Column(
+        BigInteger,
+        ForeignKey("billing_cases.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
 
     status = Column(String(20),
                     nullable=False,
                     default=InvoiceEditRequestStatus.PENDING.value)
     reason = Column(String(255), nullable=False, default="")
 
-    requested_by_user_id = Column(Integer,
-                                  ForeignKey("users.id", ondelete="RESTRICT"),
-                                  index=True,
-                                  nullable=False)
+    requested_by_user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        index=True,
+        nullable=False,
+    )
     requested_at = Column(DateTime, server_default=func.now(), nullable=False)
 
-    reviewed_by_user_id = Column(Integer,
-                                 ForeignKey("users.id", ondelete="RESTRICT"),
-                                 index=True,
-                                 nullable=True)
+    reviewed_by_user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        index=True,
+        nullable=True,
+    )
     reviewed_at = Column(DateTime, nullable=True)
     decision_notes = Column(String(255), nullable=False, default="")
 
     unlock_hours = Column(Integer, nullable=False, default=24)
     expires_at = Column(DateTime, nullable=True)
+
     applied = Column(Boolean, nullable=False, default=False)
 
-    # relationships
     invoice = relationship("BillingInvoice", foreign_keys=[invoice_id])
     case = relationship("BillingCase", foreign_keys=[billing_case_id])
+    requested_by_user = relationship("User",
+                                     foreign_keys=[requested_by_user_id])
+    reviewed_by_user = relationship("User", foreign_keys=[reviewed_by_user_id])
 
 
 # ============================================================
@@ -1170,11 +1161,9 @@ class BillingAuditLog(Base):
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
 
-    # case / invoice / line / payment / advance / preauth / claim / note
     entity_type = Column(String(32), nullable=False)
     entity_id = Column(BigInteger, nullable=False)
 
-    # create / update / approve / post / void / sync / capture
     action = Column(String(32), nullable=False)
 
     old_json = Column(JSON, nullable=True)

@@ -1,13 +1,17 @@
+# File: app/services/billing_service.py
 from __future__ import annotations
 
+import inspect
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date as dt_date
 from decimal import Decimal
 from io import BytesIO
 from typing import Any, Dict, Optional, Tuple, List
 from zoneinfo import ZoneInfo
-from sqlalchemy import func
+from fastapi import HTTPException
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 from app.core.config import settings
 from app.models.billing import (
     BillingAdvance,
@@ -27,9 +31,12 @@ from app.models.billing import (
     PayerType,
     ServiceGroup,
     AdvanceType,
+    BillingAuditLog,
 )
-
+from app.models.user import User
 from app.services.id_gen import next_billing_case_number, next_invoice_number
+from app.services.billing_calc import recompute_invoice_totals, recompute_line_amounts, line_is_deleted
+from app.models.opd import Appointment, Visit
 
 
 # ============================================================
@@ -41,6 +48,16 @@ class BillingError(RuntimeError):
 
 class BillingStateError(BillingError):
     pass
+
+
+def _enum_value(x):
+    return x.value if hasattr(x, "value") else x
+
+
+def _require_draft(inv: BillingInvoice):
+    if _enum_value(inv.status) != "DRAFT":
+        raise HTTPException(status_code=409,
+                            detail="Invoice locked. Reopen to edit.")
 
 
 # ============================================================
@@ -76,23 +93,114 @@ def _merge_meta(obj: Any, patch: Dict[str, Any]) -> None:
     current = getattr(obj, "meta_json", None)
     if not isinstance(current, dict):
         current = {}
-    # shallow merge
     current.update(patch or {})
     setattr(obj, "meta_json", current)
 
 
-# ============================================================
-# Number generators (compatible with your mixed signatures)
-# ============================================================
-import inspect
+def _now_local() -> datetime:
+    tz = ZoneInfo(getattr(settings, "TIMEZONE", "Asia/Kolkata"))
+    return datetime.now(timezone.utc).astimezone(tz)
 
 
+def _utcnow_naive() -> datetime:
+    return datetime.utcnow()
+
+
+def _to_local_naive(dt: Optional[datetime]) -> Optional[datetime]:
+    if not dt:
+        return None
+    if dt.tzinfo is None:
+        return dt
+    tz = ZoneInfo(getattr(settings, "TIMEZONE", "Asia/Kolkata"))
+    return dt.astimezone(tz).replace(tzinfo=None)
+
+
+# ============================================================
+# ✅ ACTIVE-LINE FILTER (fix for "deleted line still counted")
+# ============================================================
+def _apply_active_line_filter(q):
+    if hasattr(BillingInvoiceLine, "is_deleted"):
+        q = q.filter(
+            or_(BillingInvoiceLine.is_deleted == False,
+                BillingInvoiceLine.is_deleted.is_(None)))  # noqa: E712
+    if hasattr(BillingInvoiceLine, "is_active"):
+        q = q.filter(
+            or_(BillingInvoiceLine.is_active == True,
+                BillingInvoiceLine.is_active.is_(None)))  # noqa: E712
+    if hasattr(BillingInvoiceLine, "deleted_at"):
+        q = q.filter(BillingInvoiceLine.deleted_at.is_(None))
+    if hasattr(BillingInvoiceLine, "voided_at"):
+        q = q.filter(BillingInvoiceLine.voided_at.is_(None))
+
+    if hasattr(BillingInvoiceLine, "status"):
+        try:
+            bad = ["VOID", "CANCELLED", "CANCELED", "DELETED", "REMOVED"]
+            candidates = list(bad)
+            try:
+                candidates.append(DocStatus.VOID)
+            except Exception:
+                pass
+            q = q.filter(~BillingInvoiceLine.status.in_(candidates))
+        except Exception:
+            pass
+
+    # ✅ fallback tombstone marker (works even if no is_deleted column exists)
+    if hasattr(BillingInvoiceLine, "description"):
+        try:
+            q = q.filter(~BillingInvoiceLine.description.ilike("%(REMOVED)%"))
+        except Exception:
+            pass
+
+    return q
+
+
+def _line_is_removed(ln: BillingInvoiceLine) -> bool:
+    try:
+        if hasattr(ln, "is_deleted") and bool(getattr(ln,
+                                                      "is_deleted")) is True:
+            return True
+        if hasattr(ln, "is_active") and getattr(ln, "is_active") is False:
+            return True
+        if hasattr(ln, "deleted_at") and getattr(ln, "deleted_at",
+                                                 None) is not None:
+            return True
+        if hasattr(ln, "voided_at") and getattr(ln, "voided_at",
+                                                None) is not None:
+            return True
+        if hasattr(ln, "status"):
+            st = getattr(ln, "status", None)
+            s = st if isinstance(st, str) else (getattr(
+                st, "value", None) or getattr(st, "name", None) or str(st))
+            if str(s).upper() in {
+                    "VOID", "CANCELLED", "CANCELED", "DELETED", "REMOVED"
+            }:
+                return True
+
+        mj = getattr(ln, "meta_json", None)
+        if isinstance(mj, dict):
+            dv = mj.get("deleted")
+            if dv is True or isinstance(dv, dict):
+                return True
+            if mj.get("deleted_flag") is True:
+                return True
+
+        qty = _d(getattr(ln, "qty", 0))
+        desc = (getattr(ln, "description", "") or "")
+        if qty <= 0 and "(REMOVED)" in desc:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+# ============================================================
+# Number generators (compatible with mixed signatures)
+# ============================================================
 def _safe_call_idgen(fn, db: Session, **kwargs) -> str:
     """
-    Calls your id_gen functions without tenant logic.
-    If id_gen still requires tenant_id, we pass tenant_id=None as a compatibility fallback.
+    Calls id_gen functions safely.
+    If id_gen requires tenant_id, we pass tenant_id=None as fallback.
     """
-    sig = None
     try:
         sig = inspect.signature(fn)
         allowed = set(sig.parameters.keys())
@@ -102,20 +210,16 @@ def _safe_call_idgen(fn, db: Session, **kwargs) -> str:
     def _filtered(d: dict) -> dict:
         return {k: v for k, v in d.items() if k in allowed}
 
-    # 1) try without tenant_id
+    # try as-is
     try:
         return fn(db, **_filtered(kwargs))
     except TypeError:
         pass
 
-    # 2) compatibility fallback ONLY if id_gen requires tenant_id
-    #    (still not using tenant logic; value is None)
-    try:
-        kwargs2 = dict(kwargs)
-        kwargs2["tenant_id"] = None
-        return fn(db, **_filtered(kwargs2))
-    except TypeError as e:
-        raise e
+    # fallback tenant_id=None
+    kwargs2 = dict(kwargs)
+    kwargs2["tenant_id"] = None
+    return fn(db, **_filtered(kwargs2))
 
 
 def _call_next_case_number(
@@ -129,7 +233,6 @@ def _call_next_case_number(
     et = encounter_type.value if hasattr(encounter_type,
                                          "value") else str(encounter_type)
 
-    # Try your common signatures (no tenant_id)
     for args in [
         {
             "encounter_type": et,
@@ -138,7 +241,8 @@ def _call_next_case_number(
         {
             "encounter_type": et,
             "on_date": on_date,
-            "padding": padding or 6
+            "padding": padding or 6,
+            "reset_period": reset_period
         },
         {
             "encounter_type": et
@@ -149,7 +253,6 @@ def _call_next_case_number(
         except TypeError:
             continue
 
-    # if all fail, raise the last signature error
     return _safe_call_idgen(next_billing_case_number, db, encounter_type=et)
 
 
@@ -172,7 +275,8 @@ def _call_next_invoice_number(
         {
             "encounter_type": et,
             "on_date": on_date,
-            "padding": padding or 6
+            "padding": padding or 6,
+            "reset_period": reset_period
         },
         {
             "encounter_type": et
@@ -186,25 +290,69 @@ def _call_next_invoice_number(
     return _safe_call_idgen(next_invoice_number, db, encounter_type=et)
 
 
+def _ensure_case_number(db: Session, case: BillingCase, *,
+                        reset_period: NumberResetPeriod) -> None:
+    """
+    ✅ Fix for: case_number stuck as 'TEMP'
+    - If case_number is TEMP/blank -> generate and persist
+    """
+    cur = getattr(case, "case_number", None)
+    if cur and str(cur).strip() and str(cur).upper() != "TEMP":
+        return
+
+    try:
+        case.case_number = _call_next_case_number(
+            db,
+            encounter_type=case.encounter_type,
+            reset_period=reset_period,
+            on_date=_now_local(),
+            padding=6,
+        )
+    except Exception:
+        # hard fallback (never leave TEMP)
+        et = case.encounter_type.value if hasattr(
+            case.encounter_type, "value") else str(case.encounter_type)
+        case.case_number = f"{et}CASE{_now_local().strftime('%d%m%Y')}{secrets.randbelow(1000000):06d}"
+
+    _set_if_has(case, "updated_at", _utcnow_naive())
+    db.flush()
+
+
+def _ensure_invoice_number(db: Session, inv: BillingInvoice, *,
+                           encounter_type: EncounterType,
+                           reset_period: NumberResetPeriod) -> None:
+    cur = getattr(inv, "invoice_number", None)
+    if cur and str(cur).strip() and str(cur).upper() != "TEMP":
+        return
+    try:
+        inv.invoice_number = _call_next_invoice_number(
+            db,
+            encounter_type=encounter_type,
+            reset_period=reset_period,
+            on_date=_now_local(),
+            padding=6,
+        )
+    except Exception:
+        et = encounter_type.value if hasattr(encounter_type,
+                                             "value") else str(encounter_type)
+        inv.invoice_number = f"{et}-{_now_local().strftime('%d%m%Y')}-{secrets.randbelow(1000000):06d}"
+    _set_if_has(inv, "updated_at", _utcnow_naive())
+    db.flush()
+
+
 # ============================================================
 # GST split helpers (stored into meta_json)
 # ============================================================
-def _gst_split(
-    gst_rate: Decimal,
-    *,
-    intra_state: bool = True,
-) -> Dict[str, Decimal]:
-    """
-    If intra_state: GST splits into CGST+SGST (half+half)
-    Else: IGST only (full)
-    """
+def _gst_split(gst_rate: Decimal,
+               *,
+               intra_state: bool = True) -> Dict[str, Decimal]:
     r = _d(gst_rate)
     if r <= 0:
         return {
             "gst_rate": Decimal("0"),
             "cgst_rate": Decimal("0"),
             "sgst_rate": Decimal("0"),
-            "igst_rate": Decimal("0"),
+            "igst_rate": Decimal("0")
         }
     if intra_state:
         half = (r / Decimal("2"))
@@ -212,23 +360,18 @@ def _gst_split(
             "gst_rate": r,
             "cgst_rate": half,
             "sgst_rate": half,
-            "igst_rate": Decimal("0"),
+            "igst_rate": Decimal("0")
         }
     return {
         "gst_rate": r,
         "cgst_rate": Decimal("0"),
         "sgst_rate": Decimal("0"),
-        "igst_rate": r,
+        "igst_rate": r
     }
 
 
-def _gst_amount_split(
-    tax_amount: Decimal,
-    split_rates: Dict[str, Decimal],
-) -> Dict[str, Decimal]:
-    """
-    Splits the computed tax_amount into CGST/SGST/IGST amounts.
-    """
+def _gst_amount_split(tax_amount: Decimal,
+                      split_rates: Dict[str, Decimal]) -> Dict[str, Decimal]:
     tax = _d(tax_amount)
     if tax <= 0:
         return {
@@ -241,11 +384,9 @@ def _gst_amount_split(
     sgst_r = _d(split_rates.get("sgst_rate"))
     igst_r = _d(split_rates.get("igst_rate"))
 
-    # If IGST used, all tax is IGST
     if igst_r > 0 and (cgst_r + sgst_r) <= 0:
         return {"cgst": Decimal("0"), "sgst": Decimal("0"), "igst": tax}
 
-    # Otherwise split equally into cgst/sgst (safe even if rate odd)
     half = (tax / Decimal("2"))
     return {"cgst": half, "sgst": half, "igst": Decimal("0")}
 
@@ -276,11 +417,25 @@ def get_tariff_rate(
     return _d(row.rate), _d(row.gst_rate)
 
 
+def _tariff_lookup_first(db: Session, *, tariff_plan_id: Optional[int],
+                         item_id: Optional[int],
+                         item_types: List[str]) -> Tuple[Decimal, Decimal]:
+    if not tariff_plan_id or not item_id:
+        return Decimal("0"), Decimal("0")
+    for t in item_types:
+        r, g = get_tariff_rate(db,
+                               tariff_plan_id=tariff_plan_id,
+                               item_type=t,
+                               item_id=int(item_id))
+        if _d(r) > 0:
+            return _d(r), _d(g)
+    return Decimal("0"), Decimal("0")
+
+
 # ============================================================
 # Encounter -> patient_id resolvers
 # ============================================================
 def _patient_id_from_visit(db: Session, visit_id: int) -> int:
-    # local imports to avoid circular deps
     from app.models.opd import Visit, Appointment  # adjust if your path differs
 
     v = db.get(Visit, int(visit_id))
@@ -309,44 +464,67 @@ def get_or_create_case_for_op_visit(
     db: Session,
     *,
     visit_id: int,
-    user,
+    user: Any,
+    appointment_id: Optional[int] = None,
     tariff_plan_id: Optional[int] = None,
     reset_period: NumberResetPeriod = NumberResetPeriod.NONE,
 ) -> BillingCase:
-    # NO tenant filter
-    case = (db.query(BillingCase).filter(
-        BillingCase.encounter_type == EncounterType.OP,
-        BillingCase.encounter_id == int(visit_id),
-    ).first())
-    if case:
-        if tariff_plan_id is not None:
-            case.tariff_plan_id = tariff_plan_id
-            case.updated_by = getattr(user, "id", None)
-            db.flush()
-        return case
+    """
+    Idempotent OP BillingCase creator.
+    - encounter_type = OP
+    - encounter_id = visit_id
+    - case_number generated via your id_gen (NO tenant_id needed in DB-per-tenant)
+    """
+    visit_id = int(visit_id)
 
-    pid = _patient_id_from_visit(db, int(visit_id))
+    op_et = EncounterType.OP if hasattr(EncounterType, "OP") else "OP"
+
+    existing = (db.query(BillingCase).filter(
+        BillingCase.encounter_type == op_et,
+        BillingCase.encounter_id == visit_id,
+    ).first())
+    if existing:
+        if tariff_plan_id is not None and hasattr(existing, "tariff_plan_id"):
+            existing.tariff_plan_id = tariff_plan_id
+            existing.updated_by = getattr(user, "id", None)
+        _ensure_case_number(db, existing, reset_period=reset_period)
+        db.flush()
+        return existing
+
+    v = db.get(Visit, visit_id)
+    if not v:
+        raise ValueError(f"Visit not found: {visit_id}")
+
+    ap_id = appointment_id or getattr(v, "appointment_id", None)
+    on_date = None
+    if ap_id:
+        ap = db.get(Appointment, int(ap_id))
+        if ap and getattr(ap, "date", None):
+            on_date = ap.date
+    if on_date is None:
+        vat = getattr(v, "visit_at", None)
+        on_date = vat.date() if vat else dt_date.today()
+
+    created_by = int(getattr(user, "id", 0) or 0) or 1
 
     case = BillingCase(
-        patient_id=pid,
-        encounter_type=EncounterType.OP,
-        encounter_id=int(visit_id),
+        patient_id=int(v.patient_id),
+        encounter_type=op_et,
+        encounter_id=visit_id,
         case_number="TEMP",
-        status=BillingCaseStatus.OPEN,
-        payer_mode=PayerMode.SELF,
-        tariff_plan_id=tariff_plan_id,
-        created_by=getattr(user, "id", None),
-        updated_by=getattr(user, "id", None),
+        status=BillingCaseStatus.OPEN
+        if hasattr(BillingCaseStatus, "OPEN") else "OPEN",
+        payer_mode=PayerMode.SELF if hasattr(PayerMode, "SELF") else "SELF",
+        tariff_plan_id=tariff_plan_id
+        if hasattr(BillingCase, "tariff_plan_id") else None,
+        created_by=created_by,
+        updated_by=created_by,
     )
+
     db.add(case)
     db.flush()
 
-    case.case_number = _call_next_case_number(
-        db,
-        encounter_type=EncounterType.OP,
-        reset_period=reset_period,
-    )
-    db.flush()
+    _ensure_case_number(db, case, reset_period=reset_period)
     return case
 
 
@@ -358,7 +536,6 @@ def get_or_create_case_for_ip_admission(
     tariff_plan_id: Optional[int] = None,
     reset_period: NumberResetPeriod = NumberResetPeriod.NONE,
 ) -> BillingCase:
-    # NO tenant filter
     case = (db.query(BillingCase).filter(
         BillingCase.encounter_type == EncounterType.IP,
         BillingCase.encounter_id == int(admission_id),
@@ -367,7 +544,8 @@ def get_or_create_case_for_ip_admission(
         if tariff_plan_id is not None:
             case.tariff_plan_id = tariff_plan_id
             case.updated_by = getattr(user, "id", None)
-            db.flush()
+        _ensure_case_number(db, case, reset_period=reset_period)
+        db.flush()
         return case
 
     from app.models.ipd import IpdAdmission  # adjust if your path differs
@@ -391,34 +569,23 @@ def get_or_create_case_for_ip_admission(
     db.add(case)
     db.flush()
 
-    case.case_number = _call_next_case_number(
-        db,
-        encounter_type=EncounterType.IP,
-        reset_period=reset_period,
-    )
-    db.flush()
+    _ensure_case_number(db, case, reset_period=reset_period)
     return case
 
 
 # ============================================================
 # Invoice (module-wise)
 # ============================================================
-def _now_local():
-    tz = ZoneInfo(getattr(settings, "TIMEZONE", "Asia/Kolkata"))
-    return datetime.now(timezone.utc).astimezone(tz)
-
-
 def create_invoice(
-        db: Session,
-        *,
-        billing_case_id: int,
-        user,
-        module: Optional[str] = None,
-        invoice_type: InvoiceType = InvoiceType.PATIENT,
-        payer_type: PayerType = PayerType.PATIENT,
-        payer_id: Optional[int] = None,
-        reset_period: NumberResetPeriod = NumberResetPeriod.
-    NONE,  # daily series (date included)
+    db: Session,
+    *,
+    billing_case_id: int,
+    user,
+    module: Optional[str] = None,
+    invoice_type: InvoiceType = InvoiceType.PATIENT,
+    payer_type: PayerType = PayerType.PATIENT,
+    payer_id: Optional[int] = None,
+    reset_period: NumberResetPeriod = NumberResetPeriod.NONE,
 ) -> BillingInvoice:
     case = db.get(BillingCase, int(billing_case_id))
     if not case:
@@ -444,17 +611,11 @@ def create_invoice(
     db.add(inv)
     db.flush()
 
-    # ✅ THIS is your good format generator:
-    inv.invoice_number = next_invoice_number(
-        db,
-        tenant_id=None,  # no tenant use; id_gen maps this to 0 internally
-        encounter_type=(case.encounter_type.value if hasattr(
-            case.encounter_type, "value") else str(case.encounter_type)),
-        on_date=_now_local(),  # ensures DDMMYYYY is correct for IST
-        padding=6,
-        reset_period=reset_period,
-    )
-    db.flush()
+    # ✅ keep your preferred invoice format generator
+    _ensure_invoice_number(db,
+                           inv,
+                           encounter_type=case.encounter_type,
+                           reset_period=reset_period)
     return inv
 
 
@@ -469,12 +630,6 @@ def get_or_create_active_module_invoice(
     payer_id: Optional[int] = None,
     reset_period: NumberResetPeriod = NumberResetPeriod.NONE,
 ) -> BillingInvoice:
-    """
-    Module-wise invoice rule:
-    - Return latest invoice for (case, module, invoice_type, payer_type, payer_id)
-      that is in DRAFT/APPROVED (safe for adding lines)
-    - If only POSTED exists -> create new DRAFT invoice (same module/payer)
-    """
     inv = (db.query(BillingInvoice).filter(
         BillingInvoice.billing_case_id == int(billing_case_id),
         BillingInvoice.module == str(module),
@@ -484,6 +639,13 @@ def get_or_create_active_module_invoice(
         BillingInvoice.status.in_([DocStatus.DRAFT, DocStatus.APPROVED]),
     ).order_by(BillingInvoice.id.desc()).first())
     if inv:
+        # ensure invoice_number not TEMP (legacy)
+        case = db.get(BillingCase, int(billing_case_id))
+        if case:
+            _ensure_invoice_number(db,
+                                   inv,
+                                   encounter_type=case.encounter_type,
+                                   reset_period=reset_period)
         return inv
 
     return create_invoice(
@@ -503,13 +665,14 @@ def _recalc_invoice_totals(db: Session, invoice_id: int) -> None:
     if not inv:
         return
 
-    # Use DB truth from lines
-    row = (db.query(
+    q = db.query(
         func.coalesce(func.sum(BillingInvoiceLine.line_total), 0),
         func.coalesce(func.sum(BillingInvoiceLine.discount_amount), 0),
         func.coalesce(func.sum(BillingInvoiceLine.tax_amount), 0),
         func.coalesce(func.sum(BillingInvoiceLine.net_amount), 0),
-    ).filter(BillingInvoiceLine.invoice_id == int(inv.id)).first())
+    ).filter(BillingInvoiceLine.invoice_id == int(inv.id))
+    q = _apply_active_line_filter(q)
+    row = q.first()
 
     inv.sub_total = _d(row[0] if row else 0)
     inv.discount_total = _d(row[1] if row else 0)
@@ -518,8 +681,11 @@ def _recalc_invoice_totals(db: Session, invoice_id: int) -> None:
     inv.grand_total = _d(row[3] if row else 0)
 
     # GST split totals (meta_json)
-    lines = (db.query(BillingInvoiceLine).filter(
-        BillingInvoiceLine.invoice_id == int(inv.id)).all())
+    ql = db.query(BillingInvoiceLine).filter(
+        BillingInvoiceLine.invoice_id == int(inv.id))
+    ql = _apply_active_line_filter(ql)
+    lines = ql.all()
+
     cgst = Decimal("0")
     sgst = Decimal("0")
     igst = Decimal("0")
@@ -529,7 +695,6 @@ def _recalc_invoice_totals(db: Session, invoice_id: int) -> None:
         if tax <= 0:
             continue
 
-        # Prefer explicit meta_json split if present
         mj = getattr(ln, "meta_json", None)
         if isinstance(mj, dict) and isinstance(mj.get("gst"), dict):
             g = mj["gst"]
@@ -538,21 +703,22 @@ def _recalc_invoice_totals(db: Session, invoice_id: int) -> None:
             igst += _d(g.get("igst_amount"))
             continue
 
-        # Fallback split: intra-state assumed (half/half)
         cgst += (tax / Decimal("2"))
         sgst += (tax / Decimal("2"))
 
     _merge_meta(
-        inv, {
+        inv,
+        {
             "gst": {
                 "cgst_total": _dec_s(cgst),
                 "sgst_total": _dec_s(sgst),
                 "igst_total": _dec_s(igst),
                 "tax_total": _dec_s(_d(inv.tax_total)),
             }
-        })
+        },
+    )
 
-    inv.updated_at = datetime.utcnow()
+    _set_if_has(inv, "updated_at", _utcnow_naive())
     db.flush()
 
 
@@ -578,21 +744,25 @@ def add_auto_line_idempotent(
     source_line_key: str,
     doctor_id: Optional[int] = None,
     intra_state_gst: bool = True,
-    is_manual: bool = False,  # ✅ to stop your current TypeError from hooks
+    is_manual: bool = False,
     manual_reason: Optional[str] = None,
     meta_patch: Optional[Dict[str, Any]] = None,
 ) -> Optional[BillingInvoiceLine]:
-    """
-    Uses unique key: (billing_case_id, source_module, source_ref_id, source_line_key)
-    If already exists -> returns None
-    """
-    exists = (db.query(BillingInvoiceLine.id).filter(
+    inv = db.get(BillingInvoice, int(invoice_id))
+    if not inv:
+        raise BillingError("Invoice not found")
+    if inv.status not in (DocStatus.DRAFT, DocStatus.APPROVED):
+        raise BillingStateError("Cannot add lines to POSTED/VOID invoice")
+
+    # ✅ IMPORTANT: idempotency must check ALL lines (including deleted tombstones)
+    existing_any = (db.query(BillingInvoiceLine).filter(
         BillingInvoiceLine.billing_case_id == int(billing_case_id),
         BillingInvoiceLine.source_module == str(source_module),
         BillingInvoiceLine.source_ref_id == int(source_ref_id),
         BillingInvoiceLine.source_line_key == str(source_line_key),
-    ).first())
-    if exists:
+    ).order_by(BillingInvoiceLine.id.desc()).first())
+    if existing_any:
+        # if deleted or active -> never duplicate; respect user deletion
         return None
 
     qty = _d(qty)
@@ -640,9 +810,9 @@ def add_auto_line_idempotent(
         created_by=getattr(user, "id", None),
     )
 
-    # ✅ GST split stored in meta_json (if exists)
     _merge_meta(
-        ln, {
+        ln,
+        {
             "gst": {
                 "gst_rate": _dec_s(split_rates["gst_rate"]),
                 "cgst_rate": _dec_s(split_rates["cgst_rate"]),
@@ -656,9 +826,10 @@ def add_auto_line_idempotent(
             "module": str(source_module),
             "source": {
                 "ref_id": int(source_ref_id),
-                "line_key": str(source_line_key),
+                "line_key": str(source_line_key)
             },
-        })
+        },
+    )
     if meta_patch:
         _merge_meta(ln, meta_patch)
 
@@ -692,35 +863,26 @@ def upsert_auto_line(
     service_date: Optional[datetime] = None,
     meta_patch: Optional[Dict[str, Any]] = None,
 ) -> BillingInvoiceLine:
-    """
-    ✅ Upsert behavior for the wizard:
-    - If the unique key already exists → UPDATE qty (add) and recalc amounts
-    - Else → create new auto line (idempotent)
-    """
-
     inv = db.get(BillingInvoice, int(invoice_id))
     if not inv:
         raise BillingError("Invoice not found")
     if inv.status not in (DocStatus.DRAFT, DocStatus.APPROVED):
         raise BillingStateError("Cannot add lines to POSTED/VOID invoice")
 
-    # find existing unique key
-    existing = (db.query(BillingInvoiceLine).filter(
+    q = db.query(BillingInvoiceLine).filter(
         BillingInvoiceLine.billing_case_id == int(billing_case_id),
         BillingInvoiceLine.source_module == str(source_module),
         BillingInvoiceLine.source_ref_id == int(source_ref_id),
         BillingInvoiceLine.source_line_key == str(source_line_key),
-    ).first())
+    )
+    q = _apply_active_line_filter(q)
+    existing = q.first()
 
     if existing:
-        # ✅ increase qty (user selected again)
         existing.qty = _d(existing.qty) + _d(qty)
-
-        # keep latest price & gst if user overrides
         existing.unit_price = _d(unit_price)
         existing.gst_rate = _d(gst_rate)
 
-        # discounts
         dp = _d(discount_percent)
         da = _d(discount_amount)
 
@@ -743,17 +905,17 @@ def upsert_auto_line(
         existing.tax_amount = tax_amount
         existing.net_amount = net_amount
         existing.patient_pay_amount = net_amount
-        existing.updated_at = datetime.utcnow()
+        _set_if_has(existing, "updated_at", _utcnow_naive())
 
-        if hasattr(existing, "service_date"):
-            existing.service_date = service_date
+        if hasattr(ln, "service_date") and service_date is not None:
+            ln.service_date = _to_local_naive(service_date)
 
-        # GST split meta (if meta_json exists)
         split_rates = _gst_split(_d(existing.gst_rate),
                                  intra_state=intra_state_gst)
         split_amt = _gst_amount_split(tax_amount, split_rates)
         _merge_meta(
-            existing, {
+            existing,
+            {
                 "gst": {
                     "gst_rate": _dec_s(split_rates["gst_rate"]),
                     "cgst_rate": _dec_s(split_rates["cgst_rate"]),
@@ -764,7 +926,8 @@ def upsert_auto_line(
                     "igst_amount": _dec_s(split_amt["igst"]),
                     "taxable_amount": _dec_s(taxable),
                 }
-            })
+            },
+        )
         if meta_patch:
             _merge_meta(existing, meta_patch)
 
@@ -772,7 +935,6 @@ def upsert_auto_line(
         _recalc_invoice_totals(db, int(invoice_id))
         return existing
 
-    # create new line if not exists
     ln = add_auto_line_idempotent(
         db,
         invoice_id=int(invoice_id),
@@ -796,7 +958,6 @@ def upsert_auto_line(
         meta_patch=meta_patch,
     )
 
-    # add service_date if column exists
     if ln and hasattr(ln, "service_date"):
         ln.service_date = service_date
 
@@ -808,7 +969,7 @@ def upsert_auto_line(
 def _default_doctor_id_for_case(db: Session,
                                 case: BillingCase) -> Optional[int]:
     try:
-        from app.models.opd import Visit, Appointment  # adjust if your path differs
+        from app.models.opd import Visit, Appointment
     except Exception:
         Visit = None
         Appointment = None
@@ -832,7 +993,7 @@ def _default_doctor_id_for_case(db: Session,
 
     if case.encounter_type == EncounterType.IP:
         try:
-            from app.models.ipd import IpdAdmission  # adjust if your path differs
+            from app.models.ipd import IpdAdmission
             adm = db.get(IpdAdmission, int(case.encounter_id))
             if adm:
                 doc = (getattr(adm, "consultant_id", None)
@@ -868,7 +1029,6 @@ def add_manual_line(
     inv = db.get(BillingInvoice, int(invoice_id))
     if not inv:
         raise BillingError("Invoice not found")
-
     if inv.status not in (DocStatus.DRAFT, DocStatus.APPROVED):
         raise BillingStateError("Manual lines allowed only in DRAFT/APPROVED")
 
@@ -886,10 +1046,8 @@ def add_manual_line(
     discount_amount = _d(discount_amount)
 
     line_total = qty * unit_price
-
     if discount_amount <= 0 and discount_percent > 0:
         discount_amount = (line_total * discount_percent) / Decimal("100")
-
     if discount_amount < 0:
         discount_amount = Decimal("0")
     if discount_amount > line_total:
@@ -900,7 +1058,7 @@ def add_manual_line(
                   gst_rate) / Decimal("100") if gst_rate > 0 else Decimal("0")
     net_amount = taxable + tax_amount
 
-    key = f"MNL:{secrets.token_hex(8)}"  # <= 64 chars
+    key = f"MNL:{secrets.token_hex(8)}"
 
     split_rates = _gst_split(gst_rate, intra_state=intra_state_gst)
     split_amt = _gst_amount_split(tax_amount, split_rates)
@@ -937,7 +1095,8 @@ def add_manual_line(
     )
 
     _merge_meta(
-        ln, {
+        ln,
+        {
             "gst": {
                 "gst_rate": _dec_s(split_rates["gst_rate"]),
                 "cgst_rate": _dec_s(split_rates["cgst_rate"]),
@@ -953,12 +1112,250 @@ def add_manual_line(
                 "ref_id": int(inv.id),
                 "line_key": key
             },
-        })
+        },
+    )
 
     db.add(ln)
     db.flush()
     _recalc_invoice_totals(db, int(inv.id))
     return ln
+
+
+# ============================================================
+# ✅ Edit/Delete any line (manual + auto) + FIX totals
+# ============================================================
+def update_invoice_line(
+    db: Session,
+    *,
+    line_id: int,
+    user,
+    description: Optional[str] = None,
+    qty: Optional[Decimal] = None,
+    unit_price: Optional[Decimal] = None,
+    gst_rate: Optional[Decimal] = None,
+    discount_percent: Optional[Decimal] = None,
+    discount_amount: Optional[Decimal] = None,
+    doctor_id: Optional[int] = None,
+    intra_state_gst: bool = True,
+    service_date: Optional[datetime] = None,
+    item_code: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> BillingInvoiceLine:
+    ln = db.get(BillingInvoiceLine, int(line_id))
+    if not ln:
+        raise BillingError("Invoice line not found")
+    if _line_is_removed(ln):
+        raise BillingStateError("Cannot edit a removed/deleted line")
+
+    inv = db.get(BillingInvoice, int(getattr(ln, "invoice_id")))
+    if not inv:
+        raise BillingError("Invoice not found for this line")
+    if inv.status not in (DocStatus.DRAFT, DocStatus.APPROVED):
+        raise BillingStateError(
+            "Can edit lines only in DRAFT/APPROVED invoice")
+
+    if description is not None:
+        ln.description = str(description or "")[:255]
+    if qty is not None:
+        ln.qty = _d(qty)
+    if unit_price is not None:
+        ln.unit_price = _d(unit_price)
+    if gst_rate is not None:
+        ln.gst_rate = _d(gst_rate)
+    if item_code is not None and hasattr(ln, "item_code"):
+        ln.item_code = (str(item_code)[:64] if item_code is not None else None)
+    if doctor_id is not None and hasattr(ln, "doctor_id"):
+        ln.doctor_id = doctor_id
+    if hasattr(ln, "service_date") and service_date is not None:
+        ln.service_date = service_date
+
+    # discounts
+    dp = _d(discount_percent) if discount_percent is not None else _d(
+        getattr(ln, "discount_percent", 0))
+    da = _d(discount_amount) if discount_amount is not None else _d(
+        getattr(ln, "discount_amount", 0))
+
+    line_total = _d(getattr(ln, "qty", 0)) * _d(getattr(ln, "unit_price", 0))
+    if (discount_amount is None) and (discount_percent
+                                      is not None) and da <= 0 and dp > 0:
+        da = (line_total * dp) / Decimal("100")
+    if da < 0:
+        da = Decimal("0")
+    if da > line_total:
+        da = line_total
+
+    taxable = max(line_total - da, Decimal("0"))
+    gr = _d(getattr(ln, "gst_rate", 0))
+    tax_amount = (taxable * gr) / Decimal("100") if gr > 0 else Decimal("0")
+    net_amount = taxable + tax_amount
+
+    ln.discount_percent = dp
+    ln.discount_amount = da
+    ln.line_total = line_total
+    ln.tax_amount = tax_amount
+    ln.net_amount = net_amount
+    ln.patient_pay_amount = net_amount
+
+    split_rates = _gst_split(gr, intra_state=intra_state_gst)
+    split_amt = _gst_amount_split(tax_amount, split_rates)
+    _merge_meta(
+        ln,
+        {
+            "gst": {
+                "gst_rate": _dec_s(split_rates["gst_rate"]),
+                "cgst_rate": _dec_s(split_rates["cgst_rate"]),
+                "sgst_rate": _dec_s(split_rates["sgst_rate"]),
+                "igst_rate": _dec_s(split_rates["igst_rate"]),
+                "cgst_amount": _dec_s(split_amt["cgst"]),
+                "sgst_amount": _dec_s(split_amt["sgst"]),
+                "igst_amount": _dec_s(split_amt["igst"]),
+                "taxable_amount": _dec_s(taxable),
+            },
+            "edited": {
+                "at": _utcnow_naive().isoformat(),
+                "by": getattr(user, "id", None),
+                "reason": (str(reason)[:255] if reason else None),
+            },
+        },
+    )
+
+    _set_if_has(ln, "updated_at", _utcnow_naive())
+    db.flush()
+
+    _recalc_invoice_totals(db, int(inv.id))
+    _set_if_has(inv, "updated_by", getattr(user, "id", None))
+    db.flush()
+    return ln
+
+
+def delete_invoice_line(
+    db: Session,
+    *,
+    line_id: int,
+    user,
+    reason: Optional[str] = None,
+) -> None:
+    ln = db.get(BillingInvoiceLine, int(line_id))
+    if not ln:
+        raise BillingError("Invoice line not found")
+
+    inv = db.get(BillingInvoice, int(getattr(ln, "invoice_id")))
+    if not inv:
+        raise BillingError("Invoice not found for this line")
+    if inv.status not in (DocStatus.DRAFT, DocStatus.APPROVED):
+        raise BillingStateError(
+            "Can delete lines only in DRAFT/APPROVED invoice")
+
+    # snapshot before tombstone
+    snap_fields = [
+        "qty",
+        "unit_price",
+        "discount_percent",
+        "discount_amount",
+        "gst_rate",
+        "tax_amount",
+        "line_total",
+        "net_amount",
+        "patient_pay_amount",
+        "description",
+        "item_type",
+        "item_id",
+        "item_code",
+        "service_group",
+        "source_module",
+        "source_ref_id",
+        "source_line_key",
+    ]
+    snapshot = {}
+    for f in snap_fields:
+        if hasattr(ln, f):
+            v = getattr(ln, f, None)
+            try:
+                snapshot[f] = _dec_s(v) if isinstance(
+                    v, Decimal) else (v.value if hasattr(v, "value") else v)
+            except Exception:
+                snapshot[f] = str(v)
+
+    # ✅ mark as removed using ANY available columns
+    if hasattr(ln, "is_deleted"):
+        ln.is_deleted = True
+    if hasattr(ln, "is_active"):
+        ln.is_active = False
+    if hasattr(ln, "deleted_at"):
+        ln.deleted_at = _utcnow_naive()
+    if hasattr(ln, "deleted_by"):
+        ln.deleted_by = getattr(user, "id", None)
+    if hasattr(ln, "status"):
+        try:
+            ln.status = "DELETED"
+        except Exception:
+            pass
+
+    # ✅ tombstone marker in description (works even if no delete columns exist)
+    try:
+        if hasattr(ln, "description"):
+            d = (ln.description or "")
+            if "(REMOVED)" not in d:
+                ln.description = (
+                    d[:240] + " (REMOVED)") if len(d) > 240 else (d +
+                                                                  " (REMOVED)")
+    except Exception:
+        pass
+
+    # ✅ meta flags (compatible with billing_calc + audit)
+    _merge_meta(
+        ln,
+        {
+            "deleted": True,
+            "deleted_info": {
+                "at": _utcnow_naive().isoformat(),
+                "by": getattr(user, "id", None),
+                "reason": (str(reason)[:255] if reason else None),
+            },
+            "deleted_snapshot": snapshot,
+        },
+    )
+
+    # ✅ zero all monetary fields (so totals never break even if a query accidentally includes it)
+    for f in [
+            "qty",
+            "unit_price",
+            "discount_percent",
+            "discount_amount",
+            "gst_rate",
+            "tax_amount",
+            "line_total",
+            "net_amount",
+            "patient_pay_amount",
+    ]:
+        if hasattr(ln, f):
+            try:
+                setattr(ln, f, Decimal("0"))
+            except Exception:
+                try:
+                    setattr(ln, f, 0)
+                except Exception:
+                    pass
+
+    _set_if_has(ln, "updated_at", _utcnow_naive())
+    db.flush()
+
+    _recalc_invoice_totals(db, int(inv.id))
+    _set_if_has(inv, "updated_by", getattr(user, "id", None))
+    db.flush()
+
+
+def list_invoice_lines(
+        db: Session,
+        *,
+        invoice_id: int,
+        include_deleted: bool = False) -> List[BillingInvoiceLine]:
+    q = db.query(BillingInvoiceLine).filter(
+        BillingInvoiceLine.invoice_id == int(invoice_id)).order_by(
+            BillingInvoiceLine.id.asc())
+    if not include_deleted:
+        q = _apply_active_line_filter(q)
+    return q.all()
 
 
 # ============================================================
@@ -968,19 +1365,20 @@ def approve_invoice(db: Session, *, invoice_id: int, user) -> BillingInvoice:
     inv = db.get(BillingInvoice, int(invoice_id))
     if not inv:
         raise BillingError("Invoice not found")
-
     if inv.status != DocStatus.DRAFT:
         raise BillingStateError("Only DRAFT invoice can be approved")
 
-    line_count = (db.query(func.count(BillingInvoiceLine.id)).filter(
-        BillingInvoiceLine.invoice_id == int(inv.id)).scalar() or 0)
+    q = db.query(func.count(BillingInvoiceLine.id)).filter(
+        BillingInvoiceLine.invoice_id == int(inv.id))
+    q = _apply_active_line_filter(q)
+    line_count = q.scalar() or 0
     if int(line_count) <= 0:
         raise BillingError("Cannot approve invoice with no lines")
 
     _recalc_invoice_totals(db, int(inv.id))
 
     inv.status = DocStatus.APPROVED
-    inv.approved_at = datetime.utcnow()
+    inv.approved_at = _utcnow_naive()
     inv.approved_by = getattr(user, "id", None)
     inv.updated_by = getattr(user, "id", None)
     db.flush()
@@ -991,14 +1389,80 @@ def post_invoice(db: Session, *, invoice_id: int, user) -> BillingInvoice:
     inv = db.get(BillingInvoice, int(invoice_id))
     if not inv:
         raise BillingError("Invoice not found")
-
     if inv.status != DocStatus.APPROVED:
         raise BillingStateError("Only APPROVED invoice can be posted")
 
     inv.status = DocStatus.POSTED
-    inv.posted_at = datetime.utcnow()
+    inv.posted_at = _utcnow_naive()
     inv.posted_by = getattr(user, "id", None)
     inv.updated_by = getattr(user, "id", None)
+    db.flush()
+    return inv
+
+
+def request_invoice_edit(db: Session, *, invoice_id: int,
+                         reason: Optional[str], user) -> BillingInvoice:
+    inv = db.get(BillingInvoice, int(invoice_id))
+    if not inv:
+        raise BillingError("Invoice not found")
+
+    if inv.status == DocStatus.POSTED:
+        raise BillingStateError(
+            "POSTED invoice cannot be edited (use credit note / reversal flow)"
+        )
+
+    if inv.status not in (DocStatus.APPROVED, DocStatus.DRAFT):
+        raise BillingStateError("Only DRAFT/APPROVED invoice can request edit")
+
+    _merge_meta(
+        inv,
+        {
+            "edit_request": {
+                "at": _utcnow_naive().isoformat(),
+                "by": getattr(user, "id", None),
+                "reason": (str(reason)[:255] if reason else None),
+                "from_status": str(getattr(inv, "status", "")),
+            }
+        },
+    )
+
+    inv.status = DocStatus.DRAFT
+    inv.updated_by = getattr(user, "id", None)
+    _set_if_has(inv, "updated_at", _utcnow_naive())
+    db.flush()
+    return inv
+
+
+def reopen_invoice(db: Session, *, invoice_id: int, reason: Optional[str],
+                   user) -> BillingInvoice:
+    inv = db.get(BillingInvoice, int(invoice_id))
+    if not inv:
+        raise BillingError("Invoice not found")
+
+    if inv.status == DocStatus.VOID:
+        raise BillingStateError(
+            "VOID invoice cannot be reopened (create a new invoice)")
+    if inv.status == DocStatus.POSTED:
+        raise BillingStateError(
+            "POSTED invoice cannot be reopened (use credit note / reversal flow)"
+        )
+    if inv.status not in (DocStatus.APPROVED, DocStatus.DRAFT):
+        raise BillingStateError("Only DRAFT/APPROVED invoice can be reopened")
+
+    _merge_meta(
+        inv,
+        {
+            "reopen": {
+                "at": _utcnow_naive().isoformat(),
+                "by": getattr(user, "id", None),
+                "reason": (str(reason)[:255] if reason else None),
+                "from_status": str(getattr(inv, "status", "")),
+            }
+        },
+    )
+    inv.status = DocStatus.DRAFT
+    inv.updated_by = getattr(user, "id", None)
+    _set_if_has(inv, "updated_at", _utcnow_naive())
     db.flush()
     return inv
 
@@ -1015,7 +1479,7 @@ def void_invoice(db: Session, *, invoice_id: int, reason: str,
         )
 
     inv.status = DocStatus.VOID
-    inv.voided_at = datetime.utcnow()
+    inv.voided_at = _utcnow_naive()
     inv.voided_by = getattr(user, "id", None)
     inv.void_reason = str(reason or "")[:255]
     inv.updated_by = getattr(user, "id", None)
@@ -1060,7 +1524,6 @@ def record_payment(
 
     if int(inv.billing_case_id) != int(billing_case_id):
         raise BillingError("Invoice does not belong to billing case")
-
     if inv.status not in (DocStatus.APPROVED, DocStatus.POSTED):
         raise BillingStateError(
             "Payments allowed only for APPROVED/POSTED invoices")
@@ -1132,26 +1595,266 @@ def add_payment_for_invoice(
         received_by=getattr(user, "id", None),
         notes=notes,
     )
-    _set_if_has(p, "received_at", datetime.utcnow())
-    _set_if_has(p, "paid_at", datetime.utcnow())
+    _set_if_has(p, "received_at", _utcnow_naive())
+    _set_if_has(p, "paid_at", _utcnow_naive())
     db.add(p)
     db.flush()
     return p
 
 
 # ============================================================
-# PRINT SUMMARY + SPLIT-UP REPORT BUILDERS (for your exact bill formats)
+# ✅ OP VISIT CONSULTATION FEE AUTO ADD (Doctor Fee module)
+# ============================================================
+def _enum_pick(enum_cls, name: str, fallback):
+    try:
+        return enum_cls[name]
+    except Exception:
+        return fallback
+
+
+def _safe_get(obj, names: list, default=None):
+    for n in names:
+        if hasattr(obj, n):
+            v = getattr(obj, n, None)
+            if v is not None:
+                return v
+    return default
+
+
+def _load_user_model():
+    candidates = [
+        ("app.models.user", "User"),
+        ("app.models.users", "User"),
+        ("app.models.auth", "User"),
+        ("app.models.accounts", "User"),
+    ]
+    for mod, cls in candidates:
+        try:
+            m = __import__(mod, fromlist=[cls])
+            return getattr(m, cls)
+        except Exception:
+            continue
+    return None
+
+
+def _load_department_model():
+    candidates = [
+        ("app.models.master", "Department"),
+        ("app.models.masters", "Department"),
+        ("app.models.department", "Department"),
+        ("app.models.opd", "Department"),
+    ]
+    for mod, cls in candidates:
+        try:
+            m = __import__(mod, fromlist=[cls])
+            return getattr(m, cls)
+        except Exception:
+            continue
+    return None
+
+
+def ensure_op_visit_consultation_fee(
+    db: Session,
+    *,
+    visit_id: int,
+    user,
+    tariff_plan_id: Optional[int] = None,
+    reset_period: NumberResetPeriod = NumberResetPeriod.NONE,
+    intra_state_gst: bool = True,
+) -> Dict[str, Any]:
+    """
+    ✅ Fix for: OP visit completed but consultation fee not added.
+
+    Behavior:
+      - Ensures Billing Case exists (and case_number not TEMP)
+      - Ensures DOCTOR_FEE invoice exists
+      - Adds ONE idempotent line:
+          source_module="OPD", source_ref_id=visit_id, source_line_key="CONSULT_FEE"
+      - Description includes doctor name + department if available.
+    """
+    from app.models.opd import Visit, Appointment  # adjust if needed
+
+    v = db.get(Visit, int(visit_id))
+    if not v:
+        raise BillingError("OPD Visit not found")
+
+    # case
+    case = get_or_create_case_for_op_visit(
+        db,
+        visit_id=int(visit_id),
+        user=user,
+        tariff_plan_id=tariff_plan_id,
+        reset_period=reset_period,
+    )
+    _ensure_case_number(db, case, reset_period=reset_period)
+
+    # invoice (doctor fee module)
+    inv = get_or_create_active_module_invoice(
+        db,
+        billing_case_id=int(case.id),
+        user=user,
+        module="DOCTOR_FEE",
+        invoice_type=InvoiceType.PATIENT,
+        payer_type=PayerType.PATIENT,
+        payer_id=None,
+        reset_period=reset_period,
+    )
+
+    # doctor + dept
+    doctor_id = (_safe_get(
+        v, ["doctor_id", "doctor_user_id", "consulting_doctor_id"], None)
+                 or None)
+    dept_id = _safe_get(v, ["department_id", "dept_id"], None)
+
+    # from appointment if missing
+    appt = None
+    appt_id = _safe_get(v, ["appointment_id"], None)
+    if appt_id:
+        appt = db.get(Appointment, int(appt_id))
+        if doctor_id is None:
+            doctor_id = _safe_get(appt, ["doctor_id", "doctor_user_id"], None)
+        if dept_id is None:
+            dept_id = _safe_get(appt, ["department_id", "dept_id"], None)
+
+    # resolve names
+    doctor_name = None
+    dept_name = None
+
+    UserModel = _load_user_model()
+    if UserModel and doctor_id:
+        try:
+            u = db.get(UserModel, int(doctor_id))
+            doctor_name = (getattr(u, "full_name", None)
+                           or getattr(u, "name", None)
+                           or getattr(u, "username", None)
+                           or getattr(u, "display_name", None))
+        except Exception:
+            doctor_name = None
+
+    DeptModel = _load_department_model()
+    if DeptModel and dept_id:
+        try:
+            dpt = db.get(DeptModel, int(dept_id))
+            dept_name = getattr(dpt, "name", None) or getattr(
+                dpt, "dept_name", None)
+        except Exception:
+            dept_name = None
+
+    # fee amount (best effort)
+    fee = _safe_get(v, [
+        "consultation_fee", "consult_fee", "doctor_fee", "fee_amount", "amount"
+    ], None)
+    gst = _safe_get(v, ["gst_rate", "gst", "tax_rate"], None)
+
+    if fee is None and appt is not None:
+        fee = _safe_get(appt, [
+            "consultation_fee", "consult_fee", "doctor_fee", "fee_amount",
+            "amount"
+        ], None)
+    if gst is None and appt is not None:
+        gst = _safe_get(appt, ["gst_rate", "gst", "tax_rate"], None)
+
+    # tariff fallback (doctor-level then dept-level)
+    if _d(fee) <= 0:
+        r, g = _tariff_lookup_first(
+            db,
+            tariff_plan_id=(tariff_plan_id
+                            or getattr(case, "tariff_plan_id", None)),
+            item_id=int(doctor_id) if str(doctor_id).isdigit() else None,
+            item_types=[
+                "OP_CONSULT", "OPD_CONSULT", "CONSULTATION", "DOCTOR_CONSULT"
+            ],
+        )
+        if _d(r) > 0:
+            fee, gst = r, g
+
+    if _d(fee) <= 0:
+        r, g = _tariff_lookup_first(
+            db,
+            tariff_plan_id=(tariff_plan_id
+                            or getattr(case, "tariff_plan_id", None)),
+            item_id=int(dept_id) if str(dept_id).isdigit() else None,
+            item_types=[
+                "OP_CONSULT_DEPT", "OPD_CONSULT_DEPT", "CONSULTATION_DEPT"
+            ],
+        )
+        if _d(r) > 0:
+            fee, gst = r, g
+
+    fee = _d(fee)
+    gst = _d(gst)
+
+    # description
+    desc = "Consultation Fees"
+    if doctor_name and dept_name:
+        desc = f"Consultation Fees - Dr. {doctor_name} ({dept_name})"
+    elif doctor_name:
+        desc = f"Consultation Fees - Dr. {doctor_name}"
+    elif dept_name:
+        desc = f"Consultation Fees ({dept_name})"
+
+    # service group selection
+    sg = _enum_pick(ServiceGroup, "CONSULTATION", fallback=None)
+    if sg is None:
+        sg = _enum_pick(ServiceGroup, "DOCTOR", fallback=list(ServiceGroup)[0])
+
+        # add idempotent line
+        ln = add_auto_line_idempotent(
+            db,
+            invoice_id=int(inv.id),
+            billing_case_id=int(case.id),
+            user=user,
+            service_group=sg,
+            item_type="OP_CONSULTATION",
+            item_id=int(doctor_id) if str(doctor_id).isdigit() else None,
+            item_code="CONSULT",
+            description=desc,
+            qty=Decimal("1"),
+            unit_price=fee,
+            gst_rate=gst,
+            source_module="OPD",
+            source_ref_id=int(
+                case.id),  # ✅ CASE SCOPED (prevents global collisions)
+            source_line_key=
+            f"CASE:{int(case.id)}:VISIT:{int(visit_id)}:CONSULT_FEE",  # ✅ UNIQUE
+            doctor_id=int(doctor_id) if str(doctor_id).isdigit() else None,
+            intra_state_gst=intra_state_gst,
+            is_manual=False,
+            manual_reason=None,
+            meta_patch={
+                "opd": {
+                    "visit_id": int(visit_id),
+                    "doctor_id":
+                    int(doctor_id) if str(doctor_id).isdigit() else None,
+                    "doctor_name": doctor_name,
+                    "department_id":
+                    int(dept_id) if str(dept_id).isdigit() else None,
+                    "department_name": dept_name,
+                    "fee_source": "visit/appointment/tariff(best-effort)",
+                }
+            },
+        )
+
+    _recalc_invoice_totals(db, int(inv.id))
+
+    return {
+        "billing_case_id": int(case.id),
+        "case_number": getattr(case, "case_number", None),
+        "invoice_id": int(inv.id),
+        "invoice_number": getattr(inv, "invoice_number", None),
+        "added_line_id": (int(ln.id) if ln else None),
+        "skipped": (ln is None),
+        "unit_price": float(fee),
+        "gst_rate": float(gst),
+        "description": desc,
+    }
+
+
+# ============================================================
+# PRINT SUMMARY + SPLIT-UP REPORT BUILDERS
 # ============================================================
 def build_invoice_print_payload(db: Session, *,
                                 invoice_id: int) -> Dict[str, Any]:
-    """
-    Returns a print-ready structure:
-      - invoice header
-      - case + encounter
-      - line items (grouped)
-      - totals + GST split
-      - payments (optional)
-    """
     inv = db.get(BillingInvoice, int(invoice_id))
     if not inv:
         raise BillingError("Invoice not found")
@@ -1160,10 +1863,11 @@ def build_invoice_print_payload(db: Session, *,
     if not case:
         raise BillingError("Billing case not found")
 
-    # Pull lines
-    lines = (db.query(BillingInvoiceLine).filter(
+    ql = db.query(BillingInvoiceLine).filter(
         BillingInvoiceLine.invoice_id == int(inv.id)).order_by(
-            BillingInvoiceLine.id.asc()).all())
+            BillingInvoiceLine.id.asc())
+    ql = _apply_active_line_filter(ql)
+    lines = ql.all()
 
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     for ln in lines:
@@ -1192,12 +1896,13 @@ def build_invoice_print_payload(db: Session, *,
             if hasattr(ln, "meta_json") else None,
             "source_module":
             getattr(ln, "source_module", None),
+            "is_manual":
+            bool(getattr(ln, "is_manual", False)),
         })
 
-    # Payments for this invoice
-    payments = (db.query(BillingPayment).filter(
+    payments = db.query(BillingPayment).filter(
         BillingPayment.invoice_id == int(inv.id)).order_by(
-            BillingPayment.id.asc()).all())
+            BillingPayment.id.asc()).all()
     pay_rows = [{
         "id": int(p.id),
         "mode": str(getattr(p, "mode", "")),
@@ -1207,7 +1912,6 @@ def build_invoice_print_payload(db: Session, *,
         "notes": getattr(p, "notes", None),
     } for p in payments]
 
-    # Ensure totals up to date
     _recalc_invoice_totals(db, int(inv.id))
 
     gst_meta = {}
@@ -1251,19 +1955,13 @@ def build_invoice_print_payload(db: Session, *,
 
 def build_case_splitup_report(db: Session, *,
                               billing_case_id: int) -> Dict[str, Any]:
-    """
-    Your “single dashboard” split-up report:
-      - All invoices under a case (module-wise)
-      - Module totals
-      - Case totals + payments + advances
-    """
     case = db.get(BillingCase, int(billing_case_id))
     if not case:
         raise BillingError("Billing case not found")
 
-    invoices = (db.query(BillingInvoice).filter(
+    invoices = db.query(BillingInvoice).filter(
         BillingInvoice.billing_case_id == int(case.id)).order_by(
-            BillingInvoice.id.asc()).all())
+            BillingInvoice.id.asc()).all()
 
     inv_payloads = []
     module_totals: Dict[str, Dict[str, Decimal]] = {}
@@ -1276,8 +1974,9 @@ def build_case_splitup_report(db: Session, *,
                 "sub_total": Decimal("0"),
                 "discount_total": Decimal("0"),
                 "tax_total": Decimal("0"),
-                "grand_total": Decimal("0"),
+                "grand_total": Decimal("0")
             })
+
         module_totals[mod]["sub_total"] += _d(getattr(inv, "sub_total", 0))
         module_totals[mod]["discount_total"] += _d(
             getattr(inv, "discount_total", 0))
@@ -1304,12 +2003,12 @@ def build_case_splitup_report(db: Session, *,
             if hasattr(inv, "meta_json") else None,
         })
 
-    payments_sum = (db.query(func.coalesce(
+    payments_sum = db.query(func.coalesce(
         func.sum(BillingPayment.amount),
-        0)).filter(BillingPayment.billing_case_id == int(case.id)).scalar())
-    advances_sum = (db.query(func.coalesce(
+        0)).filter(BillingPayment.billing_case_id == int(case.id)).scalar()
+    advances_sum = db.query(func.coalesce(
         func.sum(BillingAdvance.amount),
-        0)).filter(BillingAdvance.billing_case_id == int(case.id)).scalar())
+        0)).filter(BillingAdvance.billing_case_id == int(case.id)).scalar()
 
     case_grand = sum(v["grand_total"] for v in module_totals.values())
     balance = _d(case_grand) - _d(payments_sum) - _d(advances_sum)
@@ -1344,29 +2043,7 @@ def build_case_splitup_report(db: Session, *,
 # ============================================================
 # LIS / RIS -> add lines to invoice (SAFE optional integration)
 # ============================================================
-
-
-def _enum_pick(enum_cls, name: str, fallback):
-    try:
-        return enum_cls[name]
-    except Exception:
-        return fallback
-
-
-def _safe_get(obj, names: list, default=None):
-    for n in names:
-        if hasattr(obj, n):
-            v = getattr(obj, n, None)
-            if v is not None:
-                return v
-    return default
-
-
 def _load_lis_order_and_items(db: Session, lis_order_id: int):
-    """
-    Best-effort loader (works even if your LIS model names differ).
-    Returns: (order_row, item_rows[list])
-    """
     candidates = [
         ("app.models.lis", "LisOrder"),
         ("app.models.lis", "LabOrder"),
@@ -1376,7 +2053,6 @@ def _load_lis_order_and_items(db: Session, lis_order_id: int):
     ]
 
     order = None
-    OrderModel = None
     for mod, cls in candidates:
         try:
             m = __import__(mod, fromlist=[cls])
@@ -1391,7 +2067,6 @@ def _load_lis_order_and_items(db: Session, lis_order_id: int):
         raise BillingError(
             "LIS order not found (LIS module/model not available)")
 
-    # Try item models
     item_candidates = [
         ("app.models.lis", "LisOrderItem"),
         ("app.models.lis", "LabOrderItem"),
@@ -1405,7 +2080,6 @@ def _load_lis_order_and_items(db: Session, lis_order_id: int):
         try:
             m = __import__(mod, fromlist=[cls])
             ItemModel = getattr(m, cls)
-            # common FK names
             fk = None
             for fk_name in ["order_id", "lis_order_id", "lab_order_id"]:
                 if hasattr(ItemModel, fk_name):
@@ -1474,21 +2148,11 @@ def _load_ris_order_and_items(db: Session, ris_order_id: int):
     return order, items
 
 
-def add_lines_from_lis_order(
-    db: Session,
-    *,
-    invoice_id: int,
-    lis_order_id: int,
-    user,
-) -> Dict[str, Any]:
-    """
-    Adds LIS lines into invoice using idempotent source keys.
-    SAFE even if LIS module not present (returns BillingError with readable msg).
-    """
+def add_lines_from_lis_order(db: Session, *, invoice_id: int,
+                             lis_order_id: int, user) -> Dict[str, Any]:
     inv = db.get(BillingInvoice, int(invoice_id))
     if not inv:
         raise BillingError("Invoice not found")
-
     if inv.status not in (DocStatus.DRAFT, DocStatus.APPROVED):
         raise BillingStateError(
             "Can add LIS lines only to DRAFT/APPROVED invoice")
@@ -1501,10 +2165,8 @@ def add_lines_from_lis_order(
 
     added = []
     skipped = 0
-
     sg_lab = _enum_pick(ServiceGroup, "LAB", fallback=list(ServiceGroup)[0])
 
-    # If items exist -> add item-wise
     if items:
         for it in items:
             item_id = _safe_get(it, ["test_id", "service_id", "item_id", "id"],
@@ -1518,7 +2180,6 @@ def add_lines_from_lis_order(
             unit_price = _d(
                 _safe_get(it, ["rate", "price", "unit_price", "amount"], 0))
             gst_rate = _d(_safe_get(it, ["gst_rate", "gst", "tax_rate"], 0))
-
             line_key = str(
                 _safe_get(it, ["id"], None) or code
                 or f"IT:{secrets.token_hex(4)}")
@@ -1546,7 +2207,7 @@ def add_lines_from_lis_order(
                 meta_patch={
                     "lis": {
                         "order_id": int(lis_order_id),
-                        "item_id": int(_safe_get(it, ["id"], 0) or 0),
+                        "item_id": int(_safe_get(it, ["id"], 0) or 0)
                     }
                 },
             )
@@ -1564,7 +2225,6 @@ def add_lines_from_lis_order(
             "skipped": skipped
         }
 
-    # Fallback: single consolidated line
     total = _d(
         _safe_get(order,
                   ["total_amount", "grand_total", "net_amount", "amount"], 0))
@@ -1614,20 +2274,11 @@ def add_lines_from_lis_order(
     }
 
 
-def add_line_from_ris_order(
-    db: Session,
-    *,
-    invoice_id: int,
-    ris_order_id: int,
-    user,
-) -> Dict[str, Any]:
-    """
-    Adds RIS lines into invoice (idempotent).
-    """
+def add_line_from_ris_order(db: Session, *, invoice_id: int, ris_order_id: int,
+                            user) -> Dict[str, Any]:
     inv = db.get(BillingInvoice, int(invoice_id))
     if not inv:
         raise BillingError("Invoice not found")
-
     if inv.status not in (DocStatus.DRAFT, DocStatus.APPROVED):
         raise BillingStateError(
             "Can add RIS lines only to DRAFT/APPROVED invoice")
@@ -1638,14 +2289,13 @@ def add_line_from_ris_order(
 
     order, items = _load_ris_order_and_items(db, int(ris_order_id))
 
-    # pick service group
     sg_scan = _enum_pick(ServiceGroup, "SCAN", fallback=list(ServiceGroup)[0])
     sg_xray = _enum_pick(ServiceGroup, "XRAY", fallback=sg_scan)
 
     modality = str(
         _safe_get(order, ["modality", "study_type", "service_type"], "")
         or "").upper()
-    sg = sg_xray if "XRAY" in modality or "X-RAY" in modality else sg_scan
+    sg = sg_xray if ("XRAY" in modality or "X-RAY" in modality) else sg_scan
 
     added = []
     skipped = 0
@@ -1708,7 +2358,6 @@ def add_line_from_ris_order(
             "skipped": skipped
         }
 
-    # fallback consolidated
     total = _d(
         _safe_get(order,
                   ["total_amount", "grand_total", "net_amount", "amount"], 0))
@@ -1744,12 +2393,12 @@ def add_line_from_ris_order(
         },
     )
 
-    added = [int(ln.id)] if ln else []
-    skipped = 0 if ln else 1
+    added2 = [int(ln.id)] if ln else []
+    skipped2 = 0 if ln else 1
     _recalc_invoice_totals(db, int(inv.id))
     return {
         "invoice_id": int(inv.id),
         "ris_order_id": int(ris_order_id),
-        "added_line_ids": added,
-        "skipped": skipped
+        "added_line_ids": added2,
+        "skipped": skipped2
     }

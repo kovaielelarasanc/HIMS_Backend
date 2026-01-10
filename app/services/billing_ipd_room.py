@@ -24,7 +24,7 @@ from app.models.billing import (
     CoverageFlag,
 )
 from app.services.id_gen import next_billing_case_number, next_invoice_number
-
+from app.services.ipd_billing import sync_ipd_room_charges
 IST = timezone(timedelta(hours=5, minutes=30))
 
 
@@ -238,11 +238,10 @@ def _compute_daily_charges_ist(
 # -------------------------
 def sync_ipd_room_charges(
     db: Session,
-    *,
     admission_id: int,
-    upto_dt: datetime,
-    user,
-    gst_rate: Optional[Decimal] = None,
+    upto_dt: Optional[datetime] = None,
+    user: Optional[Any] = None,
+    gst_rate: float = 0.0,
 ) -> Dict[str, Any]:
     """
     ✅ New billing module sync:
@@ -419,12 +418,10 @@ def sync_ipd_room_charges(
     _recalc_invoice_totals(db, int(inv.id))
     case.status = BillingCaseStatus.READY_FOR_POST
 
-    return {
-        "billing_case_id": int(case.id),
-        "invoice_id": int(inv.id),
-        "from_date": from_date.isoformat(),
-        "to_date": to_date.isoformat(),
-        "days_billed": len(days),
-        "missing_rate_days": int(missing_days),
-        "missing_room_types": missing_room_types,
-    }
+    return sync_ipd_room_charges(
+            db=db,
+            admission_id=admission_id,
+            upto_dt=upto_dt,
+            user_id=getattr(user, "id", None) if user else None,
+            gst_rate=gst_rate,
+        )

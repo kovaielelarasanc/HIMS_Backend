@@ -8,7 +8,8 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_db, current_user as auth_current_user
 from app.models.user import User
 from app.models.ipd import IpdAdmission
-from app.models.billing import Invoice
+
+from app.models.billing import DocStatus
 
 from app.services.ipd_billing import (
     ensure_ipd_invoice,
@@ -45,17 +46,20 @@ def get_or_create_ipd_invoice(
 ):
     _need_any(user, ["ipd.view", "billing.view", "ipd.manage"])
     adm = _get_adm(db, admission_id)
-    inv = ensure_ipd_invoice(db,
-                             admission_id=adm.id,
-                             patient_id=adm.patient_id,
-                             user_id=getattr(user, "id", None))
+
+    inv = ensure_ipd_invoice(
+        db,
+        admission_id=adm.id,
+        patient_id=adm.patient_id,
+        user_id=getattr(user, "id", None),
+    )
     db.commit()
     return {
         "invoice_id": inv.id,
-        "billing_type": inv.billing_type,
+        "billing_case_id": inv.billing_case_id,
+        "module": inv.module,
         "status": inv.status,
         "invoice_number": inv.invoice_number,
-        "invoice_uid": inv.invoice_uid,
     }
 
 
@@ -67,15 +71,20 @@ def get_or_create_ipd_pharmacy_invoice(
 ):
     _need_any(user, ["ipd.view", "billing.view", "ipd.manage"])
     adm = _get_adm(db, admission_id)
-    inv = ensure_ipd_pharmacy_invoice(db,
-                                      admission_id=adm.id,
-                                      patient_id=adm.patient_id,
-                                      user_id=getattr(user, "id", None))
+
+    inv = ensure_ipd_pharmacy_invoice(
+        db,
+        admission_id=adm.id,
+        patient_id=adm.patient_id,
+        user_id=getattr(user, "id", None),
+    )
     db.commit()
     return {
         "invoice_id": inv.id,
-        "billing_type": inv.billing_type,
-        "status": inv.status
+        "billing_case_id": inv.billing_case_id,
+        "module": inv.module,
+        "status": inv.status,
+        "invoice_number": inv.invoice_number,
     }
 
 
@@ -87,15 +96,20 @@ def get_or_create_ipd_ot_invoice(
 ):
     _need_any(user, ["ipd.view", "billing.view", "ipd.manage"])
     adm = _get_adm(db, admission_id)
-    inv = ensure_ipd_ot_invoice(db,
-                                admission_id=adm.id,
-                                patient_id=adm.patient_id,
-                                user_id=getattr(user, "id", None))
+
+    inv = ensure_ipd_ot_invoice(
+        db,
+        admission_id=adm.id,
+        patient_id=adm.patient_id,
+        user_id=getattr(user, "id", None),
+    )
     db.commit()
     return {
         "invoice_id": inv.id,
-        "billing_type": inv.billing_type,
-        "status": inv.status
+        "billing_case_id": inv.billing_case_id,
+        "module": inv.module,
+        "status": inv.status,
+        "invoice_number": inv.invoice_number,
     }
 
 
@@ -108,6 +122,7 @@ def sync_ipd_invoice_services(
 ):
     _need_any(user, ["billing.manage", "ipd.manage"])
     _get_adm(db, admission_id)
+
     inv = sync_lis_ris_to_ipd_invoice(
         db,
         admission_id=admission_id,
@@ -115,7 +130,11 @@ def sync_ipd_invoice_services(
         only_final_status=only_final_status,
     )
     db.commit()
-    return {"message": "Synced LIS/RIS to IPD invoice", "invoice_id": inv.id}
+    return {
+        "message": "Synced LIS/RIS to IPD invoice",
+        "invoice_id": inv.id,
+        "status": inv.status
+    }
 
 
 @router.post("/admissions/{admission_id}/billing/bed-charges")
@@ -128,6 +147,7 @@ def post_bed_charges(
 ):
     _need_any(user, ["billing.manage", "ipd.manage"])
     _get_adm(db, admission_id)
+
     inv = add_bed_charges_to_ipd_invoice(
         db,
         admission_id=admission_id,
@@ -135,5 +155,15 @@ def post_bed_charges(
         from_date=from_date,
         to_date=to_date,
     )
+
+    # block if posted (service already blocks) - just extra clarity for UI
+    if inv.status == DocStatus.POSTED:
+        raise HTTPException(
+            400, "Invoice is POSTED; cannot auto-post bed/room charges")
+
     db.commit()
-    return {"message": "Bed charges posted", "invoice_id": inv.id}
+    return {
+        "message": "Room charges posted",
+        "invoice_id": inv.id,
+        "status": inv.status
+    }

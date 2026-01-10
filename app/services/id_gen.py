@@ -6,14 +6,14 @@ from datetime import date, datetime, timezone
 from typing import Optional, Union
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.models.ui_branding import UiBranding
-
-# Billing number series models
 from app.models.billing import BillingNumberSeries, NumberDocType, NumberResetPeriod
+
+IST = ZoneInfo("Asia/Kolkata")
 
 
 # ============================================================
@@ -33,6 +33,7 @@ def _normalize_to_date(d: Optional[Union[date, datetime]]) -> date:
 
     if isinstance(d, datetime):
         tz = _hospital_tz()
+        # if naive, treat as UTC (keeps old behavior)
         if d.tzinfo is None:
             d = d.replace(tzinfo=timezone.utc)
         return d.astimezone(tz).date()
@@ -44,40 +45,31 @@ def _dt_ddmmyyyy(d: Optional[Union[date, datetime]]) -> str:
     return _normalize_to_date(d).strftime("%d%m%Y")
 
 
-def _dt_yyyymm(d: Optional[Union[date, datetime]]) -> str:
-    return _normalize_to_date(d).strftime("%Y%m")
-
-
 def _dt_yyyy(d: Optional[Union[date, datetime]]) -> str:
     return _normalize_to_date(d).strftime("%Y")
 
 
+def _dt_yyyy_mm(d: Optional[Union[date, datetime]]) -> str:
+    return _normalize_to_date(d).strftime("%Y-%m")
+
+
 # ============================================================
-# Org code helpers (UiBranding)
+# Org code = UiBranding.org_name first 3 letters (as requested)
 # ============================================================
-def _clean_code(s: str, max_len: int = 3) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9]", "", (s or "").strip().upper())
-    return (cleaned[:max_len] or "").strip()
+def _clean_org3_from_name(org_name: str) -> str:
+    """
+    Requirement: UI_Branding ORG_NAME first three letters.
+    We take first 3 alphanumeric characters (ignoring spaces/symbols), uppercase.
+    Example:
+      "Sushrutha Medical Centre" -> "SUS"
+      "NUTRYAH Digital Health"   -> "NUT"
+    """
+    s = re.sub(r"[^A-Za-z0-9]", "", (org_name or "").strip().upper())
+    return (s[:3] or "").strip()
 
 
-def _acronym_from_org_name(org_name: str, max_len: int = 3) -> str:
-    name = (org_name or "").strip()
-    if not name:
-        return "NH"
-
-    words = re.findall(r"[A-Za-z0-9]+", name.upper())
-    if not words:
-        return "NH"
-
-    if len(words) >= 2:
-        code = "".join(w[0] for w in words[:max_len])
-    else:
-        code = words[0][:max_len]
-
-    return (code or "NH").strip()
-
-
-def _org_code_from_settings(max_len: int = 3) -> str:
+def _org3_from_settings() -> str:
+    # fallback only if org_name not available
     candidates = [
         getattr(settings, "PROVIDER_TENANT_CODE", None),
         getattr(settings, "VITE_PROVIDER_TENANT_CODE", None),
@@ -87,125 +79,113 @@ def _org_code_from_settings(max_len: int = 3) -> str:
     ]
     for c in candidates:
         if isinstance(c, str) and c.strip():
-            code = _clean_code(c, max_len=max_len)
-            if code:
-                return code
+            v = re.sub(r"[^A-Za-z0-9]", "", c.strip().upper())
+            if v:
+                return (v[:3] or "NH").strip()
     return "NH"
 
 
-def _org_code_from_branding(db: Session, max_len: int = 3) -> str:
-    b = db.query(UiBranding).order_by(UiBranding.id.desc()).first()
+def _org3_from_branding(db: Session) -> str:
+    """
+    Uses latest UiBranding row (tenant DB usually has one branding row).
+    If UiBranding has tenant_id and db.info["tenant_id"] exists, filters.
+    """
+    q = db.query(UiBranding)
+
+    try:
+        tid = db.info.get("tenant_id", None)  # type: ignore[attr-defined]
+        if tid is not None and hasattr(UiBranding, "tenant_id"):
+            q = q.filter(UiBranding.tenant_id == int(tid))
+    except Exception:
+        pass
+
+    b = q.order_by(UiBranding.id.desc()).first()
     if not b:
-        return _org_code_from_settings(max_len=max_len)
+        return _org3_from_settings()
 
     org_name = getattr(b, "org_name", None) or ""
-    code = _acronym_from_org_name(org_name, max_len=max_len)
-    return _clean_code(
-        code, max_len=max_len) or _org_code_from_settings(max_len=max_len)
+    code = _clean_org3_from_name(org_name)
+    return code or _org3_from_settings()
 
 
 # ============================================================
-# Common helpers
+# Series core (matches your BillingNumberSeries model)
+# UNIQUE(doc_type, reset_period, prefix)
 # ============================================================
-def _enc_code(encounter_type: Optional[str]) -> str:
-    if not encounter_type:
-        return ""
-    s = str(encounter_type).strip().upper()
-    if s in ("OP", "IP", "OT", "ER"):
-        return s
-    if s.startswith("OP"):
-        return "OP"
-    if s.startswith("IP"):
-        return "IP"
-    if s.startswith("OT"):
-        return "OT"
-    if s.startswith("ER"):
-        return "ER"
-    return ""
-
-
-def _period_key(
-    on_date: Optional[Union[date, datetime]],
-    reset_period: NumberResetPeriod,
-) -> Optional[str]:
+def _period_key(reset_period: NumberResetPeriod,
+                on_date: Optional[Union[date, datetime]]) -> Optional[str]:
     if reset_period == NumberResetPeriod.NONE:
         return None
     if reset_period == NumberResetPeriod.YEAR:
         return _dt_yyyy(on_date)
     if reset_period == NumberResetPeriod.MONTH:
-        return _dt_yyyymm(on_date)
+        return _dt_yyyy_mm(on_date)
     return None
 
 
-def _series_prefix_and_output_prefix(
+def _get_or_create_series_row(
     db: Session,
     *,
-    tag: str,  # "BC" / "INV" / "CN" / "DN" / "RC"
-    encounter_type: Optional[str],
-    on_date: Optional[Union[date, datetime]],
-    reset_period: NumberResetPeriod,
-) -> tuple[str, str]:
-    """
-    We want output numbers always like:
-      ORG + ENC + TAG + DDMMYYYY + 000001
-
-    But we DON'T want new series rows every day when reset_period is YEAR/MONTH.
-    So:
-      - If reset_period == NONE -> series_prefix includes date (daily unique series)
-      - Else -> series_prefix excludes date (one series row per month/year), but output still includes date
-    """
-    code = _org_code_from_branding(db, max_len=3)
-    enc = _enc_code(encounter_type)
-    dd = _dt_ddmmyyyy(on_date)
-
-    base = f"{code}{enc}{tag}"
-    if reset_period == NumberResetPeriod.NONE:
-        series_prefix = f"{base}{dd}"
-    else:
-        series_prefix = base
-
-    output_prefix = f"{base}{dd}"
-    return series_prefix, output_prefix
-
-
-def _ensure_series_row(
-    db: Session,
-    *,
-    tenant_id: int,
     doc_type: NumberDocType,
     prefix: str,
     reset_period: NumberResetPeriod,
     padding: int,
-    last_period_key: Optional[str],
-) -> None:
+    period_key: Optional[str],
+) -> BillingNumberSeries:
     """
-    Concurrency-safe upsert so we can reliably lock with SELECT ... FOR UPDATE next.
-    Requires UNIQUE KEY on (tenant_id, doc_type, reset_period, prefix).
+    Concurrency-safe:
+      - try SELECT ... FOR UPDATE
+      - if missing, INSERT in nested transaction (safe)
+      - if IntegrityError due to race, re-fetch FOR UPDATE
     """
-    db.execute(
-        text("""
-            INSERT INTO billing_number_series
-              (tenant_id, doc_type, prefix, reset_period, padding, next_number, last_period_key, is_active, created_at, updated_at)
-            VALUES
-              (:tenant_id, :doc_type, :prefix, :reset_period, :padding, 1, :last_period_key, 1, NOW(), NOW())
-            ON DUPLICATE KEY UPDATE
-              id = id
-            """),
-        {
-            "tenant_id": int(tenant_id),
-            "doc_type": str(doc_type.value),
-            "prefix": str(prefix),
-            "reset_period": str(reset_period.value),
-            "padding": int(padding),
-            "last_period_key": last_period_key,
-        },
-    )
+    prefix = (prefix or "").strip().upper()
+
+    row = (db.query(BillingNumberSeries).filter(
+        BillingNumberSeries.doc_type == doc_type,
+        BillingNumberSeries.reset_period == reset_period,
+        BillingNumberSeries.prefix == prefix,
+    ).with_for_update().first())
+    if row:
+        return row
+
+    try:
+        with db.begin_nested():
+            new_row = BillingNumberSeries(
+                doc_type=doc_type,
+                prefix=prefix,
+                reset_period=reset_period,
+                padding=int(padding or 6),
+                next_number=1,
+                last_period_key=period_key,
+                is_active=True,
+            )
+            db.add(new_row)
+            db.flush()
+
+        row2 = (db.query(BillingNumberSeries).filter(
+            BillingNumberSeries.doc_type == doc_type,
+            BillingNumberSeries.reset_period == reset_period,
+            BillingNumberSeries.prefix == prefix,
+        ).with_for_update().first())
+        if not row2:
+            raise RuntimeError("BillingNumberSeries row create failed")
+        return row2
+
+    except IntegrityError:
+        row3 = (db.query(BillingNumberSeries).filter(
+            BillingNumberSeries.doc_type == doc_type,
+            BillingNumberSeries.reset_period == reset_period,
+            BillingNumberSeries.prefix == prefix,
+        ).with_for_update().first())
+        if not row3:
+            raise RuntimeError(
+                "BillingNumberSeries row not found after collision")
+        return row3
 
 
 def _next_series_number(
     db: Session,
     *,
-    tenant_id: Optional[int],
     doc_type: NumberDocType,
     series_prefix: str,
     output_prefix: str,
@@ -214,49 +194,27 @@ def _next_series_number(
     padding: int = 6,
 ) -> str:
     """
-    Atomic sequential number generator using BillingNumberSeries.
-
-    IMPORTANT:
-      ✅ Must be called inside a DB transaction.
-      Example:
-        with db.begin():
-            inv_no = next_invoice_number(...)
-            ...
+    Returns: output_prefix + zero_padded(next_number)
+    Applies YEAR/MONTH reset using last_period_key.
     """
-    # IMPORTANT FIX FOR MYSQL UNIQUE + NULL:
-    # MySQL UNIQUE allows multiple NULLs, so we NEVER store NULL tenant_id in number series.
-    tenant_key = int(tenant_id or 0)
+    series_prefix = (series_prefix or "").strip().upper()
+    output_prefix = (output_prefix or "").strip().upper()
 
-    series_prefix = (series_prefix or "").strip().upper() or "NH"
-    output_prefix = (output_prefix or "").strip().upper() or "NH"
+    pkey = _period_key(reset_period, on_date)
 
-    pkey = _period_key(on_date, reset_period)
-
-    # Ensure the row exists (safe under concurrency)
-    _ensure_series_row(
+    row = _get_or_create_series_row(
         db,
-        tenant_id=tenant_key,
         doc_type=doc_type,
         prefix=series_prefix,
         reset_period=reset_period,
         padding=int(padding or 6),
-        last_period_key=pkey,
+        period_key=pkey,
     )
 
-    row = (
-        db.query(BillingNumberSeries).filter(
-            BillingNumberSeries.tenant_id == tenant_key,
-            BillingNumberSeries.doc_type == doc_type,
-            BillingNumberSeries.prefix == series_prefix,
-            BillingNumberSeries.reset_period == reset_period,
-            BillingNumberSeries.is_active == True,  # noqa: E712
-        ).with_for_update().first())
+    if not row.is_active:
+        raise RuntimeError("Number series is inactive")
 
-    if not row:
-        # Should never happen due to _ensure_series_row, but keep safe fallback
-        raise RuntimeError("BillingNumberSeries row not found after upsert")
-
-    # Reset if period changed (MONTH/YEAR)
+    # period reset only when using YEAR/MONTH
     if reset_period != NumberResetPeriod.NONE:
         if (row.last_period_key or "") != (pkey or ""):
             row.next_number = 1
@@ -265,13 +223,13 @@ def _next_series_number(
     n = int(row.next_number or 1)
     row.next_number = n + 1
     row.padding = int(padding or row.padding or 6)
-
     db.flush()
+
     return f"{output_prefix}{n:0{row.padding}d}"
 
 
 # ============================================================
-# OP / IP / Rx IDs (your existing style)
+# OP / IP / Rx IDs (kept same)
 # ============================================================
 def make_op_episode_id(
     db: Session,
@@ -280,8 +238,8 @@ def make_op_episode_id(
     on_date: Optional[Union[date, datetime]] = None,
     id_width: int = 4,
 ) -> str:
-    code = _org_code_from_branding(db, max_len=3)
-    return f"{code}OP{_dt_ddmmyyyy(on_date)}{visit_id:0{id_width}d}"
+    org = _org3_from_branding(db)
+    return f"{org}OP{_dt_ddmmyyyy(on_date)}{visit_id:0{id_width}d}"
 
 
 def make_ip_admission_code(
@@ -291,8 +249,8 @@ def make_ip_admission_code(
     on_date: Optional[Union[date, datetime]] = None,
     id_width: int = 6,
 ) -> str:
-    code = _org_code_from_branding(db, max_len=3)
-    return f"{code}IP{_dt_ddmmyyyy(on_date)}{admission_id:0{id_width}d}"
+    org = _org3_from_branding(db)
+    return f"{org}IP{_dt_ddmmyyyy(on_date)}{admission_id:0{id_width}d}"
 
 
 def make_rx_number(
@@ -302,36 +260,68 @@ def make_rx_number(
     on_date: Optional[Union[date, datetime]] = None,
     id_width: int = 5,
 ) -> str:
-    code = _org_code_from_branding(db, max_len=3)
-    return f"{code}RX{_dt_ddmmyyyy(on_date)}{rx_id:0{id_width}d}"
+    org = _org3_from_branding(db)
+    return f"{org}RX{_dt_ddmmyyyy(on_date)}{rx_id:0{id_width}d}"
 
 
 # ============================================================
-# BILLING IDs (Series-based audit-safe sequential)
+# Generic series number (PUBLIC API)
 # ============================================================
-def next_billing_case_number(
+def next_number_from_series(
     db: Session,
     *,
-    tenant_id: Optional[int] = None,
-    encounter_type: Optional[str] = None,
-    on_date: Optional[Union[date, datetime]] = None,
+    doc_type: NumberDocType,
+    prefix: str,
     padding: int = 6,
     reset_period: NumberResetPeriod = NumberResetPeriod.NONE,
+    on_date: Optional[Union[date, datetime]] = None,
 ) -> str:
-    series_prefix, output_prefix = _series_prefix_and_output_prefix(
-        db,
-        tag="BC",
-        encounter_type=encounter_type,
-        on_date=on_date,
-        reset_period=reset_period,
-    )
+    """
+    Safe sequential generator using BillingNumberSeries (tenant DB).
+    """
+    series_prefix = (prefix or "").strip().upper()
+    output_prefix = series_prefix
     return _next_series_number(
         db,
-        tenant_id=tenant_id,
-        doc_type=NumberDocType.CASE,
+        doc_type=doc_type,
         series_prefix=series_prefix,
         output_prefix=output_prefix,
         reset_period=reset_period,
+        on_date=on_date,
+        padding=padding,
+    )
+
+
+# ============================================================
+# Billing identifiers (YOUR REQUIRED FORMAT)
+# Format: ORG3 + DDMMYYYY + ######
+# Example: SUS10012026000001
+# ============================================================
+def _org_date_prefix(db: Session, on_date: Optional[Union[date,
+                                                          datetime]]) -> str:
+    org = _org3_from_branding(db)
+    dstr = _dt_ddmmyyyy(on_date)
+    return f"{org}{dstr}"
+
+
+def next_billing_case_number(
+    db: Session,
+    *,
+    on_date: Optional[Union[date, datetime]] = None,
+    padding: int = 6,
+) -> str:
+    """
+    Output: ORG3 + DDMMYYYY + ######
+    Uses doc_type=CASE (separate sequence from invoices/receipts).
+    Default: DAILY sequence (series_prefix includes date).
+    """
+    base = _org_date_prefix(db, on_date)
+    return _next_series_number(
+        db,
+        doc_type=NumberDocType.CASE,
+        series_prefix=base,  # daily series
+        output_prefix=base,  # printed format same
+        reset_period=NumberResetPeriod.NONE,
         on_date=on_date,
         padding=padding,
     )
@@ -340,82 +330,43 @@ def next_billing_case_number(
 def next_invoice_number(
     db: Session,
     *,
-    tenant_id: Optional[int] = None,
-    encounter_type: Optional[str] = None,
     on_date: Optional[Union[date, datetime]] = None,
     padding: int = 6,
-    reset_period: NumberResetPeriod = NumberResetPeriod.NONE,
 ) -> str:
-    series_prefix, output_prefix = _series_prefix_and_output_prefix(
-        db,
-        tag="INV",
-        encounter_type=encounter_type,
-        on_date=on_date,
-        reset_period=reset_period,
-    )
+    """
+    Output: ORG3 + DDMMYYYY + ######
+    Example: SUS10012026000001
+    Default: DAILY sequence (series_prefix includes date).
+    """
+    base = _org_date_prefix(db, on_date)
     return _next_series_number(
         db,
-        tenant_id=tenant_id,
         doc_type=NumberDocType.INVOICE,
-        series_prefix=series_prefix,
-        output_prefix=output_prefix,
-        reset_period=reset_period,
+        series_prefix=base,  # daily series
+        output_prefix=base,  # printed format same
+        reset_period=NumberResetPeriod.NONE,
         on_date=on_date,
         padding=padding,
     )
 
 
-def next_credit_note_number(
+def next_note_number(
     db: Session,
     *,
-    tenant_id: Optional[int] = None,
-    encounter_type: Optional[str] = None,
     on_date: Optional[Union[date, datetime]] = None,
     padding: int = 6,
-    reset_period: NumberResetPeriod = NumberResetPeriod.NONE,
 ) -> str:
-    series_prefix, output_prefix = _series_prefix_and_output_prefix(
-        db,
-        tag="CN",
-        encounter_type=encounter_type,
-        on_date=on_date,
-        reset_period=reset_period,
-    )
+    """
+    Credit/Debit notes share NOTE doc_type => one shared running sequence
+    (because output format does not include CN/DN tag).
+    """
+    base = _org_date_prefix(db, on_date)
     return _next_series_number(
         db,
-        tenant_id=tenant_id,
         doc_type=NumberDocType.NOTE,
-        series_prefix=series_prefix,
-        output_prefix=output_prefix,
-        reset_period=reset_period,
-        on_date=on_date,
-        padding=padding,
-    )
-
-
-def next_debit_note_number(
-    db: Session,
-    *,
-    tenant_id: Optional[int] = None,
-    encounter_type: Optional[str] = None,
-    on_date: Optional[Union[date, datetime]] = None,
-    padding: int = 6,
-    reset_period: NumberResetPeriod = NumberResetPeriod.NONE,
-) -> str:
-    series_prefix, output_prefix = _series_prefix_and_output_prefix(
-        db,
-        tag="DN",
-        encounter_type=encounter_type,
-        on_date=on_date,
-        reset_period=reset_period,
-    )
-    return _next_series_number(
-        db,
-        tenant_id=tenant_id,
-        doc_type=NumberDocType.NOTE,
-        series_prefix=series_prefix,
-        output_prefix=output_prefix,
-        reset_period=reset_period,
+        series_prefix=base,
+        output_prefix=base,
+        reset_period=NumberResetPeriod.NONE,
         on_date=on_date,
         padding=padding,
     )
@@ -424,26 +375,34 @@ def next_debit_note_number(
 def next_receipt_number(
     db: Session,
     *,
-    tenant_id: Optional[int] = None,
-    encounter_type: Optional[str] = None,
     on_date: Optional[Union[date, datetime]] = None,
     padding: int = 6,
-    reset_period: NumberResetPeriod = NumberResetPeriod.NONE,
 ) -> str:
-    series_prefix, output_prefix = _series_prefix_and_output_prefix(
-        db,
-        tag="RC",
-        encounter_type=encounter_type,
-        on_date=on_date,
-        reset_period=reset_period,
-    )
+    """
+    Output: ORG3 + DDMMYYYY + ######
+    """
+    base = _org_date_prefix(db, on_date)
     return _next_series_number(
         db,
-        tenant_id=tenant_id,
         doc_type=NumberDocType.RECEIPT,
-        series_prefix=series_prefix,
-        output_prefix=output_prefix,
-        reset_period=reset_period,
+        series_prefix=base,
+        output_prefix=base,
+        reset_period=NumberResetPeriod.NONE,
         on_date=on_date,
         padding=padding,
     )
+
+
+# Backward-compatible aliases (if your code calls these)
+def next_credit_note_number(db: Session,
+                            *,
+                            on_date: Optional[Union[date, datetime]] = None,
+                            padding: int = 6) -> str:
+    return next_note_number(db, on_date=on_date, padding=padding)
+
+
+def next_debit_note_number(db: Session,
+                           *,
+                           on_date: Optional[Union[date, datetime]] = None,
+                           padding: int = 6) -> str:
+    return next_note_number(db, on_date=on_date, padding=padding)

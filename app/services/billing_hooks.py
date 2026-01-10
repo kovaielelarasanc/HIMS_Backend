@@ -1,17 +1,15 @@
+# FILE: app/services/billing_hooks.py
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any
 
 from sqlalchemy.orm import Session
 
 from app.models.billing import (
-    BillingCase,
     BillingInvoiceLine,
-    EncounterType,
     InvoiceType,
     PayerType,
-    DocStatus,
     ServiceGroup,
     PayMode,
 )
@@ -45,7 +43,6 @@ def _pharmacy_kind_for_item(db: Session, sale_item: PharmacySaleItem) -> str:
     Returns:
       - "PHM" for medicines
       - "PHC" for consumables
-    This is written to work even if your inventory item model differs.
     """
     # 1) if sale_item already has a hint
     for attr in ("is_consumable", "consumable", "is_medicine", "medicine"):
@@ -56,15 +53,13 @@ def _pharmacy_kind_for_item(db: Session, sale_item: PharmacySaleItem) -> str:
             if attr in ("is_medicine", "medicine") and bool(v) is True:
                 return "PHM"
 
-    # 2) try inventory item master if available
+    # 2) try inventory master (best-effort)
     item_id = getattr(sale_item, "item_id", None)
     if item_id:
         try:
-            # adjust names if your inventory master differs
             from app.models.pharmacy_inventory import PharmacyItem  # type: ignore
             it = db.get(PharmacyItem, int(item_id))
             if it:
-                # common fields
                 if getattr(it, "is_consumable", False):
                     return "PHC"
                 cat = (getattr(it, "category", None)
@@ -76,7 +71,7 @@ def _pharmacy_kind_for_item(db: Session, sale_item: PharmacySaleItem) -> str:
         except Exception:
             pass
 
-    # 3) fallback: name-based heuristics (safe)
+    # 3) fallback: name heuristics
     name = (getattr(sale_item, "item_name", "") or "").lower()
     if any(k in name for k in [
             "syringe", "glove", "gauze", "cotton", "bandage", "mask", "tube",
@@ -87,10 +82,6 @@ def _pharmacy_kind_for_item(db: Session, sale_item: PharmacySaleItem) -> str:
 
 
 def _service_group_for_pharmacy(kind: str) -> ServiceGroup:
-    """
-    If your ServiceGroup has CONSUMABLE, use it.
-    Otherwise keep PHARM and store kind in meta_json.
-    """
     if kind == "PHC":
         if hasattr(ServiceGroup, "CONSUMABLE"):
             return getattr(ServiceGroup, "CONSUMABLE")
@@ -100,23 +91,60 @@ def _service_group_for_pharmacy(kind: str) -> ServiceGroup:
 
 
 # ============================================================
-# OPD consultation (module = OPD)
+# OPD consultation (module = OPD)  ✅ SIGNATURE FIXED
 # ============================================================
 def autobill_opd_consultation(
     db: Session,
     *,
-    visit_id: int,
-    appointment_id: Optional[int],
-    user,
+    # You can call EITHER way:
+    visit_id: Optional[int] = None,
+    appointment_id: Optional[int] = None,
+    # OR pass objects (as your routes_opd currently does)
+    visit: Optional[Any] = None,
+    appointment: Optional[Any] = None,
+    user: Any,
     fee_amount: Optional[Decimal] = None,
     gst_rate: Optional[Decimal] = None,
 ) -> Dict[str, Any]:
     """
-    Creates:
+    Creates (idempotent):
       - BillingCase: (OP, visit_id)
       - Invoice: module="OPD"
       - Line: source_module="OPD", source_ref_id=visit_id, source_line_key="CONSULT"
     """
+    # Resolve ids from objects if provided
+    if visit is not None and visit_id is None:
+        visit_id = int(getattr(visit, "id"))
+    if appointment is not None and appointment_id is None:
+        appointment_id = int(getattr(appointment, "id"))
+
+    if not visit_id:
+        raise BillingError(
+            "visit_id is required for OPD consultation autobill")
+
+    # Best-effort: auto-pick fee from DoctorFee if not supplied
+    if fee_amount is None:
+        try:
+            from app.models.opd import DoctorFee  # type: ignore
+            doc_id = None
+            if appointment is not None:
+                doc_id = getattr(appointment, "doctor_user_id", None)
+            if doc_id is None and visit is not None:
+                doc_id = getattr(visit, "doctor_user_id", None)
+
+            if doc_id:
+                row = db.query(DoctorFee).filter(
+                    DoctorFee.doctor_user_id == int(doc_id),
+                    DoctorFee.is_active.is_(True),
+                ).first()
+                if row:
+                    fee_amount = _d(getattr(row, "base_fee", 0))
+        except Exception:
+            pass
+
+    fee_amount = _d(fee_amount)
+    gst_rate = _d(gst_rate)
+
     case = get_or_create_case_for_op_visit(db,
                                            visit_id=int(visit_id),
                                            user=user)
@@ -131,26 +159,6 @@ def autobill_opd_consultation(
         payer_id=None,
     )
 
-    # idempotent
-    exists = (db.query(BillingInvoiceLine.id).filter(
-        BillingInvoiceLine.billing_case_id == int(case.id),
-        BillingInvoiceLine.source_module == "OPD",
-        BillingInvoiceLine.source_ref_id == int(visit_id),
-        BillingInvoiceLine.source_line_key == "CONSULT",
-    ).first())
-    if exists:
-        return {
-            "ok": True,
-            "case_id": int(case.id),
-            "invoice_id": int(inv.id),
-            "added": False
-        }
-
-    if fee_amount is None:
-        fee_amount = Decimal("0")
-    if gst_rate is None:
-        gst_rate = Decimal("0")
-
     created = add_auto_line_idempotent(
         db,
         invoice_id=int(inv.id),
@@ -163,8 +171,8 @@ def autobill_opd_consultation(
         item_code=None,
         description="OPD Consultation Fee",
         qty=Decimal("1"),
-        unit_price=_d(fee_amount),
-        gst_rate=_d(gst_rate),
+        unit_price=fee_amount,
+        gst_rate=gst_rate,
         source_module="OPD",
         source_ref_id=int(visit_id),
         source_line_key="CONSULT",
@@ -172,13 +180,15 @@ def autobill_opd_consultation(
         meta_patch={"opd": {
             "appointment_id": appointment_id
         }},
+        is_manual=False,
+        manual_reason=None,
     )
 
     return {
         "ok": True,
         "case_id": int(case.id),
         "invoice_id": int(inv.id),
-        "added": bool(created)
+        "added": (created is not None),
     }
 
 
@@ -186,12 +196,11 @@ def autobill_opd_consultation(
 # LIS -> module="LAB"
 # ============================================================
 def autobill_lis_order(db: Session, *, lis_order_id: int,
-                       user) -> Dict[str, Any]:
+                       user: Any) -> Dict[str, Any]:
     o = db.get(LisOrder, int(lis_order_id))
     if not o:
         raise BillingError("LIS Order not found")
 
-    # context: opd/ipd
     ct = (getattr(o, "context_type", None) or "").lower()
     cid = getattr(o, "context_id", None)
 
@@ -216,7 +225,6 @@ def autobill_lis_order(db: Session, *, lis_order_id: int,
         payer_id=None,
     )
 
-    # items
     items = getattr(o, "items", None)
     if items is None:
         items = db.query(LisOrderItem).filter(
@@ -255,19 +263,20 @@ def autobill_lis_order(db: Session, *, lis_order_id: int,
             source_ref_id=int(o.id),
             source_line_key=f"TEST:{test_id}",
             doctor_id=getattr(o, "ordering_user_id", None),
+            is_manual=False,
+            manual_reason=None,
         )
         if created is None:
             skipped += 1
         else:
             added += 1
 
-    # pointer optional
     if hasattr(o, "billing_invoice_id"):
         o.billing_invoice_id = int(inv.id)
     if hasattr(o, "billing_status"):
         o.billing_status = "billed"
-    db.flush()
 
+    db.flush()
     return {
         "ok": True,
         "case_id": int(case.id),
@@ -281,7 +290,7 @@ def autobill_lis_order(db: Session, *, lis_order_id: int,
 # RIS -> module="RIS"
 # ============================================================
 def autobill_ris_order(db: Session, *, ris_order_id: int,
-                       user) -> Dict[str, Any]:
+                       user: Any) -> Dict[str, Any]:
     o = db.get(RisOrder, int(ris_order_id))
     if not o:
         raise BillingError("RIS Order not found")
@@ -339,14 +348,16 @@ def autobill_ris_order(db: Session, *, ris_order_id: int,
         source_ref_id=int(o.id),
         source_line_key=f"TEST:{test_id}",
         doctor_id=getattr(o, "ordering_user_id", None),
+        is_manual=False,
+        manual_reason=None,
     )
 
     if hasattr(o, "billing_invoice_id"):
         o.billing_invoice_id = int(inv.id)
     if hasattr(o, "billing_status"):
         o.billing_status = "billed"
-    db.flush()
 
+    db.flush()
     return {
         "ok": True,
         "case_id": int(case.id),
@@ -360,7 +371,7 @@ def autobill_ris_order(db: Session, *, ris_order_id: int,
 # PHARMACY: split into PHM (meds) + PHC (consumables)
 # ============================================================
 def autobill_pharmacy_sale(db: Session, *, sale_id: int,
-                           user) -> Dict[str, Any]:
+                           user: Any) -> Dict[str, Any]:
     sale = db.get(PharmacySale, int(sale_id))
     if not sale:
         raise BillingError("PharmacySale not found")
@@ -381,7 +392,6 @@ def autobill_pharmacy_sale(db: Session, *, sale_id: int,
             "Sale has no visit_id/admission_id to map encounter (counter sale)"
         )
 
-    # module invoices
     inv_phm = get_or_create_active_module_invoice(
         db,
         billing_case_id=int(case.id),
@@ -389,7 +399,8 @@ def autobill_pharmacy_sale(db: Session, *, sale_id: int,
         module="PHM",
         invoice_type=InvoiceType.PATIENT,
         payer_type=PayerType.PATIENT,
-        payer_id=None)
+        payer_id=None,
+    )
     inv_phc = get_or_create_active_module_invoice(
         db,
         billing_case_id=int(case.id),
@@ -397,15 +408,13 @@ def autobill_pharmacy_sale(db: Session, *, sale_id: int,
         module="PHC",
         invoice_type=InvoiceType.PATIENT,
         payer_type=PayerType.PATIENT,
-        payer_id=None)
+        payer_id=None,
+    )
 
     items = db.query(PharmacySaleItem).filter(
         PharmacySaleItem.sale_id == int(sale.id)).all()
 
-    added_phm = 0
-    skipped_phm = 0
-    added_phc = 0
-    skipped_phc = 0
+    added_phm = skipped_phm = added_phc = skipped_phc = 0
 
     for it in items:
         kind = _pharmacy_kind_for_item(db, it)  # "PHM" or "PHC"
@@ -417,7 +426,6 @@ def autobill_pharmacy_sale(db: Session, *, sale_id: int,
         qty = _d(getattr(it, "quantity", 0) or 0)
         unit_price = _d(getattr(it, "unit_price", 0) or 0)
 
-        # tariff preferred
         rate, gst = get_tariff_rate(
             db,
             tariff_plan_id=getattr(case, "tariff_plan_id", None),
@@ -442,8 +450,7 @@ def autobill_pharmacy_sale(db: Session, *, sale_id: int,
             qty=qty if qty != 0 else Decimal("1"),
             unit_price=rate,
             gst_rate=gst,
-            source_module=
-            kind,  # ✅ IMPORTANT: idempotency won’t clash (PHM vs PHC)
+            source_module=kind,  # ✅ idempotency separated: PHM vs PHC
             source_ref_id=int(sale.id),
             source_line_key=f"SALE_ITEM:{getattr(it, 'id', item_id)}",
             doctor_id=None,
@@ -451,6 +458,8 @@ def autobill_pharmacy_sale(db: Session, *, sale_id: int,
                 "kind": kind,
                 "sale_id": int(sale.id)
             }},
+            is_manual=False,
+            manual_reason=None,
         )
 
         if kind == "PHM":
@@ -482,13 +491,9 @@ def add_pharmacy_payment_for_sale(
     *,
     sale_id: int,
     paid_amount: Decimal,
-    user,
+    user: Any,
     mode: PayMode = PayMode.CASH,
 ) -> Dict[str, Any]:
-    """
-    Records payment with txn_ref "PHARM:<bill_number>".
-    We attach it to PHM invoice by default; case-level reporting uses txn_ref anyway.
-    """
     sale = db.get(PharmacySale, int(sale_id))
     if not sale:
         raise BillingError("PharmacySale not found")

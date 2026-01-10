@@ -62,8 +62,122 @@ from app.services.billing_particulars import (
     get_particular_options,
     add_particular_lines,
 )
+from app.schemas.charge_item_master import AddChargeItemLineIn, AddChargeItemLineOut
+from app.services.billing_charge_item_service import add_charge_item_line_to_invoice, fetch_idempotent_existing_line
 
 router = APIRouter(prefix="/billing", tags=["Billing"])
+
+
+def _ensure_draft_misc_invoice_for_case(
+    db: Session,
+    *,
+    case: BillingCase,
+    user: User,
+    invoice_type: InvoiceType,
+    payer_type: PayerType,
+    payer_id: Optional[int],
+    allow_duplicate_draft: bool,
+    reset_period: NumberResetPeriod,
+) -> BillingInvoice:
+    inv = (db.query(BillingInvoice).filter(
+        BillingInvoice.billing_case_id == int(case.id)).filter(
+            BillingInvoice.status == DocStatus.DRAFT).filter(
+                (BillingInvoice.module == None)
+                | (BillingInvoice.module == "")
+                | (BillingInvoice.module == "MISC")).filter(
+                    BillingInvoice.invoice_type == invoice_type).filter(
+                        BillingInvoice.payer_type == payer_type).filter(
+                            BillingInvoice.payer_id == payer_id).order_by(
+                                desc(BillingInvoice.id)).first())
+
+    if inv:
+        if (getattr(inv, "module", None) or "").strip() == "":
+            inv.module = "MISC"
+        return inv
+
+    inv = create_new_invoice_for_case(
+        db,
+        case=case,
+        user=user,
+        module="MISC",
+        invoice_type=invoice_type,
+        payer_type=payer_type,
+        payer_id=payer_id,
+        reset_period=reset_period,
+        allow_duplicate_draft=allow_duplicate_draft,
+    )
+    db.flush()
+    return inv
+
+
+@router.post("/cases/{case_id}/charge-items/add",
+             response_model=AddChargeItemLineOut)
+def add_charge_item_to_case_misc_invoice(
+        case_id: int,
+        inp: AddChargeItemLineIn,
+        invoice_type: InvoiceType = Query(InvoiceType.PATIENT),
+        payer_type: PayerType = Query(PayerType.PATIENT),
+        payer_id: Optional[int] = Query(None),
+        reset_period: NumberResetPeriod = Query(NumberResetPeriod.YEAR),
+        allow_duplicate_draft: bool = Query(False),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    case = _get_case_or_404(db, user, int(case_id))
+
+    try:
+        inv = _ensure_draft_misc_invoice_for_case(
+            db,
+            case=case,
+            user=user,
+            invoice_type=invoice_type,
+            payer_type=payer_type,
+            payer_id=payer_id,
+            allow_duplicate_draft=allow_duplicate_draft,
+            reset_period=reset_period,
+        )
+
+        inv2, line = add_charge_item_line_to_invoice(
+            db,
+            invoice_id=int(inv.id),
+            charge_item_id=int(inp.charge_item_id),
+            qty=inp.qty,
+            unit_price=inp.unit_price,
+            gst_rate=inp.gst_rate,
+            discount_percent=inp.discount_percent,
+            discount_amount=inp.discount_amount,
+            idempotency_key=inp.idempotency_key,
+            revenue_head_id=inp.revenue_head_id,
+            cost_center_id=inp.cost_center_id,
+            doctor_id=inp.doctor_id,
+            manual_reason=inp.manual_reason,
+            created_by=getattr(user, "id", None),
+        )
+
+        db.commit()
+        db.refresh(inv2)
+        db.refresh(line)
+        return {"invoice": inv2, "line": line}
+
+    except IntegrityError:
+        db.rollback()
+        if inp.idempotency_key:
+            existing = fetch_idempotent_existing_line(
+                db,
+                billing_case_id=int(case.id),
+                invoice_id=int(inv.id),
+                idempotency_key=str(inp.idempotency_key),
+            )
+            if existing:
+                inv3 = db.get(BillingInvoice, int(inv.id))
+                return {"invoice": inv3, "line": existing}
+        raise HTTPException(
+            status_code=409,
+            detail="Could not add line (duplicate or constraint error)")
+
+    except Exception as e:
+        db.rollback()
+        _err(e)
 
 
 def _require_draft_invoice(inv: BillingInvoice):
@@ -1824,6 +1938,17 @@ def add_manual_line_v2(
         inv = _get_invoice_or_404(db, user, invoice_id)
         _require_draft_invoice(inv)
 
+        # ✅ HARD BLOCK: no one can inject CHARGE_ITEM via manual API
+        it = (inp.item_type or "").strip().upper()
+        if it in {"CHARGE_ITEM", "CHARGEITEM"}:
+            raise HTTPException(
+                status_code=422,
+                detail=
+                ("item_type=CHARGE_ITEM is not allowed in manual line API. "
+                 "Use /masters/charge-items/invoices/{invoice_id}/lines/charge-item "
+                 "(Charge items must be billed under a MISC invoice)."),
+            )
+
         ln = add_manual_line(
             db,
             invoice_id=int(inv.id),
@@ -1934,35 +2059,46 @@ def add_from_ris(
         db.rollback()
         _err(e)
 
+
 class EditReasonIn(BaseModel):
     reason: str = Field(..., min_length=3, max_length=255)
 
+
 @router.post("/invoices/{invoice_id}/edit-request")
 def request_edit(
-    invoice_id: int,
-    inp: EditReasonIn,
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+        invoice_id: int,
+        inp: EditReasonIn,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
 ):
     inv = _get_invoice_or_404(db, user, invoice_id)
     if _enum_value(inv.status) != "APPROVED":
-        raise HTTPException(status_code=409, detail="Edit request allowed only for APPROVED invoices")
+        raise HTTPException(
+            status_code=409,
+            detail="Edit request allowed only for APPROVED invoices")
 
     # ✅ Minimal: store as BillingNote OR create your own table
     # If you already have BillingNote model, use it.
     # Otherwise, for now return ok and you can wire admin flow later.
-    return {"ok": True, "message": "Edit request captured", "invoice_id": int(inv.id), "reason": inp.reason}
+    return {
+        "ok": True,
+        "message": "Edit request captured",
+        "invoice_id": int(inv.id),
+        "reason": inp.reason
+    }
+
 
 @router.post("/invoices/{invoice_id}/reopen")
 def reopen_invoice(
-    invoice_id: int,
-    inp: EditReasonIn,
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+        invoice_id: int,
+        inp: EditReasonIn,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
 ):
     inv = _get_invoice_or_404(db, user, invoice_id)
     if _enum_value(inv.status) != "APPROVED":
-        raise HTTPException(status_code=409, detail="Only APPROVED invoices can be reopened")
+        raise HTTPException(status_code=409,
+                            detail="Only APPROVED invoices can be reopened")
 
     # ✅ permission check (your deps.py already has require_perm)
     from app.api.deps import require_perm
@@ -1977,7 +2113,14 @@ def reopen_invoice(
     db.refresh(inv)
 
     # ✅ AUDIT: here you should write BillingAuditLog (recommended)
-    return {"ok": True, "invoice_id": int(inv.id), "status": _enum_value(inv.status), "reason": inp.reason}
+    return {
+        "ok": True,
+        "invoice_id": int(inv.id),
+        "status": _enum_value(inv.status),
+        "reason": inp.reason
+    }
+
+
 # ============================================================
 # ✅ Approve / Post / Void
 # ============================================================
