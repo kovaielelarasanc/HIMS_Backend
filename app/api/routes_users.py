@@ -4,17 +4,17 @@ from datetime import datetime
 import random
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func
-
+from sqlalchemy import or_
 from app.api.deps import get_db, current_user, require_perm
 from app.core.security import hash_password
 from app.models.user import User, UserLoginSeq, UserSession
 from app.models.role import Role
-from app.schemas.user import UserCreate, UserOut, UserUpdate, UserSaveResponse
+from app.schemas.user import UserCreate, UserOut, UserUpdate, UserSaveResponse, DoctorListResponse
 from app.services.otp_service import send_email_verify_otp
 from app.utils.otp_tokens import verify_otp
 
@@ -416,3 +416,58 @@ def admin_verify_email_alias(
     me: User = Depends(current_user),
 ):
     return admin_verify_email_otp(user_id, payload, db, me)
+
+
+def has_perm(user: User, code: str) -> bool:
+    if getattr(user, "is_admin", False):
+        return True
+    for r in (getattr(user, "roles", None) or []):
+        for p in (getattr(r, "permissions", None) or []):
+            if getattr(p, "code", None) == code:
+                return True
+    return False
+
+@router.get("/doctor")
+def list_doctors(
+    q: Optional[str] = Query(default=None, description="Search by name/login_id/email"),
+    include_inactive: bool = Query(default=False),
+    limit: int = Query(default=500, ge=1, le=2000),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    # ✅ permission (change code if your system uses different one)
+    if not has_perm(user, "doctors.view"):
+        raise HTTPException(status_code=403, detail="Not permitted")
+
+    qry = db.query(User).filter(User.is_doctor.is_(True))
+
+    if not include_inactive:
+        qry = qry.filter(User.is_active.is_(True))
+
+    if q:
+        like = f"%{q.strip()}%"
+        qry = qry.filter(
+            or_(
+                User.name.ilike(like),
+                User.login_id.ilike(like),
+                User.email.ilike(like),
+            )
+        )
+
+    qry = qry.order_by(User.name.asc()).limit(limit)
+
+    doctors = []
+    for d in qry.all():
+        doctors.append(
+            {
+                "id": d.id,
+                "login_id": d.login_id,
+                "name": d.name,
+                "email": d.email,
+                "is_active": bool(d.is_active),
+                "department_id": d.department_id,  # keep if you want, but no join
+            }
+        )
+
+    # ✅ IMPORTANT: frontend expects res.data.doctors
+    return {"status": True, "doctors": doctors}

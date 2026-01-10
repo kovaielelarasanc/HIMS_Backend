@@ -164,6 +164,13 @@ def seed_permissions(db: Session) -> None:
         ("pharmacy.accounts.supplier_ledger", ["view", "manage", "export"]),
         ("pharmacy.accounts.supplier_payments", ["view", "manage", "export"]),
         ("pharmacy.accounts.supplier_invoices", ["view", "manage", "export"]),
+        ("inventory.indents", ["view", "create", "update", "submit", "approve", "cancel"]),
+        ("inventory.issues", ["view", "create", "update", "post", "cancel"]),
+        ("inventory.catalog", ["view"]),
+        ("inventory.locations", ["view"]),
+        ("inventory.items", ["view"]),
+        ("inventory.stock", ["view"]),
+        ("inventory.batches", ["view"]),
         
         # -------- LIS ----------
         ("lab.masters", ["view", "manage"]),
@@ -241,6 +248,13 @@ def seed_permissions(db: Session) -> None:
         ("pharmacy.sales", ["view", "create", "return"]),
         ("pharmacy.billing", ["view", "create", "refund"]),
         ("pharmacy.returns", ["view", "manage"]),
+        ("pharmacy.prescriptions", ["view", "create", "update", "sign","cancel"]),
+        ("pharmacy.dispense", ["view", "create"]),
+        ("pharmacy.sales", ["view", "create","update"]),
+        ("pharmacy.payments", ["view", "create"]),
+        ("pharmacy.stock", ["view"]),
+        ("pharmacy.reports", ["view"]),
+    
 
         # -------- Settings / Customization ----------
         ("settings.customization", ["view", "manage"]),

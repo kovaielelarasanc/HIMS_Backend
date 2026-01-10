@@ -89,3 +89,23 @@ class UserLite(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class DoctorOut(BaseModel):
+    id: int
+    login_id: str
+    name: str
+    email: Optional[str] = None
+    is_active: bool
+    department_id: Optional[int] = None
+
+    class Config:
+        from_attributes = True
+
+
+
+class DoctorListResponse(BaseModel):
+    items: List[DoctorOut]
+    page: int
+    page_size: int
+    total: int

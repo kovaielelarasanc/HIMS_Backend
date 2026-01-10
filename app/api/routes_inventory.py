@@ -7,7 +7,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from io import StringIO, BytesIO
 from typing import Any, Dict, List, Optional, Set, Tuple, Literal
-
+from pathlib import Path
 from fastapi import (
     APIRouter,
     Depends,
@@ -19,8 +19,9 @@ from fastapi import (
 from fastapi.responses import StreamingResponse
 
 from sqlalchemy import func, and_, or_, case
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
+from sqlalchemy.orm import Session, joinedload
+
 
 from barcode import Code128
 from barcode.writer import ImageWriter
@@ -70,9 +71,12 @@ from app.schemas.inventory_bulk_upload import (
 from app.services.inventory_bulk_upload import (
     TEMPLATE_HEADERS,
     REQUIRED_HEADERS,
+    UploadError,
     parse_upload_to_rows,
     validate_item_rows,
     apply_items_import,
+    make_csv_template_bytes,
+    make_excel_template_bytes,
 )
 from app.services.inventory import (
     create_stock_transaction,
@@ -101,6 +105,127 @@ router = APIRouter(prefix="/inventory", tags=["Inventory - Pharmacy"])
 # ✅ FIX: SupplierPaymentMethod typing (your old code used Enum style)
 # ------------------------------------------------------------
 SupplierPaymentMethod = Literal["UPI", "BANK_TRANSFER", "CASH", "CHEQUE", "OTHER"]
+
+# ============================================================
+# ✅ Item payload normalization + friendly DB errors
+# ============================================================
+
+# columns that are NOT NULL in DB but frontend may send null
+_ITEM_NON_NULL_STR_FIELDS = {
+    "manufacturer",
+    "storage_condition",
+    "schedule_system",
+    "schedule_code",
+    "schedule_notes",
+    "generic_name",
+    "brand_name",
+    "dosage_form",
+    "strength",
+    "route",
+    "therapeutic_class",
+    "prescription_status",
+    "side_effects",
+    "drug_interactions",
+    "material_type",
+    "sterility_status",
+    "size_dimensions",
+    "intended_use",
+    "reusable_status",
+    "atc_code",
+    "hsn_code",
+    "unit",
+    "pack_size",
+    "base_uom",
+    "purchase_uom",
+    "item_type",
+    "name",
+    "code",
+}
+
+_ITEM_NON_NULL_NUM_FIELDS = {
+    "reorder_level",
+    "max_level",
+    "default_tax_percent",
+    "default_price",
+    "default_mrp",
+    "conversion_factor",
+}
+
+# nullable columns
+_ITEM_NULLABLE_FIELDS = {
+    "qr_number",
+    "default_supplier_id",
+    "procurement_date",
+    "active_ingredients",
+}
+
+def _normalize_item_data_for_db(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Prevent NOT NULL column crashes when client sends null.
+    - strings -> "" for non-null columns
+    - numbers -> 0 (or 1 for conversion_factor) for non-null numeric columns
+    - schedule_code: None -> ""
+    - schedule_system: None -> "IN_DCA"
+    """
+    d = dict(data or {})
+
+    # strings
+    for k in list(d.keys()):
+        if k in _ITEM_NON_NULL_STR_FIELDS and d[k] is None:
+            # schedule_code is usually stored as "" when empty
+            d[k] = ""
+
+    # numbers
+    for k in list(d.keys()):
+        if k in _ITEM_NON_NULL_NUM_FIELDS and d[k] is None:
+            d[k] = Decimal("1") if k == "conversion_factor" else Decimal("0")
+
+    # schedule defaults
+    if "schedule_system" in d and not (d.get("schedule_system") or "").strip():
+        d["schedule_system"] = "IN_DCA"
+    if "schedule_code" in d and d.get("schedule_code") is None:
+        d["schedule_code"] = ""
+
+    return d
+
+
+def _integrity_error_message(e: IntegrityError) -> str:
+    s = str(getattr(e, "orig", e)).lower()
+
+    # duplicates
+    if "uq_inv_items_code" in s or ("duplicate" in s and "code" in s):
+        return "Item code already exists"
+    if "uq_inv_items_qr_number" in s or ("duplicate" in s and ("qr_number" in s or "qr" in s)):
+        return "QR/Barcode number already exists"
+
+    # FK (adjust name if your FK constraint differs)
+    if "fk_inv_items_default_supplier" in s or ("foreign key" in s and "default_supplier" in s):
+        return "Invalid default_supplier_id (Supplier not found)"
+
+    return "Database constraint error"
+
+
+def _qty_on_hand_for_item(db: Session, item_id: int, location_id: Optional[int] = None) -> float:
+    saleable = and_(
+        ItemBatch.is_active.is_(True),
+        ItemBatch.is_saleable.is_(True),
+        ItemBatch.status == "ACTIVE",
+        ItemBatch.item_id == item_id,
+    )
+    q = db.query(func.coalesce(func.sum(ItemBatch.current_qty), 0)).filter(saleable)
+    if location_id:
+        q = q.filter(ItemBatch.location_id == location_id)
+    return float(q.scalar() or 0)
+
+
+def _item_out_dict(db: Session, item: InventoryItem, *, location_id: Optional[int] = None) -> Dict[str, Any]:
+    # supplier relationship name in your model is "supplier"
+    sup = getattr(item, "supplier", None)
+
+    base = ItemOut.model_validate(item).model_dump()
+    base["qty_on_hand"] = _qty_on_hand_for_item(db, int(item.id), location_id=location_id)
+    base["supplier"] = {"id": int(sup.id), "name": sup.name} if sup else None
+    return base
 
 
 def _validate_payment_block(
@@ -533,10 +658,14 @@ def list_items(
     offset: int = Query(0, ge=0),
 ):
     if not has_perm(current_user, "pharmacy.inventory.items.view"):
-        raise HTTPException(status_code=403, detail="Not enough permissions")
+        return err("Not enough permissions", status_code=403)
 
     item = InventoryItem
-    qry = db.query(item).outerjoin(Supplier, Supplier.id == item.default_supplier_id)
+
+    qry = (
+        db.query(item)
+        .options(joinedload(item.supplier))  # ✅ no N+1 supplier
+    )
 
     if q and q.strip():
         like = f"%{q.strip()}%"
@@ -562,8 +691,11 @@ def list_items(
     if supplier_id:
         qry = qry.filter(item.default_supplier_id == supplier_id)
 
+    rows = qry.order_by(item.name.asc()).offset(offset).limit(limit).all()
+
+    # ✅ qty map in one query (only if include_qty)
     qty_map: Dict[int, float] = {}
-    if include_qty:
+    if include_qty and rows:
         saleable = and_(
             ItemBatch.is_active.is_(True),
             ItemBatch.is_saleable.is_(True),
@@ -574,27 +706,23 @@ def list_items(
                 ItemBatch.item_id.label("item_id"),
                 func.coalesce(func.sum(ItemBatch.current_qty), 0).label("qty"),
             )
-            .filter(saleable)
+            .filter(saleable, ItemBatch.item_id.in_([r.id for r in rows]))
         )
         if location_id:
             bq = bq.filter(ItemBatch.location_id == location_id)
         bq = bq.group_by(ItemBatch.item_id)
         qty_map = {int(r.item_id): float(r.qty or 0) for r in bq.all()}
 
-    rows = qry.order_by(item.name.asc()).offset(offset).limit(limit).all()
-
     out: List[Dict[str, Any]] = []
     for it in rows:
-        sup = getattr(it, "supplier", None) or getattr(it, "default_supplier", None)
-        out.append(
-            {
-                **ItemOut.model_validate(it).model_dump(),
-                "qty_on_hand": float(qty_map.get(it.id, 0)),
-                "supplier": {"id": sup.id, "name": sup.name} if sup else None,
-            }
-        )
+        sup = getattr(it, "supplier", None)
+        base = ItemOut.model_validate(it).model_dump()
+        base["qty_on_hand"] = float(qty_map.get(int(it.id), 0))
+        base["supplier"] = {"id": int(sup.id), "name": sup.name} if sup else None
+        out.append(base)
 
     return ok(out)
+
 
 
 @router.get("/item-batches", response_model=List[PharmacyBatchPickOut])
@@ -700,43 +828,65 @@ def create_item(
     current_user: User = Depends(auth_current_user),
 ):
     if not has_perm(current_user, "pharmacy.inventory.items.manage"):
-        raise HTTPException(status_code=403, detail="Not enough permissions")
+        return err("Not enough permissions", status_code=403)
 
-    if db.query(InventoryItem).filter_by(code=payload.code).first():
-        raise HTTPException(status_code=400, detail="Item code already exists")
+    # ✅ only "actually provided" fields (important!)
+    provided = set(getattr(payload, "model_fields_set", set()) or set())
 
-    data = payload.model_dump()  # create usually includes defaults
+    # basic uniqueness pre-check (fast message)
+    if db.query(InventoryItem.id).filter(InventoryItem.code == payload.code).first():
+        return err("Item code already exists", status_code=400)
+
+    data = _normalize_item_data_for_db(payload.model_dump())
 
     data["name"] = smart_title(data.get("name", ""))
     data["generic_name"] = smart_title(data.get("generic_name", ""))
     data["brand_name"] = smart_title(data.get("brand_name", ""))
 
-    item = InventoryItem(**data)
-    _apply_type_sync(item)
+    # ✅ validate supplier id if provided
+    if data.get("default_supplier_id"):
+        sup = db.get(Supplier, int(data["default_supplier_id"]))
+        if not sup:
+            return err("Invalid default_supplier_id (Supplier not found)", status_code=400)
 
-    # ✅ schedule sync
-    # ✅ inside create_item after item = InventoryItem(**data) and _apply_type_sync(item)
+    try:
+        item = InventoryItem(**data)
 
-    _apply_schedule_sync(
-        item,
-        schedule_system=getattr(payload, "schedule_system", None),
-        schedule_code=getattr(payload, "schedule_code", None),
-        prescription_status=getattr(payload, "prescription_status", None),
-        system_provided=("schedule_system" in data),
-        schedule_provided=("schedule_code" in data),
-        ps_provided=("prescription_status" in data),
-    )
+        _apply_type_sync(item)
 
+        # ✅ schedule sync (only overwrite if field was truly provided by client)
+        _apply_schedule_sync(
+            item,
+            schedule_system=getattr(payload, "schedule_system", None),
+            schedule_code=getattr(payload, "schedule_code", None),
+            prescription_status=getattr(payload, "prescription_status", None),
+            system_provided=("schedule_system" in provided),
+            schedule_provided=("schedule_code" in provided),
+            ps_provided=("prescription_status" in provided),
+        )
 
-    db.add(item)
-    db.flush()
+        # ✅ high alert rule (optional)
+        if getattr(item, "high_alert_flag", False) and not getattr(item, "requires_double_check", False):
+            item.requires_double_check = True
 
-    if not item.qr_number:
-        item.qr_number = f"MED-{item.id:06d}"
+        db.add(item)
+        db.flush()
 
-    db.commit()
-    db.refresh(item)
-    return ok(ItemOut.model_validate(item))
+        if not item.qr_number:
+            item.qr_number = f"MED-{item.id:06d}"
+
+        db.commit()
+        db.refresh(item)
+
+        return ok(_item_out_dict(db, item))
+
+    except IntegrityError as e:
+        db.rollback()
+        return err(_integrity_error_message(e), status_code=400)
+    except SQLAlchemyError:
+        db.rollback()
+        return err("Database error while creating item", status_code=500)
+
 
 
 # ✅ UPDATE ITEM (this is what your PUT is hitting)
@@ -748,25 +898,41 @@ def update_item(
     current_user: User = Depends(auth_current_user),
 ):
     if not has_perm(current_user, "pharmacy.inventory.items.manage"):
-        raise HTTPException(status_code=403, detail="Not enough permissions")
+        return err("Not enough permissions", status_code=403)
 
     item = db.get(InventoryItem, item_id)
     if not item:
-        raise HTTPException(status_code=404, detail="Item not found")
+        return err("Item not found", status_code=404)
 
     data = payload.model_dump(exclude_unset=True)
+    data = _normalize_item_data_for_db(data)
 
-    # uniqueness if code is being changed
+    # ✅ uniqueness checks
     if "code" in data and data["code"]:
         exists = (
-            db.query(InventoryItem)
+            db.query(InventoryItem.id)
             .filter(InventoryItem.code == data["code"], InventoryItem.id != item_id)
             .first()
         )
         if exists:
-            raise HTTPException(status_code=400, detail="Item code already exists")
+            return err("Item code already exists", status_code=400)
 
-    # smart title for only provided fields
+    if "qr_number" in data and data["qr_number"]:
+        exists = (
+            db.query(InventoryItem.id)
+            .filter(InventoryItem.qr_number == data["qr_number"], InventoryItem.id != item_id)
+            .first()
+        )
+        if exists:
+            return err("QR/Barcode number already exists", status_code=400)
+
+    # ✅ validate supplier id if provided
+    if "default_supplier_id" in data and data["default_supplier_id"]:
+        sup = db.get(Supplier, int(data["default_supplier_id"]))
+        if not sup:
+            return err("Invalid default_supplier_id (Supplier not found)", status_code=400)
+
+    # title-case only when provided
     if "name" in data:
         data["name"] = smart_title(data.get("name", ""))
     if "generic_name" in data:
@@ -774,26 +940,39 @@ def update_item(
     if "brand_name" in data:
         data["brand_name"] = smart_title(data.get("brand_name", ""))
 
-    # apply changes
-    for k, v in data.items():
-        setattr(item, k, v)
+    try:
+        # apply changes
+        for k, v in data.items():
+            setattr(item, k, v)
 
-    _apply_type_sync(item)
+        _apply_type_sync(item)
 
-    # ✅ schedule sync (ONLY overwrite if field provided)
-    _apply_schedule_sync(
-        item,
-        schedule_system=data.get("schedule_system") if "schedule_system" in data else None,
-        schedule_code=data.get("schedule_code") if "schedule_code" in data else None,
-        prescription_status=data.get("prescription_status") if "prescription_status" in data else None,
-        system_provided=("schedule_system" in data),
-        schedule_provided=("schedule_code" in data),
-        ps_provided=("prescription_status" in data),
-    )
+        # ✅ schedule sync ONLY for provided fields (data contains only provided fields)
+        _apply_schedule_sync(
+            item,
+            schedule_system=data.get("schedule_system") if "schedule_system" in data else None,
+            schedule_code=data.get("schedule_code") if "schedule_code" in data else None,
+            prescription_status=data.get("prescription_status") if "prescription_status" in data else None,
+            system_provided=("schedule_system" in data),
+            schedule_provided=("schedule_code" in data),
+            ps_provided=("prescription_status" in data),
+        )
 
-    db.commit()
-    db.refresh(item)
-    return ok(ItemOut.model_validate(item))
+        if getattr(item, "high_alert_flag", False) and not getattr(item, "requires_double_check", False):
+            item.requires_double_check = True
+
+        db.commit()
+        db.refresh(item)
+
+        return ok(_item_out_dict(db, item))
+
+    except IntegrityError as e:
+        db.rollback()
+        return err(_integrity_error_message(e), status_code=400)
+    except SQLAlchemyError:
+        db.rollback()
+        return err("Database error while updating item", status_code=500)
+
 
 @router.get("/items/drug-schedules")
 def get_drug_schedules_catalog(current_user: User = Depends(auth_current_user)):
@@ -932,147 +1111,52 @@ def download_sample_items_csv(current_user: User = Depends(auth_current_user)):
 
 
 
+# ============================================================
+# TEMPLATE DOWNLOAD (CSV / XLSX / XLSM)
+# ============================================================
 @router.get("/items/bulk-upload/template")
 def download_items_template(
-    format: str = Query("csv", pattern="^(csv|xlsx)$"),
+    format: str = Query("xlsx", pattern="^(csv|xlsx|xlsm)$"),
     current_user: User = Depends(auth_current_user),
 ):
     if not has_perm(current_user, "pharmacy.inventory.items.manage"):
         raise HTTPException(status_code=403, detail="Not enough permissions")
 
-    def row_from_dict(sample: dict) -> list:
-        # ✅ Always match TEMPLATE_HEADERS order
-        return [sample.get(h, "") for h in TEMPLATE_HEADERS]
-
-    # ✅ Sample DRUG (includes schedule fields + new InventoryItem fields)
-    sample_drug = {
-        "code": "ITEM001",
-        "qr_number": "MED-000001",
-        "name": "Paracetamol 500mg",
-
-        "item_type": "DRUG",
-        "is_consumable": "FALSE",
-        "lasa_flag": "FALSE",
-        "is_active": "TRUE",
-
-        "unit": "TAB",
-        "pack_size": "10",
-        "reorder_level": "50",
-        "max_level": "500",
-
-        "manufacturer": "ABC Pharma",
-        "default_supplier_id": "",
-        "procurement_date": "",  # YYYY-MM-DD
-        "storage_condition": "ROOM_TEMP",
-
-        "default_tax_percent": "12",
-        "default_price": "1.50",
-        "default_mrp": "2.00",
-
-        # ✅ Schedule (your new backend fields)
-        "schedule_system": "IN_DCA",
-        "schedule_code": "H",
-        "schedule_notes": "Rx only",
-
-        # Drug fields (new model)
-        "generic_name": "Paracetamol",
-        "brand_name": "",
-        "dosage_form": "Tablet",
-        "strength": "500mg",
-        "active_ingredients": "Paracetamol",
-        "route": "oral",
-        "therapeutic_class": "Analgesic",
-        "prescription_status": "RX",
-        "side_effects": "",
-        "drug_interactions": "",
-
-        # Other codes
-        "atc_code": "N02BE01",
-        "hsn_code": "3004",
-
-        # Compatibility (if your TEMPLATE_HEADERS still uses old names)
-        "form": "Tablet",
-        "class_name": "Analgesic",
-        "storage_conditions": "ROOM_TEMP",
-        "route_of_administration": "oral",
-        "reusable_disposable": "DISPOSABLE",
-    }
-
-    # ✅ Optional: sample CONSUMABLE row (safe – only fills if headers exist)
-    sample_consumable = {
-        "code": "CON001",
-        "qr_number": "CON-000001",
-        "name": "Sterile Gauze 4x4",
-
-        "item_type": "CONSUMABLE",
-        "is_consumable": "TRUE",
-        "lasa_flag": "FALSE",
-        "is_active": "TRUE",
-
-        "unit": "PCS",
-        "pack_size": "1",
-        "reorder_level": "200",
-        "max_level": "2000",
-
-        "manufacturer": "XYZ Medical",
-        "storage_condition": "ROOM_TEMP",
-
-        "default_tax_percent": "0",
-        "default_price": "5.00",
-        "default_mrp": "6.00",
-
-        "material_type": "cotton",
-        "sterility_status": "STERILE",
-        "size_dimensions": "4x4",
-        "intended_use": "Wound dressing",
-        "reusable_status": "DISPOSABLE",
-
-        "hsn_code": "3005",
-    }
-
     if format == "csv":
-        output = StringIO()
-        w = csv.writer(output)
-        w.writerow(TEMPLATE_HEADERS)
-
-        # ✅ 1 or 2 sample rows
-        w.writerow(row_from_dict(sample_drug))
-        w.writerow(row_from_dict(sample_consumable))
-
-        data = output.getvalue().encode("utf-8-sig")
+        data = make_csv_template_bytes()
         return StreamingResponse(
             BytesIO(data),
             media_type="text/csv",
-            headers={"Content-Disposition": "attachment; filename=items_template.csv"},
+            headers={"Content-Disposition": 'attachment; filename="items_template.csv"'},
         )
 
+    # XLSM support (real xlsm only if base template exists)
+    base_xlsm = Path("app/static/templates/items_template_base.xlsm")  # put your macro template here if you have
+    macro_enabled = (format == "xlsm")
     try:
-        from openpyxl import Workbook
-    except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail="openpyxl required for xlsx template. Install: pip install openpyxl",
-        )
+        content, ext = make_excel_template_bytes(macro_enabled=macro_enabled, base_xlsm_path=base_xlsm)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Items"
-    ws.append(TEMPLATE_HEADERS)
+    if macro_enabled and ext != "xlsm":
+        # No base_xlsm provided -> fallback to xlsx to avoid corrupted downloads
+        ext = "xlsx"
 
-    ws.append(row_from_dict(sample_drug))
-    ws.append(row_from_dict(sample_consumable))
+    media = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    if ext == "xlsm":
+        media = "application/vnd.ms-excel.sheet.macroEnabled.12"
 
-    buf = BytesIO()
-    wb.save(buf)
-    buf.seek(0)
     return StreamingResponse(
-        buf,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": "attachment; filename=items_template.xlsx"},
+        BytesIO(content),
+        media_type=media,
+        headers={"Content-Disposition": f'attachment; filename="items_template.{ext}"'},
     )
 
 
 
+# ============================================================
+# PREVIEW
+# ============================================================
 @router.post("/items/bulk-upload/preview", response_model=BulkUploadPreviewOut)
 def preview_items_upload(
     file: UploadFile = File(...),
@@ -1092,25 +1176,32 @@ def preview_items_upload(
         raise HTTPException(status_code=400, detail=str(e))
 
     normalized, errs = validate_item_rows(rows)
-    sample_rows = normalized[:20]
+
+    # compute per-row validity
+    err_rows = {e.row for e in errs if e.row and e.row > 1}
+    valid_rows = max(0, len(normalized) - len(err_rows))
 
     return BulkUploadPreviewOut(
         file_type=file_type,
         total_rows=len(rows),
-        valid_rows=len(normalized) - len([e for e in errs if e.row != 0]),
-        error_rows=len(errs),
+        valid_rows=valid_rows,
+        error_rows=len(err_rows),
         required_columns=REQUIRED_HEADERS,
         optional_columns=[c for c in TEMPLATE_HEADERS if c not in REQUIRED_HEADERS],
-        sample_rows=sample_rows,
+        sample_rows=normalized[:20],
         errors=[BulkUploadErrorOut(row=e.row, code=e.code, column=e.column, message=e.message) for e in errs],
     )
 
 
+# ============================================================
+# COMMIT
+# ============================================================
 @router.post("/items/bulk-upload/commit", response_model=BulkUploadCommitOut)
 def commit_items_upload(
     file: UploadFile = File(...),
     update_blanks: bool = Query(False, description="If true, blank cells overwrite existing values"),
     strict: bool = Query(True, description="If true, any error stops commit"),
+    create_missing_locations: bool = Query(True, description="Auto-create missing opening stock locations"),
     db: Session = Depends(get_db),
     current_user: User = Depends(auth_current_user),
 ):
@@ -1134,9 +1225,15 @@ def commit_items_upload(
             detail=[{"row": e.row, "code": e.code, "column": e.column, "message": e.message} for e in errs],
         )
 
-    created, updated, skipped, db_errs = apply_items_import(db, normalized, update_blanks=update_blanks)
-    out_errs = errs + db_errs
+    created, updated, skipped, db_errs = apply_items_import(
+        db,
+        normalized,
+        update_blanks=update_blanks,
+        create_missing_locations=create_missing_locations,
+        user_id=getattr(current_user, "id", None),
+    )
 
+    out_errs = errs + db_errs
     return BulkUploadCommitOut(
         created=created,
         updated=updated,

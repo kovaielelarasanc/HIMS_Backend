@@ -8,7 +8,7 @@ import logging
 import sys
 from app.core.config import settings
 from app.api.router import api_router
-
+from sqlalchemy.exc import SQLAlchemyError
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import HTTPException
 from starlette.status import HTTP_500_INTERNAL_SERVER_ERROR
@@ -65,6 +65,20 @@ setup_logging()
 
 logger = logging.getLogger("app")
 logger.info("✅ App starting...")
+
+DEBUG = os.getenv("DEBUG", "1") == "1"  # set DEBUG=0 in prod
+
+@app.exception_handler(SQLAlchemyError)
+async def sqlalchemy_exception_handler(request: Request, exc: SQLAlchemyError):
+    logger.exception("DB error on %s %s", request.method, request.url.path)
+    msg = str(getattr(exc, "orig", exc)) if DEBUG else "Database error"
+    return JSONResponse(status_code=500, content={"status": False, "error": {"msg": msg}})
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    msg = f"{type(exc).__name__}: {exc}" if DEBUG else "Internal server error"
+    return JSONResponse(status_code=500, content={"status": False, "error": {"msg": msg}})
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):

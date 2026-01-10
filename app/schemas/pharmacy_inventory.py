@@ -3,10 +3,10 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
-from typing import List, Optional, Literal
+from typing import List, Optional, Literal, Any
 import re
 from enum import Enum
-from pydantic import BaseModel, Field, ConfigDict, condecimal, field_validator, EmailStr, model_validator
+from pydantic import BaseModel, Field, ConfigDict, condecimal, field_validator, EmailStr, model_validator, AliasChoices
 from app.models.pharmacy_inventory import GRNStatus  # ✅ import your model Enum
 # ---------- Locations ----------
 
@@ -225,180 +225,458 @@ def _norm_schedule(v: Optional[str]) -> Optional[str]:
 
 
 class SupplierMini(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
-    name: str
-
-
-class ItemBase(BaseModel):
     code: str
     name: str
+    phone: Optional[str] = None
+    email: Optional[str] = None
 
-    item_type: str = Field(default="DRUG")  # DRUG | CONSUMABLE | EQUIPMENT
+
+# -----------------------------
+# Normalizers / helpers
+# -----------------------------
+def _s(v: Any) -> str:
+    return ("" if v is None else str(v)).strip()
+
+
+def _u(v: Any) -> str:
+    return _s(v).upper()
+
+
+def _float(v: Any, default: float = 0.0) -> float:
+    if v is None or v == "":
+        return default
+    try:
+        return float(v)
+    except Exception:
+        raise ValueError("must be a number")
+
+
+def _dec(v: Any, default: Decimal = Decimal("0")) -> Decimal:
+    if v is None or v == "":
+        return default
+    try:
+        return Decimal(str(v))
+    except Exception:
+        raise ValueError("must be a decimal number")
+
+
+def _norm_schedule(v: Any) -> Optional[str]:
+    """
+    Normalize schedule_code:
+    - Accepts: None / '' / 'H' / 'H1' / 'X' / 'rx' / 'otc'
+    - Returns: None or upper normalized string
+    """
+    s = _u(v)
+    if not s:
+        return None
+    # allow RX/OTC to be passed in schedule_code field too
+    if s in ("RX", "OTC", "H", "H1", "X"):
+        return s
+    raise ValueError("schedule_code must be one of: H, H1, X, RX, OTC")
+
+
+def _ensure_non_negative(name: str, value: float) -> float:
+    if value < 0:
+        raise ValueError(f"{name} must be >= 0")
+    return value
+
+
+# -----------------------------
+# Base schema
+# -----------------------------
+class ItemBase(BaseModel):
+    model_config = ConfigDict(
+        extra="ignore",     
+        from_attributes=True,    # ORM support
+        populate_by_name=True,   # allow aliases
+        str_strip_whitespace=True,
+    )
+
+    # identity
+    code: str = Field(..., min_length=1, max_length=100)
+    name: str = Field(..., min_length=1, max_length=255)
+    qr_number: Optional[str] = Field(default=None, max_length=50)
+
+    # classification
+    item_type: str = Field(default="DRUG", description="DRUG | CONSUMABLE | EQUIPMENT")
+    is_consumable: bool = Field(default=False, description="Compatibility flag")
+
+    # flags
     lasa_flag: bool = False
-    is_consumable: bool = False  # kept for compatibility
+    high_alert_flag: bool = False
+    requires_double_check: bool = False
 
-    unit: str = "unit"
-    pack_size: str = "1"
-    reorder_level: float = 0
-    max_level: float = 0
+    # stock metadata
+    unit: str = Field(default="unit", max_length=50)
+    pack_size: str = Field(default="1", max_length=50)
 
-    manufacturer: Optional[str] = ""
+    # ✅ UOM conversion
+    base_uom: str = Field(default="unit", max_length=30)
+    purchase_uom: str = Field(default="unit", max_length=30)
+    conversion_factor: Decimal = Field(default=Decimal("1"))
+
+    reorder_level: Decimal = Field(default=Decimal("0"))
+    max_level: Decimal = Field(default=Decimal("0"))
+
+    # supplier / procurement
+    manufacturer: str = Field(default="", max_length=255)
     default_supplier_id: Optional[int] = None
     procurement_date: Optional[date] = None
 
-    storage_condition: str = "ROOM_TEMP"
+    # storage
+    storage_condition: str = Field(
+        default="ROOM_TEMP",
+        max_length=30,
+        validation_alias=AliasChoices("storage_condition", "storage_conditions"),
+    )
 
-    default_tax_percent: float = 0
-    default_price: float = 0
-    default_mrp: float = 0
+    # defaults (suggestions)
+    default_tax_percent: Decimal = Field(default=Decimal("0"))
+    default_price: Decimal = Field(default=Decimal("0"))
+    default_mrp: Decimal = Field(default=Decimal("0"))
 
-    # drug
-    generic_name: Optional[str] = ""
-    brand_name: Optional[str] = ""
-    dosage_form: Optional[str] = ""
-    strength: Optional[str] = ""
-    active_ingredients: Optional[List[str]] = None
-    route: Optional[str] = ""
-    therapeutic_class: Optional[str] = ""
-
-    # ✅ main status (your existing)
-    # OTC | RX | SCHEDULED
-    prescription_status: str = "RX"
-
-    # ✅ NEW: schedule code for scheduled drugs (H/H1/X)
-    # You can also send RX/OTC, we normalize it.
+    # Regulatory schedule (NEW fields from DB model)
+    schedule_system: str = Field(default="IN_DCA", max_length=20, description="IN_DCA (default)")
     schedule_code: Optional[str] = Field(default=None, description="H/H1/X or RX/OTC")
+    schedule_notes: str = Field(default="", max_length=255)
 
-    side_effects: Optional[str] = ""
-    drug_interactions: Optional[str] = ""
+    # DRUG fields
+    generic_name: str = Field(default="", max_length=255)
+    brand_name: str = Field(default="", max_length=255)
+    dosage_form: str = Field(
+        default="",
+        max_length=100,
+        validation_alias=AliasChoices("dosage_form", "form"),
+    )
+    strength: str = Field(default="", max_length=100)
+    active_ingredients: Optional[List[str]] = None  # stored JSON
+    route: str = Field(
+        default="",
+        max_length=50,
+        validation_alias=AliasChoices("route", "route_of_administration"),
+    )
+    therapeutic_class: str = Field(
+        default="",
+        max_length=255,
+        validation_alias=AliasChoices("therapeutic_class", "class_name"),
+    )
 
-    # consumable
-    material_type: Optional[str] = ""
-    sterility_status: Optional[str] = ""
-    size_dimensions: Optional[str] = ""
-    intended_use: Optional[str] = ""
-    reusable_status: Optional[str] = ""
+    # OTC | RX | SCHEDULED
+    prescription_status: str = Field(default="RX", max_length=20)
 
-    atc_code: Optional[str] = ""
-    hsn_code: Optional[str] = ""
-    qr_number: Optional[str] = None
+    side_effects: str = Field(default="")
+    drug_interactions: str = Field(default="")
+
+    # CONSUMABLE fields
+    material_type: str = Field(default="", max_length=100)
+    sterility_status: str = Field(default="", max_length=20)  # STERILE / NON_STERILE
+    size_dimensions: str = Field(default="", max_length=120)
+    intended_use: str = Field(default="")
+    reusable_status: str = Field(
+        default="",
+        max_length=20,
+        validation_alias=AliasChoices("reusable_status", "reusable_disposable"),
+    )
+
+    # codes
+    atc_code: str = Field(default="", max_length=50)
+    hsn_code: str = Field(default="", max_length=50)
+
     is_active: bool = True
 
-    @field_validator("schedule_code", mode="before")
+    # -----------------------------
+    # Field validators (normalize)
+    # -----------------------------
+    @field_validator("code", mode="before")
     @classmethod
-    def _schedule_norm(cls, v):
-        return _norm_schedule(v)
+    def _code_norm(cls, v: Any) -> str:
+        s = _s(v)
+        if not s:
+            raise ValueError("code is required")
+        return s.upper()  # keep consistent codes
+
+    @field_validator("item_type", mode="before")
+    @classmethod
+    def _item_type_norm(cls, v: Any) -> str:
+        s = _u(v) or "DRUG"
+        if s not in ("DRUG", "CONSUMABLE", "EQUIPMENT"):
+            raise ValueError("item_type must be one of: DRUG, CONSUMABLE, EQUIPMENT")
+        return s
 
     @field_validator("prescription_status", mode="before")
     @classmethod
-    def _ps_norm(cls, v):
-        s = str(v or "").strip().upper()
-        return s or "RX"
+    def _ps_norm(cls, v: Any) -> str:
+        s = _u(v) or "RX"
+        # allow some variants
+        if s == "SCHEDULE":
+            s = "SCHEDULED"
+        if s not in ("OTC", "RX", "SCHEDULED"):
+            raise ValueError("prescription_status must be one of: OTC, RX, SCHEDULED")
+        return s
 
+    @field_validator("schedule_code", mode="before")
+    @classmethod
+    def _schedule_norm(cls, v: Any) -> Optional[str]:
+        return _norm_schedule(v)
+
+    @field_validator("conversion_factor", mode="before")
+    @classmethod
+    def _conv_factor_parse(cls, v: Any) -> Decimal:
+        d = _dec(v, Decimal("1"))
+        if d <= 0:
+            raise ValueError("conversion_factor must be > 0")
+        return d
+
+    @field_validator("reorder_level", "max_level", "default_tax_percent", "default_price", "default_mrp", mode="before")
+    @classmethod
+    def _decimal_parse(cls, v: Any, info) -> Decimal:
+        d = _dec(v, Decimal("0"))
+        # allow zero, but not negative
+        if d < 0:
+            raise ValueError(f"{info.field_name} must be >= 0")
+        return d
+
+    @field_validator("active_ingredients", mode="before")
+    @classmethod
+    def _ai_parse(cls, v: Any) -> Optional[List[str]]:
+        """
+        Accept:
+        - list[str]
+        - comma-separated string
+        - None
+        """
+        if v is None or v == "":
+            return None
+        if isinstance(v, list):
+            out = [ _s(x) for x in v if _s(x) ]
+            return out or None
+        if isinstance(v, str):
+            parts = [p.strip() for p in v.split(",")]
+            parts = [p for p in parts if p]
+            return parts or None
+        raise ValueError("active_ingredients must be a list of strings or comma-separated text")
+
+    # -----------------------------
+    # Cross-field validation / sync rules
+    # -----------------------------
     @model_validator(mode="after")
-    def _sync_schedule_and_status(self):
+    def _sync_and_validate(self):
         """
-        Rules:
-        - If schedule_code is H/H1/X -> prescription_status becomes SCHEDULED
-        - If schedule_code is RX/OTC -> prescription_status becomes RX/OTC and schedule_code cleared (optional)
-        - If prescription_status is SCHEDULED and schedule_code is empty -> raise (force schedule)
+        - Keep item_type <-> is_consumable consistent
+        - High-alert implies double-check (recommended)
+        - max_level >= reorder_level
+        - schedule_code <-> prescription_status consistency
+        - Basic required fields by item_type (light rules)
         """
+        # item_type <-> is_consumable sync
+        if self.item_type == "CONSUMABLE":
+            self.is_consumable = True
+        else:
+            self.is_consumable = False
+
+        # high alert implies double-check (common hospital rule)
+        if self.high_alert_flag and not self.requires_double_check:
+            self.requires_double_check = True
+
+        # stock levels
+        if self.max_level < self.reorder_level:
+            raise ValueError("max_level must be >= reorder_level")
+
+        # Schedule rules:
         sc = (self.schedule_code or "").strip().upper() if self.schedule_code else None
         ps = (self.prescription_status or "RX").strip().upper()
 
         if sc in ("RX", "OTC"):
+            # if schedule_code is RX/OTC, we treat as prescription_status
             self.prescription_status = sc
-            # if you want schedule column blank for RX/OTC, uncomment next line:
+            # optional: keep schedule_code NULL for RX/OTC in DB
             # self.schedule_code = None
             return self
 
-        if sc:  # H/H1/X etc
+        if sc in ("H", "H1", "X"):
             self.prescription_status = "SCHEDULED"
             return self
 
-        # if status says scheduled, schedule_code must be provided
-        if ps in ("SCHEDULED", "SCHEDULE"):
+        # If prescription_status says scheduled, schedule_code must be provided
+        if ps == "SCHEDULED" and not sc:
             raise ValueError("schedule_code is required when prescription_status is SCHEDULED")
+
+        # Light rules by type (optional but helpful)
+        if self.item_type == "DRUG":
+            # at least something meaningful
+            if not (_s(self.generic_name) or _s(self.brand_name) or _s(self.name)):
+                raise ValueError("For DRUG items, provide generic_name or brand_name")
+        elif self.item_type == "CONSUMABLE":
+            if not _s(self.material_type):
+                # don't hard-fail if you don't want; but this is useful
+                raise ValueError("For CONSUMABLE items, material_type is required")
+
         return self
 
 
+# -----------------------------
+# Create / Update / Output
+# -----------------------------
 class ItemCreate(ItemBase):
     pass
 
 
 class ItemUpdate(BaseModel):
-    # all optional
-    code: Optional[str] = None
-    name: Optional[str] = None
+    """
+    PATCH/PUT schema: all optional, still validated.
+    """
+    model_config = ConfigDict(extra="forbid", from_attributes=True, str_strip_whitespace=True)
+
+    code: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    name: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    qr_number: Optional[str] = Field(default=None, max_length=50)
+
     item_type: Optional[str] = None
-    lasa_flag: Optional[bool] = None
     is_consumable: Optional[bool] = None
 
-    unit: Optional[str] = None
-    pack_size: Optional[str] = None
-    reorder_level: Optional[float] = None
-    max_level: Optional[float] = None
+    lasa_flag: Optional[bool] = None
+    high_alert_flag: Optional[bool] = None
+    requires_double_check: Optional[bool] = None
 
-    manufacturer: Optional[str] = None
+    unit: Optional[str] = Field(default=None, max_length=50)
+    pack_size: Optional[str] = Field(default=None, max_length=50)
+
+    base_uom: Optional[str] = Field(default=None, max_length=30)
+    purchase_uom: Optional[str] = Field(default=None, max_length=30)
+    conversion_factor: Optional[Decimal] = None
+
+    reorder_level: Optional[Decimal] = None
+    max_level: Optional[Decimal] = None
+
+    manufacturer: Optional[str] = Field(default=None, max_length=255)
     default_supplier_id: Optional[int] = None
     procurement_date: Optional[date] = None
 
-    storage_condition: Optional[str] = None
+    storage_condition: Optional[str] = Field(default=None, max_length=30)
 
-    default_tax_percent: Optional[float] = None
-    default_price: Optional[float] = None
-    default_mrp: Optional[float] = None
+    default_tax_percent: Optional[Decimal] = None
+    default_price: Optional[Decimal] = None
+    default_mrp: Optional[Decimal] = None
 
-    generic_name: Optional[str] = None
-    brand_name: Optional[str] = None
-    dosage_form: Optional[str] = None
-    strength: Optional[str] = None
+    schedule_system: Optional[str] = Field(default=None, max_length=20)
+    schedule_code: Optional[str] = Field(default=None)
+    schedule_notes: Optional[str] = Field(default=None, max_length=255)
+
+    generic_name: Optional[str] = Field(default=None, max_length=255)
+    brand_name: Optional[str] = Field(default=None, max_length=255)
+    dosage_form: Optional[str] = Field(default=None, max_length=100)
+    strength: Optional[str] = Field(default=None, max_length=100)
     active_ingredients: Optional[List[str]] = None
-    route: Optional[str] = None
-    therapeutic_class: Optional[str] = None
-
-    prescription_status: Optional[str] = None
-
-    # ✅ NEW (update)
-    schedule_code: Optional[str] = None
-
+    route: Optional[str] = Field(default=None, max_length=50)
+    therapeutic_class: Optional[str] = Field(default=None, max_length=255)
+    prescription_status: Optional[str] = Field(default=None, max_length=20)
     side_effects: Optional[str] = None
     drug_interactions: Optional[str] = None
 
-    material_type: Optional[str] = None
-    sterility_status: Optional[str] = None
-    size_dimensions: Optional[str] = None
+    material_type: Optional[str] = Field(default=None, max_length=100)
+    sterility_status: Optional[str] = Field(default=None, max_length=20)
+    size_dimensions: Optional[str] = Field(default=None, max_length=120)
     intended_use: Optional[str] = None
-    reusable_status: Optional[str] = None
+    reusable_status: Optional[str] = Field(default=None, max_length=20)
 
-    atc_code: Optional[str] = None
-    hsn_code: Optional[str] = None
-    qr_number: Optional[str] = None
+    atc_code: Optional[str] = Field(default=None, max_length=50)
+    hsn_code: Optional[str] = Field(default=None, max_length=50)
+
     is_active: Optional[bool] = None
 
-    @field_validator("schedule_code", mode="before")
+    # Reuse same validators from ItemBase (copy minimal important ones)
+    @field_validator("code", mode="before")
     @classmethod
-    def _schedule_norm_u(cls, v):
-        return _norm_schedule(v)
+    def _code_norm(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        s = _s(v)
+        if not s:
+            raise ValueError("code cannot be empty")
+        return s.upper()
+
+    @field_validator("item_type", mode="before")
+    @classmethod
+    def _item_type_norm(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        s = _u(v)
+        if s not in ("DRUG", "CONSUMABLE", "EQUIPMENT"):
+            raise ValueError("item_type must be one of: DRUG, CONSUMABLE, EQUIPMENT")
+        return s
 
     @field_validator("prescription_status", mode="before")
     @classmethod
-    def _ps_norm_u(cls, v):
+    def _ps_norm(cls, v: Any) -> Any:
         if v is None:
             return None
-        s = str(v or "").strip().upper()
-        return s or None
+        s = _u(v)
+        if s == "SCHEDULE":
+            s = "SCHEDULED"
+        if s not in ("OTC", "RX", "SCHEDULED"):
+            raise ValueError("prescription_status must be one of: OTC, RX, SCHEDULED")
+        return s
+
+    @field_validator("schedule_code", mode="before")
+    @classmethod
+    def _schedule_norm(cls, v: Any) -> Any:
+        # allow explicit nulling schedule_code by sending "" or null
+        if v is None or v == "":
+            return None
+        return _norm_schedule(v)
+
+    @field_validator("conversion_factor", mode="before")
+    @classmethod
+    def _conv_factor_parse(cls, v: Any) -> Any:
+        if v is None or v == "":
+            return None
+        d = _dec(v, Decimal("1"))
+        if d <= 0:
+            raise ValueError("conversion_factor must be > 0")
+        return d
+
+    @field_validator("reorder_level", "max_level", "default_tax_percent", "default_price", "default_mrp", mode="before")
+    @classmethod
+    def _decimal_parse(cls, v: Any, info) -> Any:
+        if v is None or v == "":
+            return None
+        d = _dec(v, Decimal("0"))
+        if d < 0:
+            raise ValueError(f"{info.field_name} must be >= 0")
+        return d
+
+    @field_validator("active_ingredients", mode="before")
+    @classmethod
+    def _ai_parse(cls, v: Any) -> Any:
+        if v is None or v == "":
+            return None
+        if isinstance(v, list):
+            out = [_s(x) for x in v if _s(x)]
+            return out or None
+        if isinstance(v, str):
+            parts = [p.strip() for p in v.split(",")]
+            parts = [p for p in parts if p]
+            return parts or None
+        raise ValueError("active_ingredients must be a list of strings or comma-separated text")
+
 
 
 class ItemOut(ItemBase):
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
     id: int
     qty_on_hand: float = 0
-    supplier: Optional[SupplierMini] = None
+    supplier: Optional[SupplierMini] = Field(
+        default=None,
+        validation_alias=AliasChoices("supplier", "default_supplier"),
+    )
 
     created_at: datetime
     updated_at: datetime
 
-    model_config = ConfigDict(from_attributes=True)
+    
 
 
 # ---------- Batches & Stock ----------

@@ -34,7 +34,8 @@ from app.api import (
     
     routes_billing,
     routes_billing_edits,
-    
+    routes_inventory_indent,
+    routes_inventory_consumption,
     
     routes_pharmacy_accounts,
     routes_ot_masters,
@@ -190,6 +191,10 @@ api_router.include_router(routes_inventory.router)
 api_router.include_router(routes_pharmacy.router)
 api_router.include_router(routes_pharmacy_accounts.router)
 api_router.include_router(routes_pharmacy_stock_alerts.router)
+api_router.include_router(routes_inventory_indent.router)
+api_router.include_router(routes_inventory_consumption.router)
+
+ 
 # Master database migrations
 api_router.include_router(routes_master_migrations.router)
 

@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from sqlalchemy import Column, Integer, String, Boolean, ForeignKey
 from sqlalchemy.orm import relationship
-
+from typing import List, Optional
+from pydantic import BaseModel
 from app.db.base import Base
 
 
@@ -107,3 +108,4 @@ class UserSession(Base):
     revoke_reason = Column(String(50), nullable=True)
 
     user = relationship("User", back_populates="sessions")
+
