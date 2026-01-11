@@ -3,12 +3,11 @@ from __future__ import annotations
 
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, Tuple
-
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from sqlalchemy.exc import IntegrityError
-
-from app.models.charge_item_master import ChargeItemMaster
+from datetime import datetime
+from app.models.charge_item_master import ChargeItemMaster, ChargeItemServiceHeader
 from app.models.billing import (
     BillingInvoice,
     BillingInvoiceLine,
@@ -17,7 +16,7 @@ from app.models.billing import (
     ServiceGroup,
     DocStatus,
 )
-
+from app.models.billing import BillingNumberSeries
 # ============================================================
 # Money helpers
 # ============================================================
@@ -49,11 +48,23 @@ def _enum_value(x):
     return x.value if hasattr(x, "value") else x
 
 
+def _norm(s: Optional[str]) -> str:
+    return (s or "").strip().upper()
+
+
+# ✅ This was missing (your ImportError fix)
+def is_misc_module(module: Optional[str]) -> bool:
+    """
+    True if invoice module should be treated as MISC.
+    Accepts None / "" / "MISC" as misc.
+    """
+    return _norm(module) in {"", "MISC"}
+
+
 def parse_service_group(v: Optional[str]) -> ServiceGroup:
     if not v:
         return ServiceGroup.MISC
     s = str(v).strip().upper()
-    # supports both Enum(value) and Enum[name] shapes
     try:
         return ServiceGroup(s)
     except Exception:
@@ -63,25 +74,214 @@ def parse_service_group(v: Optional[str]) -> ServiceGroup:
             return ServiceGroup.MISC
 
 
-def is_misc_module(module: Optional[str]) -> bool:
-    m = (module or "").strip().upper()
-    return (m == "") or (m == "MISC")
+# Keep in sync with your router MODULES keys (do NOT introduce new module codes)
+_ALLOWED_INVOICE_MODULES = {
+    "ADM",
+    "ROOM",
+    "BLOOD",
+    "LAB",
+    "DIET",
+    "DOC",
+    "PHM",
+    "PHC",
+    "PROC",
+    "SCAN",
+    "SURG",
+    "XRAY",
+    "MISC",
+}
+
+
+def _set_if_has(model_obj, attr: str, value):
+    """
+    Set attribute only if SQLAlchemy model has this column/attr.
+    Avoids crashing when your schema differs across installs.
+    """
+    if hasattr(model_obj.__class__, attr):
+        setattr(model_obj, attr, value)
+
+
+def _status_norm(x) -> str:
+    return _norm(str(_enum_value(x or "")))
+
+
+def _module_norm(x) -> str:
+    return _norm(str(x or "")) or "MISC"
+
+
+def next_invoice_number(
+    db: Session,
+    *,
+    doc_type: str = "INVOICE",
+    default_prefix: str = "INV-",
+    default_padding: int = 6,
+) -> str:
+    """
+    Generates next invoice number using BillingNumberSeries with row lock.
+    If series missing, creates it.
+    """
+    # If your series table does not have tenant_id/doc_type/prefix/padding/next_number,
+    # then update this function accordingly.
+    q = (db.query(BillingNumberSeries).filter(
+        BillingNumberSeries.doc_type == doc_type, ).with_for_update())
+    series = q.first()
+
+    if not series:
+        series = BillingNumberSeries(
+            doc_type=doc_type,
+            prefix=default_prefix,
+            padding=default_padding,
+            next_number=1,
+        )
+        # set reset_period only if it exists (some schemas use enum)
+        if hasattr(series.__class__, "reset_period"):
+            try:
+                series.reset_period = getattr(
+                    series.__class__,
+                    "reset_period").type.enum_class.YEARLY  # type: ignore
+            except Exception:
+                # if reset_period is string/enum unknown, ignore safely
+                pass
+
+        db.add(series)
+        db.flush()
+
+    prefix = getattr(series, "prefix", None) or default_prefix
+    padding = int(getattr(series, "padding", None) or default_padding)
+
+    n = int(getattr(series, "next_number", None) or 1)
+    series.next_number = n + 1
+
+    return f"{prefix}{str(n).zfill(padding)}"
+
+
+def get_or_create_draft_invoice_for_case_module(
+    db: Session,
+    *,
+    case: BillingCase,
+    module: str,
+    like_invoice: Optional[BillingInvoice] = None,
+    created_by: Optional[int] = None,
+) -> BillingInvoice:
+    """
+    Find existing DRAFT invoice for (case, module), else create one.
+    Copies payer fields from like_invoice when possible.
+    """
+    mod = _module_norm(module)
+
+    existing = (db.query(BillingInvoice).filter(
+        BillingInvoice.billing_case_id == case.id,
+        func.upper(BillingInvoice.module) == mod,
+    ).order_by(BillingInvoice.id.desc()).first())
+    if existing:
+        st = _status_norm(getattr(existing, "status", None))
+        if st != "DRAFT":
+            raise RuntimeError(
+                f"Target invoice '{mod}' is {st}; cannot modify")
+        return existing
+
+    inv = BillingInvoice(billing_case_id=case.id)
+
+    # Required common fields
+    _set_if_has(inv, "module", mod)
+    _set_if_has(inv, "status", DocStatus.DRAFT)
+
+    # Copy from like_invoice (best match for payer fields)
+    if like_invoice is not None:
+        _set_if_has(inv, "invoice_type",
+                    getattr(like_invoice, "invoice_type", None))
+        _set_if_has(inv, "payer_type", getattr(like_invoice, "payer_type",
+                                               None))
+        _set_if_has(inv, "payer_id", getattr(like_invoice, "payer_id", None))
+        _set_if_has(inv, "tariff_plan_id",
+                    getattr(like_invoice, "tariff_plan_id", None))
+        _set_if_has(inv, "encounter_type",
+                    getattr(like_invoice, "encounter_type", None))
+        _set_if_has(inv, "encounter_id",
+                    getattr(like_invoice, "encounter_id", None))
+
+    # Copy from case if invoice has these
+    _set_if_has(inv, "patient_id", getattr(case, "patient_id", None))
+
+    # Invoice number (if present in model)
+    if hasattr(inv.__class__, "invoice_number"):
+
+        inv.invoice_number = next_invoice_number(db)
+
+    # Totals init (safe)
+    for f in ("sub_total", "discount_total", "tax_total", "round_off",
+              "grand_total"):
+        if hasattr(inv.__class__, f):
+            setattr(inv, f, D(0))
+
+    _set_if_has(inv, "created_by", created_by)
+    if hasattr(inv.__class__, "created_at"):
+        _set_if_has(inv, "created_at", datetime.utcnow())
+
+    db.add(inv)
+    db.flush()  # get inv.id
+    return inv
+
+
+def resolve_service_group(db: Session,
+                          service_header_code: Optional[str]) -> ServiceGroup:
+    """
+    If a custom service header exists in master, use its mapped service_group.
+    Else fallback to parse_service_group() (old behavior).
+    """
+    code = _norm(service_header_code)
+    if not code:
+        return ServiceGroup.MISC
+
+    try:
+        row = (db.query(ChargeItemServiceHeader).filter(
+            func.upper(ChargeItemServiceHeader.code) == code,
+            ChargeItemServiceHeader.is_active.is_(True),
+        ).first())
+        if row and getattr(row, "service_group", None):
+            return row.service_group
+    except Exception:
+        # Table might not exist during migration; fallback safely
+        pass
+
+    return parse_service_group(code)
+
+
+def expected_invoice_module_for_charge_item(ci: ChargeItemMaster) -> str:
+    """
+    Rules (your requirement):
+      - category ADM/DIET/BLOOD => invoice.module same as category
+      - category MISC (or others) => if module_header matches predefined modules, use it
+                                   else fallback to MISC
+    """
+    cat = _norm(getattr(ci, "category", None))
+
+    if cat in {"ADM", "DIET", "BLOOD"}:
+        return cat
+
+    mh = _norm(getattr(ci, "module_header", None))
+    if mh in _ALLOWED_INVOICE_MODULES:
+        return mh
+
+    return "MISC"
 
 
 def require_editable_invoice(inv: BillingInvoice) -> None:
-    st = str(_enum_value(inv.status) or "")
+    """
+    Editable only when DRAFT (string or Enum safe).
+    """
+    st = _norm(str(_enum_value(getattr(inv, "status", None) or "")))
     if st != "DRAFT":
-        raise ValueError(
-            "Invoice locked. Reopen to edit.")  # handled in router
+        raise ValueError("Invoice locked. Reopen to edit.")
 
 
 def recalc_invoice_totals(db: Session, inv: BillingInvoice) -> None:
-    sums = db.query(
+    sums = (db.query(
         func.coalesce(func.sum(BillingInvoiceLine.line_total), 0),
         func.coalesce(func.sum(BillingInvoiceLine.discount_amount), 0),
         func.coalesce(func.sum(BillingInvoiceLine.tax_amount), 0),
         func.coalesce(func.sum(BillingInvoiceLine.net_amount), 0),
-    ).filter(BillingInvoiceLine.invoice_id == inv.id).one()
+    ).filter(BillingInvoiceLine.invoice_id == inv.id).one())
 
     sub_total = q_money(D(sums[0]))
     discount_total = q_money(D(sums[1]))
@@ -120,24 +320,13 @@ def add_charge_item_line_to_invoice(
     if not inv:
         raise LookupError("Invoice not found")
 
-    # ✅ STRICT RULE: only MISC invoices can accept CHARGE_ITEM lines
-    if not is_misc_module(getattr(inv, "module", None)):
-        cur_mod = (getattr(inv, "module", None)
-                   or "").strip().upper() or "MISC"
-        raise PermissionError(
-            f"Charge items can be added only to MISC invoices. Current invoice module is '{cur_mod}'."
-        )
-
-    # Keep data clean: if module is null/empty, normalize to MISC (still MISC)
-    if (getattr(inv, "module", None) or "").strip() == "":
-        inv.module = "MISC"
-
     # Only draft editable
     require_editable_invoice(inv)
 
-    if inv.status in (DocStatus.POSTED, DocStatus.VOID):
-        raise RuntimeError(
-            f"Invoice is {_enum_value(inv.status)}; cannot modify")
+    # ✅ safer: handle status whether Enum or str
+    stv = _norm(str(_enum_value(getattr(inv, "status", None) or "")))
+    if stv in {"POSTED", "VOID"}:
+        raise RuntimeError(f"Invoice is {stv}; cannot modify")
 
     case = db.get(BillingCase, int(inv.billing_case_id))
     if not case:
@@ -147,7 +336,33 @@ def add_charge_item_line_to_invoice(
     if not ci or not getattr(ci, "is_active", False):
         raise LookupError("Charge item not found / inactive")
 
-    sg = parse_service_group(getattr(ci, "service_header", None))
+    expected_mod = expected_invoice_module_for_charge_item(ci)
+    cur_mod = _norm(getattr(inv, "module", None)) or "MISC"
+
+    # ✅ Enforce: charge item must go into correct module invoice
+    if cur_mod not in _ALLOWED_INVOICE_MODULES:
+        cur_mod = "MISC"
+
+    if cur_mod != expected_mod:
+        # Backward-safe auto-fix only when invoice is empty
+        line_count = (db.query(func.count(BillingInvoiceLine.id)).filter(
+            BillingInvoiceLine.invoice_id == inv.id).scalar() or 0)
+
+        # If wrong module but invoice is still empty draft, fix module automatically
+        if line_count == 0 and cur_mod in {"", "MISC"}:
+            inv.module = expected_mod
+            cur_mod = expected_mod
+        else:
+            raise PermissionError(
+                f"Charge item category '{_norm(getattr(ci, 'category', None)) or 'MISC'}' "
+                f"must be billed under '{expected_mod}' invoice. Current invoice module is '{cur_mod}'."
+            )
+
+    # Normalize module if blank
+    if (getattr(inv, "module", None) or "").strip() == "":
+        inv.module = expected_mod
+
+    sg = resolve_service_group(db, getattr(ci, "service_header", None))
 
     qty2 = q_qty(D(qty))
     if qty2 <= 0:
@@ -242,7 +457,7 @@ def add_charge_item_line_to_invoice(
 
     db.add(line)
 
-    # ensure totals include pending line (autoflush usually works, still safe)
+    # totals
     recalc_invoice_totals(db, inv)
     return inv, line
 

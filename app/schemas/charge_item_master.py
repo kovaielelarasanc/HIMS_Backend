@@ -8,6 +8,69 @@ from typing import Optional, List
 from pydantic import BaseModel, Field
 
 
+
+# -------------------------
+# Module headers
+# -------------------------
+class ModuleHeaderCreate(BaseModel):
+    code: str = Field(..., max_length=16)
+    name: Optional[str] = Field(default=None, max_length=64)
+    is_active: bool = True
+
+
+class ModuleHeaderUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, max_length=64)
+    is_active: Optional[bool] = None
+
+
+class ModuleHeaderOut(BaseModel):
+    id: int
+    code: str
+    name: Optional[str] = None
+    is_active: bool
+    is_system: bool
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class ModuleHeaderListOut(BaseModel):
+    items: List[ModuleHeaderOut]
+
+
+# -------------------------
+# Service headers
+# -------------------------
+class ServiceHeaderCreate(BaseModel):
+    code: str = Field(..., max_length=16)
+    name: Optional[str] = Field(default=None, max_length=64)
+    service_group: str = Field(default="MISC", description="Maps to Billing.ServiceGroup")
+    is_active: bool = True
+
+
+class ServiceHeaderUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, max_length=64)
+    service_group: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class ServiceHeaderOut(BaseModel):
+    id: int
+    code: str
+    name: Optional[str] = None
+    service_group: str
+    is_active: bool
+    is_system: bool
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class ServiceHeaderListOut(BaseModel):
+    items: List[ServiceHeaderOut]
+
 class ChargeItemCreate(BaseModel):
     category: str = Field(..., description="ADM | DIET | MISC | BLOOD")
     code: str

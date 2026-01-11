@@ -24,6 +24,8 @@ class BillingInvoiceOut(BaseModel):
     invoice_type: str
     status: str
     grand_total: float
+    module: Optional[str] = None
+    module_label: Optional[str] = None
 
     class Config:
         from_attributes = True

@@ -1,17 +1,20 @@
 # FILE: app/services/billing_hooks.py
 from __future__ import annotations
-
+from datetime import datetime, time
 from decimal import Decimal
 from typing import Optional, Dict, Any
-
+from zoneinfo import ZoneInfo
 from sqlalchemy.orm import Session
-
+from sqlalchemy import func, desc
 from app.models.billing import (
+    BillingInvoice,
     BillingInvoiceLine,
     InvoiceType,
     PayerType,
     ServiceGroup,
     PayMode,
+    DocStatus,
+    NumberResetPeriod,
 )
 from app.services.billing_service import (
     BillingError,
@@ -21,11 +24,17 @@ from app.services.billing_service import (
     add_auto_line_idempotent,
     add_payment_for_invoice,
     get_tariff_rate,
+    add_manual_line,
 )
-
+from app.models.opd import Appointment, Visit, DoctorFee
+from app.models.user import User
+from app.models.department import Department
 from app.models.lis import LisOrder, LisOrderItem
 from app.models.ris import RisOrder
 from app.models.pharmacy_prescription import PharmacySale, PharmacySaleItem
+from app.services.billing_invoice_create import create_new_invoice_for_case
+
+IST = ZoneInfo("Asia/Kolkata")
 
 
 def _d(x) -> Decimal:
@@ -33,6 +42,46 @@ def _d(x) -> Decimal:
         return Decimal(str(x or 0))
     except Exception:
         return Decimal("0")
+
+
+def _sg_doctor_fee() -> ServiceGroup:
+    # use your existing ServiceGroup for doctor fees
+    for k in ("DOC", "DOCTOR", "CONSULTATION"):
+        if k in ServiceGroup.__members__:
+            return ServiceGroup[k]
+    return list(ServiceGroup)[0]
+
+
+def _safe_naive(dt: Optional[datetime]) -> Optional[datetime]:
+    if not dt:
+        return None
+    return dt.replace(tzinfo=None)
+
+
+def _pick_user_display_name(u: Optional[User]) -> Optional[str]:
+    if not u:
+        return None
+    for k in ["full_name", "display_name", "name", "username", "email"]:
+        v = getattr(u, k, None)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    fn = getattr(u, "first_name", None)
+    ln = getattr(u, "last_name", None)
+    if (isinstance(fn, str) and fn.strip()) or (isinstance(ln, str)
+                                                and ln.strip()):
+        return f"{(fn or '').strip()} {(ln or '').strip()}".strip() or None
+    uid = getattr(u, "id", None)
+    return f"User #{uid}" if uid else None
+
+
+def _pick_amount_from_appointment(appt: Appointment) -> Optional[Decimal]:
+    # try common fields if your appointment already stores manual amount
+    for k in ("consult_amount", "consultation_amount", "consult_fee",
+              "fee_amount", "amount"):
+        v = getattr(appt, k, None)
+        if v is not None and str(v) != "":
+            return Decimal(str(v))
+    return None
 
 
 # ============================================================
@@ -94,102 +143,175 @@ def _service_group_for_pharmacy(kind: str) -> ServiceGroup:
 # OPD consultation (module = OPD)  ✅ SIGNATURE FIXED
 # ============================================================
 def autobill_opd_consultation(
-    db: Session,
-    *,
-    # You can call EITHER way:
-    visit_id: Optional[int] = None,
-    appointment_id: Optional[int] = None,
-    # OR pass objects (as your routes_opd currently does)
-    visit: Optional[Any] = None,
-    appointment: Optional[Any] = None,
-    user: Any,
-    fee_amount: Optional[Decimal] = None,
-    gst_rate: Optional[Decimal] = None,
-) -> Dict[str, Any]:
-    """
-    Creates (idempotent):
-      - BillingCase: (OP, visit_id)
-      - Invoice: module="OPD"
-      - Line: source_module="OPD", source_ref_id=visit_id, source_line_key="CONSULT"
-    """
-    # Resolve ids from objects if provided
-    if visit is not None and visit_id is None:
-        visit_id = int(getattr(visit, "id"))
-    if appointment is not None and appointment_id is None:
-        appointment_id = int(getattr(appointment, "id"))
+        db: Session,
+        *,
+        appointment: Appointment,
+        visit: Visit,
+        user: User,
+        amount: Optional[Decimal] = None,  # ✅ manual amount
+) -> Optional[int]:
+    if not appointment or not visit:
+        return None
 
-    if not visit_id:
-        raise BillingError(
-            "visit_id is required for OPD consultation autobill")
+    # -----------------------------
+    # 1) Billing Case (OP visit)
+    # -----------------------------
+    try:
+        case = get_or_create_case_for_op_visit(
+            db,
+            visit_id=int(getattr(visit, "id")),
+            user=user,
+            tariff_plan_id=None,
+            reset_period=NumberResetPeriod.NONE,
+        )
+    except TypeError:
+        case = get_or_create_case_for_op_visit(
+            db,
+            visit_id=int(getattr(visit, "id")),
+            user=user,
+            tariff_plan_id=None,
+        )
 
-    # Best-effort: auto-pick fee from DoctorFee if not supplied
-    if fee_amount is None:
-        try:
-            from app.models.opd import DoctorFee  # type: ignore
-            doc_id = None
-            if appointment is not None:
-                doc_id = getattr(appointment, "doctor_user_id", None)
-            if doc_id is None and visit is not None:
-                doc_id = getattr(visit, "doctor_user_id", None)
+    # -----------------------------
+    # 2) Ensure DOC invoice (draft)
+    # -----------------------------
+    inv = (db.query(BillingInvoice).filter(
+        BillingInvoice.billing_case_id == int(case.id)).filter(
+            BillingInvoice.status == DocStatus.DRAFT).filter(
+                func.upper(func.coalesce(BillingInvoice.module, "MISC")) ==
+                "DOC").filter(
+                    BillingInvoice.invoice_type == InvoiceType.PATIENT).filter(
+                        BillingInvoice.payer_type == PayerType.PATIENT).filter(
+                            BillingInvoice.payer_id.is_(None)).order_by(
+                                desc(BillingInvoice.id)).first())
 
-            if doc_id:
-                row = db.query(DoctorFee).filter(
-                    DoctorFee.doctor_user_id == int(doc_id),
-                    DoctorFee.is_active.is_(True),
-                ).first()
-                if row:
-                    fee_amount = _d(getattr(row, "base_fee", 0))
-        except Exception:
-            pass
+    if not inv:
+        inv = create_new_invoice_for_case(
+            db,
+            case=case,
+            user=user,
+            module="DOC",  # ✅ store under Doctor Fees module
+            invoice_type=InvoiceType.PATIENT,
+            payer_type=PayerType.PATIENT,
+            payer_id=None,
+            reset_period=NumberResetPeriod.YEAR,
+            allow_duplicate_draft=False,
+        )
+        db.flush()
 
-    fee_amount = _d(fee_amount)
-    gst_rate = _d(gst_rate)
+    # -----------------------------
+    # 3) Idempotency
+    # -----------------------------
+    src_module = "OPD"
+    src_ref_id = int(getattr(appointment, "id"))
+    src_line_key = "CONSULT_FEE"
 
-    case = get_or_create_case_for_op_visit(db,
-                                           visit_id=int(visit_id),
-                                           user=user)
+    exists = (db.query(BillingInvoiceLine.id).filter(
+        BillingInvoiceLine.invoice_id == int(inv.id)).filter(
+            BillingInvoiceLine.source_module == src_module).
+              filter(BillingInvoiceLine.source_ref_id == src_ref_id).filter(
+                  BillingInvoiceLine.source_line_key == src_line_key).first())
+    if exists:
+        return int(inv.id)
 
-    inv = get_or_create_active_module_invoice(
-        db,
-        billing_case_id=int(case.id),
-        user=user,
-        module="OPD",
-        invoice_type=InvoiceType.PATIENT,
-        payer_type=PayerType.PATIENT,
-        payer_id=None,
-    )
+    # -----------------------------
+    # 4) Service date
+    # -----------------------------
+    service_dt = _safe_naive(getattr(visit, "visit_at", None))
+    if not service_dt:
+        ap_date = getattr(appointment, "date", None)
+        ap_slot = getattr(appointment, "slot_start", None)
+        if ap_date:
+            service_dt = datetime.combine(ap_date, ap_slot or time.min)
 
-    created = add_auto_line_idempotent(
+    # -----------------------------
+    # 5) Doctor + Department (NO DoctorFee master)
+    # -----------------------------
+    doctor_user_id = (getattr(appointment, "doctor_user_id", None)
+                      or getattr(appointment, "doctor_id", None))
+    doctor_user_id = int(doctor_user_id) if doctor_user_id else None
+
+    doctor = db.get(User, doctor_user_id) if doctor_user_id else None
+    dept = None
+    if doctor and getattr(doctor, "department_id", None):
+        dept = db.get(Department, int(doctor.department_id))
+
+    doctor_name = _pick_user_display_name(
+        doctor) or f"Doctor #{doctor_user_id}" if doctor_user_id else None
+    department_name = getattr(dept, "name", None) if dept else None
+    department_id = getattr(dept, "id", None) if dept else None
+
+    # -----------------------------
+    # 6) Amount (manual)
+    # -----------------------------
+    if amount is None:
+        amount = _pick_amount_from_appointment(appointment)
+
+    if amount is None:
+        # choose one behavior:
+        # A) default to 0 (editable later)
+        amount = Decimal("0")
+        # B) OR force it:
+        # raise Exception("Consultation amount missing. Pass amount=... or store it on Appointment.")
+
+    desc_txt = "OPD Consultation"
+    if doctor_name:
+        desc_txt += f" - {doctor_name}"
+    if department_name:
+        desc_txt += f" ({department_name})"
+
+    # -----------------------------
+    # 7) Add line
+    # -----------------------------
+    ln = add_manual_line(
         db,
         invoice_id=int(inv.id),
-        billing_case_id=int(case.id),
         user=user,
-        service_group=ServiceGroup.CONSULT
-        if hasattr(ServiceGroup, "CONSULT") else ServiceGroup.OTHER,
-        item_type="OPD_CONSULT",
-        item_id=None,
-        item_code=None,
-        description="OPD Consultation Fee",
+        service_group=_sg_doctor_fee(),
+        description=desc_txt,
         qty=Decimal("1"),
-        unit_price=fee_amount,
-        gst_rate=gst_rate,
-        source_module="OPD",
-        source_ref_id=int(visit_id),
-        source_line_key="CONSULT",
-        doctor_id=None,
-        meta_patch={"opd": {
-            "appointment_id": appointment_id
-        }},
-        is_manual=False,
-        manual_reason=None,
+        unit_price=Decimal(str(amount)),
+        gst_rate=Decimal("0"),
+        discount_percent=Decimal("0"),
+        discount_amount=Decimal("0"),
+        item_type="OPD_CONSULT",
+        item_id=int(getattr(appointment, "id")),
+        item_code=f"OPD-CONSULT-{doctor_user_id or 'NA'}",
+        doctor_id=doctor_user_id,
+        manual_reason="Auto OPD consultation",
     )
 
-    return {
-        "ok": True,
-        "case_id": int(case.id),
-        "invoice_id": int(inv.id),
-        "added": (created is not None),
-    }
+    # mark as auto if you have is_manual
+    if hasattr(ln, "is_manual"):
+        ln.is_manual = False
+
+    # set service_date
+    if hasattr(ln, "service_date") and service_dt:
+        ln.service_date = service_dt
+
+    # source fields
+    if hasattr(ln, "source_module"):
+        ln.source_module = src_module
+    if hasattr(ln, "source_ref_id"):
+        ln.source_ref_id = src_ref_id
+    if hasattr(ln, "source_line_key"):
+        ln.source_line_key = src_line_key
+
+    # ✅ save doctor/dept into meta_json so API can always show it
+    if hasattr(ln, "meta_json"):
+        ln.meta_json = {
+            "appointment_id": int(getattr(appointment, "id")),
+            "visit_id": int(getattr(visit, "id")),
+            "doctor_id": doctor_user_id,
+            "doctor_name": doctor_name,
+            "department_id": department_id,
+            "department_name": department_name,
+        }
+
+    db.add(ln)
+    db.flush()
+
+    return int(inv.id)
 
 
 # ============================================================

@@ -10,12 +10,13 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func, or_, desc
 from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel, Field
+from app.models.charge_item_master import ChargeItemMaster
 
 from app.api.deps import get_db, current_user
 from app.models.user import User
 from app.models.patient import Patient
 from app.models.payer import Payer, Tpa, CreditPlan
-
+from app.models.department import Department
 from app.models.billing import (
     BillingCase,
     BillingInvoice,
@@ -110,6 +111,61 @@ def _ensure_draft_misc_invoice_for_case(
     return inv
 
 
+def _ensure_draft_charge_item_invoice_for_case(
+    db: Session,
+    *,
+    case: BillingCase,
+    user: User,
+    module: str,
+    invoice_type: InvoiceType,
+    payer_type: PayerType,
+    payer_id: Optional[int],
+    allow_duplicate_draft: bool,
+    reset_period: NumberResetPeriod,
+) -> BillingInvoice:
+    mod = _normalize_module(module)
+
+    qry = (db.query(BillingInvoice).filter(
+        BillingInvoice.billing_case_id == int(case.id)).filter(
+            BillingInvoice.status == DocStatus.DRAFT).filter(
+                BillingInvoice.invoice_type == invoice_type).filter(
+                    BillingInvoice.payer_type == payer_type).filter(
+                        BillingInvoice.payer_id == payer_id))
+
+    # Treat NULL/"" as MISC only when expected module is MISC
+    if mod == "MISC":
+        qry = qry.filter(
+            (BillingInvoice.module == None)
+            | (BillingInvoice.module == "")
+            | (func.upper(func.coalesce(BillingInvoice.module, "MISC")) ==
+               "MISC"))
+    else:
+        qry = qry.filter(
+            func.upper(func.coalesce(BillingInvoice.module, "")) == mod)
+
+    inv = qry.order_by(desc(BillingInvoice.id)).first()
+
+    if inv:
+        # normalize blank module
+        if (getattr(inv, "module", None) or "").strip() == "":
+            inv.module = mod
+        return inv
+
+    inv = create_new_invoice_for_case(
+        db,
+        case=case,
+        user=user,
+        module=mod,
+        invoice_type=invoice_type,
+        payer_type=payer_type,
+        payer_id=payer_id,
+        reset_period=reset_period,
+        allow_duplicate_draft=allow_duplicate_draft,
+    )
+    db.flush()
+    return inv
+
+
 @router.post("/cases/{case_id}/charge-items/add",
              response_model=AddChargeItemLineOut)
 def add_charge_item_to_case_misc_invoice(
@@ -125,11 +181,28 @@ def add_charge_item_to_case_misc_invoice(
 ):
     case = _get_case_or_404(db, user, int(case_id))
 
+    # ✅ Determine correct module based on ChargeItemMaster
+    ci = db.get(ChargeItemMaster, int(inp.charge_item_id))
+    if not ci or not getattr(ci, "is_active", False):
+        raise HTTPException(status_code=404,
+                            detail="Charge item not found / inactive")
+
+    cat = (getattr(ci, "category", None) or "").strip().upper()
+
+    # category-first routing (your requirement)
+    if cat in {"ADM", "DIET", "BLOOD"}:
+        target_module = cat
+    else:
+        # category=MISC (or unknown): try module_header only if it matches predefined MODULES
+        mh = (getattr(ci, "module_header", None) or "").strip().upper()
+        target_module = mh if mh in MODULES else "MISC"
+
     try:
-        inv = _ensure_draft_misc_invoice_for_case(
+        inv = _ensure_draft_charge_item_invoice_for_case(
             db,
             case=case,
             user=user,
+            module=target_module,
             invoice_type=invoice_type,
             payer_type=payer_type,
             payer_id=payer_id,
@@ -234,59 +307,67 @@ def billing_particular_options(
         service_date_str=service_date,
     )
 
-
 class ParticularLineIn(BaseModel):
-    # per-item separate fields
-    line_key: Optional[str] = None  # allows duplicates safely
-    item_id: Optional[int] = None
-    doctor_id: Optional[int] = None
+    # ✅ Pydantic v2
+    model_config = {"populate_by_name": True, "extra": "ignore"}
 
-    service_date: Optional[str] = None
-    qty: Decimal = Decimal("1")
-    gst_rate: Decimal = Decimal("0")
-    discount_percent: Decimal = Decimal("0")
-    discount_amount: Decimal = Decimal("0")
+    line_key: Optional[str] = Field(None, alias="lineKey")
+
+    item_id: Optional[int] = Field(None, alias="itemId")
+
+    doctor_id: Optional[int] = Field(None, alias="doctorId")
+    service_date: Optional[str] = Field(None, alias="serviceDate")
+
+    qty: Decimal = Field(Decimal("1"))
+
+    gst_rate: Decimal = Field(Decimal("0"), alias="gstRate")
+    discount_percent: Decimal = Field(Decimal("0"), alias="discountPercent")
+    discount_amount: Decimal = Field(Decimal("0"), alias="discountAmount")
 
     description: Optional[str] = None
-    unit_price: Optional[Decimal] = None  # allow null (frontend sends null)
+    unit_price: Optional[Decimal] = Field(None, alias="unitPrice")
 
-    ward_id: Optional[int] = None
-    room_id: Optional[int] = None
+    ward_id: Optional[int] = Field(None, alias="wardId")
+    room_id: Optional[int] = Field(None, alias="roomId")
 
     modality: Optional[str] = None
-    duration_min: Optional[int] = None
-    split_costs: Optional[bool] = None
+    duration_min: Optional[int] = Field(None, alias="durationMin")
+    split_costs: Optional[bool] = Field(None, alias="splitCosts")
     hours: Optional[Decimal] = None
 
+    # ✅ Pydantic v1
 
 class ParticularAddIn(BaseModel):
-    payer_type: PayerType = PayerType.PATIENT
-    payer_id: Optional[int] = None
+    model_config = {"populate_by_name": True, "extra": "ignore"}
 
-    invoice_type: Optional[InvoiceType] = None
+    payer_type: PayerType = Field(PayerType.PATIENT, alias="payerType")
+    payer_id: Optional[int] = Field(None, alias="payerId")
+    invoice_type: Optional[InvoiceType] = Field(None, alias="invoiceType")
 
-    # old single/common fields (backward compatible)
-    service_date: Optional[str] = None
+    service_date: Optional[str] = Field(None, alias="serviceDate")
     qty: Decimal = Decimal("1")
-    gst_rate: Decimal = Decimal("0")
-    discount_percent: Decimal = Decimal("0")
-    discount_amount: Decimal = Decimal("0")
+
+    gst_rate: Decimal = Field(Decimal("0"), alias="gstRate")
+    discount_percent: Decimal = Field(Decimal("0"), alias="discountPercent")
+    discount_amount: Decimal = Field(Decimal("0"), alias="discountAmount")
+
     description: Optional[str] = None
-    unit_price: Optional[Decimal] = None  # allow null
+    unit_price: Optional[Decimal] = Field(None, alias="unitPrice")
 
-    item_ids: Optional[List[int]] = None
-    doctor_id: Optional[int] = None
+    item_ids: Optional[List[int]] = Field(None, alias="itemIds")
+    doctor_id: Optional[int] = Field(None, alias="doctorId")
 
-    ward_id: Optional[int] = None
-    room_id: Optional[int] = None
+    ward_id: Optional[int] = Field(None, alias="wardId")
+    room_id: Optional[int] = Field(None, alias="roomId")
 
     modality: Optional[str] = None
-    duration_min: Optional[int] = None
-    split_costs: bool = False
+    duration_min: Optional[int] = Field(None, alias="durationMin")
+    split_costs: bool = Field(False, alias="splitCosts")
     hours: Optional[Decimal] = None
 
-    # NEW: per-line input
     lines: Optional[List[ParticularLineIn]] = None
+
+    
 
 
 @router.post("/cases/{case_id}/particulars/{code}/add")
@@ -728,10 +809,12 @@ def case_invoice_summary(
     st = (status or "").strip().upper()
     sg = (service_group or "").strip().upper()
 
-    qry = (db.query(BillingInvoice, BillingInvoiceLine).join(
+    qry = (db.query(BillingInvoice, BillingInvoiceLine, User, Department).join(
         BillingInvoiceLine,
-        BillingInvoiceLine.invoice_id == BillingInvoice.id).filter(
-            BillingInvoice.billing_case_id == int(c.id)))
+        BillingInvoiceLine.invoice_id == BillingInvoice.id).outerjoin(
+            User, User.id == BillingInvoiceLine.doctor_id).outerjoin(
+                Department, Department.id == User.department_id).filter(
+                    BillingInvoice.billing_case_id == int(c.id)))
 
     if mod:
         qry = qry.filter(
@@ -787,7 +870,7 @@ def case_invoice_summary(
     groups: Dict[str, Dict[str, Any]] = {}
     total_net = Decimal("0")
 
-    for inv, ln in rows:
+    for inv, ln, doc, dept in rows:
         k = group_key(inv, ln)
         if k not in groups:
             groups[k] = {
@@ -797,7 +880,7 @@ def case_invoice_summary(
                 "items": []
             }
 
-        item = _line_to_dict(ln)
+        item = _line_to_dict(ln, inv=inv, doctor=doc, department=dept)
         item["invoice_id"] = int(inv.id)
         item["invoice_number"] = inv.invoice_number
         item["invoice_status"] = _enum_value(inv.status)
@@ -953,70 +1036,84 @@ def _invoice_to_dict(inv: BillingInvoice) -> Dict[str, Any]:
     }
 
 
-def _line_to_dict(ln: BillingInvoiceLine) -> Dict[str, Any]:
-    meta = getattr(ln, "meta_json", None)
-    return {
-        "id":
-        int(ln.id),
-        "billing_case_id":
-        int(ln.billing_case_id),
-        "invoice_id":
-        int(ln.invoice_id),
-        "service_group":
-        _enum_value(ln.service_group),
-        "item_type":
-        ln.item_type,
-        "item_id":
-        ln.item_id,
-        "item_code":
-        ln.item_code,
-        "description":
-        ln.description,
-        "qty":
-        str(getattr(ln, "qty", 0) or 0),
-        "unit_price":
-        str(getattr(ln, "unit_price", 0) or 0),
-        "discount_percent":
-        str(getattr(ln, "discount_percent", 0) or 0),
-        "discount_amount":
-        str(getattr(ln, "discount_amount", 0) or 0),
-        "gst_rate":
-        str(getattr(ln, "gst_rate", 0) or 0),
-        "tax_amount":
-        str(getattr(ln, "tax_amount", 0) or 0),
-        "line_total":
-        str(getattr(ln, "line_total", 0) or 0),
-        "net_amount":
-        str(getattr(ln, "net_amount", 0) or 0),
+def _pick_user_display_name(u: Optional[User]) -> Optional[str]:
+    if not u:
+        return None
 
-        # print columns
-        "service_date":
-        ln.service_date.isoformat()
-        if getattr(ln, "service_date", None) else None,
-        "meta_json":
-        meta,
-        "meta":
-        meta,  # ✅ alias for UI keys like meta.batch_id
-        "revenue_head_id":
-        ln.revenue_head_id,
-        "cost_center_id":
-        ln.cost_center_id,
-        "doctor_id":
-        ln.doctor_id,
-        "source_module":
-        ln.source_module,
-        "source_ref_id":
-        ln.source_ref_id,
-        "source_line_key":
-        ln.source_line_key,
-        "is_manual":
-        getattr(ln, "is_manual", False),
-        "manual_reason":
-        getattr(ln, "manual_reason", None),
-        "created_at":
-        ln.created_at.isoformat() if ln.created_at else None,
-        "updated_at":
-        ln.updated_at.isoformat() if ln.updated_at else None,
+    # common fields
+    for k in ["full_name", "display_name", "name", "username", "email"]:
+        v = getattr(u, k, None)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+    # fallback: first_name + last_name
+    fn = getattr(u, "first_name", None)
+    ln = getattr(u, "last_name", None)
+    if (isinstance(fn, str) and fn.strip()) or (isinstance(ln, str)
+                                                and ln.strip()):
+        return f"{(fn or '').strip()} {(ln or '').strip()}".strip() or None
+
+    uid = getattr(u, "id", None)
+    return f"User #{uid}" if uid else None
+
+
+def _line_to_dict(
+    ln: BillingInvoiceLine,
+    *,
+    inv: Optional[BillingInvoice] = None,
+    doctor: Optional[User] = None,
+    department: Optional[Department] = None,
+) -> Dict[str, Any]:
+    meta = getattr(ln, "meta_json", None)
+    meta = meta if isinstance(meta, dict) else {}
+
+    dt = (getattr(ln, "service_date", None) or getattr(ln, "created_at", None)
+          or getattr(inv, "created_at", None))
+    service_date_out = dt.isoformat() if dt else None
+
+    # ✅ doctor name: join first, else meta fallback
+    doc_name = _pick_user_display_name(doctor) or meta.get(
+        "doctor_name") or meta.get("consultant_name")
+
+    # ✅ dept: join first, else meta fallback
+    dept_name = (getattr(department, "name", None) if department else
+                 None) or meta.get("department_name") or meta.get("dept_name")
+    dept_id = (getattr(department, "id", None)
+               if department else None) or meta.get("department_id")
+
+    return {
+        "id": int(ln.id),
+        "billing_case_id": int(ln.billing_case_id),
+        "invoice_id": int(ln.invoice_id),
+        "service_group": _enum_value(ln.service_group),
+        "item_type": ln.item_type,
+        "item_id": ln.item_id,
+        "item_code": ln.item_code,
+        "description": ln.description,
+        "qty": str(getattr(ln, "qty", 0) or 0),
+        "unit_price": str(getattr(ln, "unit_price", 0) or 0),
+        "discount_percent": str(getattr(ln, "discount_percent", 0) or 0),
+        "discount_amount": str(getattr(ln, "discount_amount", 0) or 0),
+        "gst_rate": str(getattr(ln, "gst_rate", 0) or 0),
+        "tax_amount": str(getattr(ln, "tax_amount", 0) or 0),
+        "line_total": str(getattr(ln, "line_total", 0) or 0),
+        "net_amount": str(getattr(ln, "net_amount", 0) or 0),
+        "service_date": service_date_out,
+        "meta_json": meta,
+        "meta": meta,
+        "revenue_head_id": ln.revenue_head_id,
+        "cost_center_id": ln.cost_center_id,
+        "doctor_id": ln.doctor_id,
+        "doctor_name": doc_name,
+        "department_id": dept_id,
+        "department_name": dept_name,
+        "source_module": ln.source_module,
+        "source_ref_id": ln.source_ref_id,
+        "source_line_key": ln.source_line_key,
+        "is_manual": getattr(ln, "is_manual", False),
+        "manual_reason": getattr(ln, "manual_reason", None),
+        "created_at": ln.created_at.isoformat() if ln.created_at else None,
+        "updated_at": ln.updated_at.isoformat() if ln.updated_at else None,
     }
 
 
@@ -1830,10 +1927,19 @@ def list_invoice_lines(
 ):
     try:
         inv = _get_invoice_or_404(db, user, invoice_id)
-        rows = (db.query(BillingInvoiceLine).filter(
-            BillingInvoiceLine.invoice_id == int(inv.id)).order_by(
-                BillingInvoiceLine.id.asc()).all())
-        return {"items": [_line_to_dict(x) for x in rows]}
+
+        rows = (db.query(BillingInvoiceLine, User, Department).outerjoin(
+            User, User.id == BillingInvoiceLine.doctor_id).outerjoin(
+                Department, Department.id == User.department_id).filter(
+                    BillingInvoiceLine.invoice_id == int(inv.id)).order_by(
+                        BillingInvoiceLine.id.asc()).all())
+
+        return {
+            "items": [
+                _line_to_dict(ln, inv=inv, doctor=doc, department=dept)
+                for (ln, doc, dept) in rows
+            ]
+        }
     except Exception as e:
         _err(e)
 
@@ -1945,8 +2051,9 @@ def add_manual_line_v2(
                 status_code=422,
                 detail=
                 ("item_type=CHARGE_ITEM is not allowed in manual line API. "
-                 "Use /masters/charge-items/invoices/{invoice_id}/lines/charge-item "
-                 "(Charge items must be billed under a MISC invoice)."),
+                 "Use /billing/cases/{case_id}/charge-items/add. "
+                 "Invoice module will be auto-routed by charge item category (ADM/DIET/BLOOD/MISC)."
+                 ),
             )
 
         ln = add_manual_line(
@@ -1967,8 +2074,12 @@ def add_manual_line_v2(
             manual_reason=inp.manual_reason,
         )
 
-        if hasattr(ln, "service_date") and inp.service_date:
-            ln.service_date = inp.service_date
+        if hasattr(ln, "service_date"):
+            if inp.service_date:
+                ln.service_date = inp.service_date
+            elif getattr(ln, "service_date", None) is None:
+                ln.service_date = getattr(inv, "created_at",
+                                          None) or datetime.utcnow()
         if hasattr(ln, "meta_json") and inp.meta_json is not None:
             ln.meta_json = inp.meta_json
 
