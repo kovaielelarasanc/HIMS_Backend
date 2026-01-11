@@ -15,7 +15,6 @@ from app.models.user import User
 
 from app.services.drug_schedules import get_schedule_meta
 from app.services.inventory import create_stock_transaction
-
 from app.models.pharmacy_prescription import (
     PharmacyPrescription,
     PharmacyPrescriptionLine,
@@ -837,7 +836,7 @@ def _map_encounter_for_sale(db: Session, sale: PharmacySale) -> tuple[EncounterT
         return EncounterType.OP, int(sale.visit_id)
 
     # pseudo encounter
-    return EncounterType.OP, -int(sale.id)
+    return EncounterType.ER, -int(sale.id)
 
 
 def _ensure_case_link(db: Session, *, case_id: int, entity_type: str, entity_id: int) -> None:
@@ -956,7 +955,7 @@ def _upsert_invoice_lines_from_sale(
         .filter(
             BillingInvoiceLine.invoice_id == invoice.id,
             BillingInvoiceLine.billing_case_id == int(billing_case_id),
-            BillingInvoiceLine.source_module == "PHARM",
+            BillingInvoiceLine.source_module == "PHM",
             BillingInvoiceLine.source_ref_id == int(sale.id),
         )
         .all()
@@ -987,7 +986,7 @@ def _upsert_invoice_lines_from_sale(
             ln = BillingInvoiceLine(
                 billing_case_id=int(billing_case_id),
                 invoice_id=int(invoice.id),
-                service_group=ServiceGroup.PHARM,
+                service_group="PHM",
                 item_type=item_type,
                 item_id=int(it.item_id) if getattr(it, "item_id", None) else None,
                 item_code=getattr(item, "code", None) if item else None,
@@ -1000,7 +999,7 @@ def _upsert_invoice_lines_from_sale(
                 tax_amount=tax_amount,
                 line_total=line_total,
                 net_amount=net_amount,
-                source_module="PHARM",
+                source_module="PHM",
                 source_ref_id=int(sale.id),
                 source_line_key=key,
                 is_manual=False,
@@ -1008,7 +1007,7 @@ def _upsert_invoice_lines_from_sale(
             )
             db.add(ln)
         else:
-            ln.service_group = ServiceGroup.PHARM
+            ln.service_group = "PHM"
             ln.item_type = item_type
             ln.item_id = int(it.item_id) if getattr(it, "item_id", None) else None
             ln.item_code = getattr(item, "code", None) if item else None
@@ -1057,7 +1056,7 @@ def _ensure_billing_invoice_for_sale(db: Session, sale: PharmacySale, current_us
         inv = BillingInvoice(
             billing_case_id=billing_case.id,
             invoice_number=invoice_number,
-            module="PHARM",
+            module="PHM",
             invoice_type=InvoiceType.PHARMACY,
             status=DocStatus.DRAFT,
             payer_type=PayerType.PATIENT,
