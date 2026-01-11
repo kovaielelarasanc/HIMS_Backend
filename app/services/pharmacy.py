@@ -546,6 +546,34 @@ def assign_batches_on_send(db: Session, rx: PharmacyPrescription) -> None:
 # ============================================================
 # Rx CRUD
 # ============================================================
+def _resolve_doctor_user_id(db: Session, requested_doctor_id: Optional[int], current_user: User) -> Optional[int]:
+    """
+    Rules:
+    1) If doctor_user_id is provided -> validate user exists AND is_doctor.
+    2) If doctor_user_id is None:
+       - If logged-in user is a doctor -> use current_user.id
+       - Else -> keep None
+    """
+    if requested_doctor_id:
+        doc = (
+            db.query(User)
+            .filter(User.id == requested_doctor_id)
+            .filter(User.is_active == True)
+            .first()
+        )
+        if not doc:
+            raise HTTPException(status_code=400, detail="Invalid doctor_user_id.")
+        if not doc.is_doctor:
+            raise HTTPException(status_code=400, detail="Selected doctor_user_id is not a doctor.")
+        return doc.id
+
+    # ✅ Auto-assign if logged-in user is doctor
+    if current_user and getattr(current_user, "is_doctor", False):
+        return current_user.id
+
+    return None
+
+
 def create_prescription(db: Session, data: PrescriptionCreate, current_user: User) -> PharmacyPrescription:
     if data.type in ("OPD", "IPD") and not data.patient_id:
         raise HTTPException(status_code=400, detail="patient_id is required for OPD/IPD prescriptions.")
@@ -554,6 +582,9 @@ def create_prescription(db: Session, data: PrescriptionCreate, current_user: Use
     if data.type == "IPD" and not data.ipd_admission_id:
         raise HTTPException(status_code=400, detail="ipd_admission_id is required for IPD prescriptions.")
 
+    # ✅ doctor_user_id logic
+    doctor_user_id = _resolve_doctor_user_id(db, data.doctor_user_id, current_user)
+
     rx = PharmacyPrescription(
         prescription_number=_generate_prescription_number(db, data.type),
         type=data.type,
@@ -561,7 +592,10 @@ def create_prescription(db: Session, data: PrescriptionCreate, current_user: Use
         visit_id=data.visit_id,
         ipd_admission_id=data.ipd_admission_id,
         location_id=data.location_id,
-        doctor_user_id=data.doctor_user_id,
+
+        # ✅ auto-set doctor id if logged-in user is doctor
+        doctor_user_id=doctor_user_id,
+
         notes=data.notes,
         status="DRAFT",
         created_by_id=current_user.id,
