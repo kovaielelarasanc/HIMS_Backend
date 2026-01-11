@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, date
 from decimal import Decimal
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 from fastapi import HTTPException
 from sqlalchemy import select, and_, func
@@ -19,6 +19,14 @@ from app.models.pharmacy_inventory import (
 )
 
 from app.models.inv_indent_issue import InvIndent, InvIssue, InvIssueItem
+from app.models.inv_patient_consumption import (
+    InvPatientConsumption,
+    InvPatientConsumptionLine,
+    InvPatientConsumptionAllocation,
+)
+
+from app.services.billing_patient_consumption_sync import sync_consumption_to_billing
+
 
 # -------------------------
 # Helpers
@@ -30,8 +38,8 @@ def _today_key(d: date) -> int:
 
 def _next_series(db: Session, key: str, on_date: date) -> Tuple[int, str]:
     """
-    Generates a unique numeric id (int) and a friendly doc number string
-    using existing table inv_number_series. NO new table.
+    Uses existing inv_number_series table (NO new table).
+    Returns (doc_id, doc_no). We will NOT store doc_id in stock_txn (to avoid int overflow).
     """
     dk = _today_key(on_date)
 
@@ -50,9 +58,7 @@ def _next_series(db: Session, key: str, on_date: date) -> Tuple[int, str]:
     row.next_seq = seq + 1
     db.flush()
 
-    # Build:
-    # id: YYYYMMDD + 4-digit seq => int, unique daily
-    doc_id = int(f"{dk}{seq:04d}")
+    doc_id = int(f"{dk}{seq:04d}")   # only for display/debug
     doc_no = f"{key}-{dk}-{seq:04d}"
     return doc_id, doc_no
 
@@ -68,11 +74,14 @@ def _lock_stock_row(db: Session, location_id: int, item_id: int) -> ItemLocation
     ).scalar_one_or_none()
 
     if not stock:
-        # Create stock row if missing
-        stock = ItemLocationStock(location_id=location_id, item_id=item_id, on_hand_qty=Decimal("0"), reserved_qty=Decimal("0"))
+        stock = ItemLocationStock(
+            location_id=location_id,
+            item_id=item_id,
+            on_hand_qty=Decimal("0"),
+            reserved_qty=Decimal("0")
+        )
         db.add(stock)
         db.flush()
-        # lock again
         stock = db.execute(
             select(ItemLocationStock)
             .where(and_(
@@ -86,7 +95,6 @@ def _lock_stock_row(db: Session, location_id: int, item_id: int) -> ItemLocation
 
 
 def _fefo_batches_for_item(db: Session, location_id: int, item_id: int) -> List[ItemBatch]:
-    # FEFO: earliest expiry first, NULL expiry last
     return list(db.execute(
         select(ItemBatch)
         .where(and_(
@@ -96,7 +104,7 @@ def _fefo_batches_for_item(db: Session, location_id: int, item_id: int) -> List[
             ItemBatch.current_qty > 0,
         ))
         .order_by(
-            ItemBatch.expiry_date.is_(None),  # False first => has expiry first
+            ItemBatch.expiry_date.is_(None),
             ItemBatch.expiry_date.asc(),
             ItemBatch.id.asc(),
         )
@@ -104,43 +112,21 @@ def _fefo_batches_for_item(db: Session, location_id: int, item_id: int) -> List[
     ).scalars().all())
 
 
-def _get_or_create_reconcile_batch(db: Session, location_id: int, item_id: int) -> ItemBatch:
-    """
-    For rare case: reconciliation finds EXTRA stock (need +IN) but no batch info.
-    We'll store it in a special existing-table batch: batch_no='RECONCILE'.
-    """
-    b = db.execute(
-        select(ItemBatch)
-        .where(and_(
-            ItemBatch.location_id == location_id,
-            ItemBatch.item_id == item_id,
-            ItemBatch.batch_no == "RECONCILE",
-            ItemBatch.expiry_key == 0
-        ))
-        .with_for_update()
-    ).scalar_one_or_none()
+def _resolve_encounter(
+    *,
+    encounter_type: Optional[str],
+    encounter_id: Optional[int],
+    visit_id: Optional[int],
+) -> Tuple[Optional[str], Optional[int]]:
+    # Preferred
+    if encounter_type and encounter_id:
+        return (encounter_type, int(encounter_id))
 
-    if b:
-        return b
+    # Backward: visit_id => OP encounter
+    if visit_id:
+        return ("OP", int(visit_id))
 
-    b = ItemBatch(
-        location_id=location_id,
-        item_id=item_id,
-        batch_no="RECONCILE",
-        expiry_date=None,
-        expiry_key=0,
-        current_qty=Decimal("0"),
-        reserved_qty=Decimal("0"),
-        unit_cost=Decimal("0"),
-        mrp=Decimal("0"),
-        tax_percent=Decimal("0"),
-        is_active=True,
-        is_saleable=True,
-        status="ACTIVE",  # matches your enum value string
-    )
-    db.add(b)
-    db.flush()
-    return b
+    return (None, None)
 
 
 # -------------------------
@@ -149,17 +135,20 @@ def _get_or_create_reconcile_batch(db: Session, location_id: int, item_id: int) 
 
 def list_eligible_items(
     db: Session,
+    *,
     location_id: int,
     patient_id: Optional[int] = None,
+    encounter_type: Optional[str] = None,
+    encounter_id: Optional[int] = None,
     q: str = "",
     limit: int = 50,
 ):
     """
-    Items shown in UI dropdown:
+    Dropdown items:
     ✅ ONLY items available at location (on_hand_qty > 0)
-    ✅ If patient_id provided, further restrict to items issued via indents linked to that patient.
+    ✅ If patient_id provided -> items issued via indents linked to that patient
+    ✅ If encounter provided -> further restrict issued items to that encounter
     """
-
     base = (
         select(
             InventoryItem.id.label("item_id"),
@@ -184,8 +173,7 @@ def list_eligible_items(
         )
 
     if patient_id:
-        # Only items that were issued to this location through an indent tied to the patient
-        issued_items_subq = (
+        issued_q = (
             select(InvIssueItem.item_id)
             .join(InvIssue, InvIssue.id == InvIssueItem.issue_id)
             .join(InvIndent, InvIndent.id == InvIssue.indent_id)
@@ -194,9 +182,15 @@ def list_eligible_items(
                 InvIssue.to_location_id == location_id,
                 InvIndent.patient_id == patient_id,
             ))
-            .distinct()
-            .subquery()
         )
+
+        if encounter_type and encounter_id:
+            issued_q = issued_q.where(and_(
+                InvIndent.encounter_type == encounter_type,
+                InvIndent.encounter_id == int(encounter_id),
+            ))
+
+        issued_items_subq = issued_q.distinct().subquery()
         base = base.where(InventoryItem.id.in_(select(issued_items_subq.c.item_id)))
 
     rows = db.execute(
@@ -207,7 +201,7 @@ def list_eligible_items(
 
 
 # -------------------------
-# Patient consumption (billable) - reduces OT/Ward stock
+# Patient Consumption (Billable) — header/lines + stock_txn + billing sync
 # -------------------------
 
 @dataclass
@@ -222,31 +216,56 @@ def post_patient_consumption(
     user_id: int,
     location_id: int,
     patient_id: int,
+    encounter_type: Optional[str],
+    encounter_id: Optional[int],
     visit_id: Optional[int],
     doctor_id: Optional[int],
     notes: str,
     items: List[dict],
 ):
-    # Validate location
     loc = db.get(InventoryLocation, location_id)
     if not loc or not loc.is_active:
         raise HTTPException(status_code=404, detail="Location not found")
 
-    # Validate patient exists in your system (table name: patients)
-    # If your Patient model path differs, replace this check accordingly.
-    # We keep it soft to avoid breaking.
-    # Example: patient = db.get(Patient, patient_id)
-    # if not patient: raise HTTPException(404, "Patient not found")
+    enc_type, enc_id = _resolve_encounter(
+        encounter_type=encounter_type,
+        encounter_id=encounter_id,
+        visit_id=visit_id,
+    )
+
+    if not enc_type or not enc_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Encounter is required for billing (send encounter_type + encounter_id OR visit_id for OP).",
+        )
 
     now = datetime.utcnow()
-    doc_id, doc_no = _next_series(db, "CONS", on_date=now.date())
+    _, doc_no = _next_series(db, "CONS", on_date=now.date())
+
+    # ✅ create consumption header
+    cons = InvPatientConsumption(
+        consumption_number=doc_no,
+        posted_at=now,
+        location_id=location_id,
+        patient_id=patient_id,
+        encounter_type=enc_type,
+        encounter_id=enc_id,
+        visit_id=visit_id,
+        doctor_id=doctor_id,
+        notes=notes or "",
+        created_by_id=user_id,
+    )
+    db.add(cons)
+    db.flush()  # get cons.id
 
     out_lines = []
+    billing_lines_payload: List[dict] = []
 
     for line in items:
         item_id = int(line["item_id"])
-        req_qty: Decimal = Decimal(str(line["qty"]))
+        req_qty = Decimal(str(line["qty"]))
         batch_id = line.get("batch_id")
+        remark = (line.get("remark") or "").strip()
 
         if req_qty <= 0:
             raise HTTPException(status_code=400, detail="Qty must be > 0")
@@ -256,12 +275,21 @@ def post_patient_consumption(
             raise HTTPException(status_code=404, detail=f"Item not found: {item_id}")
 
         stock = _lock_stock_row(db, location_id, item_id)
-
         if stock.on_hand_qty < req_qty:
             raise HTTPException(
                 status_code=400,
                 detail=f"Insufficient stock for item {item.code}. Available={stock.on_hand_qty}, Requested={req_qty}",
             )
+
+        # create line
+        cons_line = InvPatientConsumptionLine(
+            consumption_id=cons.id,
+            item_id=item_id,
+            requested_qty=req_qty,
+            remark=remark,
+        )
+        db.add(cons_line)
+        db.flush()  # get line.id
 
         allocations: List[Allocation] = []
 
@@ -269,7 +297,7 @@ def post_patient_consumption(
             b = db.execute(
                 select(ItemBatch)
                 .where(and_(
-                    ItemBatch.id == batch_id,
+                    ItemBatch.id == int(batch_id),
                     ItemBatch.location_id == location_id,
                     ItemBatch.item_id == item_id,
                 ))
@@ -281,55 +309,15 @@ def post_patient_consumption(
             if b.current_qty < req_qty:
                 raise HTTPException(status_code=400, detail=f"Batch stock insufficient for item {item.code}")
 
-            # consume from this batch
             b.current_qty = b.current_qty - req_qty
             allocations.append(Allocation(batch_id=b.id, qty=req_qty))
 
-            db.add(StockTransaction(
-                location_id=location_id,
-                item_id=item_id,
-                batch_id=b.id,
-                txn_time=now,
-                txn_type="CONSUME_BILLABLE",
-                ref_type="CONSUMPTION",
-                ref_id=doc_id,
-                ref_line_id=None,
-                quantity_change=-req_qty,
-                unit_cost=b.unit_cost or stock.last_unit_cost,
-                mrp=b.mrp or stock.last_mrp,
-                remark=(line.get("remark") or "") + (f" | {doc_no} | {notes}" if notes else f" | {doc_no}"),
-                user_id=user_id,
-                patient_id=patient_id,
-                visit_id=visit_id,
-                doctor_id=doctor_id,
-            ))
-
         else:
-            # Auto FEFO allocation across batches
             remaining = req_qty
             batches = _fefo_batches_for_item(db, location_id, item_id)
-
             if not batches:
-                # No batches exist -> still allow consumption without batch
+                # allow no batch case
                 allocations.append(Allocation(batch_id=None, qty=req_qty))
-                db.add(StockTransaction(
-                    location_id=location_id,
-                    item_id=item_id,
-                    batch_id=None,
-                    txn_time=now,
-                    txn_type="CONSUME_BILLABLE",
-                    ref_type="CONSUMPTION",
-                    ref_id=doc_id,
-                    ref_line_id=None,
-                    quantity_change=-req_qty,
-                    unit_cost=stock.last_unit_cost,
-                    mrp=stock.last_mrp,
-                    remark=(line.get("remark") or "") + (f" | {doc_no} | {notes}" if notes else f" | {doc_no}"),
-                    user_id=user_id,
-                    patient_id=patient_id,
-                    visit_id=visit_id,
-                    doctor_id=doctor_id,
-                ))
                 remaining = Decimal("0")
 
             for b in batches:
@@ -338,55 +326,94 @@ def post_patient_consumption(
                 take = min(Decimal(str(b.current_qty)), remaining)
                 if take <= 0:
                     continue
-
                 b.current_qty = b.current_qty - take
                 allocations.append(Allocation(batch_id=b.id, qty=take))
-
-                db.add(StockTransaction(
-                    location_id=location_id,
-                    item_id=item_id,
-                    batch_id=b.id,
-                    txn_time=now,
-                    txn_type="CONSUME_BILLABLE",
-                    ref_type="CONSUMPTION",
-                    ref_id=doc_id,
-                    ref_line_id=None,
-                    quantity_change=-take,
-                    unit_cost=b.unit_cost or stock.last_unit_cost,
-                    mrp=b.mrp or stock.last_mrp,
-                    remark=(line.get("remark") or "") + (f" | {doc_no} | {notes}" if notes else f" | {doc_no}"),
-                    user_id=user_id,
-                    patient_id=patient_id,
-                    visit_id=visit_id,
-                    doctor_id=doctor_id,
-                ))
                 remaining -= take
 
             if remaining > 0:
                 raise HTTPException(status_code=400, detail=f"Batch stock insufficient for item {item.code}")
 
-        # reduce location stock by total requested qty
+        # save allocations + stock_txn
+        for a in allocations:
+            db.add(
+                InvPatientConsumptionAllocation(
+                    line_id=cons_line.id,
+                    batch_id=a.batch_id,
+                    qty=a.qty,
+                )
+            )
+
+            db.add(
+                StockTransaction(
+                    location_id=location_id,
+                    item_id=item_id,
+                    batch_id=a.batch_id,
+                    txn_time=now,
+                    txn_type="CONSUME_BILLABLE",
+                    ref_type="CONSUMPTION",
+                    ref_id=cons.id,              # ✅ safe int (no overflow)
+                    ref_line_id=cons_line.id,    # ✅ line traceability
+                    quantity_change=-a.qty,
+                    unit_cost=(Decimal("0")),
+                    mrp=(Decimal("0")),
+                    remark=f"{doc_no} | {notes or ''} | {remark}".strip(" |"),
+                    user_id=user_id,
+                    patient_id=patient_id,
+                    visit_id=visit_id,
+                    doctor_id=doctor_id,
+                )
+            )
+
+        # reduce location stock
         stock.on_hand_qty = stock.on_hand_qty - req_qty
 
         out_lines.append({
             "item_id": item_id,
             "requested_qty": req_qty,
-            "allocations": [{"batch_id": a.batch_id, "qty": a.qty} for a in allocations],
+            "allocations": [{"batch_id": x.batch_id, "qty": x.qty} for x in allocations],
         })
+
+        # prepare billing sync payload (use first batch_id if any)
+        billing_lines_payload.append({
+            "line_id": cons_line.id,
+            "item_id": item_id,
+            "qty": req_qty,
+            "batch_id": allocations[0].batch_id if allocations else None,
+        })
+
+    # ✅ billing sync (same DB transaction)
+    case_id, invoice_ids = sync_consumption_to_billing(
+        db,
+        consumption_id=cons.id,
+        patient_id=patient_id,
+        encounter_type=enc_type,
+        encounter_id=enc_id,
+        doctor_id=doctor_id,
+        created_by=user_id,
+        lines=billing_lines_payload,
+        tariff_plan_id=None,
+    )
+
+    cons.billing_case_id = case_id
+    cons.billing_invoice_ids_json = invoice_ids
 
     db.flush()
     db.commit()
 
     return {
-        "consumption_id": doc_id,
-        "consumption_number": doc_no,
-        "posted_at": now,
-        "location_id": location_id,
-        "patient_id": patient_id,
-        "visit_id": visit_id,
-        "doctor_id": doctor_id,
-        "notes": notes or "",
+        "consumption_id": cons.id,
+        "consumption_number": cons.consumption_number,
+        "posted_at": cons.posted_at,
+        "location_id": cons.location_id,
+        "patient_id": cons.patient_id,
+        "encounter_type": cons.encounter_type,
+        "encounter_id": cons.encounter_id,
+        "visit_id": cons.visit_id,
+        "doctor_id": cons.doctor_id,
+        "notes": cons.notes or "",
         "items": out_lines,
+        "billing_case_id": case_id,
+        "billing_invoice_ids": invoice_ids or [],
     }
 
 
@@ -395,43 +422,46 @@ def list_patient_consumptions(
     *,
     location_id: Optional[int],
     patient_id: Optional[int],
+    encounter_type: Optional[str],
+    encounter_id: Optional[int],
     date_from: Optional[date],
     date_to: Optional[date],
     limit: int,
     offset: int,
 ):
-    """
-    Nurse entry list: grouped by (ref_type='CONSUMPTION', ref_id=consumption_id)
-    txn_type includes CONSUME_BILLABLE
-    """
-    conds = [
-        StockTransaction.ref_type == "CONSUMPTION",
-        StockTransaction.txn_type == "CONSUME_BILLABLE",
-    ]
+    conds = [InvPatientConsumption.is_cancelled == False]
+
     if location_id:
-        conds.append(StockTransaction.location_id == location_id)
+        conds.append(InvPatientConsumption.location_id == location_id)
     if patient_id:
-        conds.append(StockTransaction.patient_id == patient_id)
+        conds.append(InvPatientConsumption.patient_id == patient_id)
+    if encounter_type and encounter_id:
+        conds.append(InvPatientConsumption.encounter_type == encounter_type)
+        conds.append(InvPatientConsumption.encounter_id == int(encounter_id))
     if date_from:
-        conds.append(func.date(StockTransaction.txn_time) >= date_from)
+        conds.append(func.date(InvPatientConsumption.posted_at) >= date_from)
     if date_to:
-        conds.append(func.date(StockTransaction.txn_time) <= date_to)
+        conds.append(func.date(InvPatientConsumption.posted_at) <= date_to)
 
     q = (
         select(
-            StockTransaction.ref_id.label("consumption_id"),
-            func.min(StockTransaction.txn_time).label("posted_at"),
-            func.min(StockTransaction.location_id).label("location_id"),
-            func.min(StockTransaction.patient_id).label("patient_id"),
-            func.min(StockTransaction.visit_id).label("visit_id"),
-            func.min(StockTransaction.doctor_id).label("doctor_id"),
-            func.min(StockTransaction.user_id).label("user_id"),
-            func.count().label("total_lines"),
-            func.sum(func.abs(StockTransaction.quantity_change)).label("total_qty"),
+            InvPatientConsumption.id.label("consumption_id"),
+            InvPatientConsumption.consumption_number,
+            InvPatientConsumption.posted_at,
+            InvPatientConsumption.location_id,
+            InvPatientConsumption.patient_id,
+            InvPatientConsumption.encounter_type,
+            InvPatientConsumption.encounter_id,
+            InvPatientConsumption.visit_id,
+            InvPatientConsumption.doctor_id,
+            InvPatientConsumption.created_by_id.label("user_id"),
+            func.count(InvPatientConsumptionLine.id).label("total_lines"),
+            func.coalesce(func.sum(InvPatientConsumptionLine.requested_qty), 0).label("total_qty"),
         )
+        .join(InvPatientConsumptionLine, InvPatientConsumptionLine.consumption_id == InvPatientConsumption.id)
         .where(and_(*conds))
-        .group_by(StockTransaction.ref_id)
-        .order_by(func.min(StockTransaction.txn_time).desc())
+        .group_by(InvPatientConsumption.id)
+        .order_by(InvPatientConsumption.posted_at.desc())
         .limit(limit)
         .offset(offset)
     )
@@ -440,21 +470,21 @@ def list_patient_consumptions(
 
     out = []
     for r in rows:
-        cid = int(r["consumption_id"])
-        # reconstruct doc_no (same pattern as service)
-        # If you want exact, you can store doc_no inside remark; we already do.
         out.append({
-            "consumption_id": cid,
-            "consumption_number": f"CONS-{str(cid)[:8]}-{str(cid)[8:]}",
+            "consumption_id": int(r["consumption_id"]),
+            "consumption_number": r["consumption_number"],
             "posted_at": r["posted_at"],
             "location_id": r["location_id"],
             "patient_id": r["patient_id"],
+            "encounter_type": r["encounter_type"],
+            "encounter_id": r["encounter_id"],
             "visit_id": r["visit_id"],
             "doctor_id": r["doctor_id"],
             "user_id": r["user_id"],
-            "total_lines": int(r["total_lines"]),
+            "total_lines": int(r["total_lines"] or 0),
             "total_qty": Decimal(str(r["total_qty"] or 0)),
         })
+
     return out
 
 

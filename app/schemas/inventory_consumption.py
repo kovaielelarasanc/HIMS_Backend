@@ -2,9 +2,25 @@ from __future__ import annotations
 
 from datetime import datetime, date
 from decimal import Decimal
+from enum import Enum
 from typing import List, Optional
 
 from pydantic import BaseModel, Field, conlist
+
+
+# -----------------------------
+# Simple ok wrapper (matches your frontend unwrap)
+# -----------------------------
+class OkResponse(BaseModel):
+    status: bool = True
+    data: object
+
+
+class EncounterType(str, Enum):
+    OP = "OP"
+    IP = "IP"
+    OT = "OT"
+    ER = "ER"
 
 
 class EligibleItemOut(BaseModel):
@@ -26,8 +42,15 @@ class PatientConsumeLineIn(BaseModel):
 class PatientConsumeIn(BaseModel):
     location_id: int
     patient_id: int
+
+    # ✅ preferred for billing link
+    encounter_type: Optional[EncounterType] = None
+    encounter_id: Optional[int] = None
+
+    # ✅ backward compatibility
     visit_id: Optional[int] = None
     doctor_id: Optional[int] = None
+
     notes: str = ""
     items: conlist(PatientConsumeLineIn, min_length=1)
 
@@ -47,12 +70,22 @@ class PatientConsumeOut(BaseModel):
     consumption_id: int
     consumption_number: str
     posted_at: datetime
+
     location_id: int
     patient_id: int
+
+    encounter_type: Optional[str] = None
+    encounter_id: Optional[int] = None
+
     visit_id: Optional[int] = None
     doctor_id: Optional[int] = None
     notes: str = ""
+
     items: List[PatientConsumeLineOut]
+
+    # billing result
+    billing_case_id: Optional[int] = None
+    billing_invoice_ids: List[int] = []
 
 
 class ConsumptionListRowOut(BaseModel):
@@ -60,10 +93,15 @@ class ConsumptionListRowOut(BaseModel):
     consumption_number: str
     posted_at: datetime
     location_id: int
-    patient_id: Optional[int]
-    visit_id: Optional[int]
-    doctor_id: Optional[int]
-    user_id: Optional[int]
+
+    patient_id: int
+    encounter_type: Optional[str] = None
+    encounter_id: Optional[int] = None
+
+    visit_id: Optional[int] = None
+    doctor_id: Optional[int] = None
+    user_id: Optional[int] = None
+
     total_lines: int
     total_qty: Decimal
 
@@ -86,8 +124,8 @@ class BulkReconcileLineOut(BaseModel):
     item_id: int
     before_qty: Decimal
     closing_qty: Decimal
-    auto_consumed_qty: Decimal  # positive means consumed
-    adjusted_in_qty: Decimal    # positive means added (found extra)
+    auto_consumed_qty: Decimal
+    adjusted_in_qty: Decimal
     allocations: List[BatchAllocationOut]
 
 
