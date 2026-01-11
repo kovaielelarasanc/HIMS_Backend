@@ -46,18 +46,18 @@ router = APIRouter(prefix="/ipd", tags=["IPD – Discharge"])
 # Helpers
 # ---------------------------------------------------------
 def _get_admission_or_404(db: Session, admission_id: int) -> IpdAdmission:
-    adm = db.query(IpdAdmission).get(admission_id)
+    adm = db.get(IpdAdmission, admission_id)
     if not adm:
-        raise HTTPException(404, "Admission not found")
+        raise HTTPException(status_code=404, detail="Admission not found")
     return adm
 
 
 def _need_any(user: User, codes: list[str]):
     if getattr(user, "is_admin", False):
         return
-    for r in user.roles:
-        for p in r.permissions:
-            if p.code in codes:
+    for r in getattr(user, "roles", []) or []:
+        for p in getattr(r, "permissions", []) or []:
+            if getattr(p, "code", None) in codes:
                 return
     raise HTTPException(status_code=403, detail="Not permitted")
 
@@ -79,8 +79,7 @@ def _user_display_name(u: Optional[User]) -> str:
     return f"User #{getattr(u, 'id', '')}"
 
 
-def _build_demographics_text(adm: IpdAdmission,
-                             patient: Optional[Patient]) -> str:
+def _build_demographics_text(adm: IpdAdmission, patient: Optional[Patient]) -> str:
     lines: List[str] = []
 
     if patient:
@@ -93,8 +92,7 @@ def _build_demographics_text(adm: IpdAdmission,
         if name:
             lines.append(f"Name: {name}")
 
-        age = getattr(patient, "age_years", None) or getattr(
-            patient, "age", None)
+        age = getattr(patient, "age_years", None) or getattr(patient, "age", None)
         sex = getattr(patient, "gender", None) or getattr(patient, "sex", None)
         if age is not None or sex:
             age_str = f"{age} yrs" if age is not None else ""
@@ -105,17 +103,15 @@ def _build_demographics_text(adm: IpdAdmission,
             else:
                 lines.append(f"Sex: {sex}")
 
-        uhid = getattr(patient, "uhid", None) or getattr(
-            patient, "patient_code", None)
+        uhid = getattr(patient, "uhid", None) or getattr(patient, "patient_code", None)
         if uhid:
             lines.append(f"UHID: {uhid}")
 
     display_code = getattr(adm, "display_code", None) or f"IP-{adm.id:06d}"
     lines.append(f"IP No.: {display_code}")
 
-    if adm.admitted_at:
-        lines.append("Admission: " +
-                     adm.admitted_at.strftime("%d-%m-%Y %H:%M"))
+    if getattr(adm, "admitted_at", None):
+        lines.append("Admission: " + adm.admitted_at.strftime("%d-%m-%Y %H:%M"))
 
     if getattr(adm, "status", None):
         lines.append(f"Status: {adm.status}")
@@ -130,9 +126,12 @@ def _build_followup_text_from_opd(db: Session, adm: IpdAdmission) -> str:
         return ""
 
     try:
-        q = (db.query(FollowUp).filter(
-            getattr(FollowUp, "patient_id") == adm.patient_id).order_by(
-                getattr(FollowUp, "id").desc()).first())
+        q = (
+            db.query(FollowUp)
+            .filter(getattr(FollowUp, "patient_id") == adm.patient_id)
+            .order_by(getattr(FollowUp, "id").desc())
+            .first()
+        )
     except Exception:
         return ""
 
@@ -140,9 +139,11 @@ def _build_followup_text_from_opd(db: Session, adm: IpdAdmission) -> str:
         return ""
 
     try:
-        dt = (getattr(q, "followup_date", None)
-              or getattr(q, "scheduled_date", None)
-              or getattr(q, "date", None))
+        dt = (
+            getattr(q, "followup_date", None)
+            or getattr(q, "scheduled_date", None)
+            or getattr(q, "date", None)
+        )
         reason = getattr(q, "reason", None) or getattr(q, "notes", None) or ""
         parts: List[str] = []
         if dt:
@@ -161,45 +162,47 @@ def _auto_fill_calculated_fields(
     patient: Optional[Patient],
     current_user: User,
 ) -> None:
-    if not (obj.demographics or "").strip():
+    if not (getattr(obj, "demographics", "") or "").strip():
         obj.demographics = _build_demographics_text(adm, patient)
 
-    if not (obj.follow_up or "").strip():
+    if not (getattr(obj, "follow_up", "") or "").strip():
         auto_fu = _build_followup_text_from_opd(db, adm)
         if auto_fu:
             obj.follow_up = auto_fu
 
-    if not (obj.prepared_by_name or "").strip():
+    if not (getattr(obj, "prepared_by_name", "") or "").strip():
         obj.prepared_by_name = _user_display_name(current_user)
 
-    if not (obj.reviewed_by_name or "").strip():
+    if not (getattr(obj, "reviewed_by_name", "") or "").strip():
         consultant_user = None
         try:
             if getattr(adm, "practitioner_user_id", None):
-                consultant_user = db.query(User).get(adm.practitioner_user_id)
+                consultant_user = db.get(User, adm.practitioner_user_id)
         except Exception:
             consultant_user = None
 
-        obj.reviewed_by_name = _user_display_name(
-            consultant_user) or _user_display_name(current_user)
+        obj.reviewed_by_name = _user_display_name(consultant_user) or _user_display_name(current_user)
 
 
-def _close_open_bed_assignment(db: Session, admission_id: int,
-                               stop_ts: datetime) -> None:
-    last_assign = (db.query(IpdBedAssignment).filter(
-        IpdBedAssignment.admission_id == admission_id,
-        IpdBedAssignment.to_ts.is_(None),
-    ).order_by(IpdBedAssignment.id.desc()).first())
+def _close_open_bed_assignment(db: Session, admission_id: int, stop_ts: datetime) -> None:
+    last_assign = (
+        db.query(IpdBedAssignment)
+        .filter(
+            IpdBedAssignment.admission_id == admission_id,
+            IpdBedAssignment.to_ts.is_(None),
+        )
+        .order_by(IpdBedAssignment.id.desc())
+        .first()
+    )
     if last_assign:
         last_assign.to_ts = stop_ts
 
 
-def _free_current_bed_and_close_assignment(db: Session, adm: IpdAdmission,
-                                           stop_ts: datetime) -> None:
+def _free_current_bed_and_close_assignment(db: Session, adm: IpdAdmission, stop_ts: datetime) -> None:
     _close_open_bed_assignment(db, adm.id, stop_ts)
 
-    if adm.current_bed_id:
-        bed = db.query(IpdBed).get(adm.current_bed_id)
+    if getattr(adm, "current_bed_id", None):
+        bed = db.get(IpdBed, adm.current_bed_id)
         if bed:
             bed.state = "vacant"
 
@@ -212,15 +215,11 @@ def _mark_admission_status_and_release_bed(
     new_status: str,
     stop_ts: datetime,
 ) -> None:
-    if new_status not in ("cancelled", "lama", "dama", "disappeared",
-                          "discharged"):
-        raise HTTPException(400, "Invalid status")
+    if new_status not in ("cancelled", "lama", "dama", "disappeared", "discharged"):
+        raise HTTPException(status_code=400, detail="Invalid status")
 
     adm.status = new_status
-
-    # Keep discharge_at consistent (recommended)
     adm.discharge_at = stop_ts
-
     _free_current_bed_and_close_assignment(db, adm, stop_ts)
 
 
@@ -232,20 +231,14 @@ def _finalize_discharge_and_billing(
     finalize_invoice: bool = False,
 ) -> Dict[str, Any]:
     """
-    Canonical discharge finalization:
-    - mark admission discharged
-    - release bed + close assignment at exact stop_ts
-    - ensure invoice exists
-    - sync room charges up to discharge date (idempotent lines)
-    - recalc totals
-    - optionally approve invoice
-    - lock billing at admission level
-
-    NOTE:
-    - No db.commit() here. Caller commits.
+    Canonical discharge finalization.
+    IMPORTANT FIX:
+    - Avoid calling BOTH sync_ipd_room_charges() and recalc_invoice_totals()
+      if your sync already triggers recalc internally.
+      Doing both can cause mutual recursion -> RecursionError 500.
     """
 
-    # idempotent: if already discharged/locked, just return invoice info
+    # idempotent shortcut
     if adm.status == "discharged" or getattr(adm, "billing_locked", False):
         inv = ensure_invoice_for_context(
             db=db,
@@ -264,14 +257,13 @@ def _finalize_discharge_and_billing(
             "discharge_at": getattr(adm, "discharge_at", None),
         }
 
-    # safety: do not discharge before admitted_at (if present)
     if getattr(adm, "admitted_at", None) and stop_ts < adm.admitted_at:
-        raise HTTPException(400, "discharge_at cannot be before admitted_at")
+        raise HTTPException(status_code=400, detail="discharge_at cannot be before admitted_at")
 
     # 1) discharge + bed release
     _mark_admission_status_and_release_bed(db, adm, "discharged", stop_ts)
 
-    # 2) ensure invoice (IPD module invoice under IP billing case)
+    # 2) ensure invoice
     inv = ensure_invoice_for_context(
         db=db,
         patient_id=adm.patient_id,
@@ -284,13 +276,14 @@ def _finalize_discharge_and_billing(
     # block mutation if posted/void
     if inv.status == DocStatus.POSTED:
         raise HTTPException(
-            400,
-            "Invoice is POSTED; cannot auto-sync room charges. Use edit-request / credit-debit note flow.",
+            status_code=400,
+            detail="Invoice is POSTED; cannot auto-sync room charges.",
         )
     if inv.status == DocStatus.VOID:
-        raise HTTPException(400, "Invoice is VOID; cannot sync.")
+        raise HTTPException(status_code=400, detail="Invoice is VOID; cannot sync.")
 
-    # 3) sync room charges up to discharge date (creates/updates BillingInvoiceLine)
+    # 3) sync room charges up to discharge date
+    # NOTE: Most implementations already recalc totals inside sync.
     sync_ipd_room_charges(
         db=db,
         admission_id=adm.id,
@@ -298,27 +291,27 @@ def _finalize_discharge_and_billing(
         user_id=user.id,
         gst_rate=0.0,
         invoice_id=inv.id,
-        range_only=
-        True,  # don’t delete “future” lines automatically in discharge call
+        range_only=True,
     )
 
-    # 4) totals (sync already recalcs, but keep explicit for clarity)
-    recalc_invoice_totals(db, inv.id)
+    # ✅ IMPORTANT: remove explicit recalc to avoid mutual recursion
+    # If (and only if) your sync DOES NOT recalc, then keep this,
+    # but ensure recalc_invoice_totals does NOT call sync again.
+    # recalc_invoice_totals(db, inv.id)
 
     inv.updated_by = user.id
     db.add(inv)
     db.flush()
 
-    # 5) finalize invoice (optional) -> recommend APPROVED (not POSTED)
-    if finalize_invoice:
-        if inv.status == DocStatus.DRAFT:
-            inv.status = DocStatus.APPROVED
-            inv.approved_at = datetime.utcnow()
-            inv.approved_by = user.id
+    # 4) finalize invoice optional
+    if finalize_invoice and inv.status == DocStatus.DRAFT:
+        inv.status = DocStatus.APPROVED
+        inv.approved_at = datetime.utcnow()
+        inv.approved_by = user.id
         db.add(inv)
         db.flush()
 
-    # 6) lock admission billing
+    # 5) lock admission billing
     adm.billing_locked = True
     adm.billing_locked_at = datetime.utcnow()
     adm.billing_locked_by = user.id
@@ -345,15 +338,18 @@ def _finalize_discharge_and_billing(
     response_model=Optional[DischargeSummaryOut],
 )
 def get_discharge_summary(
-        admission_id: int,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
 ):
     _need_any(user, ["ipd.view", "ipd.doctor", "ipd.manage"])
     _get_admission_or_404(db, admission_id)
 
-    obj = (db.query(IpdDischargeSummary).filter(
-        IpdDischargeSummary.admission_id == admission_id).first())
+    obj = (
+        db.query(IpdDischargeSummary)
+        .filter(IpdDischargeSummary.admission_id == admission_id)
+        .first()
+    )
     return obj
 
 
@@ -363,42 +359,37 @@ def get_discharge_summary(
     status_code=status.HTTP_200_OK,
 )
 def save_discharge_summary(
-        admission_id: int,
-        payload: DischargeSummaryIn,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
+    admission_id: int,
+    payload: DischargeSummaryIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
 ):
-    """
-    Create / Update IPD Discharge Summary.
-    If payload.finalize = true:
-      - sets discharge_datetime
-      - calls canonical discharge finalizer (billing + lock)
-      - locks summary
-    """
-
     _need_any(user, ["ipd.doctor", "ipd.manage"])
 
     adm = _get_admission_or_404(db, admission_id)
-    patient = db.query(Patient).get(adm.patient_id)
+    patient = db.get(Patient, adm.patient_id)
 
-    obj = (db.query(IpdDischargeSummary).filter(
-        IpdDischargeSummary.admission_id == admission_id).first())
+    obj = (
+        db.query(IpdDischargeSummary)
+        .filter(IpdDischargeSummary.admission_id == admission_id)
+        .first()
+    )
     if not obj:
         obj = IpdDischargeSummary(admission_id=admission_id)
         db.add(obj)
+        db.flush()
 
     # Update fields (except finalize flag)
     data = payload.model_dump(exclude={"finalize"}, exclude_unset=True)
     for field, value in data.items():
-        setattr(obj, field, value if value is not None else "")
+        setattr(obj, field, value)
 
     _auto_fill_calculated_fields(db, obj, adm, patient, user)
 
-    if payload.finalize and not obj.finalized:
-        disc_ts = obj.discharge_datetime or datetime.utcnow()
+    if payload.finalize and not getattr(obj, "finalized", False):
+        disc_ts = getattr(obj, "discharge_datetime", None) or datetime.utcnow()
         obj.discharge_datetime = disc_ts
 
-        # canonical discharge + billing + lock
         _finalize_discharge_and_billing(
             db=db,
             adm=adm,
@@ -417,20 +408,19 @@ def save_discharge_summary(
 
 
 # ---------------------------------------------------------
-# Dedicated Discharge Endpoint (Optional UI action)
+# Dedicated Discharge Endpoint
 # ---------------------------------------------------------
 @router.patch("/admissions/{admission_id}/discharge")
 def discharge_admission(
-        admission_id: int,
-        discharge_at: Optional[datetime] = None,
-        finalize_invoice: bool = False,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
+    admission_id: int,
+    discharge_at: Optional[datetime] = None,
+    finalize_invoice: bool = False,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
 ):
     _need_any(user, ["ipd.manage"])
 
     adm = _get_admission_or_404(db, admission_id)
-
     stop_ts = discharge_at or datetime.utcnow()
 
     result = _finalize_discharge_and_billing(
@@ -446,29 +436,29 @@ def discharge_admission(
 
 
 # ---------------------------------------------------------
-# Discharge PDF (allowed even after discharge)
+# Discharge PDF
 # ---------------------------------------------------------
 @router.get(
     "/admissions/{admission_id}/discharge-summary/pdf",
     response_class=StreamingResponse,
 )
 def download_discharge_summary_pdf(
-        admission_id: int,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
 ):
     _need_any(user, ["ipd.view", "ipd.doctor", "ipd.manage"])
 
-    adm = db.query(IpdAdmission).get(admission_id)
+    adm = db.get(IpdAdmission, admission_id)
     if not adm:
-        raise HTTPException(404, "Admission not found")
+        raise HTTPException(status_code=404, detail="Admission not found")
 
     pdf_bytes = generate_discharge_summary_pdf(
         db,
         admission_id=admission_id,
-        org_name="NUTRYAH DIGITAL HEALTH PRIVATE LIMITED",
-        org_address="Address line 1, City",
-        org_phone="Phone / Email",
+        org_name="",
+        org_address="",
+        org_phone="",
     )
 
     display_code = getattr(adm, "display_code", None) or f"IP-{adm.id:06d}"
@@ -489,15 +479,18 @@ def download_discharge_summary_pdf(
     response_model=Optional[DischargeChecklistOut],
 )
 def get_discharge_checklist(
-        admission_id: int,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
 ):
     _need_any(user, ["ipd.view", "ipd.nursing", "ipd.doctor", "ipd.manage"])
     _get_admission_or_404(db, admission_id)
 
-    return (db.query(IpdDischargeChecklist).filter(
-        IpdDischargeChecklist.admission_id == admission_id).first())
+    return (
+        db.query(IpdDischargeChecklist)
+        .filter(IpdDischargeChecklist.admission_id == admission_id)
+        .first()
+    )
 
 
 @router.post(
@@ -505,19 +498,23 @@ def get_discharge_checklist(
     response_model=DischargeChecklistOut,
 )
 def save_discharge_checklist(
-        admission_id: int,
-        payload: DischargeChecklistIn,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
+    admission_id: int,
+    payload: DischargeChecklistIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
 ):
     _need_any(user, ["ipd.nursing", "ipd.doctor", "ipd.manage"])
     _get_admission_or_404(db, admission_id)
 
-    chk = (db.query(IpdDischargeChecklist).filter(
-        IpdDischargeChecklist.admission_id == admission_id).first())
+    chk = (
+        db.query(IpdDischargeChecklist)
+        .filter(IpdDischargeChecklist.admission_id == admission_id)
+        .first()
+    )
     if not chk:
         chk = IpdDischargeChecklist(admission_id=admission_id)
         db.add(chk)
+        db.flush()
 
     data = payload.model_dump(exclude_unset=True)
 
@@ -549,22 +546,25 @@ def save_discharge_checklist(
 # ---------------------------------------------------------
 @router.get("/due-discharges", response_model=List[DueDischargeOut])
 def due_discharges(
-        for_date: date = Query(...),
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
+    for_date: date = Query(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
 ):
     _need_any(user, ["ipd.view", "ipd.manage"])
 
     start = datetime.combine(for_date, datetime.min.time())
     end = datetime.combine(for_date, datetime.max.time())
 
-    q = db.query(IpdAdmission).filter(
-        IpdAdmission.status == "admitted",
-        IpdAdmission.expected_discharge_at.isnot(None),
-        IpdAdmission.expected_discharge_at >= start,
-        IpdAdmission.expected_discharge_at <= end,
+    rows = (
+        db.query(IpdAdmission)
+        .filter(
+            IpdAdmission.status == "admitted",
+            IpdAdmission.expected_discharge_at.isnot(None),
+            IpdAdmission.expected_discharge_at >= start,
+            IpdAdmission.expected_discharge_at <= end,
+        )
+        .all()
     )
-    rows = q.all()
 
     return [
         DueDischargeOut(
@@ -572,7 +572,8 @@ def due_discharges(
             patient_id=r.patient_id,
             expected_discharge_at=r.expected_discharge_at,
             status=r.status,
-        ) for r in rows
+        )
+        for r in rows
     ]
 
 
@@ -581,16 +582,16 @@ def due_discharges(
 # ---------------------------------------------------------
 @router.patch("/admissions/{admission_id}/mark-status")
 def mark_special_status(
-        admission_id: int,
-        status: str = Query(..., pattern="^(lama|dama|disappeared)$"),
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
+    admission_id: int,
+    status: str = Query(..., pattern="^(lama|dama|disappeared)$"),
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
 ):
     _need_any(user, ["ipd.manage"])
 
     adm = _get_admission_or_404(db, admission_id)
-
     stop_ts = datetime.utcnow()
+
     _mark_admission_status_and_release_bed(db, adm, status, stop_ts)
 
     db.commit()
@@ -602,21 +603,23 @@ def mark_special_status(
 # ---------------------------------------------------------
 @router.post("/admissions/{admission_id}/push-to-abha")
 def push_discharge_to_abha(
-        admission_id: int,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
 ):
     _need_any(user, ["ipd.manage"])
 
-    ds = (db.query(IpdDischargeSummary).filter(
-        IpdDischargeSummary.admission_id == admission_id).first())
+    ds = (
+        db.query(IpdDischargeSummary)
+        .filter(IpdDischargeSummary.admission_id == admission_id)
+        .first()
+    )
     if not ds or not ds.finalized:
-        raise HTTPException(status_code=400,
-                            detail="Finalize discharge summary first")
+        raise HTTPException(status_code=400, detail="Finalize discharge summary first")
 
-    adm = db.query(IpdAdmission).get(admission_id)
+    adm = db.get(IpdAdmission, admission_id)
     if not adm:
-        raise HTTPException(404, "Admission not found")
+        raise HTTPException(status_code=404, detail="Admission not found")
 
     adm.abha_shared_at = datetime.utcnow()
     db.commit()
@@ -634,16 +637,19 @@ def push_discharge_to_abha(
     response_model=List[DischargeMedicationOut],
 )
 def list_discharge_medications(
-        admission_id: int,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
 ):
     _need_any(user, ["ipd.view", "ipd.doctor", "ipd.nursing", "ipd.manage"])
     _get_admission_or_404(db, admission_id)
 
-    rows = (db.query(IpdDischargeMedication).filter(
-        IpdDischargeMedication.admission_id == admission_id).order_by(
-            IpdDischargeMedication.id.asc()).all())
+    rows = (
+        db.query(IpdDischargeMedication)
+        .filter(IpdDischargeMedication.admission_id == admission_id)
+        .order_by(IpdDischargeMedication.id.asc())
+        .all()
+    )
     return rows
 
 
@@ -653,10 +659,10 @@ def list_discharge_medications(
     status_code=status.HTTP_201_CREATED,
 )
 def add_discharge_medication(
-        admission_id: int,
-        payload: DischargeMedicationIn,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
+    admission_id: int,
+    payload: DischargeMedicationIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
 ):
     _need_any(user, ["ipd.doctor", "ipd.manage"])
     _get_admission_or_404(db, admission_id)
@@ -683,21 +689,24 @@ def add_discharge_medication(
     status_code=status.HTTP_204_NO_CONTENT,
 )
 def delete_discharge_medication(
-        admission_id: int,
-        med_id: int,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
+    admission_id: int,
+    med_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
 ):
     _need_any(user, ["ipd.doctor", "ipd.manage"])
     _get_admission_or_404(db, admission_id)
 
-    obj = (db.query(IpdDischargeMedication).filter(
-        IpdDischargeMedication.id == med_id,
-        IpdDischargeMedication.admission_id == admission_id,
-    ).first())
+    obj = (
+        db.query(IpdDischargeMedication)
+        .filter(
+            IpdDischargeMedication.id == med_id,
+            IpdDischargeMedication.admission_id == admission_id,
+        )
+        .first()
+    )
     if not obj:
-        raise HTTPException(status_code=404,
-                            detail="Discharge medication not found")
+        raise HTTPException(status_code=404, detail="Discharge medication not found")
 
     db.delete(obj)
     db.commit()
@@ -709,9 +718,9 @@ def delete_discharge_medication(
     response_model=List[dict],
 )
 def list_followups_for_admission(
-        admission_id: int,
-        db: Session = Depends(get_db),
-        user=Depends(auth_current_user),
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
 ):
     _need_any(user, ["ipd.view", "ipd.doctor", "ipd.manage"])
     adm = _get_admission_or_404(db, admission_id)
@@ -721,9 +730,13 @@ def list_followups_for_admission(
     except Exception:
         return []
 
-    rows = (db.query(OpdAppointment).filter(
-        OpdAppointment.patient_id == adm.patient_id).order_by(
-            OpdAppointment.visit_date.desc()).limit(50).all())
+    rows = (
+        db.query(OpdAppointment)
+        .filter(OpdAppointment.patient_id == adm.patient_id)
+        .order_by(OpdAppointment.visit_date.desc())
+        .limit(50)
+        .all()
+    )
 
     out = []
     for r in rows:

@@ -1,15 +1,21 @@
 # FILE: app/services/pdf/ipd_case_sheet.py
 from __future__ import annotations
 
-import io
-import os
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import joinedload
 
-from reportlab.platypus import Paragraph, Spacer, Table, TableStyle, Image
+from reportlab.platypus import (
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+    PageBreak,
+    KeepTogether,
+    Image, 
+)
 from reportlab.lib import colors
 from reportlab.lib.units import mm
 
@@ -19,11 +25,11 @@ try:
 except Exception:  # pragma: no cover
     from app.models.ipd import Patient  # fallback if Patient is in ipd.py
 
-from app.models.ui_branding import UiBranding
 from app.models.ipd import (
     IpdAdmission,
     IpdBed,
     IpdRoom,
+    IpdDischargeSummary,
     IpdVital,
     IpdNursingNote,
     IpdIntakeOutput,
@@ -34,44 +40,67 @@ from app.models.ipd import (
     IpdFallRiskAssessment,
     IpdPressureUlcerAssessment,
     IpdNutritionAssessment,
+    IpdDressingTransfusion,
     IpdDischargeSummary,
+    IpdAdmissionFeedback,
+    IpdAnaesthesiaRecord,
+    IpdAssessment,
+    IpdBedAssignment,
+    IpdBedRate,
+    IpdDischargeChecklist,
+    IpdDischargeMedication,
+    IpdDrugChartDoctorAuth,
+    IpdDrugChartMeta,
+    IpdDrugChartNurseRow,
+    IpdFeedback,
+    IpdIvFluidOrder,
+    IpdMedication,
+    IpdOrder,
+    IpdOtCase,
+    IpdPackage,
+    IpdProgressNote,
+    IpdShiftHandover,
+    IpdRound,
+    IpdWard
 )
 
-# ✅ optional discharge medications table support (won’t crash if model absent)
-try:
-    from app.models.ipd import IpdDischargeMedication
-except Exception:  # pragma: no cover
-    IpdDischargeMedication = None  # type: ignore
+from app.models.ipd_referral import (
+    IpdReferral,
+    IpdReferralEvent,
+)
 
-from app.models.ipd_referral import IpdReferral
 from app.models.ipd_nursing import (
-    IpdDressingRecord,
-    IpdBloodTransfusion,
-    IpdRestraintRecord,
-    IpdIsolationPrecaution,
     IcuFlowSheet,
+    IpdBloodTransfusion,
+    IpdDressingRecord,
+    IpdIsolationPrecaution,
+    IpdNursingTimeline,
+    IpdRestraintRecord,
 )
+
+
+
+from app.models.ipd_newborn import IpdNewbornResuscitation
+
+
 from app.models.pdf_template import PdfTemplate
+from app.models.ui_branding import UiBranding
 
 from app.services.pdfs.engine import (
     build_pdf,
     PdfBuildContext,
     get_styles,
-    section_title,
-    kv_table as _kv_table,
-    simple_table as _simple_table,
     fmt_ist,
     _safe_str,
 )
 
 STYLES = get_styles()
 
-
-# -------------------------------
-# Small helpers
-# -------------------------------
+# ============================================================
+# Helpers
+# ============================================================
 def _sty(name: str, fallback: str = "Normal"):
-    return STYLES.get(name) or STYLES.get(fallback) or STYLES.get("Small")
+    return STYLES.get(name) or STYLES.get(fallback) or STYLES.get("Small") or STYLES["Normal"]
 
 
 def _get(obj: Any, *names: str, default: Any = "") -> Any:
@@ -99,72 +128,18 @@ def _calc_age_years(dob: Any) -> str:
         return ""
 
 
-def _in_range(dt: Optional[datetime], start: Optional[datetime], end: Optional[datetime]) -> bool:
-    if not dt:
-        return False
-    if start and dt < start:
-        return False
-    if end and dt > end:
-        return False
-    return True
-
-
-def kv_table(*args, **kwargs):
-    t = _kv_table(*args, **kwargs)
-    try:
-        t.hAlign = "LEFT"
-    except Exception:
-        pass
-    return t
-
-
-def simple_table(*args, **kwargs):
-    t = _simple_table(*args, **kwargs)
-    try:
-        t.hAlign = "LEFT"
-    except Exception:
-        pass
-    return t
-
-
-def kv_table_fullwidth(rows: List[List[str]], label_w: float = 52 * mm):
-    """2-col key/value table that wraps + splits across pages safely."""
-    try:
-        s = STYLES["Small"].clone("SmallWrap")
-        s.wordWrap = "CJK"
-        s.leading = max(getattr(s, "leading", 10), 10)
-    except Exception:
-        s = STYLES["Small"]
-
-    data = []
-    for k, v in rows:
-        key = Paragraph(f"<b>{_safe_str(k)}</b>", s)
-        vv = _safe_str(v or "—").replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br/>")
-        val = Paragraph(vv, s)
-        data.append([key, val])
-
-    t = Table(data, colWidths=[label_w, None], hAlign="LEFT", splitByRow=1)
-    t.setStyle(TableStyle([
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("BOX", (0, 0), (-1, -1), 0.6, colors.black),
-        ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.lightgrey),
-        ("LEFTPADDING", (0, 0), (-1, -1), 5),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-    ]))
-    return t
-
-
 def _patient_full_name(p: Any) -> str:
     if not p:
         return ""
-    parts = [getattr(p, "prefix", ""), getattr(p, "first_name", ""), getattr(p, "last_name", "")]
+    parts = [
+        getattr(p, "prefix", ""),
+        getattr(p, "first_name", ""),
+        getattr(p, "last_name", ""),
+    ]
     return " ".join([str(x).strip() for x in parts if x and str(x).strip()]).strip()
 
 
 def _patient_address(p: Any) -> str:
-    """Safe address resolution: Patient.addresses[0] if present, else fallback fields."""
     if not p:
         return ""
     addrs = getattr(p, "addresses", None) or []
@@ -179,59 +154,216 @@ def _patient_address(p: Any) -> str:
             _get(a, "pincode", "pin_code", "zip", default=""),
         ]
         return ", ".join([x for x in parts if x and str(x).strip()]).strip(", ")
-
-    # fallback if your Patient stores address directly
     return _safe_str(_get(p, "address", "full_address", "address_line", default=""))
 
 
-# -------------------------------
-# Template resolve
-# -------------------------------
+def _yn_box(v: Optional[bool]) -> str:
+    # Govt form style Yes/No tick boxes (image-free)
+    if v is True:
+        return "Yes (X)   No ( )"
+    if v is False:
+        return "Yes ( )   No (X)"
+    return "Yes ( )   No ( )"
+
+
+def _opt_box(options: List[str], selected: Optional[str]) -> str:
+    # options => ["A", "B", ...], selected => "A"
+    out = []
+    for o in options:
+        out.append(f"{o} ({'X' if selected == o else ' '})")
+    return "   ".join(out)
+
+
+def _para(txt: str, style: str = "Small") -> Paragraph:
+    s = _sty(style, "Small")
+    safe = _safe_str(txt).replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br/>")
+    return Paragraph(safe, s)
+
+
+def _h1(txt: str) -> Paragraph:
+    # Govt-like centered heading
+    return Paragraph(f"<para align='center'><b>{_safe_str(txt)}</b></para>", _sty("Normal", "Normal"))
+
+
+def _section_band(title: str) -> Table:
+    # Dark band header like Govt forms (still monochrome)
+    t = Table([[Paragraph(f"<b>{_safe_str(title)}</b>", _sty("Small", "Small"))]], colWidths=[None])
+    t.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, -1), colors.whitesmoke),
+                ("BOX", (0, 0), (-1, -1), 0.8, colors.black),
+                ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ]
+        )
+    )
+    return t
+
+
+def _boxed_table(data: List[List[Any]], col_widths: Optional[List[float]] = None, repeat_rows: int = 0) -> Table:
+    t = Table(data, colWidths=col_widths, repeatRows=repeat_rows, hAlign="LEFT", splitByRow=1)
+    t.setStyle(
+        TableStyle(
+            [
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("BOX", (0, 0), (-1, -1), 0.8, colors.black),
+                ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.lightgrey),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                ("TOPPADDING", (0, 0), (-1, -1), 3),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ]
+        )
+    )
+    return t
+
+def _boxed_lines(
+    title: Optional[str],
+    lines: List[str],
+    *,
+    style: str = "Small",
+) -> Table:
+    """
+    ✅ Splittable Govt-like boxed content:
+    - Each line is its own table row => ReportLab can split across pages safely.
+    - Avoids LayoutError caused by one huge cell.
+    """
+    data: List[List[Any]] = []
+    if title:
+        data.append([_para(f"<b>{title}</b>", style)])
+    for ln in lines:
+        data.append([_para(ln if ln.strip() else " ", style)])
+    return _boxed_table(data, col_widths=[None])
+
+
+
+def _field_row_2col(label: str, value: Any) -> List[Any]:
+    sL = _sty("Small", "Small")
+    sV = _sty("Small", "Small")
+    return [
+        Paragraph(f"<b>{_safe_str(label)}</b>", sL),
+        Paragraph(_safe_str(value) if _safe_str(value).strip() else " ", sV),
+    ]
+
+
+def _kv_grid_2x2(pairs: List[List[str]]) -> Table:
+    """
+    pairs is list of [label, value], will render as 2 columns repeated across rows:
+    [L1 V1 | L2 V2]
+    """
+    rows = []
+    sL = _sty("Small", "Small")
+    sV = _sty("Small", "Small")
+
+    # pad to even count
+    p = list(pairs)
+    if len(p) % 2 == 1:
+        p.append(["", ""])
+
+    for i in range(0, len(p), 2):
+        (l1, v1) = p[i]
+        (l2, v2) = p[i + 1]
+        rows.append(
+            [
+                Paragraph(f"<b>{_safe_str(l1)}</b>", sL),
+                Paragraph(_safe_str(v1) if _safe_str(v1).strip() else " ", sV),
+                Paragraph(f"<b>{_safe_str(l2)}</b>", sL),
+                Paragraph(_safe_str(v2) if _safe_str(v2).strip() else " ", sV),
+            ]
+        )
+
+    return _boxed_table(rows, col_widths=[38 * mm, None, 38 * mm, None])
+
+
+def _blank_lines(title: str, lines: int = 8) -> Table:
+    s = _sty("Small", "Small")
+    data = [[Paragraph(f"<b>{_safe_str(title)}</b>", s)]]
+    for _ in range(lines):
+        data.append([Paragraph("__________________________________________________________________________________________", s)])
+    t = Table(data, colWidths=[None], hAlign="LEFT")
+    t.setStyle(
+        TableStyle(
+            [
+                ("BOX", (0, 0), (-1, -1), 0.8, colors.black),
+                ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.lightgrey),
+                ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ]
+        )
+    )
+    return t
+
+
+# ============================================================
+# Template resolve (Govt L3 style)
+# ============================================================
 def get_ipd_case_sheet_default_template() -> Dict[str, Any]:
+    # Govt-style maternity case-sheet sections (image-free)
     return {
-        "name": "IPD Case Sheet (NABH)",
+        "name": "Case Sheet for Maternity Services - L3 Facility (Govt Layout, No Images)",
         "sections": [
-            {"code": "patient_admission", "label": "Patient & Admission Snapshot", "enabled": True, "order": 10, "required": True},
-            {"code": "diagnosis_plan", "label": "Diagnosis, History & Care Plan", "enabled": True, "order": 20, "required": True},
-            {"code": "bed_transfers", "label": "Bed & Transfer History", "enabled": True, "order": 30, "required": False},
-            {"code": "vitals", "label": "Vitals Chart", "enabled": True, "order": 40, "required": False},
-            {"code": "nursing_notes", "label": "Nursing Notes", "enabled": True, "order": 50, "required": False},
-            {"code": "intake_output", "label": "Intake / Output", "enabled": True, "order": 60, "required": False},
-            {"code": "assessments", "label": "Risk & Clinical Assessments", "enabled": True, "order": 70, "required": False},
-            {"code": "med_orders", "label": "Medication Orders", "enabled": True, "order": 80, "required": False},
-            {"code": "mar", "label": "Medication Administration (MAR)", "enabled": True, "order": 90, "required": False},
-            {"code": "referrals", "label": "Referrals", "enabled": True, "order": 100, "required": False},
-            {"code": "procedures", "label": "Dressing / Transfusion / Restraint / Isolation / ICU", "enabled": True, "order": 110, "required": False},
-            {"code": "discharge", "label": "Discharge Summary & Counseling", "enabled": True, "order": 120, "required": False},
-            {"code": "signatures", "label": "Signatures & Acknowledgement", "enabled": True, "order": 130, "required": True},
+            {"code": "gov_header", "label": "Govt Header", "enabled": True, "order": 5, "required": True},
+            {"code": "admission_form", "label": "Admission Form", "enabled": True, "order": 10, "required": True},
+            {"code": "presenting_history", "label": "Presenting Complaints & History", "enabled": True, "order": 20, "required": True},
+            {"code": "safe_checklist_1", "label": "SAFE Childbirth Checklist - Check 1", "enabled": True, "order": 30, "required": True},
+            {"code": "obstetric_notes", "label": "Obstetric Notes", "enabled": True, "order": 40, "required": True},
+            {"code": "partograph", "label": "Simplified Partograph (Blank Grid)", "enabled": True, "order": 50, "required": True},
+            {"code": "consent", "label": "Consent for Procedures", "enabled": True, "order": 60, "required": True},
+            {"code": "pre_anaesthetic", "label": "Pre-Anesthetic Check-up", "enabled": True, "order": 70, "required": True},
+            {"code": "anaesthesia_notes", "label": "Anesthesia Notes", "enabled": True, "order": 80, "required": True},
+            {"code": "safe_checklist_2", "label": "SAFE Childbirth Checklist - Check 2", "enabled": True, "order": 90, "required": True},
+            {"code": "procedure_notes", "label": "Operation/Procedure Notes", "enabled": True, "order": 100, "required": True},
+            {"code": "delivery_notes", "label": "Delivery Notes + Baby Notes", "enabled": True, "order": 110, "required": True},
+            {"code": "post_delivery_continuation", "label": "Post Delivery Continuation Sheets", "enabled": True, "order": 120, "required": True},
+            {"code": "transfusion_notes", "label": "Blood Transfusion / Procedure Notes", "enabled": True, "order": 130, "required": True},
+            {"code": "safe_checklist_3", "label": "SAFE Childbirth Checklist - Check 3", "enabled": True, "order": 140, "required": True},
+            {"code": "postpartum_assessment", "label": "Assessment of Postpartum Condition", "enabled": True, "order": 150, "required": True},
+            {"code": "safe_checklist_4", "label": "SAFE Childbirth Checklist - Check 4", "enabled": True, "order": 160, "required": True},
+            {"code": "discharge_notes", "label": "Discharge Notes", "enabled": True, "order": 170, "required": True},
+            {"code": "discharge_form", "label": "Discharge/Referral/LAMA/Death Form", "enabled": True, "order": 180, "required": True},
+            {"code": "signatures", "label": "Signatures", "enabled": True, "order": 190, "required": True},
+            {"code": "newborn_resuscitation", "label": "Newborn Resuscitation & Examination", "enabled": True, "order": 115, "required": False},
         ],
         "settings": {
-            "show_empty_sections": False,
             "max_rows_per_section": 30,
-        }
+            "show_empty_sections": True,
+        },
     }
 
 
 def _resolve_template(db, template_id: Optional[int]) -> Dict[str, Any]:
     if template_id:
-        t = db.query(PdfTemplate).filter(PdfTemplate.id == template_id, PdfTemplate.is_active == True).first()
+        t = (
+            db.query(PdfTemplate)
+            .filter(PdfTemplate.id == template_id, PdfTemplate.is_active == True)  # noqa: E712
+            .first()
+        )
         if t:
             return {"name": t.name, "sections": t.sections or [], "settings": t.settings or {}}
 
-    t2 = db.query(PdfTemplate).filter(
-        PdfTemplate.module == "ipd",
-        PdfTemplate.code == "case_sheet",
-        PdfTemplate.is_active == True,
-    ).first()
+    t2 = (
+        db.query(PdfTemplate)
+        .filter(
+            PdfTemplate.module == "ipd",
+            PdfTemplate.code == "case_sheet",
+            PdfTemplate.is_active == True,  # noqa: E712
+        )
+        .first()
+    )
     if t2:
         return {"name": t2.name, "sections": t2.sections or [], "settings": t2.settings or {}}
 
     return get_ipd_case_sheet_default_template()
 
 
-# -------------------------------
+# ============================================================
 # Data container
-# -------------------------------
+# ============================================================
 @dataclass
 class IpdCaseSheetData:
     admission: IpdAdmission
@@ -253,212 +385,1121 @@ class IpdCaseSheetData:
     icu_flows: List[IcuFlowSheet]
     discharge: Optional[IpdDischargeSummary]
     discharge_meds: List[Any]
+    newborn_resus: Optional[Any]   # ✅ NEW
 
 
-def _load_ipd_case_sheet_data(
-    db,
-    admission_id: int,
-    enabled_section_codes: set[str],
-    start: Optional[datetime],
-    end: Optional[datetime],
-    max_rows: int,
-) -> IpdCaseSheetData:
-    # ✅ DO NOT joinedload(patient_id). It's a column.
-    # ✅ Load admission + bed/ward first
-    adm = db.query(IpdAdmission).options(
-        joinedload(IpdAdmission.current_bed)
+
+def _load_ipd_case_sheet_data(db, admission_id: int) -> IpdCaseSheetData:
+    adm = (
+        db.query(IpdAdmission)
+        .options(
+            joinedload(IpdAdmission.current_bed)
             .joinedload(IpdBed.room)
             .joinedload(IpdRoom.ward),
-    ).filter(IpdAdmission.id == admission_id).first()
+        )
+        .filter(IpdAdmission.id == admission_id)
+        .first()
+    )
     if not adm:
         raise ValueError("Admission not found")
 
-    # ✅ Load patient separately (works even if you didn't define relationship in model)
+    # patient (attach)
     patient = None
     try:
-        patient = db.query(Patient).options(
-            joinedload(getattr(Patient, "addresses"))
-        ).filter(Patient.id == adm.patient_id).first()
+        patient = db.query(Patient).options(joinedload(getattr(Patient, "addresses"))).filter(Patient.id == adm.patient_id).first()
     except Exception:
         patient = db.query(Patient).filter(Patient.id == adm.patient_id).first()
 
-    # attach for PDF usage
     try:
         setattr(adm, "patient", patient)
     except Exception:
         pass
 
-    vitals: List[IpdVital] = []
-    nursing_notes: List[IpdNursingNote] = []
-    io_rows: List[IpdIntakeOutput] = []
-    transfers: List[IpdTransfer] = []
-    referrals: List[IpdReferral] = []
-    med_orders: List[IpdMedicationOrder] = []
-    mar_rows: List[IpdMedicationAdministration] = []
-    pain: List[IpdPainAssessment] = []
-    fall: List[IpdFallRiskAssessment] = []
-    pressure: List[IpdPressureUlcerAssessment] = []
-    nutrition: List[IpdNutritionAssessment] = []
-    dressings: List[IpdDressingRecord] = []
-    transfusions: List[IpdBloodTransfusion] = []
-    restraints: List[IpdRestraintRecord] = []
-    isolations: List[IpdIsolationPrecaution] = []
-    icu_flows: List[IcuFlowSheet] = []
-    discharge: Optional[IpdDischargeSummary] = None
-    discharge_meds: List[Any] = []
+    discharge = db.query(IpdDischargeSummary).filter(IpdDischargeSummary.admission_id == admission_id).first()
 
-    if "vitals" in enabled_section_codes:
-        rows = db.query(IpdVital).filter(IpdVital.admission_id == admission_id).order_by(IpdVital.recorded_at.desc()).limit(max_rows * 3).all()
-        vitals = [r for r in rows if _in_range(getattr(r, "recorded_at", None), start, end)][:max_rows]
-
-    if "nursing_notes" in enabled_section_codes:
-        rows = db.query(IpdNursingNote).filter(IpdNursingNote.admission_id == admission_id).order_by(IpdNursingNote.entry_time.desc()).limit(max_rows * 3).all()
-        nursing_notes = [r for r in rows if _in_range(getattr(r, "entry_time", None), start, end)][:max_rows]
-
-    if "intake_output" in enabled_section_codes:
-        rows = db.query(IpdIntakeOutput).filter(IpdIntakeOutput.admission_id == admission_id).order_by(IpdIntakeOutput.recorded_at.desc()).limit(max_rows * 3).all()
-        io_rows = [r for r in rows if _in_range(getattr(r, "recorded_at", None), start, end)][:max_rows]
-
-    if "bed_transfers" in enabled_section_codes:
-        rows = db.query(IpdTransfer).filter(IpdTransfer.admission_id == admission_id).order_by(IpdTransfer.requested_at.desc()).limit(max_rows * 2).all()
-        transfers = [r for r in rows if _in_range(getattr(r, "requested_at", None), start, end)][:max_rows]
-
-    if "referrals" in enabled_section_codes:
-        rows = db.query(IpdReferral).filter(IpdReferral.admission_id == admission_id).order_by(IpdReferral.requested_at.desc()).limit(max_rows * 2).all()
-        referrals = [r for r in rows if _in_range(getattr(r, "requested_at", None), start, end)][:max_rows]
-
-    if "med_orders" in enabled_section_codes:
-        rows = db.query(IpdMedicationOrder).filter(IpdMedicationOrder.admission_id == admission_id).order_by(IpdMedicationOrder.start_datetime.desc()).limit(max_rows * 3).all()
-        med_orders = [r for r in rows if _in_range(getattr(r, "start_datetime", None), start, end)][:max_rows]
-
-    if "mar" in enabled_section_codes:
-        rows = db.query(IpdMedicationAdministration).filter(IpdMedicationAdministration.admission_id == admission_id).order_by(IpdMedicationAdministration.scheduled_datetime.desc()).limit(max_rows * 4).all()
-        mar_rows = [r for r in rows if _in_range(getattr(r, "scheduled_datetime", None), start, end)][:max_rows]
-
-    if "assessments" in enabled_section_codes:
-        pain = db.query(IpdPainAssessment).filter(IpdPainAssessment.admission_id == admission_id).order_by(IpdPainAssessment.recorded_at.desc()).limit(max_rows).all()
-        fall = db.query(IpdFallRiskAssessment).filter(IpdFallRiskAssessment.admission_id == admission_id).order_by(IpdFallRiskAssessment.recorded_at.desc()).limit(max_rows).all()
-        pressure = db.query(IpdPressureUlcerAssessment).filter(IpdPressureUlcerAssessment.admission_id == admission_id).order_by(IpdPressureUlcerAssessment.recorded_at.desc()).limit(max_rows).all()
-        nutrition = db.query(IpdNutritionAssessment).filter(IpdNutritionAssessment.admission_id == admission_id).order_by(IpdNutritionAssessment.recorded_at.desc()).limit(max_rows).all()
-
-    if "procedures" in enabled_section_codes:
-        dressings = db.query(IpdDressingRecord).filter(IpdDressingRecord.admission_id == admission_id).order_by(IpdDressingRecord.performed_at.desc()).limit(max_rows).all()
-        transfusions = db.query(IpdBloodTransfusion).filter(IpdBloodTransfusion.admission_id == admission_id).order_by(IpdBloodTransfusion.created_at.desc()).limit(max_rows).all()
-        restraints = db.query(IpdRestraintRecord).filter(IpdRestraintRecord.admission_id == admission_id).order_by(IpdRestraintRecord.created_at.desc()).limit(max_rows).all()
-        isolations = db.query(IpdIsolationPrecaution).filter(IpdIsolationPrecaution.admission_id == admission_id).order_by(IpdIsolationPrecaution.created_at.desc()).limit(max_rows).all()
-        icu_flows = db.query(IcuFlowSheet).filter(IcuFlowSheet.admission_id == admission_id).order_by(IcuFlowSheet.recorded_at.desc()).limit(max_rows).all()
-
-    if "discharge" in enabled_section_codes:
-        discharge = db.query(IpdDischargeSummary).filter(IpdDischargeSummary.admission_id == admission_id).first()
-        # discharge meds (optional)
-        if IpdDischargeMedication is not None:
-            discharge_meds = db.query(IpdDischargeMedication).filter(
-                IpdDischargeMedication.admission_id == admission_id
-            ).order_by(IpdDischargeMedication.id.asc()).all()
-
-    return IpdCaseSheetData(
-        admission=adm,
-        vitals=vitals,
-        nursing_notes=nursing_notes,
-        io_rows=io_rows,
-        transfers=transfers,
-        referrals=referrals,
-        med_orders=med_orders,
-        mar_rows=mar_rows,
-        pain=pain,
-        fall=fall,
-        pressure=pressure,
-        nutrition=nutrition,
-        dressings=dressings,
-        transfusions=transfusions,
-        restraints=restraints,
-        isolations=isolations,
-        icu_flows=icu_flows,
-        discharge=discharge,
-        discharge_meds=discharge_meds,
-    )
+    return IpdCaseSheetData(admission=adm, discharge=discharge)
 
 
-# -------------------------------
-# Header (Logo + Org details + Doc title)
-# -------------------------------
-def _sec_header(db, doc_title: str = "IPD Case Sheet") -> List[Any]:
+# ============================================================
+# Govt Header (NO images)
+# ============================================================
+def _gov_header(db, d: IpdCaseSheetData) -> List[Any]:
     branding = None
     try:
-        branding = db.query(UiBranding).filter(
-            getattr(UiBranding, "is_active", True) == True
-        ).order_by(UiBranding.id.desc()).first()
+        branding = (
+            db.query(UiBranding)
+            .filter(getattr(UiBranding, "is_active", True) == True)  # noqa: E712
+            .order_by(UiBranding.id.desc())
+            .first()
+        )
     except Exception:
         branding = None
 
-    org_name = _safe_str(_get(branding, "org_name", "organization_name", "name", default=""))
-    tagline = _safe_str(_get(branding, "tagline", "slogan", default=""))
-    address = _safe_str(_get(branding, "address", "org_address", "full_address", default=""))
-    phone = _safe_str(_get(branding, "phone", "phone_number", "mobile", "contact_number", default=""))
-    website = _safe_str(_get(branding, "website", "web", "url", default=""))
+    facility = _safe_str(_get(branding, "org_name", "facility_name", "name", default="Name of Facility"))
+    district = _safe_str(_get(branding, "org_district", "district", default=""))
+    block = _safe_str(_get(branding, "org_block", "block", default=""))
+    phone = _safe_str(_get(branding, "org_phone", "phone", "contact_number", default=""))
 
-    logo_flow = None
-    logo_bytes = _get(branding, "logo_bytes", "logo_blob", "logo_data", default=None)
-    logo_path = _get(branding, "logo_path", "logo_file_path", "logo_local_path", default=None)
+    title = "CASE SHEET FOR MATERNITY SERVICES - L3 FACILITY"
+    motto = "lR;eso t;rs"  # as in sample PDF (ASCII transliteration)
 
-    try:
-        if logo_bytes and isinstance(logo_bytes, (bytes, bytearray)):
-            logo_flow = Image(io.BytesIO(logo_bytes), width=22 * mm, height=22 * mm)
-        elif logo_path and isinstance(logo_path, str) and os.path.exists(logo_path):
-            logo_flow = Image(logo_path, width=22 * mm, height=22 * mm)
-    except Exception:
-        logo_flow = None
-
-    if not logo_flow:
-        logo_flow = Spacer(22 * mm, 22 * mm)
-
-    left_lines = []
-    if org_name:
-        left_lines.append(f"<b>{org_name}</b>")
-    if tagline:
-        left_lines.append(f"<font size='9'>{tagline}</font>")
-    if address:
-        left_lines.append(f"<font size='8'>{address}</font>")
-
-    contact_bits = []
-    if phone:
-        contact_bits.append(phone)
-    if website:
-        contact_bits.append(website)
-    if contact_bits:
-        left_lines.append(f"<font size='8'>{' | '.join(contact_bits)}</font>")
-
-    left_html = "<br/>".join(left_lines) if left_lines else "<b> </b>"
-    left = Paragraph(left_html, _sty("Normal"))
-
-    right = Paragraph(f"<para align='right'><b>{_safe_str(doc_title)}</b></para>", _sty("Normal"))
-
-    hdr = Table(
-        [[logo_flow, left, right]],
-        colWidths=[26 * mm, None, 40 * mm],
+    head = Table(
+        [
+            [Paragraph(f"<b>{_safe_str(facility)}</b>", _sty("Normal", "Normal")), _h1(title)],
+            [Paragraph(f"Block: {_safe_str(block)}", _sty("Small", "Small")), Paragraph(motto, _sty("Small", "Small"))],
+            [Paragraph(f"District: {_safe_str(district)}", _sty("Small", "Small")), Paragraph(f"Contact No. (facility): {_safe_str(phone)}", _sty("Small", "Small"))],
+        ],
+        colWidths=[None, None],
         hAlign="LEFT",
     )
-    hdr.setStyle(TableStyle([
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 0),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-        ("TOPPADDING", (0, 0), (-1, -1), 0),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-    ]))
+    head.setStyle(
+        TableStyle(
+            [
+                ("BOX", (0, 0), (-1, -1), 0.8, colors.black),
+                ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.lightgrey),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ]
+        )
+    )
 
-    sep = Table([[""]], colWidths=[None])
-    sep.setStyle(TableStyle([
-        ("LINEBELOW", (0, 0), (-1, -1), 0.8, colors.black),
-        ("TOPPADDING", (0, 0), (-1, -1), 2),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-    ]))
-
-    return [hdr, sep, Spacer(1, 2)]
+    return [head, Spacer(1, 6)]
 
 
-# -------------------------------
+# ============================================================
+# Section: Admission Form (Govt layout)
+# ============================================================
+def _sec_admission_form(d: IpdCaseSheetData) -> List[Any]:
+    adm = d.admission
+    patient = getattr(adm, "patient", None)
+    discharge = d.discharge
+
+    # Patient basics
+    name = _safe_str(_patient_full_name(patient))
+    age = _calc_age_years(_get(patient, "dob", default=None))
+    gender = _safe_str(_get(patient, "gender", default=""))
+    phone = _safe_str(_get(patient, "phone", "mobile", default=""))
+    address = _safe_str(_patient_address(patient))
+
+    # Govt-specific IDs (if your DB has them; else blank)
+    mcts = _safe_str(_get(adm, "mcts_no", "mcts_number", default=""))
+    aadhar = _safe_str(_get(patient, "aadhar_no", "aadhaar_no", "aadhaar", default=_get(adm, "aadhar_no", default="")))
+    ipd_reg = _safe_str(_get(adm, "display_code", "registration_no", default=""))
+    booked = _get(adm, "booked", default=None)  # bool?
+    bpl = _get(adm, "bpl_jsy_registered", "bpl_jsy", default=None)  # bool?
+    referred_from = _safe_str(_get(adm, "referred_from", "referred_by", default=""))
+    referral_reason = _safe_str(_get(adm, "referral_reason", "referred_reason", default=""))
+
+    marital = _safe_str(_get(patient, "marital_status", default=""))
+    relation = _safe_str(_get(patient, "relation_name", "spouse_name", "husband_name", "father_name", default=""))
+
+    admitted_at = fmt_ist(_get(adm, "admitted_at", default=None))
+    companion = _safe_str(_get(adm, "birth_companion_name", "companion_name", default=""))
+
+    admission_cat = _safe_str(_get(adm, "admission_category", default=""))
+    lmp = _safe_str(_get(adm, "lmp", default=""))
+    edd = _safe_str(_get(adm, "edd", default=""))
+
+    prov_dx = _safe_str(_get(adm, "preliminary_diagnosis", "provisional_diagnosis", default=""))
+    final_dx = _safe_str(_get(discharge, "final_diagnosis_primary", default=_get(adm, "final_diagnosis", default="")))
+
+    contraception = _safe_str(_get(adm, "contraception_history", default=""))
+
+    # Delivery outcome (if you store)
+    delivery_outcome = _safe_str(_get(adm, "delivery_outcome", default=""))
+    baby_sex = _safe_str(_get(adm, "baby_sex", default=""))
+    baby_weight = _safe_str(_get(adm, "baby_birth_weight_kg", "baby_weight_kg", default=""))
+    delivery_dt = _safe_str(_get(adm, "delivery_date", default=""))
+    delivery_time = _safe_str(_get(adm, "delivery_time", default=""))
+    mode_delivery = _safe_str(_get(adm, "mode_of_delivery", default=""))
+    final_outcome = _safe_str(_get(adm, "final_outcome", default=""))
+
+    # Yes/No boxes
+    booked_box = _yn_box(booked if isinstance(booked, bool) else None)
+    bpl_box = _yn_box(bpl if isinstance(bpl, bool) else None)
+
+    # Admission category options exactly like sample wording (stored or blank)
+    cat_opts = [
+        "presented with labor pain",
+        "presented with complications of pregnancy",
+        "referred in from other facility",
+    ]
+    cat_box = _opt_box(cat_opts, admission_cat if admission_cat in cat_opts else None)
+
+    top = _kv_grid_2x2(
+        [
+            ["MCTS No.", mcts],
+            ["Booked", booked_box],
+            ["IPD/Registration No.", ipd_reg],
+            ["BPL/JSY Registration", bpl_box],
+            ["Aadhar Card No.", aadhar],
+            ["Referred from & Reason", (referred_from + (" | " + referral_reason if referral_reason else "")).strip(" |")],
+        ]
+    )
+
+    mid = _boxed_table(
+        [
+            [
+                _para(f"<b>Name:</b> {name}"),
+                _para(f"<b>Age:</b> {age}"),
+                _para(f"<b>W/o OR D/o:</b> {relation}"),
+            ],
+            [
+                _para(f"<b>Address:</b> {address}"),
+                _para(f"<b>Contact No:</b> {phone}"),
+                _para(f"<b>Marital status:</b> {marital}"),
+            ],
+            [
+                _para(f"<b>Admission date & time:</b> {admitted_at}"),
+                _para(f"<b>Name of birth companion:</b> {companion}"),
+                _para(" "),
+            ],
+            [
+                _para("<b>Admission category:</b>"),
+                _para(cat_box),
+                _para(" "),
+            ],
+            [
+                _para(f"<b>LMP:</b> {lmp}"),
+                _para(f"<b>EDD:</b> {edd}"),
+                _para(" "),
+            ],
+            [
+                _para(f"<b>Provisional Diagnosis:</b> {prov_dx}"),
+                _para(f"<b>Final Diagnosis:</b> {final_dx}"),
+                _para(" "),
+            ],
+            [
+                _para(f"<b>Contraception History:</b> {contraception}"),
+                _para(" "),
+                _para(" "),
+            ],
+        ],
+        col_widths=[None, None, None],
+    )
+
+    delivery = _boxed_table(
+        [
+            [
+                _para("<b>Delivery outcome:</b> Live / Abortion / Still Birth (Fresh/Macerated) / Preterm (Yes/No)"),
+                _para("<b>Sex of Baby:</b> Male / Female"),
+                _para("<b>Birth weight (in kgs):</b>"),
+            ],
+            [
+                _para(_safe_str(delivery_outcome) or " "),
+                _para(_safe_str(baby_sex) or " "),
+                _para(_safe_str(baby_weight) or " "),
+            ],
+            [
+                _para("<b>Delivery date:</b>"),
+                _para("<b>Time:</b>"),
+                _para("<b>Mode of Delivery/Procedure:</b> Normal / Assisted / CS / Other"),
+            ],
+            [
+                _para(_safe_str(delivery_dt) or " "),
+                _para(_safe_str(delivery_time) or " "),
+                _para(_safe_str(mode_delivery) or " "),
+            ],
+            [
+                _para("<b>Indication for assisted / LSCS / Others:</b>"),
+                _para(" "),
+                _para(" "),
+            ],
+            [
+                _para("__________________________________________________________________________________"),
+                _para(" "),
+                _para(" "),
+            ],
+            [
+                _para("<b>Final outcome:</b> Discharge / Referral / Death / LAMA / Abortion"),
+                _para(" "),
+                _para(" "),
+            ],
+            [
+                _para(_safe_str(final_outcome) or " "),
+                _para(" "),
+                _para(" "),
+            ],
+        ],
+        col_widths=[None, 50 * mm, 60 * mm],
+    )
+
+    sign = _boxed_table(
+        [
+            [_para("<b>Name and signature of service provider:</b> ________________________________"),
+             _para("<b>Designation:</b> ____________________"),
+             _para("<b>Date & Time:</b> ____________________")],
+        ],
+        col_widths=[None, 60 * mm, 55 * mm],
+    )
+
+    return [
+        _section_band("Admission Form"),
+        top,
+        Spacer(1, 6),
+        mid,
+        Spacer(1, 6),
+        delivery,
+        Spacer(1, 6),
+        sign,
+        PageBreak(),
+    ]
+
+
+# ============================================================
+# Section: Presenting complaints & history
+# ============================================================
+def _sec_presenting_history(d: IpdCaseSheetData) -> List[Any]:
+    adm = d.admission
+
+    # pull from admission if exists
+    presenting = _safe_str(_get(adm, "presenting_complaints", "chief_complaint", default=""))
+    medical = _safe_str(_get(adm, "medical_history", default=""))
+    surgical = _safe_str(_get(adm, "surgical_history", default=""))
+    family = _safe_str(_get(adm, "family_history", default=""))
+    gravida = _safe_str(_get(adm, "gravida", default=""))
+    parity = _safe_str(_get(adm, "parity", default=""))
+    abortion = _safe_str(_get(adm, "abortion", default=""))
+    living = _safe_str(_get(adm, "living_children", default=""))
+    onset = _safe_str(_get(adm, "labour_onset_datetime", "onset_of_labor", default=""))
+
+    # PV + exam fields (if you have)
+    cerv_dil = _safe_str(_get(adm, "cervical_dilatation_cm", default=""))
+    cerv_eff = _safe_str(_get(adm, "cervical_effacement_pct", default=""))
+    pv_count = _safe_str(_get(adm, "pv_exams_count", default=""))
+    membranes = _safe_str(_get(adm, "membranes", default=""))  # Ruptured/Intact
+    amniotic = _safe_str(_get(adm, "amniotic_fluid_color", default=""))  # Clear/Meconium/Blood
+    pelvis = _safe_str(_get(adm, "pelvis_adequate", default=""))  # Yes/No
+
+    # Vitals
+    pulse = _safe_str(_get(adm, "pulse", default=""))
+    rr = _safe_str(_get(adm, "resp_rate", "respiratory_rate", default=""))
+    fhr = _safe_str(_get(adm, "fhr", default=""))
+    bp = _safe_str(_get(adm, "bp", default=""))
+    temp = _safe_str(_get(adm, "temperature", "temp", default=""))
+
+    # Investigations
+    bg = _safe_str(_get(adm, "blood_group", default=""))
+    hb = _safe_str(_get(adm, "hb", default=""))
+    sugar = _safe_str(_get(adm, "blood_sugar", default=""))
+    urine_prot = _safe_str(_get(adm, "urine_protein", default=""))
+    urine_sugar = _safe_str(_get(adm, "urine_sugar", default=""))
+    hiv = _safe_str(_get(adm, "hiv", default=""))
+    hbsag = _safe_str(_get(adm, "hbsag", default=""))
+    syphilis = _safe_str(_get(adm, "syphilis", default=""))
+    malaria = _safe_str(_get(adm, "malaria", default=""))
+
+    # Antenatal / gestation
+    lmp = _safe_str(_get(adm, "lmp", default=""))
+    edd = _safe_str(_get(adm, "edd", default=""))
+    fundal = _safe_str(_get(adm, "fundal_height_wks", default=""))
+    usg_age = _safe_str(_get(adm, "usg_gestation_age", default=""))
+    preterm = _get(adm, "preterm", default=None)
+    steroid = _get(adm, "antenatal_corticosteroid_given", default=None)
+
+    # build Govt-like blocks
+    block1 = _boxed_table(
+        [
+            [_para("<b>Presenting complaints:</b>"), _para(presenting or " ")],
+        ],
+        col_widths=[60 * mm, None],
+    )
+
+    block2 = _boxed_table(
+        [
+            [_para("<b>Past Obstetrics History:</b>"),
+             _para("APH: ________   PPH: ________   PE/E: ________   C-section: ________"),
+             _para("Obstructed labor: ________   Still births: ________   Congenital anomaly: ________"),
+             _para("Anemia: ________   Others (Specify): __________________________________________")],
+        ],
+        col_widths=[None],
+    )
+
+    block3 = _boxed_table(
+        [
+            [_para("<b>Medical / Surgical History (Please specify):</b>"),
+             _para((medical + ("\n" + surgical if surgical else "")).strip() or " ")],
+            [_para("<b>Family H/o chronic illness (Please specify):</b>"), _para(family or " ")],
+        ],
+        col_widths=[70 * mm, None],
+    )
+
+    block4 = _boxed_table(
+        [
+            [
+                _para(f"<b>Date and time of onset of labor:</b> {onset}"),
+                _para(f"<b>Gravida:</b> {gravida}   <b>Parity:</b> {parity}   <b>Abortion:</b> {abortion}   <b>Living:</b> {living}"),
+            ],
+            [
+                _para("<b>PV Examination</b> Cervical dilatation: ______  Cervical effacement: ______  No. of PV Examinations: ______"),
+                _para(f"Cervical dilatation: {cerv_dil or ' '}   Cervical effacement: {cerv_eff or ' '}   PV count: {pv_count or ' '}"),
+            ],
+            [
+                _para("Membranes: Ruptured / Intact     Colour of amniotic fluid: Clear / Meconium / Blood     Pelvis adequate: Yes / No"),
+                _para(f"Membranes: {membranes or ' '}   AF colour: {amniotic or ' '}   Pelvis: {pelvis or ' '}"),
+            ],
+            [
+                _para(f"<b>Gestational Age</b>  LMP: {lmp}   EDD: {edd}   Fundal height (wks): {fundal}   Age from USG: {usg_age}"),
+                _para(f"Pre-term: {_yn_box(preterm if isinstance(preterm, bool) else None)}    Antenatal corticosteroid given: {_yn_box(steroid if isinstance(steroid, bool) else None)}"),
+            ],
+        ],
+        col_widths=[None, None],
+    )
+
+    vitals = _boxed_table(
+        [
+            [_para("<b>Vitals</b> Pulse: ___/min   Respiratory rate: ___/min   FHR: ___/min   BP: ___ mmHg   Temperature: ___ C/F"),
+             _para(f"Pulse: {pulse}   RR: {rr}   FHR: {fhr}   BP: {bp}   Temp: {temp}")],
+        ],
+        col_widths=[None, None],
+    )
+
+    inv = _boxed_table(
+        [
+            [_para("<b>Investigations</b> Blood Group & Rh: ____   Hb: ____   Blood Sugar: ____   Urine Protein: ____   Urine Sugar: ____"),
+             _para(f"BG/Rh: {bg}   Hb: {hb}   Sugar: {sugar}   Ur Prot: {urine_prot}   Ur Sugar: {urine_sugar}")],
+            [_para("HIV: ____   HBsAg: ____   Syphilis: ____   Malaria: ____   Others: _________________________________"),
+             _para(f"HIV: {hiv}   HBsAg: {hbsag}   Syphilis: {syphilis}   Malaria: {malaria}")],
+        ],
+        col_widths=[None, None],
+    )
+
+    exam = _boxed_table(
+        [
+            [_para("<b>PA Examination</b> Presentation: Cephalic / Others ___   Engagement: ___   Lie: ___"),
+             _para("General: Height: ____ cms   Weight: ____ kgs   Pallor: ___   Jaundice: ___   Pedal Edema: ___")],
+        ],
+        col_widths=[None, None],
+    )
+
+    return [
+        _section_band("Presenting Complaints & History"),
+        block1,
+        Spacer(1, 6),
+        block2,
+        Spacer(1, 6),
+        block3,
+        Spacer(1, 6),
+        block4,
+        Spacer(1, 6),
+        vitals,
+        Spacer(1, 6),
+        inv,
+        Spacer(1, 6),
+        exam,
+        PageBreak(),
+    ]
+
+
+# ============================================================
+# SAFE Childbirth Checklist (structured, image-free)
+# ============================================================
+def _sec_safe_checklist_1(_: IpdCaseSheetData) -> List[Any]:
+    story: List[Any] = []
+    story.append(_section_band("Before Birth – SAFE CHILDBIRTH CHECKLIST"))
+
+    # Page 1 (Admission)
+    story.append(_boxed_lines(
+        "CHECK-1 On Admission",
+        [
+            "Does Mother need referral?   Yes ( )   No ( )",
+            "Partograph started?   Yes ( )   No ( )   (Start when cervix ≥ 4 cm)",
+            "Does Mother need antibiotics?   Yes, given ( )   No ( )",
+            "Inj. Magnesium sulfate?   Yes, given ( )   No ( )",
+            "Corticosteroid (24–34 weeks if indicated)?   Yes, given ( )   No ( )",
+            "HIV status of the mother: Positive ( )  Negative ( )  Follow Universal Precautions ( )",
+            "Encouraged a birth companion during labour/birth/till discharge: Yes ( )  No ( )",
+        ],
+    ))
+    story.append(Spacer(1, 6))
+
+    story.append(_boxed_lines(
+        "Counsel Mother and Birth Companion to call for help if there is:",
+        [
+            "• Bleeding",
+            "• Severe abdominal pain",
+            "• Difficulty in breathing",
+            "• Severe headache or blurring vision",
+            "• Urge to push",
+            "• Can’t empty bladder every 2 hours",
+        ],
+    ))
+    story.append(Spacer(1, 6))
+
+    story.append(_boxed_lines(
+        "Confirm Supplies / Hygiene",
+        [
+            "Are soap, water and gloves available?   Yes ( )   No ( )",
+            "I will wash hands and wear gloves for each vaginal exam ( )",
+            "If not available, supplies arranged ( )",
+            "Mother/companion will call for help during labour if needed ( )",
+        ],
+    ))
+    story.append(Spacer(1, 6))
+
+    story.append(_boxed_lines(
+        "Refer to FRU/Higher centre if danger signs present (tick):",
+        [
+            "Vaginal bleeding ( )   High fever ( )   Severe headache/blurred vision ( )   Convulsions ( )",
+            "Severe abdominal pain ( )   Difficulty in breathing ( )   Oligouria (<400 ml/24 hrs) ( )",
+            "Foul-smelling discharge ( )   History of heart disease/major illness ( )",
+        ],
+    ))
+
+    # ✅ split checklist into two pages to guarantee no LayoutError
+    story.append(PageBreak())
+
+    # Page 2 (Clinical criteria blocks)
+    story.append(_section_band("SAFE Checklist – Clinical Actions (Continuation)"))
+
+    story.append(_boxed_lines(
+        "Give antibiotics to Mother if (tick):",
+        [
+            "Temperature ≥ 38°C (100.5°F) ( )",
+            "Foul-smelling vaginal discharge ( )",
+            "Rupture of membranes >12 hrs without labour OR >18 hrs with labour ( )",
+            "Labour >24 hrs / obstructed labour ( )",
+            "Rupture of membranes <37 wks gestation ( )",
+        ],
+    ))
+    story.append(Spacer(1, 6))
+
+    story.append(_boxed_lines(
+        "Give first dose of inj. magnesium sulfate and refer OR full dose if at FRU if:",
+        [
+            "Systolic ≥160 or Diastolic ≥110 with ≥+3 proteinuria OR BP ≥140/90 with trace to +2 proteinuria along with:",
+            "Severe headache ( )  Pain in upper abdomen ( )  Convulsions ( )  Blurring of vision ( )  Difficulty breathing ( )",
+        ],
+    ))
+    story.append(Spacer(1, 6))
+
+    story.append(_boxed_lines(
+        "Give corticosteroids (24–34 weeks) if:",
+        [
+            "True pre-term labour ( )",
+            "Imminent delivery (APH, PPROM, Severe PE/E) ( )",
+            "Dose: Inj. Dexamethasone 6 mg IM 12 hourly – total 4 doses",
+        ],
+    ))
+    story.append(Spacer(1, 6))
+
+    story.append(_boxed_lines(
+        "Provider Details",
+        [
+            "Name of Provider: ____________________________",
+            "Date: ____/____/____     Signature: ____________________________",
+            "NO OXYTOCIN/other uterotonics for unnecessary induction/augmentation of labour",
+            "Counsel: No bath/oil for baby, no pre-lacteal feed, start breastfeeding within 30 minutes, wrap and keep warm",
+        ],
+    ))
+
+    story.append(PageBreak())
+    return story
+
+
+
+def _sec_obstetric_notes(d: IpdCaseSheetData) -> List[Any]:
+    adm = d.admission
+    augmentation = _get(adm, "augmentation_performed", default=None)
+    indication = _safe_str(_get(adm, "augmentation_indication", default=""))
+
+    t = _boxed_table(
+        [
+            [
+                _para("<b>OBSTETRIC NOTES (INTERVENTIONS BEFORE DELIVERY)</b>", "Small"),
+            ],
+            [
+                _para(f"Augmentation performed: {_yn_box(augmentation if isinstance(augmentation, bool) else None)}", "Small"),
+            ],
+            [
+                _para("If yes, specify indication for augmentation:", "Small"),
+            ],
+            [
+                _para(indication or "__________________________________________________________________________________", "Small"),
+            ],
+            [
+                _para("<b>AUGMENT ONLY IF INDICATED AND IN CENTERS WITH FACILITY FOR C-SECTION</b>", "Small"),
+            ],
+        ],
+        col_widths=[None],
+    )
+    return [
+        _section_band("Obstetric Notes"),
+        t,
+        PageBreak(),
+    ]
+
+
+# ============================================================
+# Partograph (blank grid, image-free)
+# ============================================================
+def _sec_partograph(_: IpdCaseSheetData) -> List[Any]:
+    s = _sty("Small", "Small")
+
+    # Identification data lines
+    ident = _boxed_table(
+        [
+            [
+                _para("<b>THE SIMPLIFIED PARTOGRAPH</b><br/>Start plotting partograph when woman is in active labor i.e., Cx ≥ 4 cms", "Small")
+            ],
+            [
+                _para("Identification Data:  Name: ____________________   W/o: ____________________   Age: _____   Reg. No.: ____________________", "Small")
+            ],
+            [
+                _para("Date & Time of Admission: ____________________   Date & Time of ROM: ____________________", "Small")
+            ],
+        ],
+        col_widths=[None],
+    )
+
+    # Build a blank graph grid (simple, but Govt-like)
+    # 12 time columns + label column
+    cols = 13
+    header = [""] + [str(i) for i in range(1, 13)]
+    grid = [header]
+    # Foetal condition block
+    grid.append(["Foetal heart rate"] + [""] * 12)
+    for _ in range(6):
+        grid.append([""] + [""] * 12)
+    grid.append(["Amniotic fluid"] + [""] * 12)
+    grid.append([""] + [""] * 12)
+
+    # Labour block
+    grid.append(["Cervix (cm) (Plot X)"] + [""] * 12)
+    for _ in range(6):
+        grid.append([""] + [""] * 12)
+
+    grid.append(["Contractions per 10 min"] + [""] * 12)
+    for _ in range(4):
+        grid.append([""] + [""] * 12)
+
+    grid.append(["Drugs and IV fluid given"] + [""] * 12)
+    grid.append([""] + [""] * 12)
+
+    # Maternal condition
+    grid.append(["Pulse and BP"] + [""] * 12)
+    for _ in range(6):
+        grid.append([""] + [""] * 12)
+    grid.append(["Temp (°C)"] + [""] * 12)
+
+    t = Table(grid, colWidths=[40 * mm] + [ (None) ] * 12, hAlign="LEFT")
+    t.setStyle(
+        TableStyle(
+            [
+                ("FONT", (0, 0), (-1, -1), "Helvetica", 7),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("BOX", (0, 0), (-1, -1), 0.8, colors.black),
+                ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.lightgrey),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
+                ("LEFTPADDING", (0, 0), (-1, -1), 2),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+                ("TOPPADDING", (0, 0), (-1, -1), 2),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+            ]
+        )
+    )
+
+    footer = _boxed_table(
+        [[Paragraph("Initiate plotting on alert line     |     Refer to FRU when ALERT LINE is crossed", s)]],
+        col_widths=[None],
+    )
+
+    return [
+        _section_band("Partograph (Blank Grid, No Images)"),
+        ident,
+        Spacer(1, 6),
+        t,
+        Spacer(1, 6),
+        footer,
+        PageBreak(),
+    ]
+
+
+# ============================================================
+# Consent + Pre-anesthetic + Anesthesia Notes
+# ============================================================
+def _sec_consent(_: IpdCaseSheetData) -> List[Any]:
+    consent1 = _boxed_table(
+        [
+            [
+                _para(
+                    "<b>Consent for procedures</b><br/>"
+                    "I ____________________ son/daughter/wife of ____________________ age (yrs) _____ address ____________________<br/>"
+                    "________________________________________ myself ( ) or other ( ) age _____ relation (Son/Daughter/Father/Mother/Wife/Other) __________ "
+                    "provide my consent for Medical/Surgical __________ / Anesthesia __________ procedure (write the name of procedure).<br/>"
+                    "I have been informed about probable consequences in detail in the language I understand. "
+                    "I am signing this consent without undue pressure and in complete consciousness.<br/>"
+                    "The doctor/provider shall not be held responsible in case of complication/mishap.<br/><br/>"
+                    "Parent/Guardian's signature: ____________________",
+                    "Small",
+                )
+            ]
+        ],
+        col_widths=[None],
+    )
+
+    consent2 = _boxed_table(
+        [
+            [
+                _para(
+                    "<b>Consent for PPIUCD</b><br/>"
+                    "I ____________________ son/daughter/wife of ____________________ age (yrs) ____ address ____________________<br/>"
+                    "_________________ myself ( ) or other ( ) age _____ relation (Mother/Father/Husband) __________ provide my consent for procedure "
+                    "(write the name of procedure).<br/>"
+                    "I have been informed about probable consequences in detail in the language I understand. "
+                    "I am signing this consent without undue pressure and in complete consciousness.<br/>"
+                    "The doctor/provider shall not be held responsible in case of complication/mishap.<br/><br/>"
+                    "Name & signature of patient: ____________________      Name & signature of attendant: ____________________",
+                    "Small",
+                )
+            ]
+        ],
+        col_widths=[None],
+    )
+
+    return [
+        _section_band("Consent Forms"),
+        consent1,
+        Spacer(1, 6),
+        consent2,
+        PageBreak(),
+    ]
+
+
+def _sec_pre_anaesthetic(_: IpdCaseSheetData) -> List[Any]:
+    return [
+        _section_band("Notes on Pre-Anesthetic Check-up"),
+        _boxed_table(
+            [[
+                _para(
+                    "Date: ____/____/____   Time: __________<br/>"
+                    "Planned procedure: ________________________________________________________________<br/><br/>"
+                    "<b>History:</b><br/>"
+                    "__________________________________________________________________________________<br/>"
+                    "__________________________________________________________________________________<br/><br/>"
+                    "<b>Physical Examination:</b><br/>"
+                    "__________________________________________________________________________________<br/>"
+                    "CVS: _____________________________________________________________________________<br/>"
+                    "RS: ______________________________________________________________________________<br/>"
+                    "CNS: _____________________________________________________________________________<br/>"
+                    "Others: __________________________________________________________________________<br/><br/>"
+                    "<b>Investigations:</b><br/>"
+                    "__________________________________________________________________________________<br/><br/>"
+                    "<b>Instructions:</b><br/>"
+                    "__________________________________________________________________________________<br/><br/>"
+                    "Signature of Anesthetist: ____________________",
+                    "Small",
+                )
+            ]],
+            col_widths=[None],
+        ),
+        PageBreak(),
+    ]
+
+
+def _sec_anaesthesia_notes(_: IpdCaseSheetData) -> List[Any]:
+    return [
+        _section_band("Anesthesia Notes"),
+        _boxed_table(
+            [[
+                _para(
+                    "Date: ____/____/____   Start time: __________   End time: __________<br/>"
+                    "Procedure: _______________________________________________________________________<br/>"
+                    "Name of Anesthesiologist: ____________________   Name of Anesthesia Nurse: ____________________<br/><br/>"
+                    "<b>Notes:</b><br/>"
+                    "__________________________________________________________________________________<br/>"
+                    "__________________________________________________________________________________<br/>"
+                    "__________________________________________________________________________________<br/><br/>"
+                    "<b>Reversal:</b><br/>"
+                    "__________________________________________________________________________________<br/><br/>"
+                    "<b>Post-operative Instructions:</b><br/>"
+                    "__________________________________________________________________________________<br/><br/>"
+                    "Signature of Anesthetist: ____________________",
+                    "Small",
+                )
+            ]],
+            col_widths=[None],
+        ),
+        PageBreak(),
+    ]
+
+
+# ============================================================
+# SAFE Checklist 2/3/4 (structured)
+# ============================================================
+def _sec_safe_checklist_2(_: IpdCaseSheetData) -> List[Any]:
+    story: List[Any] = []
+    story.append(_section_band("Just Before and During Birth – SAFE CHILDBIRTH CHECKLIST"))
+    story.append(_boxed_lines(
+        "CHECK-2 Just Before and During Birth (or C-Section)",
+        [
+            "Give antibiotics to Mother if any present (tick):",
+            "• Temperature ≥38°C ( )  • Foul-smelling discharge ( )  • ROM >18 hrs with labour ( )",
+            "• Labour >24 hrs/obstructed ( )  • Cesarean section ( )",
+            "",
+            "Does Mother need: Antibiotics? Yes, given ( ) No ( )     Magnesium sulfate? Yes, given ( ) No ( )",
+            "",
+            "Confirm essential supplies:",
+            "For Mother: Gloves ( ) Soap & clean water ( ) Oxytocin 10 units syringe ( ) Pads ( )",
+            "For Baby: Two clean warm towels ( ) Sterile scissors/blade ( ) Mucus extractor ( ) Cord ties ( ) Bag-and-mask ( )",
+            "",
+            "Care for mother after birth (AMTSL):",
+            "• Oxytocin 10 units IM within 1 minute ( )  • Controlled cord traction ( )  • Uterine massage ( )",
+            "",
+            "Care for baby after birth:",
+            "• Dry, wrap, keep warm ( )  • Vit K ( )  • Initiate breastfeeding ( )",
+            "If not breathing: clear airway + stimulate ( ) then bag-and-mask ( ) call for help ( )",
+            "",
+            "Provider: Name ____________________   Date ____/____/____   Signature ____________________",
+        ],
+    ))
+    story.append(PageBreak())
+    return story
+
+
+def _sec_safe_checklist_3(_: IpdCaseSheetData) -> List[Any]:
+    story: List[Any] = []
+    story.append(_section_band("Soon After Birth – SAFE CHILDBIRTH CHECKLIST"))
+    story.append(_boxed_lines(
+        "CHECK-3 Soon After Birth (within 1 hour)",
+        [
+            "Is Mother bleeding abnormally?   Yes ( )   No ( )",
+            "Does Mother need: Antibiotics? Yes, given ( ) No ( )    Magnesium sulfate? Yes, given ( ) No ( )",
+            "Does Baby need: Antibiotics? Yes, given ( ) No ( )    Referral? Yes, organized ( ) No ( )",
+            "Special care/monitoring?   Yes, organized ( )   No ( )",
+            "Syrup Nevirapine (if HIV+ as per protocol): Yes ( ) No ( )",
+            "",
+            "Provider: Name ____________________   Date ____/____/____   Signature ____________________",
+        ],
+    ))
+    story.append(PageBreak())
+    return story
+
+
+def _sec_safe_checklist_4(_: IpdCaseSheetData) -> List[Any]:
+    story: List[Any] = []
+    story.append(_section_band("Before Discharge – SAFE CHILDBIRTH CHECKLIST"))
+    story.append(_boxed_lines(
+        "CHECK-4 Before Discharge",
+        [
+            "Is Mother’s bleeding controlled?   Yes ( )   No ( )",
+            "Does mother need antibiotics?   Yes ( )   No ( )",
+            "Does baby need antibiotics?   Yes ( )   No ( )",
+            "Is baby feeding well?   Yes ( )   No ( )",
+            "",
+            "Counsel danger signs:",
+            "Baby: fast/difficult breathing, fever, unusually cold, stops feeding, lethargy, whole body yellow",
+            "Mother: excessive bleeding, severe abdominal pain, severe headache/blurred vision, breathing difficulty, fever/chills, foul discharge",
+            "",
+            "Offer family planning options ( )   Arrange follow-up/transport ( )",
+            "",
+            "Provider: Name ____________________   Date ____/____/____   Signature ____________________",
+        ],
+    ))
+    story.append(PageBreak())
+    return story
+
+
+
+# ============================================================
+# Procedure / Delivery / Continuation / Transfusion notes
+# ============================================================
+def _sec_procedure_notes(_: IpdCaseSheetData) -> List[Any]:
+    return [
+        _section_band("Operation / Procedure Notes (If applicable)"),
+        _boxed_table(
+            [[
+                _para(
+                    "Procedure performed: ______________________________________________________________<br/>"
+                    "Indication for the procedure: ______________________________________________________<br/><br/>"
+                    "__________________________________________________________________________________<br/>"
+                    "__________________________________________________________________________________<br/><br/>"
+                    "Condition at transfer to ward: _____________________________________________________<br/><br/>"
+                    "Treatment advised: _________________________________________________________________<br/>"
+                    "__________________________________________________________________________________<br/><br/>"
+                    "Whether Patient/Guardian explained about the procedure and probable complications: Yes ( ) No ( )<br/>"
+                    "Consent of patient/guardian: Yes ( ) No ( )<br/>"
+                    "Procedure start time: __________   Procedure end time: __________   Type of Anesthesia: __________<br/><br/>"
+                    "Procedure notes: _________________________________________________________________<br/><br/>"
+                    "Signature of Doctor: ____________________",
+                    "Small",
+                )
+            ]],
+            col_widths=[None],
+        ),
+        PageBreak(),
+    ]
+
+
+def _sec_delivery_notes(_: IpdCaseSheetData) -> List[Any]:
+    return [
+        _section_band("Delivery Notes"),
+        _boxed_table(
+            [[
+                _para(
+                    "<b>DELIVERY NOTES</b><br/>"
+                    "Delivery date: ____/____/____   Time: __________<br/>"
+                    "Abortion ( )   Single ( )   Twin/Multiple ( )<br/>"
+                    "Episiotomy: No ( ) Yes ( )   Delayed Cord Clamping ( )<br/>"
+                    "PPIUCD Inserted: Yes ( ) No ( )<br/>"
+                    "Type of delivery: Normal ( )  Assisted: Vacuum ( ) Forceps ( )  LSCS ( )  Others ( ) __________<br/>"
+                    "Outcome: Live birth ( )  Fresh Still Birth ( )  Macerated Still Birth ( )<br/>"
+                    "AMTSL performed: No ( ) Yes ( )<br/>"
+                    "1. Uterotonic administered: Inj. Oxytocin ( ) OR Tab Misoprostol ( )<br/>"
+                    "2. CCT: Yes ( ) No ( )<br/>"
+                    "3. Uterine massage: Yes ( ) No ( )<br/>"
+                    "Complications (tick): PPH ( ) Sepsis ( ) PE/E ( ) Prolonged labor ( ) Obstructed labor ( ) Fetal distress ( )<br/>"
+                    "Maternal death: Cause and Time: ___________________________________________________<br/>"
+                    "Others (specify): _________________________________________________________________<br/><br/>"
+                    "<b>BABY NOTES</b><br/>"
+                    "Sex of the baby: Male ( ) Female ( )   Skin-to-skin contact done: Yes ( ) No ( )<br/>"
+                    "Any congenital anomaly (specify): _________________________________________________<br/>"
+                    "Any other complication (specify): _________________________________________________<br/>"
+                    "Injection Vitamin K1 administered: Yes ( ) No ( )  If yes, dose: __________<br/>"
+                    "Vaccination done: BCG ( ) OPV ( ) Hep B ( )   Temperature of baby: __________<br/>"
+                    "Birth weight (kg): __________   Did the baby cry immediately after birth: Yes ( ) No ( )<br/>"
+                    "Did the baby require resuscitation: Yes ( ) No ( )  If yes, initiated in labor room: Yes ( ) No ( )<br/>"
+                    "Breastfeeding initiated: Yes ( ) No ( )   Time of initiation: __________<br/>"
+                    "Preterm: Yes ( ) No ( )<br/>",
+                    "Small",
+                )
+            ]],
+            col_widths=[None],
+        ),
+        PageBreak(),
+    ]
+
+
+def _sec_post_delivery_continuation(_: IpdCaseSheetData) -> List[Any]:
+    # Govt sample shows multiple continuation sheets (we provide 2 pages)
+    sheet = _boxed_table(
+        [[_para("<b>Continuation Sheet for Post Delivery Notes</b>", "Small")],
+         [_para("Notes:", "Small")],
+         [_para("__________________________________________________________________________________", "Small")],
+         [_para("__________________________________________________________________________________", "Small")],
+         [_para("__________________________________________________________________________________", "Small")],
+         [_para("__________________________________________________________________________________", "Small")],
+         [_para("__________________________________________________________________________________", "Small")],
+         [_para("__________________________________________________________________________________", "Small")]],
+        col_widths=[None],
+    )
+    return [
+        _section_band("Post Delivery Notes (Continuation)"),
+        sheet,
+        PageBreak(),
+        _section_band("Post Delivery Notes (Continuation)"),
+        sheet,
+        PageBreak(),
+    ]
+
+
+def _sec_transfusion_notes(_: IpdCaseSheetData) -> List[Any]:
+    return [
+        _section_band("Blood Transfusion or Other Procedure Notes"),
+        _boxed_table(
+            [[_para("Details / Notes:", "Small")],
+             [_para("__________________________________________________________________________________", "Small")],
+             [_para("__________________________________________________________________________________", "Small")],
+             [_para("__________________________________________________________________________________", "Small")],
+             [_para("__________________________________________________________________________________", "Small")],
+             [_para("Signature: ____________________   Date: ____/____/____   Time: __________", "Small")]],
+            col_widths=[None],
+        ),
+        PageBreak(),
+    ]
+
+
+# ============================================================
+# Postpartum Assessment Grid (Mother + Baby) like sample
+# ============================================================
+def _sec_postpartum_assessment(_: IpdCaseSheetData) -> List[Any]:
+    s = _sty("Small", "Small")
+
+    # columns as in sample
+    cols = ["", ""] + ["30 min", "30 min", "30 min", "30 min", "6 hrs", "6 hrs", "6 hrs", "Day 2\nMorning", "Day 2\nEvening"]
+
+    def row(section: str, param: str) -> List[Any]:
+        return [section, param] + [""] * (len(cols) - 2)
+
+    data: List[List[Any]] = []
+    data.append(cols)
+
+    # Mother block
+    mother_rows = [
+        "BP (mmHg)",
+        "Temp (°C/°F)",
+        "Pulse (per min)",
+        "Breast condition (soft/engorged)",
+        "Bleeding PV (Normal-N / Excessive-E)",
+        "Uterine Tone (Soft-S / Contracted-C / Tender-T)",
+        "Episiotomy/Tear (healthy/infected)",
+    ]
+    for i, p in enumerate(mother_rows):
+        data.append(row("Mother" if i == 0 else "", p))
+
+    # Baby block
+    baby_rows = [
+        "Resp rate (per min)",
+        "Temp (°C/°F)",
+        "Breastfeeding/Suckling (yes/no)",
+        "Activity (good/lethargy)",
+        "Umbilical stump (dry/bleeding)",
+        "Jaundice (yes/no)",
+        "Passed urine? (yes/no)",
+        "Passed stool? (yes/no)",
+    ]
+    for i, p in enumerate(baby_rows):
+        data.append(row("Baby" if i == 0 else "", p))
+
+    t = Table(data, colWidths=[22 * mm, 55 * mm] + [18 * mm] * (len(cols) - 2), hAlign="LEFT")
+    t.setStyle(
+        TableStyle(
+            [
+                ("FONT", (0, 0), (-1, -1), "Helvetica", 7),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("BOX", (0, 0), (-1, -1), 0.8, colors.black),
+                ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.lightgrey),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
+                ("SPAN", (0, 1), (0, 7)),
+                ("SPAN", (0, 8), (0, 15)),
+                ("VALIGN", (0, 1), (0, 15), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 2),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+                ("TOPPADDING", (0, 0), (-1, -1), 2),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+            ]
+        )
+    )
+
+    top_notes = _boxed_table(
+        [[_para("Notes for Mother:", "Small")],
+         [_para("__________________________________________________________________________________", "Small")],
+         [_para("Notes for Baby:", "Small")],
+         [_para("__________________________________________________________________________________", "Small")],
+         [_para("Clinical diagnosis (tick): Normal ( ) Infection ( ) Jaundice ( ) Hypothermia ( ) Convulsions ( ) Death ( ) Others: __________", "Small")],
+         [_para("Date & time of transfer to PNC ward: ____/____/____  Time: __________   Condition at transfer: ____________________________", "Small")],
+         [_para("If referred, reason for referral of mother/baby: _________________________________________________", "Small")]],
+        col_widths=[None],
+    )
+
+    return [
+        _section_band("Assessment of Postpartum Condition"),
+        top_notes,
+        Spacer(1, 6),
+        t,
+        PageBreak(),
+    ]
+
+
+# ============================================================
+# Discharge Notes + Discharge Form
+# ============================================================
+def _sec_discharge_notes(d: IpdCaseSheetData) -> List[Any]:
+    ds = d.discharge
+    # Use discharge summary if present; else blank lines
+    cond = _safe_str(_get(ds, "discharge_condition", default=""))
+    advise = _safe_str(_get(ds, "follow_up", "advice", default=""))
+    other = _safe_str(_get(ds, "notes", default=""))
+
+    t = _boxed_table(
+        [
+            [_para("<b>Discharge Notes</b>", "Small")],
+            [_para("Condition at Discharge:", "Small")],
+            [_para(cond or "__________________________________________________________________________________", "Small")],
+            [_para("Advise at Discharge:", "Small")],
+            [_para(advise or "__________________________________________________________________________________", "Small")],
+            [_para("Other notes:", "Small")],
+            [_para(other or "__________________________________________________________________________________", "Small")],
+        ],
+        col_widths=[None],
+    )
+
+    return [
+        _section_band("Discharge Notes"),
+        t,
+        PageBreak(),
+    ]
+
+
+def _sec_discharge_form(d: IpdCaseSheetData) -> List[Any]:
+    adm = d.admission
+    patient = getattr(adm, "patient", None)
+
+    name = _safe_str(_patient_full_name(patient))
+    age = _calc_age_years(_get(patient, "dob", default=None))
+    mcts = _safe_str(_get(adm, "mcts_no", "mcts_number", default=""))
+    ipd_reg = _safe_str(_get(adm, "display_code", "registration_no", default=""))
+
+    t = _boxed_table(
+        [[
+            _para(
+                "<b>Discharge/ Referral/ LAMA/ Death Form</b> (Tick whichever applicable)<br/><br/>"
+                f"Name: {name}   W/o or D/o: ____________________   Age (yrs): {age}   MCTS No.: {mcts}<br/>"
+                f"IPD/Registration No.: {ipd_reg}<br/><br/>"
+                "Date of admission: ____/____/____   Time of admission: __________<br/>"
+                "Date of Discharge/Referral: ____/____/____   Time of Discharge/Referral: __________<br/>"
+                "Date of delivery: ____/____/____   Time of delivery: __________<br/><br/>"
+                "Delivery outcome: Live birth ( )  Abortion ( )  Single ( )  Still birth Fresh ( )  Macerated ( )  Twins/Multiple ( )<br/>"
+                "Final outcome: Discharge ( )  Referred out ( )  LAMA ( )  Death ( )  Abortion ( )<br/><br/>"
+                "<b>Discharge summary:</b><br/>"
+                "Condition of mother: ____________________________________________<br/>"
+                "FP option (if provided): _________________________________________<br/>"
+                "Condition of baby: ______________________________________________<br/>"
+                "Sex of baby: M ( ) F ( )   Birth weight (kgs): ________<br/>"
+                "Pre-term: Yes ( ) No ( )   Inj. Vit K1: Yes ( ) No ( )<br/>"
+                "Immunization: BCG ( ) OPV ( ) Hepatitis B ( )<br/>"
+                "Advice on discharge: Counselling on danger signs for mother and baby ( )  Rest/nutrition/fluids ( )<br/>"
+                "Tab iron: ________   Tab calcium: ________<br/><br/>"
+                "<b>Treatment given:</b><br/>"
+                "__________________________________________________________________________________<br/>"
+                "__________________________________________________________________________________<br/><br/>"
+                "Follow-up date: ____/____/____<br/><br/>"
+                "<b>Referral summary (if referred):</b><br/>"
+                "Reason for referral: _____________________________________________________________<br/>"
+                "Facility name (referred to): _____________________________________________________<br/>"
+                "Treatment given on referral: _____________________________________________________<br/>"
+                "__________________________________________________________________________________<br/><br/>"
+                "Name and Phone No. / Signature of service provider: ________________________________<br/>",
+                "Small",
+            )
+        ]],
+        col_widths=[None],
+    )
+    return [
+        _section_band("Notes on Discharge / Referral / Death"),
+        t,
+        PageBreak(),
+    ]
+
+
+def _sec_signatures(d: IpdCaseSheetData) -> List[Any]:
+    ds = d.discharge
+    prepared = _safe_str(_get(ds, "prepared_by_name", default=""))
+    reviewed = _safe_str(_get(ds, "reviewed_by_name", default=""))
+    regno = _safe_str(_get(ds, "reviewed_by_regno", default=""))
+
+    t = _boxed_table(
+        [
+            [_para("<b>Signatures</b>", "Small")],
+            [_para(f"Prepared By: {prepared or '__________________________'}", "Small")],
+            [_para(f"Reviewed By (Doctor): {reviewed or '__________________________'}   Reg No: {regno or '__________'}", "Small")],
+            [_para("Patient/Attendant Acknowledgement: __________________________", "Small")],
+            [_para("Date & Time: ____________________", "Small")],
+        ],
+        col_widths=[None],
+    )
+    return [
+        _section_band("Signatures & Acknowledgement"),
+        t,
+    ]
+
+
+# ============================================================
 # Build PDF
-# -------------------------------
+# ============================================================
 def build_ipd_case_sheet_pdf(
     *,
     db,
@@ -466,26 +1507,27 @@ def build_ipd_case_sheet_pdf(
     template_id: Optional[int],
     period_from: Optional[datetime],
     period_to: Optional[datetime],
+    user: Any = None,          # ✅ accept route param
+    **_kwargs: Any,            # ✅ ignore any future extra params
 ) -> tuple[bytes, str]:
     tpl = _resolve_template(db, template_id)
     sections = sorted(tpl["sections"], key=lambda x: int(x.get("order", 9999)))
     enabled_codes = {s["code"] for s in sections if s.get("enabled") or s.get("required")}
 
-    settings = tpl.get("settings") or {}
-    max_rows = int(settings.get("max_rows_per_section") or 30)
-    show_empty = bool(settings.get("show_empty_sections") or False)
-
-    data = _load_ipd_case_sheet_data(db, admission_id, enabled_codes, period_from, period_to, max_rows)
-
+    data = _load_ipd_case_sheet_data(db, admission_id)
     adm = data.admission
+
     subtitle = ""
     if period_from or period_to:
         subtitle = f"Report Period: {_safe_str(period_from.date() if period_from else '')} to {_safe_str(period_to.date() if period_to else '')}"
 
     story: List[Any] = []
-    story.extend(_sec_header(db, doc_title="IPD Case Sheet"))
-    story.append(Spacer(1, 4))
 
+    # Govt header always first (no engine title duplication)
+    if "gov_header" in enabled_codes:
+        story.extend(_gov_header(db, data))
+
+    # sections in order
     for s in sections:
         code = s.get("code")
         required = bool(s.get("required"))
@@ -493,30 +1535,44 @@ def build_ipd_case_sheet_pdf(
         if not (enabled or required):
             continue
 
-        if code == "patient_admission":
-            story.extend(_sec_patient_admission(data))
-        elif code == "diagnosis_plan":
-            story.extend(_sec_diagnosis_plan(data))
-        elif code == "bed_transfers":
-            story.extend(_sec_bed_transfers(data, show_empty))
-        elif code == "vitals":
-            story.extend(_sec_vitals(data, show_empty))
-        elif code == "nursing_notes":
-            story.extend(_sec_nursing_notes(data, show_empty))
-        elif code == "intake_output":
-            story.extend(_sec_intake_output(data, show_empty))
-        elif code == "assessments":
-            story.extend(_sec_assessments(data, show_empty))
-        elif code == "med_orders":
-            story.extend(_sec_med_orders(data, show_empty))
-        elif code == "mar":
-            story.extend(_sec_mar(data, show_empty))
-        elif code == "referrals":
-            story.extend(_sec_referrals(data, show_empty))
-        elif code == "procedures":
-            story.extend(_sec_procedures(data, show_empty))
-        elif code == "discharge":
-            story.extend(_sec_discharge_and_counseling(data, show_empty))
+        if code == "gov_header":
+            continue
+        if code == "admission_form":
+            story.extend(_sec_admission_form(data))
+        elif code == "presenting_history":
+            story.extend(_sec_presenting_history(data))
+        elif code == "safe_checklist_1":
+            story.extend(_sec_safe_checklist_1(data))
+        elif code == "obstetric_notes":
+            story.extend(_sec_obstetric_notes(data))
+        elif code == "partograph":
+            story.extend(_sec_partograph(data))
+        elif code == "consent":
+            story.extend(_sec_consent(data))
+        elif code == "pre_anaesthetic":
+            story.extend(_sec_pre_anaesthetic(data))
+        elif code == "anaesthesia_notes":
+            story.extend(_sec_anaesthesia_notes(data))
+        elif code == "safe_checklist_2":
+            story.extend(_sec_safe_checklist_2(data))
+        elif code == "procedure_notes":
+            story.extend(_sec_procedure_notes(data))
+        elif code == "delivery_notes":
+            story.extend(_sec_delivery_notes(data))
+        elif code == "post_delivery_continuation":
+            story.extend(_sec_post_delivery_continuation(data))
+        elif code == "transfusion_notes":
+            story.extend(_sec_transfusion_notes(data))
+        elif code == "safe_checklist_3":
+            story.extend(_sec_safe_checklist_3(data))
+        elif code == "postpartum_assessment":
+            story.extend(_sec_postpartum_assessment(data))
+        elif code == "safe_checklist_4":
+            story.extend(_sec_safe_checklist_4(data))
+        elif code == "discharge_notes":
+            story.extend(_sec_discharge_notes(data))
+        elif code == "discharge_form":
+            story.extend(_sec_discharge_form(data))
         elif code == "signatures":
             story.extend(_sec_signatures(data))
         else:
@@ -524,560 +1580,15 @@ def build_ipd_case_sheet_pdf(
 
         story.append(Spacer(1, 6))
 
-    # ✅ Important: keep ctx.title blank to avoid duplicate engine header blocks (if engine prints title)
     pdf = build_pdf(
         db=db,
         ctx=PdfBuildContext(
-            title="",
+            title="",  # keep blank to avoid duplicate engine headers
             subtitle=subtitle or "",
             meta={"admission_id": admission_id},
         ),
         story=story,
     )
 
-    filename = f"IPD_CaseSheet_{adm.display_code}.pdf"
+    filename = f"Maternity_CaseSheet_L3_{_safe_str(getattr(adm, 'display_code', admission_id))}.pdf"
     return pdf, filename
-
-
-# -------------------------------
-# Layout helpers
-# -------------------------------
-def _kv_box(rows: List[List[str]]) -> Table:
-    data = []
-    for k, v in rows:
-        data.append([
-            Paragraph(f"<b>{_safe_str(k)}</b>", _sty("Small", "Small")),
-            Paragraph((_safe_str(v) or "—"), _sty("Small", "Small")),
-        ])
-
-    t = Table(data, colWidths=[32 * mm, None], hAlign="LEFT")
-    t.setStyle(TableStyle([
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 3),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
-        ("TOPPADDING", (0, 0), (-1, -1), 2),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-        ("LINEBELOW", (0, 0), (-1, -1), 0.25, colors.lightgrey),
-    ]))
-    return t
-
-
-# -------------------------------
-# Section Renderers
-# -------------------------------
-def _sec_patient_admission(d: IpdCaseSheetData) -> List[Any]:
-    """
-    ✅ Layout:
-    - 2 rows × 2 columns
-    - 5 fields in each column
-    """
-    adm = d.admission
-    bed = getattr(adm, "current_bed", None)
-    room = getattr(bed, "room", None) if bed else None
-    ward = getattr(room, "ward", None) if room else None
-
-    patient = getattr(adm, "patient", None)
-
-    patient_name = _safe_str(_patient_full_name(patient))
-    patient_code = _safe_str(_get(patient, "uhid", default=""))
-    abha = _safe_str(_get(patient, "abha_number", default=""))
-    gender = _safe_str(_get(patient, "gender", default=""))
-    dob = _get(patient, "dob", default=None)
-    age = _calc_age_years(dob)
-    phone = _safe_str(_get(patient, "phone", default=""))
-    address = _safe_str(_patient_address(patient))
-
-    primary_doc = _safe_str(_get(adm, "practitioner_user_id", "primary_doctor_user_id", default=""))
-    primary_nurse = _safe_str(_get(adm, "primary_nurse_user_id", "nurse_user_id", default=""))
-
-    top_left = _kv_box([
-        ["UHID", patient_code],
-        ["Patient Name", patient_name],
-        ["Age / Gender", f"{age} / {gender}".strip(" /")],
-        ["Mobile", phone],
-        ["Address", address],
-    ])
-
-    top_right = _kv_box([
-        ["Admission Code", _safe_str(getattr(adm, "display_code", ""))],
-        ["Admission Type", _safe_str(getattr(adm, "admission_type", ""))],
-        ["Status", _safe_str(getattr(adm, "status", ""))],
-        ["Admitted At", fmt_ist(getattr(adm, "admitted_at", None))],
-        ["Expected Discharge", fmt_ist(getattr(adm, "expected_discharge_at", None))],
-    ])
-
-    bottom_left = _kv_box([
-        ["Ward", _safe_str(getattr(ward, "name", ""))],
-        ["Room", _safe_str(_get(room, "number", "name", default=""))],
-        ["Bed", _safe_str(_get(bed, "code", "name", default=""))],
-        ["Primary Doctor (user_id)", primary_doc],
-        ["Primary Nurse (user_id)", primary_nurse],
-    ])
-
-    bottom_right = _kv_box([
-        ["Payor Type", _safe_str(getattr(adm, "payor_type", ""))],
-        ["Insurer", _safe_str(getattr(adm, "insurer_name", ""))],
-        ["Policy No", _safe_str(getattr(adm, "policy_number", ""))],
-        ["ABHA No", abha],
-        ["Remarks", _safe_str(_get(adm, "remarks", "notes", default=""))],
-    ])
-
-    grid = Table([[top_left, top_right], [bottom_left, bottom_right]], colWidths=[None, None], hAlign="LEFT")
-    grid.setStyle(TableStyle([
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("BOX", (0, 0), (-1, -1), 0.8, colors.black),
-        ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.lightgrey),
-        ("LEFTPADDING", (0, 0), (-1, -1), 4),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-    ]))
-
-    return [section_title("Patient & Admission Snapshot"), grid]
-
-
-def _sec_diagnosis_plan(d: IpdCaseSheetData) -> List[Any]:
-    adm = d.admission
-    story = [section_title("Diagnosis, History & Care Plan")]
-
-    diag = Paragraph(
-        f"<b>Preliminary Diagnosis</b><br/>{_safe_str(getattr(adm, 'preliminary_diagnosis', '')) or '—'}",
-        _sty("Small", "Small"),
-    )
-    hist = Paragraph(
-        f"<b>History</b><br/>{_safe_str(getattr(adm, 'history', '')) or '—'}",
-        _sty("Small", "Small"),
-    )
-    plan = Paragraph(
-        f"<b>Care Plan</b><br/>{_safe_str(getattr(adm, 'care_plan', '')) or '—'}",
-        _sty("Small", "Small"),
-    )
-
-    t = Table([[diag, hist], [plan, ""]], colWidths=[None, None], hAlign="LEFT")
-    t.setStyle(TableStyle([
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("SPAN", (0, 1), (-1, 1)),
-        ("BOX", (0, 0), (-1, -1), 0.8, colors.black),
-        ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.lightgrey),
-        ("LEFTPADDING", (0, 0), (-1, -1), 5),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-    ]))
-
-    story.append(t)
-    return story
-
-
-def _sec_bed_transfers(d: IpdCaseSheetData, show_empty: bool) -> List[Any]:
-    story = [section_title("Bed & Transfer History")]
-    if not d.transfers:
-        if show_empty:
-            story.append(Paragraph("No transfer records for selected period.", STYLES["Muted"]))
-        return story
-
-    data = [["Requested At", "From Bed", "To Bed", "Status", "Reason"]]
-    for x in d.transfers:
-        data.append([
-            fmt_ist(getattr(x, "requested_at", None)),
-            _safe_str(getattr(getattr(x, "from_bed", None), "code", "")),
-            _safe_str(getattr(getattr(x, "to_bed", None), "code", "")),
-            _safe_str(getattr(x, "status", "")),
-            _safe_str(getattr(x, "reason", "")),
-        ])
-    story.append(simple_table(data, col_widths=[mm * 35, mm * 25, mm * 25, mm * 25, None]))
-    return story
-
-
-def _sec_vitals(d: IpdCaseSheetData, show_empty: bool) -> List[Any]:
-    story = [section_title("Vitals Chart")]
-    if not d.vitals:
-        if show_empty:
-            story.append(Paragraph("No vitals recorded for selected period.", STYLES["Muted"]))
-        return story
-
-    data = [["Recorded At", "BP", "Pulse", "RR", "SpO2", "Temp (C)"]]
-    for v in d.vitals:
-        bp = ""
-        if getattr(v, "bp_systolic", None) is not None or getattr(v, "bp_diastolic", None) is not None:
-            bp = f"{_safe_str(getattr(v, 'bp_systolic', ''))}/{_safe_str(getattr(v, 'bp_diastolic', ''))}"
-        data.append([
-            fmt_ist(getattr(v, "recorded_at", None)),
-            bp,
-            _safe_str(getattr(v, "pulse", "")),
-            _safe_str(getattr(v, "rr", "")),
-            _safe_str(getattr(v, "spo2", "")),
-            _safe_str(getattr(v, "temp_c", "")),
-        ])
-    story.append(simple_table(data, col_widths=[mm * 38, mm * 24, mm * 18, mm * 16, mm * 18, mm * 20]))
-    return story
-
-
-def _sec_nursing_notes(d: IpdCaseSheetData, show_empty: bool) -> List[Any]:
-    story = [section_title("Nursing Notes (NABH)")]
-    if not d.nursing_notes:
-        if show_empty:
-            story.append(Paragraph("No nursing notes for selected period.", STYLES["Muted"]))
-        return story
-
-    data = [["Entry Time", "Shift", "Condition", "Interventions / Response"]]
-    for n in d.nursing_notes:
-        summary = " | ".join([x for x in [
-            _safe_str(getattr(n, "nursing_interventions", "")),
-            _safe_str(getattr(n, "response_progress", "")),
-            _safe_str(getattr(n, "significant_events", "")),
-        ] if x])
-        data.append([
-            fmt_ist(getattr(n, "entry_time", None)),
-            _safe_str(getattr(n, "shift", "")),
-            (_safe_str(getattr(n, "patient_condition", ""))[:120] or "—"),
-            (summary[:180] or "—"),
-        ])
-    story.append(simple_table(data, col_widths=[mm * 35, mm * 20, mm * 55, None]))
-    return story
-
-
-def _sec_intake_output(d: IpdCaseSheetData, show_empty: bool) -> List[Any]:
-    story = [section_title("Intake / Output")]
-    if not d.io_rows:
-        if show_empty:
-            story.append(Paragraph("No intake/output records for selected period.", STYLES["Muted"]))
-        return story
-
-    data = [["Recorded At", "Oral", "IV", "Blood", "Urine", "Drains", "Remarks"]]
-    for x in d.io_rows:
-        urine = (getattr(x, "urine_foley_ml", 0) or 0) + (getattr(x, "urine_voided_ml", 0) or 0)
-        data.append([
-            fmt_ist(getattr(x, "recorded_at", None)),
-            _safe_str(getattr(x, "intake_oral_ml", "")),
-            _safe_str(getattr(x, "intake_iv_ml", "")),
-            _safe_str(getattr(x, "intake_blood_ml", "")),
-            _safe_str(urine),
-            _safe_str(getattr(x, "drains_ml", "")),
-            _safe_str(getattr(x, "remarks", ""))[:90],
-        ])
-    story.append(simple_table(data, col_widths=[mm * 35, mm * 18, mm * 18, mm * 18, mm * 18, mm * 18, None]))
-    return story
-
-
-def _sec_assessments(d: IpdCaseSheetData, show_empty: bool) -> List[Any]:
-    story = [section_title("Risk & Clinical Assessments")]
-    empty_all = not (d.pain or d.fall or d.pressure or d.nutrition)
-    if empty_all:
-        if show_empty:
-            story.append(Paragraph("No assessments available.", STYLES["Muted"]))
-        return story
-
-    def add_block(title: str, rows: List[List[str]]):
-        if not rows:
-            return
-        story.append(Paragraph(f"<b>{_safe_str(title)}</b>", STYLES["Small"]))
-        story.append(simple_table([rows[0]] + rows[1:], col_widths=[mm * 35, mm * 25, None]))
-        story.append(Spacer(1, 4))
-
-    if d.pain:
-        rows = [["Recorded At", "Score", "Intervention / Notes"]]
-        for x in d.pain[:10]:
-            rows.append([fmt_ist(getattr(x, "recorded_at", None)), _safe_str(getattr(x, "score", "")), _safe_str(getattr(x, "intervention", ""))[:120]])
-        add_block("Pain Assessment", rows)
-
-    if d.fall:
-        rows = [["Recorded At", "Risk Level", "Precautions"]]
-        for x in d.fall[:10]:
-            rows.append([fmt_ist(getattr(x, "recorded_at", None)), _safe_str(getattr(x, "risk_level", "")), _safe_str(getattr(x, "precautions", ""))[:120]])
-        add_block("Fall Risk", rows)
-
-    if d.pressure:
-        rows = [["Recorded At", "Risk Level", "Plan"]]
-        for x in d.pressure[:10]:
-            rows.append([fmt_ist(getattr(x, "recorded_at", None)), _safe_str(getattr(x, "risk_level", "")), _safe_str(getattr(x, "management_plan", ""))[:120]])
-        add_block("Pressure Ulcer Risk", rows)
-
-    if d.nutrition:
-        rows = [["Recorded At", "Risk Level", "Dietician Referral"]]
-        for x in d.nutrition[:10]:
-            rows.append([fmt_ist(getattr(x, "recorded_at", None)), _safe_str(getattr(x, "risk_level", "")), "Yes" if getattr(x, "dietician_referral", False) else "No"])
-        add_block("Nutrition", rows)
-
-    return story
-
-
-def _sec_med_orders(d: IpdCaseSheetData, show_empty: bool) -> List[Any]:
-    story = [section_title("Medication Orders")]
-    if not d.med_orders:
-        if show_empty:
-            story.append(Paragraph("No medication orders for selected period.", STYLES["Muted"]))
-        return story
-
-    data = [["Start", "Drug", "Dose", "Route", "Freq", "Status"]]
-    for x in d.med_orders:
-        dose = ""
-        if getattr(x, "dose", None) is not None:
-            dose = f"{_safe_str(getattr(x, 'dose', ''))} {_safe_str(getattr(x, 'dose_unit', ''))}".strip()
-        data.append([
-            fmt_ist(getattr(x, "start_datetime", None)),
-            _safe_str(getattr(x, "drug_name", ""))[:45],
-            dose,
-            _safe_str(getattr(x, "route", "")),
-            _safe_str(getattr(x, "frequency", "")),
-            _safe_str(getattr(x, "order_status", "")),
-        ])
-    story.append(simple_table(data, col_widths=[mm * 35, None, mm * 25, mm * 22, mm * 22, mm * 20]))
-    return story
-
-
-def _sec_mar(d: IpdCaseSheetData, show_empty: bool) -> List[Any]:
-    story = [section_title("Medication Administration Record (MAR)")]
-    if not d.mar_rows:
-        if show_empty:
-            story.append(Paragraph("No MAR entries for selected period.", STYLES["Muted"]))
-        return story
-
-    data = [["Scheduled", "Status", "Given At", "Remarks"]]
-    for x in d.mar_rows:
-        data.append([
-            fmt_ist(getattr(x, "scheduled_datetime", None)),
-            _safe_str(getattr(x, "given_status", "")),
-            fmt_ist(getattr(x, "given_datetime", None)),
-            _safe_str(getattr(x, "remarks", ""))[:90],
-        ])
-    story.append(simple_table(data, col_widths=[mm * 40, mm * 25, mm * 35, None]))
-    return story
-
-
-def _sec_referrals(d: IpdCaseSheetData, show_empty: bool) -> List[Any]:
-    story = [section_title("Referrals")]
-    if not d.referrals:
-        if show_empty:
-            story.append(Paragraph("No referrals for selected period.", STYLES["Muted"]))
-        return story
-
-    data = [["Requested At", "Type", "Category", "Priority", "To", "Status"]]
-    for r in d.referrals:
-        to_txt = (
-            getattr(r, "to_department", None)
-            or getattr(r, "to_service", None)
-            or _safe_str(getattr(getattr(r, "to_user", None), "name", ""))
-            or getattr(r, "external_org", None)
-            or ""
-        )
-        data.append([
-            fmt_ist(getattr(r, "requested_at", None)),
-            _safe_str(getattr(r, "ref_type", "")),
-            _safe_str(getattr(r, "category", "")),
-            _safe_str(getattr(r, "priority", "")),
-            _safe_str(to_txt)[:35],
-            _safe_str(getattr(r, "status", "")),
-        ])
-    story.append(simple_table(data, col_widths=[mm * 35, mm * 18, mm * 25, mm * 20, None, mm * 22]))
-    return story
-
-
-def _sec_procedures(d: IpdCaseSheetData, show_empty: bool) -> List[Any]:
-    story = [section_title("Procedures & Critical Care Logs")]
-    any_data = any([d.dressings, d.transfusions, d.restraints, d.isolations, d.icu_flows])
-    if not any_data:
-        if show_empty:
-            story.append(Paragraph("No procedure/critical care entries.", STYLES["Muted"]))
-        return story
-
-    if d.dressings:
-        data = [["Performed At", "Wound Site", "Type", "Pain Score", "Next Due"]]
-        for x in d.dressings[:10]:
-            data.append([
-                fmt_ist(getattr(x, "performed_at", None)),
-                _safe_str(getattr(x, "wound_site", "")),
-                _safe_str(getattr(x, "dressing_type", "")),
-                _safe_str(getattr(x, "pain_score", "")),
-                fmt_ist(getattr(x, "next_dressing_due", None)),
-            ])
-        story.append(Paragraph("<b>Dressing</b>", STYLES["Small"]))
-        story.append(simple_table(data, col_widths=[mm * 35, None, mm * 30, mm * 20, mm * 30]))
-        story.append(Spacer(1, 4))
-
-    if d.transfusions:
-        data = [["Created At", "Status", "Indication", "Consent", "Notes"]]
-        for x in d.transfusions[:10]:
-            data.append([
-                fmt_ist(getattr(x, "created_at", None)),
-                _safe_str(getattr(x, "status", "")),
-                _safe_str(getattr(x, "indication", ""))[:30],
-                "Yes" if getattr(x, "consent_taken", False) else "No",
-                _safe_str(getattr(x, "edit_reason", ""))[:40],
-            ])
-        story.append(Paragraph("<b>Blood Transfusion</b>", STYLES["Small"]))
-        story.append(simple_table(data, col_widths=[mm * 35, mm * 25, None, mm * 18, mm * 40]))
-        story.append(Spacer(1, 4))
-
-    if d.restraints:
-        data = [["Started At", "Status", "Type", "Device/Site", "Reason"]]
-        for x in d.restraints[:10]:
-            data.append([
-                fmt_ist(getattr(x, "started_at", None)),
-                _safe_str(getattr(x, "status", "")),
-                _safe_str(getattr(x, "restraint_type", "")),
-                f"{_safe_str(getattr(x, 'device', ''))}/{_safe_str(getattr(x, 'site', ''))}",
-                _safe_str(getattr(x, "reason", ""))[:50],
-            ])
-        story.append(Paragraph("<b>Restraints</b>", STYLES["Small"]))
-        story.append(simple_table(data, col_widths=[mm * 35, mm * 22, mm * 22, mm * 35, None]))
-        story.append(Spacer(1, 4))
-
-    if d.isolations:
-        data = [["Started At", "Status", "Type", "Indication", "Review Due"]]
-        for x in d.isolations[:10]:
-            data.append([
-                fmt_ist(getattr(x, "started_at", None)),
-                _safe_str(getattr(x, "status", "")),
-                _safe_str(getattr(x, "precaution_type", "")),
-                _safe_str(getattr(x, "indication", ""))[:40],
-                fmt_ist(getattr(x, "review_due_at", None)),
-            ])
-        story.append(Paragraph("<b>Isolation Precautions</b>", STYLES["Small"]))
-        story.append(simple_table(data, col_widths=[mm * 35, mm * 22, mm * 30, None, mm * 30]))
-        story.append(Spacer(1, 4))
-
-    if d.icu_flows:
-        data = [["Recorded At", "Shift", "GCS", "Urine (ml)", "Notes"]]
-        for x in d.icu_flows[:10]:
-            data.append([
-                fmt_ist(getattr(x, "recorded_at", None)),
-                _safe_str(getattr(x, "shift", "")),
-                _safe_str(getattr(x, "gcs_score", "")),
-                _safe_str(getattr(x, "urine_output_ml", "")),
-                _safe_str(getattr(x, "notes", ""))[:50],
-            ])
-        story.append(Paragraph("<b>ICU Flow Sheet</b>", STYLES["Small"]))
-        story.append(simple_table(data, col_widths=[mm * 35, mm * 20, mm * 15, mm * 25, None]))
-
-    return story
-
-
-def _discharge_meds_table(meds: List[Any]) -> Optional[Table]:
-    if not meds:
-        return None
-    try:
-        s = STYLES["Small"].clone("MedWrap")
-        s.wordWrap = "CJK"
-    except Exception:
-        s = STYLES["Small"]
-
-    header = ["Drug", "Dose", "Route", "Frequency", "Days", "Advice"]
-    data = [[Paragraph(f"<b>{h}</b>", s) for h in header]]
-
-    for m in meds:
-        dose = f"{_safe_str(getattr(m, 'dose', ''))} {_safe_str(getattr(m, 'dose_unit', ''))}".strip()
-        advice = _safe_str(getattr(m, "advice_text", "")).replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br/>")
-
-        data.append([
-            Paragraph(_safe_str(getattr(m, "drug_name", "")) or "—", s),
-            Paragraph(dose or "—", s),
-            Paragraph(_safe_str(getattr(m, "route", "")) or "—", s),
-            Paragraph(_safe_str(getattr(m, "frequency", "")) or "—", s),
-            Paragraph(_safe_str(getattr(m, "duration_days", "")) or "—", s),
-            Paragraph(advice or "—", s),
-        ])
-
-    t = Table(
-        data,
-        colWidths=[None, 26 * mm, 18 * mm, 24 * mm, 14 * mm, None],
-        repeatRows=1,
-        splitByRow=1,
-        hAlign="LEFT",
-    )
-    t.setStyle(TableStyle([
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("BOX", (0, 0), (-1, -1), 0.6, colors.black),
-        ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.lightgrey),
-        ("LEFTPADDING", (0, 0), (-1, -1), 4),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-        ("TOPPADDING", (0, 0), (-1, -1), 3),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-    ]))
-    return t
-
-
-def _sec_discharge_and_counseling(d: IpdCaseSheetData, show_empty: bool) -> List[Any]:
-    story = [section_title("Discharge Summary & Counseling")]
-    ds = d.discharge
-    if not ds:
-        if show_empty:
-            story.append(Paragraph("Discharge summary not available.", STYLES["Muted"]))
-        return story
-
-    rows: List[List[str]] = []
-
-    def add(label: str, value: Any, always: bool = False):
-        v = _safe_str(value)
-        if always or v.strip() or show_empty:
-            rows.append([label, v or "—"])
-
-    add("Final Dx (Primary)", ds.final_diagnosis_primary, always=True)
-    add("Final Dx (Secondary)", ds.final_diagnosis_secondary)
-    add("ICD-10 Codes", ds.icd10_codes)
-    add("Hospital Course", ds.hospital_course, always=True)
-    add("Discharge Condition", ds.discharge_condition, always=True)
-    add("Discharge Type", ds.discharge_type)
-    add("Allergies", ds.allergies)
-
-    add("Demographics", ds.demographics)
-    add("Medical History", ds.medical_history)
-    add("Treatment Summary", ds.treatment_summary)
-
-    add("Procedures", ds.procedures)
-    add("Investigations", ds.investigations)
-    add("Diet Instructions", ds.diet_instructions)
-    add("Activity Instructions", ds.activity_instructions)
-    add("Warning Signs", ds.warning_signs)
-    add("Referral Details", ds.referral_details)
-    add("Patient Education", ds.patient_education)
-
-    add("Insurance Details", ds.insurance_details)
-    add("Stay Summary", ds.stay_summary)
-    add("Follow-up", ds.follow_up)
-    add("Follow-up Appointment Ref", ds.followup_appointment_ref)
-
-    add("Implants", ds.implants)
-    add("Pending Reports", ds.pending_reports)
-
-    add("Discharge Date & Time", fmt_ist(ds.discharge_datetime))
-    add("Prepared By", ds.prepared_by_name)
-    reviewed = (ds.reviewed_by_name or "").strip()
-    regno = (ds.reviewed_by_regno or "").strip()
-    add("Reviewed By (Doctor)", f"{reviewed}{('  Reg No: ' + regno) if regno else ''}".strip())
-    add("Finalized", "Yes" if ds.finalized else "No")
-    add("Finalized At", fmt_ist(ds.finalized_at))
-
-    story.append(kv_table_fullwidth(rows, label_w=52 * mm))
-
-    # ✅ Discharge medications table (20+ rows will auto expand & split)
-    meds_tbl = _discharge_meds_table(d.discharge_meds or [])
-    if meds_tbl is not None:
-        story.append(Spacer(1, 4))
-        story.append(Paragraph("<b>Discharge Medications</b>", STYLES["Small"]))
-        story.append(meds_tbl)
-
-    return story
-
-
-def _sec_signatures(d: IpdCaseSheetData) -> List[Any]:
-    story = [section_title("Signatures & Acknowledgement")]
-    ds = d.discharge
-
-    prepared_by = _safe_str(getattr(ds, "prepared_by_name", "")) if ds else ""
-    reviewed_by = _safe_str(getattr(ds, "reviewed_by_name", "")) if ds else ""
-    regno = _safe_str(getattr(ds, "reviewed_by_regno", "")) if ds else ""
-    ack = _safe_str(getattr(ds, "patient_ack_name", "")) if ds else ""
-    ack_dt = fmt_ist(getattr(ds, "patient_ack_datetime", None)) if ds else ""
-
-    rows = [
-        ["Prepared By", prepared_by or "_________________________"],
-        ["Reviewed By (Doctor)", (reviewed_by or "_________________________") + (f"\nReg No: {regno}" if regno else "")],
-        ["Patient / Attendant\nAcknowledgement", ack or "_________________________"],
-        ["Date & Time", ack_dt or "_________________________"],
-    ]
-
-    # ✅ Increase label column width to avoid overflow
-    # Try 72mm. If still tight, increase to 78mm/80mm.
-    story.append(kv_table_fullwidth(rows, label_w=72 * mm))
-    return story

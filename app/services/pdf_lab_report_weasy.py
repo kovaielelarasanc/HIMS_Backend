@@ -1595,19 +1595,19 @@ def _build_lab_report_pdf_reportlab(
 
     sig_y = current_y - 10 * mm
     c.line(LEFT, sig_y, LEFT + 60 * mm, sig_y)
-    c.line(LEFT + 65 * mm, sig_y, LEFT + 125 * mm, sig_y)
+    # c.line(LEFT + 65 * mm, sig_y, LEFT + 125 * mm, sig_y)
     c.line(page_w - RIGHT - 60 * mm, sig_y, page_w - RIGHT, sig_y)
 
     c.setFillColor(INK)
     c.setFont("Helvetica-Bold", 8.8)
     c.drawString(LEFT, sig_y - 5 * mm, "Medical Lab Technician")
-    c.drawString(LEFT + 65 * mm, sig_y - 5 * mm, "Dr. / Pathologist")
+    # c.drawString(LEFT + 65 * mm, sig_y - 5 * mm, "Dr. / Pathologist")
     c.drawRightString(page_w - RIGHT, sig_y - 5 * mm, "Authorized Signatory")
 
     c.setFillColor(MUTED)
     c.setFont("Helvetica", 7.8)
     c.drawString(LEFT, sig_y - 9 * mm, "(DMLT, BMLT)")
-    c.drawString(LEFT + 65 * mm, sig_y - 9 * mm, "(Verified)")
+    # c.drawString(LEFT + 65 * mm, sig_y - 9 * mm, "(Verified)")
     c.drawRightString(page_w - RIGHT, sig_y - 9 * mm, "(MD)")
 
     draw_footer(page_no)

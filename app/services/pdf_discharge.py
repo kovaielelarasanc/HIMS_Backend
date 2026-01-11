@@ -2,16 +2,22 @@
 from __future__ import annotations
 
 import io
+import os
 import html
-from datetime import datetime, date
+import logging
+from pathlib import Path
+from datetime import datetime, date, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import Session
-
+from reportlab.lib.enums import TA_RIGHT
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.units import mm
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.utils import ImageReader
+from reportlab.pdfgen import canvas as rl_canvas
 from reportlab.platypus import (
     SimpleDocTemplate,
     Paragraph,
@@ -29,340 +35,550 @@ from app.models.ipd import (
 from app.models.patient import Patient
 from app.models.user import User
 from app.models.department import Department
+from app.models.ui_branding import UiBranding
+
+logger = logging.getLogger(__name__)
+
+IST = ZoneInfo("Asia/Kolkata")
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# SAFE FILE HANDLING (your original logic)
 # ---------------------------------------------------------------------------
+def _safe_relpath(rel: str | None) -> str:
+    rel = (rel or "").strip().lstrip("/").replace("\\", "/")
+    return rel.replace("..", "")
 
-def _safe_dt(
-    value: Optional[datetime | date],
-    with_time: bool = True,
-    default: str = "",
-) -> str:
-    """
-    Safely format datetime/date. Handles None and weird values gracefully.
-    """
-    if not value:
-        return default
 
-    # If MySQL "zero date" somehow leaks through as string
-    if isinstance(value, str) and value.startswith("0000-00-00"):
-        return default
+def _resolve_storage_file(storage_dir: str, rel_path: str | None) -> Optional[Path]:
+    rel = _safe_relpath(rel_path)
+    if not rel:
+        return None
+    p = Path(storage_dir).joinpath(rel)
+    if p.exists() and p.is_file():
+        return p
+    return None
 
+
+def _try_image_reader(path: Path | None) -> Optional[ImageReader]:
+    if not path:
+        return None
     try:
-        if isinstance(value, datetime):
-            fmt = "%d-%m-%Y %I:%M %p" if with_time else "%d-%m-%Y"
-            return value.strftime(fmt)
-        if isinstance(value, date):
-            return value.strftime("%d-%m-%Y")
-        # Fallback: try to parse string
-        if isinstance(value, str):
-            dt = datetime.fromisoformat(value.replace(" ", "T"))
-            fmt = "%d-%m-%Y %I:%M %p" if with_time else "%d-%m-%Y"
-            return dt.strftime(fmt)
+        return ImageReader(str(path))
     except Exception:
-        return default
-
-    return default
-
-
-def _esc(text: Optional[str]) -> str:
-    """HTML-escape plain text (None-safe)."""
-    if not text:
-        return ""
-    return html.escape(text)
+        logger.exception("Image load failed: %s", path)
+        return None
 
 
-def _nl2br(text: Optional[str]) -> str:
-    """Convert multi-line text into HTML with <br> (with proper escaping)."""
-    if not text:
-        return ""
-    return "<br>".join(html.escape(line) for line in text.splitlines())
+def _get_storage_dir() -> str:
+    """
+    Where uploaded files live on disk.
+    Priority:
+      1) env STORAGE_DIR / UPLOAD_DIR / MEDIA_ROOT
+      2) ./storage (project root)
+    """
+    for k in ("STORAGE_DIR", "UPLOAD_DIR", "MEDIA_ROOT"):
+        v = (os.getenv(k) or "").strip()
+        if v:
+            return os.path.abspath(v)
+    return os.path.abspath(os.path.join(os.getcwd(), "storage"))
 
 
-def _age_sex(patient: Optional[Patient]) -> str:
-    if not patient:
-        return ""
-    age_str = ""
+def _resolve_branding_logo_reader(
+    branding: Optional[UiBranding],
+    storage_dir: str,
+) -> Optional[ImageReader]:
+    """
+    Logo priority:
+      1) If logo_path is absolute + exists => use
+      2) Else treat logo_path as relative under storage_dir (safe)
+      3) Else None
+    """
+    if not branding:
+        return None
+
+    raw = (getattr(branding, "logo_path", None) or "").strip()
+    if not raw:
+        return None
+
+    # Skip URLs (ReportLab won't fetch remote)
+    if raw.startswith("http://") or raw.startswith("https://"):
+        return None
+
+    # Absolute path support
     try:
-        if getattr(patient, "age_years", None) is not None:
-            age_str = f"{patient.age_years} Y"
-        elif getattr(patient, "dob", None):
-            today = date.today()
-            years = today.year - patient.dob.year - (
-                (today.month, today.day) < (patient.dob.month, patient.dob.day)
-            )
-            age_str = f"{years} Y"
+        p = Path(raw)
+        if p.is_absolute() and p.exists() and p.is_file():
+            img = _try_image_reader(p)
+            if img:
+                return img
     except Exception:
         pass
 
-    sex = getattr(patient, "gender", "") or getattr(patient, "sex", "") or ""
-    if sex:
-        sex = sex.upper()[0]
-    parts = [p for p in [age_str, sex] if p]
-    return " / ".join(parts)
+    # Relative under storage_dir
+    safe_p = _resolve_storage_file(storage_dir, raw)
+    return _try_image_reader(safe_p)
 
 
-def _br_to_para(text: Optional[str]) -> str:
-    """
-    Convert our stored HTML-ish strings (with <br>) into something
-    ReportLab Paragraph can understand.
-    """
+# ---------------------------------------------------------------------------
+# Helpers (IST formatting)
+# ---------------------------------------------------------------------------
+def _esc(text: Optional[str]) -> str:
+    return html.escape(text) if text else ""
+
+
+def _nl(text: Optional[str]) -> str:
     if not text:
         return ""
-    return text.replace("<br>", "<br/>")
+    return "<br/>".join(html.escape(x) for x in str(text).splitlines() if x is not None)
+
+
+def _to_ist(dt: datetime) -> datetime:
+    """
+    Convert datetime to IST.
+    - If tz-aware: convert to IST
+    - If tz-naive: assume UTC (common in backend: datetime.utcnow()) and convert to IST
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(IST)
+
+
+def _safe_date(dt: Optional[datetime | date]) -> str:
+    if not dt:
+        return ""
+    try:
+        if isinstance(dt, datetime):
+            return _to_ist(dt).strftime("%d-%m-%Y")
+        if isinstance(dt, date):
+            return dt.strftime("%d-%m-%Y")
+    except Exception:
+        return ""
+    return ""
+
+
+def _safe_time(dt: Optional[datetime | date]) -> str:
+    if not dt:
+        return ""
+    try:
+        if isinstance(dt, datetime):
+            return _to_ist(dt).strftime("%I:%M %p")  # IST
+    except Exception:
+        return ""
+    return ""
+
+
+def _safe_dt(dt: Optional[datetime | date], with_time: bool = True) -> str:
+    if not dt:
+        return ""
+    try:
+        if isinstance(dt, datetime):
+            d = _to_ist(dt)
+            return d.strftime("%d-%m-%Y %I:%M %p") if with_time else d.strftime("%d-%m-%Y")
+        if isinstance(dt, date):
+            return dt.strftime("%d-%m-%Y")
+    except Exception:
+        return ""
+    return ""
+
+
+def _patient_name(patient: Optional[Patient]) -> str:
+    if not patient:
+        return ""
+    for attr in ("full_name", "name", "patient_name", "display_name"):
+        val = getattr(patient, attr, None)
+        if val:
+            return str(val)
+    first = getattr(patient, "first_name", None) or ""
+    last = getattr(patient, "last_name", None) or ""
+    mid = getattr(patient, "middle_name", None) or ""
+    return " ".join([x for x in [first, mid, last] if x]).strip()
+
+
+def _load_branding(db: Session) -> Optional[UiBranding]:
+    try:
+        return db.query(UiBranding).order_by(UiBranding.id.asc()).first()
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
-# Core: Build context from DB
+# Page X of Y canvas
 # ---------------------------------------------------------------------------
+class NumberedCanvas(rl_canvas.Canvas):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._saved_page_states = []
 
-def build_discharge_context(
-    db: Session,
-    admission_id: int,
-    org_name: Optional[str] = None,
-    org_tagline: Optional[str] = None,
-    org_address: Optional[str] = None,
-    org_phone: Optional[str] = None,
-    org_email: Optional[str] = None,
-) -> dict:
-    """
-    Build a rich context dictionary for the discharge summary.
-    org_* parameters allow overriding defaults from router/branding.
-    """
+    def showPage(self):
+        # ✅ Save current page state, then start a new page WITHOUT finalizing twice
+        self._saved_page_states.append(dict(self.__dict__))
+        self._startPage()  # ✅ IMPORTANT (prevents duplicate pages)
+
+    def save(self):
+        page_count = len(self._saved_page_states)
+        for state in self._saved_page_states:
+            self.__dict__.update(state)
+            if getattr(self, "_draw_page_count_cb", None):
+                self._draw_page_count_cb(self, page_count)
+            super().showPage()
+        super().save()
+
+
+
+# ---------------------------------------------------------------------------
+# Header / Footer (FIXED ALIGNMENT)
+# ---------------------------------------------------------------------------
+def _draw_letterhead_header_footer(
+    branding: Optional[UiBranding],
+    ctx: dict,
+    *,
+    storage_dir: str,
+    header_h_mm: int,
+    footer_h_mm: int,
+    show_page_number: bool,
+):
+    styles = getSampleStyleSheet()
+
+    org_name_style = ParagraphStyle(
+        "OrgName",
+        parent=styles["Normal"],
+        fontName="Helvetica-Bold",
+        fontSize=12,
+        leading=13.5,
+        textColor=colors.black,
+        alignment=TA_RIGHT,   # ✅ RIGHT ALIGN
+    )
+    org_tag_style = ParagraphStyle(
+        "OrgTag",
+        parent=styles["Normal"],
+        fontName="Helvetica",
+        fontSize=9,
+        leading=10.5,
+        textColor=colors.black,
+        alignment=TA_RIGHT,   # ✅ RIGHT ALIGN
+    )
+    org_meta_style = ParagraphStyle(
+        "OrgMeta",
+        parent=styles["Normal"],
+        fontName="Helvetica",
+        fontSize=8,
+        leading=9.6,
+        textColor=colors.black,
+        alignment=TA_RIGHT,   # ✅ RIGHT ALIGN
+    )
+    footer_style = ParagraphStyle(
+        "Footer",
+        parent=styles["Normal"],
+        fontName="Helvetica",
+        fontSize=7.5,
+        leading=9,
+        textColor=colors.black,
+    )
+
+    LOGO_W = 70 * mm  # requirement
+
+    def on_page(c: rl_canvas.Canvas, doc: SimpleDocTemplate):
+        page_w, page_h = A4
+        left = doc.leftMargin
+        right = page_w - doc.rightMargin
+
+        header_h = header_h_mm * mm
+        footer_h = footer_h_mm * mm
+
+        top = page_h
+        header_bottom = top - header_h
+
+        # Divider under header
+        c.saveState()
+        c.setStrokeColor(colors.black)
+        c.setLineWidth(1)
+        c.line(left, header_bottom, right, header_bottom)
+        c.restoreState()
+
+        pad_top = 2 * mm
+        pad_bottom = 1 * mm
+
+
+        # ✅ LOGO TOP-LEFT aligned
+        logo_box_h = max(1, header_h - (pad_top + pad_bottom))
+        logo_x = left
+        logo_y = top - pad_top - logo_box_h  # top aligned
+
+        img = _resolve_branding_logo_reader(branding, storage_dir)
+        if img:
+            try:
+                c.drawImage(
+                    img,
+                    logo_x,
+                    logo_y,
+                    width=LOGO_W,
+                    height=logo_box_h,
+                    preserveAspectRatio=True,
+                    anchor="nw",  # top-left anchor feel
+                    mask="auto",
+                )
+            except Exception:
+                logger.exception("drawImage failed for branding logo")
+
+        # ✅ ORG BLOCK TOP-RIGHT aligned
+        gap = 6 * mm
+        avail_w = (right - left) - LOGO_W - gap
+        if avail_w < 40 * mm:
+            # very small space fallback
+            text_x = left + LOGO_W + gap
+            text_w = max(0, right - text_x)
+        else:
+            text_w = min(avail_w, 120 * mm)  # keep it right-side column
+            text_x = right - text_w
+
+        org_name = ctx.get("org_name", "") or ""
+        org_tagline = ctx.get("org_tagline", "") or ""
+        org_phone = ctx.get("org_phone", "") or ""
+        org_website = ctx.get("org_website", "") or ""
+        org_address = ctx.get("org_address", "") or ""
+
+        meta_line = " | ".join(
+            [
+                x
+                for x in [
+                    (f"Ph: {_esc(org_phone)}" if org_phone else ""),
+                    (f"W: {_esc(org_website)}" if org_website else ""),
+                ]
+                if x
+            ]
+        )
+        # ✅ Use FULL remaining width after logo, but text ends at RIGHT margin
+        gap = 6 * mm
+        text_x = left + LOGO_W + gap
+        text_w = max(0, right - text_x)
+
+        # top start
+        y = top - pad_top
+
+        p1 = Paragraph(_esc(org_name), org_name_style)
+        _, h1 = p1.wrap(text_w, header_h)
+        p1.drawOn(c, text_x, y - h1)
+        y -= (h1 + 1.2 * mm)
+
+        if org_tagline:
+            p2 = Paragraph(_esc(org_tagline), org_tag_style)
+            _, h2 = p2.wrap(text_w, header_h)
+            p2.drawOn(c, text_x, y - h2)
+            y -= (h2 + 1.0 * mm)
+
+        meta_block = "<br/>".join([x for x in [meta_line, _esc(org_address)] if x]).strip()
+        if meta_block:
+            max_h = max(10 * mm, y - (header_bottom + pad_bottom))
+            p3 = Paragraph(meta_block, org_meta_style)
+            _, h3 = p3.wrap(text_w, max_h)
+            p3.drawOn(c, text_x, y - h3)
+
+        # Footer line
+        c.saveState()
+        c.setStrokeColor(colors.black)
+        c.setLineWidth(1)
+        c.line(left, footer_h, right, footer_h)
+        c.restoreState()
+
+        ftxt = "Confidential Medical Record • Computer-generated document • For emergencies, visit Emergency/Casualty immediately."
+        pf = Paragraph(ftxt, footer_style)
+        pf.wrap((right - left) * 0.78, footer_h - 2 * mm)
+        pf.drawOn(c, left, 2 * mm)
+
+    def draw_page_count(c: rl_canvas.Canvas, page_count: int):
+        if not show_page_number:
+            return
+        page_w, _ = A4
+        right_margin = getattr(c, "_doc_right_margin", 15 * mm)
+        right = page_w - right_margin
+        c.saveState()
+        c.setFont("Helvetica", 8)
+        c.setFillColor(colors.black)
+        c.drawRightString(right, 2.2 * mm, f"Page {c.getPageNumber()} of {page_count}")
+        c.restoreState()
+
+    return on_page, draw_page_count
+
+
+# ---------------------------------------------------------------------------
+# Build context
+# ---------------------------------------------------------------------------
+def build_discharge_context(db: Session, admission_id: int) -> dict:
     adm: IpdAdmission | None = db.query(IpdAdmission).get(admission_id)
     if not adm:
         raise ValueError("Admission not found")
 
-    patient: Patient | None = (
-        db.query(Patient).get(adm.patient_id)
-        if getattr(adm, "patient_id", None)
-        else None
-    )
-    dept: Department | None = (
-        db.query(Department).get(adm.department_id)
-        if getattr(adm, "department_id", None)
-        else None
-    )
-    bed: IpdBed | None = (
-        db.query(IpdBed).get(adm.current_bed_id)
-        if getattr(adm, "current_bed_id", None)
-        else None
-    )
-    doctor: User | None = (
-        db.query(User).get(adm.practitioner_user_id)
-        if getattr(adm, "practitioner_user_id", None)
-        else None
-    )
+    patient: Patient | None = db.query(Patient).get(adm.patient_id) if getattr(adm, "patient_id", None) else None
+    dept: Department | None = db.query(Department).get(adm.department_id) if getattr(adm, "department_id", None) else None
+    doctor: User | None = db.query(User).get(adm.practitioner_user_id) if getattr(adm, "practitioner_user_id", None) else None
 
-    summary: IpdDischargeSummary | None = (
+    s: IpdDischargeSummary | None = (
         db.query(IpdDischargeSummary)
         .filter(IpdDischargeSummary.admission_id == admission_id)
         .first()
     )
 
-    checklist: IpdDischargeChecklist | None = (
+    _ = (
         db.query(IpdDischargeChecklist)
         .filter(IpdDischargeChecklist.admission_id == admission_id)
         .first()
     )
 
-    # Basic org details – overridable via args (for branding)
-    org_name = org_name or "HOSPITAL NAME"
-    org_tagline = org_tagline or "Quality Healthcare & Patient Safety"
-    org_address = org_address or ""
-    org_phone = org_phone or ""
-    org_email = org_email or ""
+    b = _load_branding(db)
 
-    ctx = {
+    org_name = (getattr(b, "org_name", None) if b else None) or "HOSPITAL NAME"
+    org_tagline = (getattr(b, "org_tagline", None) if b else None) or ""
+    org_address = (getattr(b, "org_address", None) if b else None) or ""
+    org_phone = (getattr(b, "org_phone", None) if b else None) or ""
+    org_website = (getattr(b, "org_website", None) if b else None) or ""
+
+    tel = getattr(patient, "phone", None) or getattr(patient, "tel_no", None) or ""
+    mobile = getattr(patient, "mobile", None) or getattr(patient, "mobile_no", None) or getattr(patient, "phone", None) or ""
+
+    doc_phone = getattr(doctor, "mobile", None) or getattr(doctor, "phone", None) or ""
+
+    admitted_at = getattr(adm, "admitted_at", None)
+    discharge_dt = (getattr(s, "discharge_datetime", None) if s else None) or getattr(adm, "discharged_at", None) or getattr(adm, "discharge_datetime", None)
+
+    ipd_no = (
+        getattr(adm, "ipd_no", None)
+        or getattr(adm, "ipd_number", None)
+        or getattr(adm, "admission_code", None)
+        or f"IP-{adm.id:06d}"
+    )
+    admission_no = (
+        getattr(adm, "admission_no", None)
+        or getattr(adm, "admission_number", None)
+        or str(adm.id)
+    )
+
+    consultant_block = " / ".join([x for x in [
+        (_esc(getattr(doctor, "full_name", None) or getattr(doctor, "name", None) or "") if doctor else ""),
+        (_esc(doc_phone) if doc_phone else ""),
+        (_esc(getattr(dept, "name", None) or "") if dept else ""),
+    ] if x]).strip()
+
+    provisional_dx = getattr(s, "provisional_diagnosis", None) if s else ""
+    final_dx = " / ".join([x for x in [
+        getattr(s, "final_diagnosis_primary", "") if s else "",
+        getattr(s, "final_diagnosis_secondary", "") if s else "",
+    ] if x]).strip()
+
+    icd10 = getattr(s, "icd10_codes", "") if s else ""
+    presenting_complaints = getattr(s, "presenting_complaints", "") if s else ""
+    summary_illness = getattr(s, "summary_presenting_illness", "") if s else ""
+    if not summary_illness:
+        summary_illness = getattr(s, "hospital_course", "") if s else ""
+
+    key_findings = getattr(s, "key_findings", "") if s else ""
+    substance = getattr(s, "substance_abuse_history", "") if s else ""
+    past_history = getattr(s, "medical_history", "") if s else ""
+    family_history = getattr(s, "family_history", "") if s else ""
+    investigations = getattr(s, "investigations", "") if s else ""
+    course = getattr(s, "hospital_course", "") if s else ""
+
+    meds = getattr(s, "medications", "") if s else ""
+    follow = getattr(s, "follow_up", "") if s else ""
+    diet = getattr(s, "diet_instructions", "") if s else ""
+    activity = getattr(s, "activity_instructions", "") if s else ""
+    warning = getattr(s, "warning_signs", "") if s else ""
+
+    advice_parts = []
+    if meds:
+        advice_parts.append("Medications:\n" + str(meds))
+    if diet:
+        advice_parts.append("Diet:\n" + str(diet))
+    if activity:
+        advice_parts.append("Activity:\n" + str(activity))
+    if follow:
+        advice_parts.append("Follow-up:\n" + str(follow))
+    if warning:
+        advice_parts.append("Warning signs:\n" + str(warning))
+    advice = "\n\n".join(advice_parts)
+
+    patient_ack_name = getattr(s, "patient_ack_name", "") if s else ""
+    if not patient_ack_name:
+        patient_ack_name = _patient_name(patient)
+
+    reviewed_by = getattr(s, "reviewed_by_name", "") if s else ""
+    prepared_by = getattr(s, "prepared_by_name", "") if s else ""
+    reviewed_reg = getattr(s, "reviewed_by_regno", "") if s else ""
+    mlc = getattr(adm, "mlc_no", None) or (getattr(s, "mlc_no", None) if s else "") or ""
+
+    return {
         "org_name": org_name,
         "org_tagline": org_tagline,
         "org_address": org_address,
         "org_phone": org_phone,
-        "org_email": org_email,
-        # Admission / patient identifiers
-        "admission_code": getattr(adm, "admission_code", None)
-        or f"IP-{adm.id:06d}",
-        "patient_code": getattr(patient, "display_code", None)
-        or getattr(patient, "patient_code", None)
-        or (f"PT-{patient.id:06d}" if patient else ""),
-        "patient_name": getattr(patient, "full_name", None)
-        or getattr(patient, "name", None)
-        or "",
-        "age_sex": _age_sex(patient),
-        "uhid": getattr(patient, "uhid", None)
-        or getattr(patient, "mrn", None)
-        or "",
-        "mobile": getattr(patient, "mobile", None)
-        or getattr(patient, "phone", None)
-        or "",
-        "address": getattr(patient, "address", "") or "",
-        "department": getattr(dept, "name", "") or "",
-        "doctor_name": getattr(doctor, "full_name", None)
-        or getattr(doctor, "name", None)
-        or "",
-        "admitted_at": _safe_dt(getattr(adm, "admitted_at", None)),
-        "expected_discharge_at": _safe_dt(
-            getattr(adm, "expected_discharge_at", None)
-        ),
-        "bed_code": getattr(bed, "code", "") or "",
-        "payor_type": getattr(adm, "payor_type", "") or "",
-        "insurer_name": getattr(adm, "insurer_name", "") or "",
-        "policy_number": getattr(adm, "policy_number", "") or "",
+        "org_website": org_website,
+
+        "patient_name": _patient_name(patient),
+        "tel": str(tel or ""),
+        "mobile": str(mobile or ""),
+        "ipd_no": str(ipd_no or ""),
+        "admission_no": str(admission_no or ""),
+        "consultant_block": consultant_block,
+
+        # ✅ IST output
+        "date_adm": _safe_date(admitted_at),
+        "time_adm": _safe_time(admitted_at),
+        "date_dis": _safe_date(discharge_dt),
+        "time_dis": _safe_time(discharge_dt),
+
+        "mlc": str(mlc or ""),
+        "provisional_dx": str(provisional_dx or ""),
+        "final_dx": str(final_dx or ""),
+        "icd10": str(icd10 or ""),
+        "presenting_complaints": str(presenting_complaints or ""),
+        "summary_illness": str(summary_illness or ""),
+        "key_findings": str(key_findings or ""),
+        "substance": str(substance or ""),
+        "past_history": str(past_history or ""),
+        "family_history": str(family_history or ""),
+        "investigations": str(investigations or ""),
+        "course": str(course or ""),
+        "advice": str(advice or ""),
+
+        "doctor_name": (getattr(doctor, "full_name", None) or getattr(doctor, "name", None) or ""),
+        "prepared_by": str(prepared_by or ""),
+        "reviewed_by": str(reviewed_by or ""),
+        "reviewed_regno": str(reviewed_reg or ""),
+        "patient_ack_name": str(patient_ack_name or ""),
     }
 
-    s = summary
-
-    ctx.update(
-        {
-            # Demographics in free-text (if doctor overrode)
-            "demographics": _nl2br(getattr(s, "demographics", "") if s else ""),
-            "medical_history": _nl2br(
-                getattr(s, "medical_history", "") if s else ""
-            ),
-            "treatment_summary": _nl2br(
-                getattr(s, "treatment_summary", "") if s else ""
-            ),
-            "medications": _nl2br(getattr(s, "medications", "") if s else ""),
-            "follow_up": _nl2br(getattr(s, "follow_up", "") if s else ""),
-            "icd10_codes": _esc(getattr(s, "icd10_codes", "") if s else ""),
-            # A. MUST-HAVE
-            "final_diag_primary": _esc(
-                getattr(s, "final_diagnosis_primary", "") if s else ""
-            ),
-            "final_diag_secondary": _esc(
-                getattr(s, "final_diagnosis_secondary", "") if s else ""
-            ),
-            "hospital_course": _nl2br(
-                getattr(s, "hospital_course", "") if s else ""
-            ),
-            "discharge_condition": _esc(
-                getattr(s, "discharge_condition", "") if s else ""
-            ),
-            "discharge_type": _esc(
-                getattr(s, "discharge_type", "") if s else ""
-            ),
-            "allergies": _nl2br(getattr(s, "allergies", "") if s else ""),
-            # B. Strongly recommended
-            "procedures": _nl2br(getattr(s, "procedures", "") if s else ""),
-            "investigations": _nl2br(getattr(s, "investigations", "") if s else ""),
-            "diet_instructions": _nl2br(
-                getattr(s, "diet_instructions", "") if s else ""
-            ),
-            "activity_instructions": _nl2br(
-                getattr(s, "activity_instructions", "") if s else ""
-            ),
-            "warning_signs": _nl2br(
-                getattr(s, "warning_signs", "") if s else ""
-            ),
-            "referral_details": _nl2br(
-                getattr(s, "referral_details", "") if s else ""
-            ),
-            # C. Operational / admin / billing
-            "insurance_details": _nl2br(
-                getattr(s, "insurance_details", "") if s else ""
-            ),
-            "stay_summary": _nl2br(
-                getattr(s, "stay_summary", "") if s else ""
-            ),
-            "patient_ack_name": _esc(
-                getattr(s, "patient_ack_name", "") if s else ""
-            ),
-            "patient_ack_datetime": _safe_dt(
-                getattr(s, "patient_ack_datetime", None) if s else None
-            ),
-            # D. Doctor & validation
-            "prepared_by_name": _esc(
-                getattr(s, "prepared_by_name", "") if s else ""
-            ),
-            "reviewed_by_name": _esc(
-                getattr(s, "reviewed_by_name", "") if s else ""
-            ),
-            "reviewed_by_regno": _esc(
-                getattr(s, "reviewed_by_regno", "") if s else ""
-            ),
-            "discharge_datetime": _safe_dt(
-                getattr(s, "discharge_datetime", None) if s else None
-            ),
-            # E. Safety & Quality
-            "implants": _nl2br(getattr(s, "implants", "") if s else ""),
-            "pending_reports": _nl2br(
-                getattr(s, "pending_reports", "") if s else ""
-            ),
-            "patient_education": _nl2br(
-                getattr(s, "patient_education", "") if s else ""
-            ),
-            "followup_appointment_ref": _esc(
-                getattr(s, "followup_appointment_ref", "") if s else ""
-            ),
-            "finalized": bool(getattr(s, "finalized", False) if s else False),
-            "finalized_at": _safe_dt(
-                getattr(s, "finalized_at", None) if s else None
-            ),
-        }
-    )
-
-    # Checklist info (financial / clinical clearances)
-    c = checklist
-    ctx.update(
-        {
-            "financial_clearance": bool(
-                getattr(c, "financial_clearance", False) if c else False
-            ),
-            "clinical_clearance": bool(
-                getattr(c, "clinical_clearance", False) if c else False
-            ),
-            "delay_reason": _nl2br(
-                getattr(c, "delay_reason", "") if c else ""
-            ),
-            "checklist_submitted": bool(
-                getattr(c, "submitted", False) if c else False
-            ),
-            "checklist_submitted_at": _safe_dt(
-                getattr(c, "submitted_at", None) if c else None
-            ),
-        }
-    )
-
-    return ctx
-
 
 # ---------------------------------------------------------------------------
-# PDF builder using ReportLab (no WeasyPrint)
+# PDF builder
 # ---------------------------------------------------------------------------
+def render_discharge_summary_pdf(db: Session, admission_id: int) -> bytes:
+    ctx = build_discharge_context(db, admission_id)
+    branding = _load_branding(db)
+    storage_dir = _get_storage_dir()
 
-def render_discharge_summary_pdf(
-    db: Session,
-    admission_id: int,
-    org_name: Optional[str] = None,
-    org_address: Optional[str] = None,
-    org_phone: Optional[str] = None,
-    org_tagline: Optional[str] = None,
-    org_email: Optional[str] = None,
-) -> bytes:
-    """
-    High-level API used by FastAPI route.
-    Generates a structured A4 PDF using ReportLab.
-    """
-    ctx = build_discharge_context(
-        db,
-        admission_id,
-        org_name=org_name,
-        org_tagline=org_tagline,
-        org_address=org_address,
-        org_phone=org_phone,
-        org_email=org_email,
-    )
+    header_h_mm = int(getattr(branding, "pdf_header_height_mm", None) or 28) if branding else 40
+    header_h_mm = max(22, min(header_h_mm, 32))
+    footer_h_mm = int(getattr(branding, "pdf_footer_height_mm", None) or 14) if branding else 14
+    show_page_number = bool(getattr(branding, "pdf_show_page_number", True) if branding else True)
 
     buf = io.BytesIO()
+
     doc = SimpleDocTemplate(
         buf,
         pagesize=A4,
-        leftMargin=15 * mm,
-        rightMargin=15 * mm,
-        topMargin=18 * mm,
-        bottomMargin=15 * mm,
+        leftMargin=12 * mm,
+        rightMargin=12 * mm,
+        topMargin=(header_h_mm * mm) + (0.5 * mm),     # ✅ reduced gap under header
+        bottomMargin=(footer_h_mm * mm) + (2 * mm),  # ✅ slightly tighter
+    )
+
+    on_page, draw_page_count = _draw_letterhead_header_footer(
+        branding,
+        ctx,
+        storage_dir=storage_dir,
+        header_h_mm=header_h_mm,
+        footer_h_mm=footer_h_mm,
+        show_page_number=show_page_number,
     )
 
     styles = getSampleStyleSheet()
@@ -370,341 +586,142 @@ def render_discharge_summary_pdf(
         "Title",
         parent=styles["Normal"],
         fontName="Helvetica-Bold",
-        fontSize=16,
-        leading=18,
-        textColor=colors.HexColor("#0f172a"),
+        fontSize=14,
+        alignment=1,
+        textColor=colors.black,
+        spaceAfter=4,
     )
-    subtitle_style = ParagraphStyle(
-        "Subtitle",
+    cell_label = ParagraphStyle(
+        "CellLabel",
         parent=styles["Normal"],
-        fontSize=10,
-        textColor=colors.HexColor("#6b7280"),
-    )
-    small_style = ParagraphStyle(
-        "Small",
-        parent=styles["Normal"],
+        fontName="Helvetica",
         fontSize=9,
         leading=11,
+        textColor=colors.black,
     )
-    label_style = ParagraphStyle(
-        "Label",
+    cell_value = ParagraphStyle(
+        "CellValue",
         parent=styles["Normal"],
+        fontName="Helvetica",
         fontSize=9,
-        textColor=colors.HexColor("#6b7280"),
+        leading=11,
+        textColor=colors.black,
     )
-    section_title_style = ParagraphStyle(
-        "SectionTitle",
-        parent=styles["Normal"],
-        fontName="Helvetica-Bold",
-        fontSize=11,
-        textColor=colors.HexColor("#0f172a"),
-        spaceBefore=6,
-        spaceAfter=2,
-    )
-    bold_label = ParagraphStyle(
-        "BoldLabel",
-        parent=styles["Normal"],
-        fontName="Helvetica-Bold",
-        fontSize=9,
-    )
+
+    def L(text: str) -> Paragraph:
+        return Paragraph(_esc(text), cell_label)
+
+    def V(text: str) -> Paragraph:
+        return Paragraph(_nl(text) if text else "", cell_value)
 
     story: list = []
+    story.append(Paragraph("DISCHARGE SUMMARY", title_style))
+    story.append(Spacer(1, 0.8 * mm))  # ✅ tighter
 
-    # -------------------------------------------------------------------
-    # HEADER
-    # -------------------------------------------------------------------
-    story.append(Paragraph(_esc(ctx.get("org_name")), title_style))
-    if ctx.get("org_tagline"):
-        story.append(Paragraph(_esc(ctx.get("org_tagline")), subtitle_style))
 
-    org_meta_parts = []
-    if ctx.get("org_address"):
-        org_meta_parts.append(_esc(ctx.get("org_address")))
-    if ctx.get("org_phone"):
-        org_meta_parts.append(f"Phone: {_esc(ctx.get('org_phone'))}")
-    if ctx.get("org_email"):
-        org_meta_parts.append(f"Email: {_esc(ctx.get('org_email'))}")
-    org_meta = "<br/>".join(org_meta_parts)
-
-    if org_meta:
-        story.append(Spacer(1, 2 * mm))
-        story.append(Paragraph(org_meta, small_style))
-
-    story.append(Spacer(1, 4 * mm))
-    story.append(Paragraph("<b>Discharge Summary</b>", styles["Heading4"]))
-    story.append(
-        Paragraph(
-            f"<font size='8' color='#6b7280'>Generated on {_safe_dt(datetime.utcnow())}</font>",
-            styles["Normal"],
-        )
-    )
-    story.append(Spacer(1, 4 * mm))
-
-    # -------------------------------------------------------------------
-    # PATIENT / ADMISSION BLOCK
-    # -------------------------------------------------------------------
-    data = [
-        [
-            Paragraph("<b>Patient Name</b>", label_style),
-            Paragraph(_esc(ctx.get("patient_name")), small_style),
-            Paragraph("<b>UHID / Patient ID</b>", label_style),
-            Paragraph(_esc(ctx.get("patient_code") or ctx.get("uhid")), small_style),
-        ],
-        [
-            Paragraph("<b>Age / Sex</b>", label_style),
-            Paragraph(_esc(ctx.get("age_sex")), small_style),
-            Paragraph("<b>Mobile</b>", label_style),
-            Paragraph(_esc(ctx.get("mobile")), small_style),
-        ],
-        [
-            Paragraph("<b>Admission No.</b>", label_style),
-            Paragraph(_esc(ctx.get("admission_code")), small_style),
-            Paragraph("<b>Ward / Bed</b>", label_style),
-            Paragraph(_esc(ctx.get("bed_code")), small_style),
-        ],
-        [
-            Paragraph("<b>Department</b>", label_style),
-            Paragraph(_esc(ctx.get("department")), small_style),
-            Paragraph("<b>Consultant</b>", label_style),
-            Paragraph(_esc(ctx.get("doctor_name")), small_style),
-        ],
-        [
-            Paragraph("<b>Admitted On</b>", label_style),
-            Paragraph(_esc(ctx.get("admitted_at")), small_style),
-            Paragraph("<b>Discharge Date &amp; Time</b>", label_style),
-            Paragraph(_esc(ctx.get("discharge_datetime")), small_style),
-        ],
-        [
-            Paragraph("<b>Payor Type</b>", label_style),
-            Paragraph(_esc(ctx.get("payor_type")), small_style),
-            Paragraph("<b>Insurer / Policy No.</b>", label_style),
-            Paragraph(
-                "<br/>".join(
-                    [
-                        _esc(ctx.get("insurer_name")),
-                        _esc(ctx.get("policy_number")),
-                    ]
-                ),
-                small_style,
-            ),
-        ],
+    colw = [35 * mm, 55 * mm, 35 * mm, 55 * mm]
+    top_rows = [
+        [L("Name of Patient:"), V(ctx["patient_name"]), "", ""],
+        [L("Tel No."), V(ctx["tel"]), L("Mobile No."), V(ctx["mobile"])],
+        [L("IPD No."), V(ctx["ipd_no"]), L("Admission No."), V(ctx["admission_no"])],
+        [L("Treating Consultant/s Name, contact numbers\nand Department/Specialty"), V(ctx["consultant_block"]), "", ""],
+        [L("Date of Admission"), V(ctx["date_adm"]), L("Time of Admission"), V(ctx["time_adm"])],
+        [L("Date of Discharge"), V(ctx["date_dis"]), L("Time of Discharge"), V(ctx["time_dis"])],
     ]
-    t = Table(data, colWidths=[30 * mm, 55 * mm, 30 * mm, 55 * mm])
-    t.setStyle(
-        TableStyle(
-            [
-                ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#e5e7eb")),
-                ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#e5e7eb")),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 3),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 3),
-                ("TOPPADDING", (0, 0), (-1, -1), 2),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-            ]
-        )
-    )
-    story.append(t)
-    story.append(Spacer(1, 2 * mm))
-    if ctx.get("address"):
-        story.append(
-            Paragraph(
-                f"<font size='8' color='#6b7280'>Address: {_esc(ctx.get('address'))}</font>",
-                styles["Normal"],
-            )
-        )
 
-    # -------------------------------------------------------------------
-    # SECTION A: Final Diagnosis & Hospital Course
-    # -------------------------------------------------------------------
-    story.append(Spacer(1, 4 * mm))
-    story.append(Paragraph("A. Final Diagnosis & Hospital Course", section_title_style))
-
-    story.append(Paragraph("Final primary diagnosis:", bold_label))
-    story.append(Paragraph(_esc(ctx.get("final_diag_primary")), small_style))
-    story.append(Spacer(1, 1 * mm))
-
-    story.append(Paragraph("Secondary / comorbid diagnoses:", bold_label))
-    story.append(Paragraph(_esc(ctx.get("final_diag_secondary")), small_style))
-    story.append(Spacer(1, 1 * mm))
-
-    story.append(Paragraph("Hospital course / clinical summary:", bold_label))
-    story.append(
-        Paragraph(_br_to_para(ctx.get("hospital_course", "")), small_style)
-    )
-    story.append(Spacer(1, 1 * mm))
-
-    cond = _esc(ctx.get("discharge_condition"))
-    dtype = _esc(ctx.get("discharge_type"))
-    story.append(
-        Paragraph(
-            f"Discharge condition: {cond or '-'}<br/>Discharge type: {dtype or '-'}",
-            small_style,
-        )
-    )
-    story.append(Spacer(1, 1 * mm))
-
-    story.append(Paragraph("Allergies:", bold_label))
-    allergies = ctx.get("allergies") or "NKDA (if none specified)"
-    story.append(Paragraph(_br_to_para(allergies), small_style))
-
-    # -------------------------------------------------------------------
-    # SECTION B: Procedures, Investigations, Instructions
-    # -------------------------------------------------------------------
-    story.append(Spacer(1, 4 * mm))
-    story.append(Paragraph("B. Procedures, Investigations & Instructions", section_title_style))
-
-    story.append(Paragraph("Procedures / surgeries performed:", bold_label))
-    story.append(Paragraph(_br_to_para(ctx.get("procedures", "")), small_style))
-    story.append(Spacer(1, 1 * mm))
-
-    story.append(Paragraph("Investigation highlights:", bold_label))
-    story.append(Paragraph(_br_to_para(ctx.get("investigations", "")), small_style))
-    story.append(Spacer(1, 1 * mm))
-
-    story.append(Paragraph("Diet instructions:", bold_label))
-    story.append(Paragraph(_br_to_para(ctx.get("diet_instructions", "")), small_style))
-    story.append(Spacer(1, 1 * mm))
-
-    story.append(Paragraph("Activity instructions:", bold_label))
-    story.append(Paragraph(_br_to_para(ctx.get("activity_instructions", "")), small_style))
-    story.append(Spacer(1, 1 * mm))
-
-    story.append(Paragraph("Warning / red-flag symptoms:", bold_label))
-    story.append(Paragraph(_br_to_para(ctx.get("warning_signs", "")), small_style))
-    story.append(Spacer(1, 1 * mm))
-
-    story.append(Paragraph("Referral / transfer details (if referred):", bold_label))
-    story.append(Paragraph(_br_to_para(ctx.get("referral_details", "")), small_style))
-
-    # -------------------------------------------------------------------
-    # SECTION C: Medications & Follow-up
-    # -------------------------------------------------------------------
-    story.append(Spacer(1, 4 * mm))
-    story.append(Paragraph("C. Discharge Medications & Follow-up", section_title_style))
-
-    story.append(Paragraph("Discharge medications:", bold_label))
-    story.append(Paragraph(_br_to_para(ctx.get("medications", "")), small_style))
-    story.append(Spacer(1, 1 * mm))
-
-    follow = _br_to_para(ctx.get("follow_up", ""))
-    follow_ref = _esc(ctx.get("followup_appointment_ref") or "")
-    follow_text = follow + (
-        f"<br/><font size='8' color='#6b7280'>Follow-up appointment ID / token: {follow_ref}</font>"
-        if follow_ref
-        else ""
-    )
-    story.append(Paragraph("Follow-up advice:", bold_label))
-    story.append(Paragraph(follow_text, small_style))
-
-    # -------------------------------------------------------------------
-    # SECTION D: Insurance, Stay, Safety
-    # -------------------------------------------------------------------
-    story.append(Spacer(1, 4 * mm))
-    story.append(Paragraph("D. Insurance, Stay Summary & Safety", section_title_style))
-
-    story.append(Paragraph("Insurance / TPA details:", bold_label))
-    story.append(Paragraph(_br_to_para(ctx.get("insurance_details", "")), small_style))
-    story.append(Spacer(1, 1 * mm))
-
-    story.append(Paragraph("Hospital stay summary:", bold_label))
-    story.append(Paragraph(_br_to_para(ctx.get("stay_summary", "")), small_style))
-    story.append(Spacer(1, 1 * mm))
-
-    story.append(Paragraph("Implants used (if any):", bold_label))
-    story.append(Paragraph(_br_to_para(ctx.get("implants", "")), small_style))
-    story.append(Spacer(1, 1 * mm))
-
-    story.append(Paragraph("Pending reports:", bold_label))
-    story.append(Paragraph(_br_to_para(ctx.get("pending_reports", "")), small_style))
-    story.append(Spacer(1, 1 * mm))
-
-    story.append(Paragraph("Patient education provided:", bold_label))
-    story.append(Paragraph(_br_to_para(ctx.get("patient_education", "")), small_style))
-
-    # -------------------------------------------------------------------
-    # SECTION E: Clearances & Signatures
-    # -------------------------------------------------------------------
-    story.append(Spacer(1, 4 * mm))
-    story.append(Paragraph("E. Clearances, Acknowledgement & Signatures", section_title_style))
-
-    fin_done = ctx.get("financial_clearance")
-    clin_done = ctx.get("clinical_clearance")
-    checklist_sub = ctx.get("checklist_submitted")
-
-    story.append(Paragraph("Financial & clinical clearance:", bold_label))
-    story.append(
-        Paragraph(
-            f"Financial clearance: {'Done' if fin_done else 'Pending'}<br/>"
-            f"Clinical discharge clearance: {'Done' if clin_done else 'Pending'}<br/>"
-            f"Delay reason: {_br_to_para(ctx.get('delay_reason', ''))}",
-            small_style,
-        )
-    )
-    story.append(Spacer(1, 1 * mm))
-
-    story.append(Paragraph("Checklist submission:", bold_label))
-    story.append(
-        Paragraph(
-            f"Status: {'Submitted' if checklist_sub else 'Not submitted'}<br/>"
-            f"Submitted at: {_esc(ctx.get('checklist_submitted_at') or '')}",
-            small_style,
-        )
-    )
-    story.append(Spacer(1, 2 * mm))
-
-    story.append(Paragraph("Patient / Attendant acknowledgement:", bold_label))
-    story.append(
-        Paragraph(
-            f"Name: {_esc(ctx.get('patient_ack_name') or '')}<br/>"
-            f"Date &amp; time: {_esc(ctx.get('patient_ack_datetime') or '')}<br/>"
-            "Signature: __________________________",
-            small_style,
-        )
-    )
-    story.append(Spacer(1, 2 * mm))
-
-    story.append(Paragraph("Doctor & system validation:", bold_label))
-    story.append(
-        Paragraph(
-            f"Prepared by: {_esc(ctx.get('prepared_by_name') or '')}<br/>"
-            f"Reviewed &amp; approved by: {_esc(ctx.get('reviewed_by_name') or '')}<br/>"
-            f"Registration no.: {_esc(ctx.get('reviewed_by_regno') or '')}<br/>"
-            "Digital signature: __________________",
-            small_style,
-        )
-    )
+    top = Table(top_rows, colWidths=colw)
+    top.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 1, colors.black),
+        ("INNERGRID", (0, 0), (-1, -1), 1, colors.black),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("SPAN", (1, 0), (3, 0)),
+        ("SPAN", (1, 3), (3, 3)),
+    ]))
+    story.append(top)
     story.append(Spacer(1, 3 * mm))
 
-    finalized_text = f"Finalized: {'Yes' if ctx.get('finalized') else 'No'}"
-    finalized_at_text = f"Finalized at: {_esc(ctx.get('finalized_at') or '')}"
-    story.append(
-        Paragraph(
-            f"<font size='8' color='#6b7280'>{finalized_text} &nbsp;&nbsp; {finalized_at_text}</font>",
-            styles["Normal"],
-        )
-    )
+    mlc_tbl = Table([[L("MLC No. / FIR No."), V(ctx["mlc"])]], colWidths=[60 * mm, sum(colw) - 60 * mm])
+    mlc_tbl.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 1, colors.black),
+        ("INNERGRID", (0, 0), (-1, -1), 1, colors.black),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.append(mlc_tbl)
+
+    main_rows = [
+        ["Provisional Diagnosis at the time of Admission", ctx["provisional_dx"]],
+        ["Final Diagnosis at the time of Discharge", ctx["final_dx"]],
+        ["ICD-10 code(s) or any other codes, as recommended\nby the Authority, for Final diagnosis", ctx["icd10"]],
+        ["Presenting Complaints with Duration and Reason\nfor Admission", ctx["presenting_complaints"]],
+        ["Summary of Presenting Illness", ctx["summary_illness"]],
+        ["Key findings, on physical examination at the time of\nadmission", ctx["key_findings"]],
+        ["History of alcoholism, tobacco or substance abuse,\nif any", ctx["substance"]],
+        ["Significant Past Medical and Surgical History, if any", ctx["past_history"]],
+        ["Family History if significant/relevant to diagnosis or\ntreatment", ctx["family_history"]],
+        ["Summary of key investigations during\nHospitalization", ctx["investigations"]],
+        ["Course in the Hospital including complications, if\nany", ctx["course"]],
+        ["Advice on Discharge", ctx["advice"]],
+    ]
+
+    main = Table([[L(a), V(b)] for a, b in main_rows], colWidths=[75 * mm, sum(colw) - 75 * mm])
+    main.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 1, colors.black),
+        ("INNERGRID", (0, 0), (-1, -1), 1, colors.black),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.append(main)
+
     story.append(Spacer(1, 3 * mm))
 
-    story.append(
-        Paragraph(
-            "<font size='8' color='#6b7280'>"
-            "This is a computer-generated discharge summary. Kindly bring this document for all "
-            "future consultations. In case of any worsening symptoms, please visit the hospital "
-            "emergency / casualty immediately."
-            "</font>",
-            styles["Normal"],
-        )
+    sign_rows = [
+        [L("Name of treating\nConsultant/ Authorized\nTeam Doctor"), L("Signature of treating\nConsultant/ Authorized\nTeam Doctor")],
+        [V(ctx["doctor_name"] or ctx["prepared_by"] or ctx["reviewed_by"]), V("____________________________")],
+        [L("Name of Patient /\nAttendant"), L("Signature of Patient /\nAttendant")],
+        [V(ctx["patient_ack_name"]), V("____________________________")],
+    ]
+    sign = Table(sign_rows, colWidths=[(sum(colw) / 2), (sum(colw) / 2)])
+    sign.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 1, colors.black),
+        ("INNERGRID", (0, 0), (-1, -1), 1, colors.black),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.append(sign)
+
+    def _on_page(c, d):
+        c._doc_right_margin = d.rightMargin
+        on_page(c, d)
+
+    def canvas_maker(*args, **kwargs):
+        c = NumberedCanvas(*args, **kwargs)
+        c._draw_page_count_cb = draw_page_count
+        return c
+
+    doc.build(
+        story,
+        onFirstPage=_on_page,
+        onLaterPages=_on_page,
+        canvasmaker=canvas_maker,
     )
 
-    # Build PDF
-    doc.build(story)
     buf.seek(0)
     return buf.getvalue()
 
-
-# ---------------------------------------------------------------------------
-# Backward-compatible alias for existing router imports
-# ---------------------------------------------------------------------------
 
 def generate_discharge_summary_pdf(
     db: Session,
@@ -715,17 +732,4 @@ def generate_discharge_summary_pdf(
     org_tagline: Optional[str] = None,
     org_email: Optional[str] = None,
 ) -> bytes:
-    """
-    Alias kept so existing imports like:
-        from app.services.pdf_discharge import generate_discharge_summary_pdf
-    continue to work without any change.
-    """
-    return render_discharge_summary_pdf(
-        db,
-        admission_id,
-        org_name=org_name,
-        org_address=org_address,
-        org_phone=org_phone,
-        org_tagline=org_tagline,
-        org_email=org_email,
-    )
+    return render_discharge_summary_pdf(db, admission_id)
