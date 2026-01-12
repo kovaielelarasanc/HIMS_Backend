@@ -22,7 +22,7 @@ from app.services.billing_service import (
     get_or_create_case_for_ip_admission,
     get_or_create_active_module_invoice,
     add_auto_line_idempotent,
-    add_payment_for_invoice,
+    record_payment,
     get_tariff_rate,
     add_manual_line,
 )
@@ -626,7 +626,7 @@ def add_pharmacy_payment_for_sale(
     invoice_id = int(
         bill_res["invoice_id_phm"])  # attach payment to PHM invoice
 
-    p = add_payment_for_invoice(
+    p = record_payment(
         db,
         billing_case_id=case_id,
         invoice_id=invoice_id,

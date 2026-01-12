@@ -189,6 +189,23 @@ class InvoiceEditRequestStatus(str, PyEnum):
     REJECTED = "REJECTED"
 
 
+class PaymentDirection(str, enum.Enum):
+    IN = "IN"  # money received
+    OUT = "OUT"  # money paid back (refund)
+
+
+class PaymentKind(str, enum.Enum):
+    RECEIPT = "RECEIPT"  # normal payment
+    ADVANCE_ADJUSTMENT = "ADVANCE_ADJUSTMENT"  # applying advance to invoices
+    REFUND = "REFUND"  # refund
+    WRITE_OFF = "WRITE_OFF"  # optional future use
+
+
+class ReceiptStatus(str, enum.Enum):
+    ACTIVE = "ACTIVE"
+    VOID = "VOID"
+
+
 # ============================================================
 # Number Series (for Case / Invoice / Note / Receipt)
 # ============================================================
@@ -601,6 +618,11 @@ class BillingInvoice(Base):
         back_populates="billing_invoice",
         lazy="selectin",
     )
+    payment_allocations = relationship(
+        "BillingPaymentAllocation",
+        back_populates="invoice",
+        lazy="selectin",
+    )
 
     created_by_user = relationship("User", foreign_keys=[created_by])
     updated_by_user = relationship("User", foreign_keys=[updated_by])
@@ -696,6 +718,7 @@ class BillingInvoiceLine(Base):
     approved_amount = Column(Money, nullable=False, default=0)
     patient_pay_amount = Column(Money, nullable=False, default=0)
     requires_preauth = Column(Boolean, nullable=False, default=False)
+    insurer_pay_amount = Column(Money, nullable=False, default=0)  # NEW
 
     # manual add
     is_manual = Column(Boolean, nullable=False, default=False)
@@ -739,7 +762,7 @@ class BillingPayment(Base):
     id = Column(BigInteger, primary_key=True, autoincrement=True)
 
     billing_case_id = Column(
-        BigInteger,
+        BigInteger,  # ✅ FIX
         ForeignKey("billing_cases.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
@@ -761,21 +784,48 @@ class BillingPayment(Base):
     amount = Column(Money, nullable=False, default=0)
 
     txn_ref = Column(String(64), nullable=True)
-
     received_at = Column(DateTime, nullable=False, server_default=func.now())
 
     received_by = Column(Integer,
                          ForeignKey("users.id", ondelete="SET NULL"),
                          nullable=True)
-
     notes = Column(String(255), nullable=True)
+
+    # ✅ keep only ONE receipt_number
+    receipt_number = Column(String(50), nullable=True, unique=True, index=True)
+
+    kind = Column(Enum(PaymentKind),
+                  nullable=False,
+                  default=PaymentKind.RECEIPT)
+    direction = Column(Enum(PaymentDirection),
+                       nullable=False,
+                       default=PaymentDirection.IN)
+    status = Column(Enum(ReceiptStatus),
+                    nullable=False,
+                    default=ReceiptStatus.ACTIVE)
+
+    meta_json = Column(JSON, nullable=True)
+
+    voided_by = Column(Integer,
+                       ForeignKey("users.id", ondelete="SET NULL"),
+                       nullable=True)
+    voided_at = Column(DateTime, nullable=True)
+    void_reason = Column(String(255), nullable=True)
 
     created_at = Column(DateTime, nullable=False, server_default=func.now())
 
     billing_case = relationship("BillingCase", back_populates="payments")
     invoice = relationship("BillingInvoice", back_populates="payments")
-
     received_by_user = relationship("User", foreign_keys=[received_by])
+
+    allocations = relationship(
+        "BillingPaymentAllocation",
+        back_populates="payment",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+
+    voided_by_user = relationship("User", foreign_keys=[voided_by])
 
 
 class BillingAdvance(Base):
@@ -813,6 +863,182 @@ class BillingAdvance(Base):
 
     billing_case = relationship("BillingCase", back_populates="advances")
     entry_by_user = relationship("User", foreign_keys=[entry_by])
+    applications = relationship(
+        "BillingAdvanceApplication",
+        primaryjoin="BillingAdvance.id==BillingAdvanceApplication.advance_id",
+        viewonly=True,
+    )
+
+
+class BillingPaymentAllocation(Base):
+    __tablename__ = "billing_payment_allocations"
+    __table_args__ = (
+        Index("idx_bpa_case", "billing_case_id"),
+        Index("idx_bpa_payment", "payment_id"),
+        Index("idx_bpa_invoice", "invoice_id"),
+        Index("idx_bpa_bucket", "payer_bucket"),
+        Index("idx_bpa_tenant", "tenant_id"),
+        MYSQL_ARGS,
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, nullable=True, index=True)
+
+    billing_case_id = Column(
+        BigInteger,
+        ForeignKey("billing_cases.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+
+    payment_id = Column(
+        BigInteger,
+        ForeignKey("billing_payments.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    invoice_id = Column(
+        BigInteger,
+        ForeignKey("billing_invoices.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    # ✅ this MUST exist because DB has NOT NULL payer_bucket
+    payer_bucket = Column(
+        Enum(PayerType),  # PATIENT/INSURER/CORPORATE matches DB
+        nullable=False,
+        default=PayerType.PATIENT,
+    )
+
+    amount = Column(Money, nullable=False, default=0)
+
+    # ✅ audit columns (add in DB below)
+    status = Column(Enum(ReceiptStatus),
+                    nullable=False,
+                    default=ReceiptStatus.ACTIVE)
+    allocated_at = Column(DateTime, nullable=False, server_default=func.now())
+    allocated_by = Column(Integer, nullable=True)
+
+    voided_at = Column(DateTime, nullable=True)
+    voided_by = Column(Integer, nullable=True)
+    void_reason = Column(String(255), nullable=True)
+
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime,
+                        nullable=False,
+                        server_default=func.now(),
+                        onupdate=func.now())
+
+    payment = relationship("BillingPayment",
+                           back_populates="allocations",
+                           lazy="selectin")
+    invoice = relationship("BillingInvoice",
+                           back_populates="payment_allocations",
+                           lazy="selectin")
+
+
+# class BillingPaymentAllocation(Base):
+#     __tablename__ = "billing_payment_allocations"
+#     __table_args__ = (
+#         Index("ix_pay_alloc_case", "billing_case_id"),
+#         Index("ix_pay_alloc_invoice", "invoice_id"),
+#         Index("ix_pay_alloc_payment", "payment_id"),
+#         MYSQL_ARGS,
+#     )
+
+#     id = Column(BigInteger, primary_key=True,
+#                 autoincrement=True)  # ✅ add autoincrement
+#     tenant_id = Column(Integer, nullable=True, index=True)  # optional
+
+#     billing_case_id = Column(
+#         BigInteger,
+#         ForeignKey("billing_cases.id", ondelete="RESTRICT"),
+#         nullable=False,
+#         index=True,
+#     )
+
+#     payment_id = Column(
+#         BigInteger,  # ✅ FIX
+#         ForeignKey("billing_payments.id", ondelete="CASCADE"),
+#         nullable=False,
+#         index=True,
+#     )
+
+#     invoice_id = Column(
+#         BigInteger,  # ✅ FIX
+#         ForeignKey("billing_invoices.id", ondelete="SET NULL"),
+#         nullable=True,
+#         index=True,
+#     )
+
+#     amount = Column(Money, nullable=False, default=0)
+
+#     status = Column(Enum(ReceiptStatus),
+#                     nullable=False,
+#                     default=ReceiptStatus.ACTIVE)
+
+#     allocated_at = Column(DateTime, nullable=False, server_default=func.now())
+#     allocated_by = Column(Integer, nullable=True)
+
+#     voided_at = Column(DateTime, nullable=True)
+#     voided_by = Column(Integer, nullable=True)
+#     void_reason = Column(String(255), nullable=True)
+
+#     created_at = Column(DateTime, nullable=False, server_default=func.now())
+#     updated_at = Column(DateTime,
+#                         nullable=False,
+#                         server_default=func.now(),
+#                         onupdate=func.now())
+
+#     payment = relationship("BillingPayment",
+#                            back_populates="allocations",
+#                            lazy="selectin")
+#     invoice = relationship("BillingInvoice",
+#                            back_populates="payment_allocations",
+#                            lazy="selectin")
+
+
+class BillingAdvanceApplication(Base):
+    """
+    Tracks how advances are consumed when applying to invoices.
+    (Advance wallet -> applied as ADVANCE_ADJUSTMENT payment)
+    """
+    __tablename__ = "billing_advance_applications"
+    __table_args__ = (
+        Index("idx_baa_case", "billing_case_id"),
+        Index("idx_baa_advance", "advance_id"),
+        Index("idx_baa_payment", "payment_id"),
+        MYSQL_ARGS,
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+
+    billing_case_id = Column(
+        BigInteger,
+        ForeignKey("billing_cases.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+
+    advance_id = Column(
+        BigInteger,
+        ForeignKey("billing_advances.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+
+    payment_id = Column(
+        BigInteger,
+        ForeignKey("billing_payments.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    amount = Column(Money, nullable=False, default=0)
+
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
 
 
 # ============================================================

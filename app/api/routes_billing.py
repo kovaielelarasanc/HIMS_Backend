@@ -53,6 +53,7 @@ from app.services.billing_service import (
     post_invoice,
     void_invoice,
     record_payment,
+    record_payment_full,
     record_advance,
     BillingError,
     BillingStateError,
@@ -65,8 +66,172 @@ from app.services.billing_particulars import (
 )
 from app.schemas.charge_item_master import AddChargeItemLineIn, AddChargeItemLineOut
 from app.services.billing_charge_item_service import add_charge_item_line_to_invoice, fetch_idempotent_existing_line
+from app.services.billing_claims_service import (
+    upsert_draft_claim_from_invoice,
+    claim_submit,
+    claim_acknowledge,
+    claim_approve,
+    claim_settle,
+    claim_to_dict,
+    get_claim,
+)
+
+from app.services.billing_service import update_invoice_line, delete_invoice_line
+
+try:
+    from app.services.billing_finance import apply_advances_to_case, case_financials as case_financials_v2
+except Exception:
+    try:
+        from app.services.billing_service import apply_advances_to_case, case_financials_v2 as case_financials_v2  # type: ignore
+    except Exception:
+        apply_advances_to_case = None  # type: ignore
+        case_financials_v2 = None  # type: ignore
+
+import io
+import csv
+
+from fastapi.responses import StreamingResponse, Response
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import mm
 
 router = APIRouter(prefix="/billing", tags=["Billing"])
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+from typing import Any, Dict, Optional, Tuple, List, Union
+
+
+def _find_payment_row_in_obj(db: Session,
+                             obj: Any) -> Optional[BillingPayment]:
+    """
+    Try very hard to locate a BillingPayment ORM row inside an unknown return payload.
+    - If we find an ORM row -> return it
+    - If we find an id/payment_id -> db.get and return
+    - Recurses into dict/list/tuple
+    """
+    if obj is None:
+        return None
+
+    # ORM row directly
+    if isinstance(obj, BillingPayment):
+        return obj
+
+    # common "id carriers"
+    def _try_id(v: Any) -> Optional[BillingPayment]:
+        if v is None:
+            return None
+        try:
+            pid = int(v)
+        except Exception:
+            return None
+        row = db.get(BillingPayment, pid)
+        return row
+
+    # dict payload
+    if isinstance(obj, dict):
+        # If a nested "payment" exists
+        if "payment" in obj:
+            row = _find_payment_row_in_obj(db, obj.get("payment"))
+            if row:
+                return row
+
+        # Try common id keys
+        for k in ("payment_id", "billing_payment_id", "receipt_id", "id"):
+            if k in obj and obj.get(k) is not None:
+                row = _try_id(obj.get(k))
+                if row:
+                    return row
+
+        # Recurse values
+        for v in obj.values():
+            row = _find_payment_row_in_obj(db, v)
+            if row:
+                return row
+
+    # list/tuple/set payload
+    if isinstance(obj, (list, tuple, set)):
+        for v in obj:
+            row = _find_payment_row_in_obj(db, v)
+            if row:
+                return row
+
+    return None
+
+
+def _find_payment_dict_in_obj(obj: Any) -> Optional[Dict[str, Any]]:
+    """
+    If no ORM row is discoverable, try to find a serialized payment dict
+    (one that at least looks like a payment).
+    """
+    if obj is None:
+        return None
+
+    # Already a payment-like dict
+    if isinstance(obj, dict):
+        # common wrapper keys
+        if "payment" in obj and isinstance(obj["payment"], dict):
+            return obj["payment"]
+
+        # heuristic: looks like payment
+        keys = set(obj.keys())
+        if {"billing_case_id", "amount"
+            }.issubset(keys) and ("mode" in keys or "payer_type" in keys):
+            return obj
+
+        # search nested
+        for v in obj.values():
+            found = _find_payment_dict_in_obj(v)
+            if found:
+                return found
+
+    if isinstance(obj, (list, tuple, set)):
+        for v in obj:
+            found = _find_payment_dict_in_obj(v)
+            if found:
+                return found
+
+    return None
+
+
+def _extract_allocations(obj: Any) -> Optional[Any]:
+    """
+    Pull allocations if present. Handles different key names.
+    """
+    if isinstance(obj, dict):
+        for k in ("allocations", "allocation", "allocs",
+                  "payment_allocations"):
+            if k in obj:
+                return obj.get(k)
+        # also allow nested
+        if "data" in obj:
+            return _extract_allocations(obj.get("data"))
+    return None
+
+
+def _pick_status(enum_cls, *preferred_names: str):
+    """Return enum member if exists else None."""
+    for n in preferred_names:
+        if n and n in getattr(enum_cls, "__members__", {}):
+            return enum_cls[n]
+    return None
+
+
+def _require_perm_code(user: User, code: str):
+    # uses your existing deps.require_perm if present
+    if getattr(user, "is_admin", False):
+        return
+    from app.api.deps import require_perm
+    require_perm(user, code)
+
+
+def _money(x) -> str:
+    try:
+        return str(Decimal(str(x or 0)))
+    except Exception:
+        return "0"
 
 
 def _ensure_draft_misc_invoice_for_case(
@@ -234,7 +399,7 @@ def add_charge_item_to_case_misc_invoice(
 
     except IntegrityError:
         db.rollback()
-        if inp.idempotency_key:
+        if inp.idempotency_key and inv is not None:
             existing = fetch_idempotent_existing_line(
                 db,
                 billing_case_id=int(case.id),
@@ -307,6 +472,7 @@ def billing_particular_options(
         service_date_str=service_date,
     )
 
+
 class ParticularLineIn(BaseModel):
     # ✅ Pydantic v2
     model_config = {"populate_by_name": True, "extra": "ignore"}
@@ -337,6 +503,7 @@ class ParticularLineIn(BaseModel):
 
     # ✅ Pydantic v1
 
+
 class ParticularAddIn(BaseModel):
     model_config = {"populate_by_name": True, "extra": "ignore"}
 
@@ -366,8 +533,6 @@ class ParticularAddIn(BaseModel):
     hours: Optional[Decimal] = None
 
     lines: Optional[List[ParticularLineIn]] = None
-
-    
 
 
 @router.post("/cases/{case_id}/particulars/{code}/add")
@@ -859,9 +1024,13 @@ def case_invoice_summary(
     def group_label(key: str) -> str:
         if key.startswith("INV:"):
             iid = int(key.split(":")[1])
-            inv = next((x for (x, _) in rows if int(x.id) == iid), None)
-            if inv:
-                return f"{(inv.module or 'MISC').upper()} · {inv.invoice_number or f'#{inv.id}'}"
+            inv_obj = next(
+                (inv for (inv, ln, doc, dept) in rows if int(inv.id) == iid),
+                None)
+            if inv_obj:
+                mod2 = (inv_obj.module or "MISC").upper()
+                num = inv_obj.invoice_number or f"#{inv_obj.id}"
+                return f"{mod2} · {num}"
             return f"Invoice #{iid}"
         if gb == "service_group":
             return key
@@ -1119,30 +1288,18 @@ def _line_to_dict(
 
 def _payment_to_dict(p: BillingPayment) -> Dict[str, Any]:
     return {
-        "id":
-        int(p.id),
-        "billing_case_id":
-        int(p.billing_case_id),
-        "invoice_id":
-        int(p.invoice_id) if p.invoice_id else None,
-        "payer_type":
-        _enum_value(p.payer_type),
-        "payer_id":
-        p.payer_id,
-        "mode":
-        _enum_value(p.mode),
-        "amount":
-        str(getattr(p, "amount", 0) or 0),
-        "txn_ref":
-        getattr(p, "txn_ref", None),
-        "notes":
-        getattr(p, "notes", None),
-        "received_at":
-        p.received_at.isoformat() if getattr(p, "received_at", None) else None,
-        "created_at":
-        p.created_at.isoformat() if getattr(p, "created_at", None) else None,
-        "received_by":
-        getattr(p, "received_by", None),
+        "id": int(p.id),
+        "billing_case_id": int(p.billing_case_id),
+        "invoice_id": int(p.invoice_id) if p.invoice_id else None,
+        "payer_type": _enum_value(getattr(p, "payer_type", None)),
+        "payer_id": getattr(p, "payer_id", None),
+        "mode": _enum_value(getattr(p, "mode", None)),
+        "amount": str(getattr(p, "amount", 0) or 0),
+        "txn_ref": getattr(p, "txn_ref", None),
+        "notes": getattr(p, "notes", None),
+        "received_at": p.received_at.isoformat() if getattr(p, "received_at", None) else None,
+        "created_at": p.created_at.isoformat() if getattr(p, "created_at", None) else None,
+        "received_by": getattr(p, "received_by", None),
     }
 
 
@@ -1168,10 +1325,8 @@ def _get_case_or_404(db: Session, user: User, case_id: int) -> BillingCase:
     return c
 
 
-def _get_invoice_or_404(db: Session, user: User,
-                        invoice_id: int) -> BillingInvoice:
-    inv = db.query(BillingInvoice).filter(
-        BillingInvoice.id == int(invoice_id)).first()
+def _get_invoice_or_404(db: Session, user: User, invoice_id: int) -> BillingInvoice:
+    inv = db.query(BillingInvoice).filter(BillingInvoice.id == int(invoice_id)).first()
     if not inv:
         raise HTTPException(status_code=404, detail="Invoice not found")
     return inv
@@ -1944,6 +2099,102 @@ def list_invoice_lines(
         _err(e)
 
 
+class InvoiceLineUpdateIn(BaseModel):
+    model_config = {"extra": "ignore"}
+
+    qty: Optional[Decimal] = None
+    unit_price: Optional[Decimal] = None
+    gst_rate: Optional[Decimal] = None
+    discount_percent: Optional[Decimal] = None
+    discount_amount: Optional[Decimal] = None
+    description: Optional[str] = None
+    doctor_id: Optional[int] = None
+    service_date: Optional[datetime] = None
+    meta_json: Optional[Dict[str, Any]] = None
+
+    reason: str = Field(..., min_length=3, max_length=255)
+
+
+@router.put("/lines/{line_id}")
+def update_line(
+        line_id: int,
+        inp: InvoiceLineUpdateIn,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    try:
+        ln = db.get(BillingInvoiceLine, int(line_id))
+        if not ln:
+            raise HTTPException(status_code=404,
+                                detail="Invoice line not found")
+
+        inv = _get_invoice_or_404(db, user, int(ln.invoice_id))
+
+        # ✅ allow edit only in DRAFT/APPROVED (approved requires reopen flow usually)
+        st = str(_enum_value(inv.status) or "").upper()
+        if st not in {"DRAFT", "APPROVED"}:
+            raise HTTPException(status_code=409, detail="Invoice locked")
+
+        # ✅ Permission gate
+        from app.api.deps import require_perm
+        if not getattr(user, "is_admin", False):
+            require_perm(user, "billing.invoice.lines.edit")
+
+        updated = update_invoice_line(
+            db,
+            line_id=int(line_id),
+            user=user,
+            qty=inp.qty,
+            unit_price=inp.unit_price,
+            gst_rate=inp.gst_rate,
+            discount_percent=inp.discount_percent,
+            discount_amount=inp.discount_amount,
+            description=inp.description,
+            doctor_id=inp.doctor_id,
+            service_date=inp.service_date,
+            meta_json=inp.meta_json,
+            reason=inp.reason,
+        )
+
+        db.commit()
+        db.refresh(updated)
+        return {"line": _line_to_dict(updated, inv=inv)}
+
+    except Exception as e:
+        db.rollback()
+        _err(e)
+
+
+@router.delete("/lines/{line_id}")
+def delete_line(
+        line_id: int,
+        reason: str = Query(..., min_length=3, max_length=255),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    try:
+        ln = db.get(BillingInvoiceLine, int(line_id))
+        if not ln:
+            return {"ok": True}  # ✅ idempotent delete
+
+        inv = _get_invoice_or_404(db, user, int(ln.invoice_id))
+        st = str(_enum_value(inv.status) or "").upper()
+        if st not in {"DRAFT", "APPROVED"}:
+            raise HTTPException(status_code=409, detail="Invoice locked")
+
+        from app.api.deps import require_perm
+        if not getattr(user, "is_admin", False):
+            require_perm(user, "billing.invoice.lines.delete")
+
+        delete_invoice_line(db, line_id=int(line_id), user=user, reason=reason)
+        db.commit()
+        return {"ok": True}
+
+    except Exception as e:
+        db.rollback()
+        _err(e)
+
+
 @router.get("/invoices/{invoice_id}/payments")
 def list_invoice_payments(
         invoice_id: int,
@@ -2017,17 +2268,22 @@ def create_case_invoice(
 # ============================================================
 class ManualLineCreateIn(BaseModel):
     service_group: ServiceGroup
-    description: str
-    qty: Decimal = Decimal("1")
-    unit_price: Decimal = Decimal("0")
-    gst_rate: Decimal = Decimal("0")
-    discount_percent: Decimal = Decimal("0")
-    discount_amount: Decimal = Decimal("0")
+    description: str = Field(..., min_length=2, max_length=255)
+
+    qty: Decimal = Field(default=Decimal("1"), gt=0)
+    unit_price: Decimal = Field(default=Decimal("0"), ge=0)
+
+    gst_rate: Decimal = Field(default=Decimal("0"), ge=0, le=100)
+    discount_percent: Decimal = Field(default=Decimal("0"), ge=0, le=100)
+    discount_amount: Decimal = Field(default=Decimal("0"), ge=0)
+
     item_type: Optional[str] = None
     item_id: Optional[int] = None
     item_code: Optional[str] = None
+
     doctor_id: Optional[int] = None
-    manual_reason: Optional[str] = "Manual entry"
+    manual_reason: Optional[str] = Field(default="Manual entry",
+                                         max_length=255)
 
     service_date: Optional[datetime] = None
     meta_json: Optional[Dict[str, Any]] = None
@@ -2259,9 +2515,16 @@ def post(
 ):
     try:
         _get_invoice_or_404(db, user, invoice_id)
-        inv = post_invoice(db, invoice_id=invoice_id, user=user)
+
+        # ✅ IMPORTANT: make billing_service.post_invoice return (inv, claim)
+        inv, claim = post_invoice(db, invoice_id=invoice_id, user=user)
+
         db.commit()
-        return {"id": int(inv.id), "status": _enum_value(inv.status)}
+        return {
+            "id": int(inv.id),
+            "status": _enum_value(inv.status),
+            "claim": claim_to_dict(claim) if claim else None,
+        }
     except Exception as e:
         db.rollback()
         _err(e)
@@ -2284,67 +2547,183 @@ def void(
         _err(e)
 
 
+class PaymentIn(BaseModel):
+    amount: Decimal = Field(..., gt=0)
+    mode: PayMode = PayMode.CASH
+    invoice_id: Optional[int] = None
+    txn_ref: Optional[str] = None
+    notes: Optional[str] = None
+    payer_type: PayerType = PayerType.PATIENT
+    payer_id: Optional[int] = None
+
+
 # ============================================================
 # ✅ Payments / Advances
 # ============================================================
 @router.post("/cases/{case_id}/payments")
 def pay(
-        case_id: int,
-        amount: Decimal,
-        mode: PayMode = PayMode.CASH,
-        invoice_id: Optional[int] = None,
-        txn_ref: Optional[str] = None,
-        notes: Optional[str] = None,
-        db: Session = Depends(get_db),
-        user: User = Depends(current_user),
+    case_id: int,
+
+    # ✅ allow JSON body (recommended)
+    inp: Optional[PaymentIn] = Body(default=None),
+
+    # ✅ backward-compatible query params
+    amount: Optional[Decimal] = Query(default=None),
+    mode: PayMode = Query(default=PayMode.CASH),
+    invoice_id: Optional[int] = Query(default=None),
+    txn_ref: Optional[str] = Query(default=None),
+    notes: Optional[str] = Query(default=None),
+    payer_type: PayerType = Query(default=PayerType.PATIENT),
+    payer_id: Optional[int] = Query(default=None),
+
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
 ):
     try:
-        _get_case_or_404(db, user, case_id)
+        _get_case_or_404(db, user, int(case_id))
 
+        # ✅ merge body over query params (only if body values are not None)
+        if inp is not None:
+            if inp.amount is not None:
+                amount = inp.amount
+            if inp.mode is not None:
+                mode = inp.mode
+            if inp.invoice_id is not None:
+                invoice_id = inp.invoice_id
+            if inp.txn_ref is not None:
+                txn_ref = inp.txn_ref
+            if inp.notes is not None:
+                notes = inp.notes
+            if inp.payer_type is not None:
+                payer_type = inp.payer_type
+            if inp.payer_id is not None:
+                payer_id = inp.payer_id
+
+        if amount is None:
+            raise HTTPException(status_code=422, detail="amount is required")
+
+        # ✅ choose invoice (POSTED preferred, else APPROVED)
         inv_id = invoice_id
         if inv_id is None:
-            inv_id = (db.query(BillingInvoice.id).filter(
-                BillingInvoice.billing_case_id == int(case_id)).filter(
-                    BillingInvoice.status == DocStatus.POSTED).order_by(
-                        desc(BillingInvoice.created_at)).limit(1).scalar())
+            inv_id = (
+                db.query(BillingInvoice.id)
+                .filter(BillingInvoice.billing_case_id == int(case_id))
+                .filter(BillingInvoice.status == DocStatus.POSTED)
+                .order_by(desc(BillingInvoice.created_at))
+                .limit(1)
+                .scalar()
+            )
+
             if inv_id is None:
-                inv_id = (db.query(BillingInvoice.id).filter(
-                    BillingInvoice.billing_case_id == int(case_id)).filter(
-                        BillingInvoice.status == DocStatus.APPROVED).order_by(
-                            desc(BillingInvoice.created_at)).limit(1).scalar())
+                inv_id = (
+                    db.query(BillingInvoice.id)
+                    .filter(BillingInvoice.billing_case_id == int(case_id))
+                    .filter(BillingInvoice.status == DocStatus.APPROVED)
+                    .order_by(desc(BillingInvoice.created_at))
+                    .limit(1)
+                    .scalar()
+                )
 
             if inv_id is None:
                 raise HTTPException(
                     status_code=409,
-                    detail="No APPROVED/POSTED invoice found for this case")
+                    detail="No APPROVED/POSTED invoice found for this case",
+                )
 
         inv = _get_invoice_or_404(db, user, int(inv_id))
+
+        # ✅ hard validations (4xx, not 500)
         if int(inv.billing_case_id) != int(case_id):
             raise HTTPException(
                 status_code=400,
-                detail="Selected invoice does not belong to this case")
+                detail="Selected invoice does not belong to this case",
+            )
 
-        p = record_payment(
+        if inv.status not in (DocStatus.APPROVED, DocStatus.POSTED):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Invoice must be APPROVED/POSTED to accept payments (current: {inv.status})",
+            )
+
+        # ✅ record payment (always returns ORM now)
+        pay_row, allocations = record_payment_full(
             db,
-            billing_case_id=case_id,
+            billing_case_id=int(case_id),
             user=user,
-            amount=amount,
+            amount=Decimal(str(amount)),
             mode=mode,
             invoice_id=int(inv_id),
             txn_ref=txn_ref,
             notes=notes,
+            payer_type=payer_type,
+            payer_id=payer_id,
         )
+
         db.commit()
-        db.refresh(p)
-        return {
-            "id": int(p.id),
-            "amount": str(p.amount),
-            "mode": _enum_value(p.mode),
-            "invoice_id": int(p.invoice_id) if p.invoice_id else None
-        }
+
+        # ✅ refresh only ORM row (it is guaranteed by wrapper)
+        try:
+            db.refresh(pay_row)
+        except Exception:
+            # should not happen now, but keep it defensive
+            pass
+
+        out: Dict[str, Any] = {"payment": _payment_to_dict(pay_row)}
+        if allocations is not None:
+            out["allocations"] = allocations
+        return out
+
+    except HTTPException:
+        db.rollback()
+        raise
+
+    except IntegrityError as e:
+        db.rollback()
+        logger.exception("Payment IntegrityError")
+        raise HTTPException(
+            status_code=409,
+            detail="Payment could not be recorded due to a database constraint.",
+        ) from e
+
+    except Exception as e:
+        db.rollback()
+        logger.exception("Unhandled error in /payments")
+        raise HTTPException(status_code=500, detail="Internal Server Error") from e
+
+
+@router.post("/cases/{case_id}/advances/apply")
+def apply_advance_to_invoices(
+        case_id: int,
+        max_apply_amount: Optional[Decimal] = None,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    if apply_advances_to_case is None:
+        raise HTTPException(status_code=501,
+                            detail="apply_advances_to_case not wired")
+
+    try:
+        _get_case_or_404(db, user, case_id)
+        res = apply_advances_to_case(db,
+                                     billing_case_id=case_id,
+                                     user=user,
+                                     max_apply_amount=max_apply_amount)
+        db.commit()
+        return {"ok": True, **res}
     except Exception as e:
         db.rollback()
         _err(e)
+
+
+@router.get("/cases/{case_id}/finance")
+def case_finance(case_id: int,
+                 db: Session = Depends(get_db),
+                 user: User = Depends(current_user)):
+    _get_case_or_404(db, user, case_id)
+    if case_financials_v2 is None:
+        raise HTTPException(status_code=501,
+                            detail="case_financials_v2 not wired")
+    return {"ok": True, "finance": case_financials_v2(db, case_id=case_id)}
 
 
 @router.post("/cases/{case_id}/advances")
@@ -2397,6 +2776,625 @@ def advance(
         }
     except Exception as e:
         db.rollback()
+        _err(e)
+
+
+# ============================================================
+# ✅ Refunds (Deposit / Advance Refund)
+# ============================================================
+class RefundIn(BaseModel):
+    amount: Decimal = Field(..., gt=0)
+    mode: PayMode = PayMode.CASH
+    txn_ref: Optional[str] = None
+    remarks: Optional[str] = None
+    # optional: if you want to restrict refund to "advance balance only"
+    strict_deposit_refund: bool = True
+
+
+@router.get("/cases/{case_id}/refunds")
+def list_case_refunds(
+        case_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    try:
+        _get_case_or_404(db, user, case_id)
+        rows = (db.query(BillingAdvance).filter(
+            BillingAdvance.billing_case_id == int(case_id)).filter(
+                BillingAdvance.entry_type == AdvanceType.REFUND).order_by(
+                    desc(BillingAdvance.entry_at)).all())
+        return {"items": [_advance_to_dict(x) for x in rows]}
+    except Exception as e:
+        _err(e)
+
+
+@router.post("/cases/{case_id}/refunds")
+def refund_deposit(
+        case_id: int,
+        inp: RefundIn,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    """
+    Refund workflow:
+    - Uses BillingAdvance entry_type=REFUND
+    - Validates refundable balance (advance - refunds - applied_to_invoices*) if strict_deposit_refund=True
+    - If strict_deposit_refund=False, allows refund even if overpaid scenario exists (rare; but some hospitals do).
+    """
+    try:
+        _get_case_or_404(db, user, case_id)
+        _require_perm_code(user, "billing.refunds.create")
+
+        # deposit totals
+        adv = (db.query(func.coalesce(
+            func.sum(BillingAdvance.amount),
+            0)).filter(BillingAdvance.billing_case_id == int(case_id)).filter(
+                BillingAdvance.entry_type == AdvanceType.ADVANCE).scalar()
+               ) or 0
+
+        refunds = (db.query(func.coalesce(
+            func.sum(BillingAdvance.amount),
+            0)).filter(BillingAdvance.billing_case_id == int(case_id)).filter(
+                BillingAdvance.entry_type == AdvanceType.REFUND).scalar()) or 0
+
+        adv = Decimal(str(adv or 0))
+        refunds = Decimal(str(refunds or 0))
+        refundable = adv - refunds
+
+        if inp.strict_deposit_refund and inp.amount > refundable:
+            raise HTTPException(
+                status_code=409,
+                detail=
+                f"Refund exceeds refundable deposit. Refundable={refundable}",
+            )
+
+        # record refund as an Advance entry with entry_type=REFUND
+        try:
+            a = record_advance(
+                db,
+                billing_case_id=int(case_id),
+                user=user,
+                amount=Decimal(str(inp.amount)),
+                entry_type=AdvanceType.REFUND,
+                mode=inp.mode,
+                txn_ref=inp.txn_ref,
+                remarks=(inp.remarks or "").strip() or None,
+            )
+        except TypeError:
+            # backward compat signature
+            a = record_advance(
+                db,
+                billing_case_id=int(case_id),
+                user=user,
+                amount=Decimal(str(inp.amount)),
+                advance_type=AdvanceType.REFUND,
+                mode=inp.mode,
+                txn_ref=inp.txn_ref,
+                notes=(inp.remarks or "").strip() or None,
+            )
+
+        db.commit()
+        db.refresh(a)
+        return {
+            "ok": True,
+            "refund": _advance_to_dict(a),
+            "refundable_balance": str(refundable - inp.amount)
+        }
+
+    except Exception as e:
+        db.rollback()
+        _err(e)
+
+
+# ============================================================
+# ✅ Claims: Reject / Cancel / Reopen (Lifecycle controls)
+# ============================================================
+class ClaimDecisionIn(BaseModel):
+    remarks: str = ""
+    reason_code: Optional[str] = None
+    amount: Optional[
+        Decimal] = None  # optional: rejection may include allowed amount / deductions
+
+
+def _claim_status_name(c: BillingClaim) -> str:
+    return str(_enum_value(getattr(c, "status", "") or "")).upper()
+
+
+@router.post("/claims/{claim_id}/reject")
+def reject_claim(
+        claim_id: int,
+        inp: ClaimDecisionIn = Body(default=ClaimDecisionIn()),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    """
+    Reject/deny a claim:
+    - allowed from SUBMITTED/ACKNOWLEDGED (typically)
+    - sets status to REJECTED (or DENIED if your enum uses that)
+    """
+    try:
+        _require_perm_code(user, "billing.claims.reject")
+        c = get_claim(db, int(claim_id))
+
+        cur = _claim_status_name(c)
+        allowed = {"SUBMITTED", "ACKNOWLEDGED", "UNDER_REVIEW"}
+        if cur not in allowed:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Claim cannot be rejected from status={cur}")
+
+        st_rejected = (_pick_status(ClaimStatus, "REJECTED")
+                       or _pick_status(ClaimStatus, "DENIED")
+                       or _pick_status(ClaimStatus, "CANCELLED"))
+        if st_rejected is None:
+            raise HTTPException(
+                status_code=500,
+                detail="ClaimStatus missing REJECTED/DENIED in enum")
+
+        c.status = st_rejected
+        if hasattr(c, "remarks"):
+            c.remarks = (inp.remarks or "").strip() or None
+
+        # optional fields if your model has them
+        if inp.reason_code and hasattr(c, "reason_code"):
+            setattr(c, "reason_code", inp.reason_code)
+
+        db.add(c)
+        db.commit()
+        db.refresh(c)
+        return {"claim": claim_to_dict(c)}
+
+    except Exception as e:
+        db.rollback()
+        _err(e)
+
+
+@router.post("/claims/{claim_id}/cancel")
+def cancel_claim(
+        claim_id: int,
+        inp: ClaimDecisionIn = Body(default=ClaimDecisionIn()),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    """
+    Cancel claim (hospital cancels the submission):
+    - allowed from DRAFT/SUBMITTED/ACKNOWLEDGED
+    """
+    try:
+        _require_perm_code(user, "billing.claims.cancel")
+        c = get_claim(db, int(claim_id))
+        cur = _claim_status_name(c)
+
+        allowed = {"DRAFT", "SUBMITTED", "ACKNOWLEDGED"}
+        if cur not in allowed:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Claim cannot be cancelled from status={cur}")
+
+        st_cancel = _pick_status(ClaimStatus, "CANCELLED") or _pick_status(
+            ClaimStatus, "VOID")
+        if st_cancel is None:
+            raise HTTPException(
+                status_code=500,
+                detail="ClaimStatus missing CANCELLED/VOID in enum")
+
+        c.status = st_cancel
+        if hasattr(c, "remarks"):
+            c.remarks = (inp.remarks or "").strip() or None
+
+        db.add(c)
+        db.commit()
+        db.refresh(c)
+        return {"claim": claim_to_dict(c)}
+
+    except Exception as e:
+        db.rollback()
+        _err(e)
+
+
+@router.post("/claims/{claim_id}/reopen")
+def reopen_claim(
+        claim_id: int,
+        inp: ClaimDecisionIn = Body(default=ClaimDecisionIn()),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    """
+    Reopen claim back to DRAFT:
+    - allowed from REJECTED/DENIED/CANCELLED (depending on your enum)
+    """
+    try:
+        _require_perm_code(user, "billing.claims.reopen")
+        c = get_claim(db, int(claim_id))
+        cur = _claim_status_name(c)
+
+        allowed = {"REJECTED", "DENIED", "CANCELLED", "VOID"}
+        if cur not in allowed:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Claim cannot be reopened from status={cur}")
+
+        st_draft = _pick_status(ClaimStatus, "DRAFT")
+        if st_draft is None:
+            raise HTTPException(status_code=500,
+                                detail="ClaimStatus missing DRAFT in enum")
+
+        c.status = st_draft
+        if hasattr(c, "remarks") and inp.remarks:
+            c.remarks = (inp.remarks or "").strip() or None
+
+        db.add(c)
+        db.commit()
+        db.refresh(c)
+        return {"claim": claim_to_dict(c)}
+
+    except Exception as e:
+        db.rollback()
+        _err(e)
+
+
+# ============================================================
+# ✅ Invoice Print / Export (PDF + CSV)
+# ============================================================
+def _render_invoice_pdf_bytes(db: Session, invoice_id: int) -> bytes:
+    inv = db.query(BillingInvoice).filter(
+        BillingInvoice.id == int(invoice_id)).first()
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+
+    case = db.query(BillingCase).filter(
+        BillingCase.id == int(inv.billing_case_id)).first()
+    patient = db.query(Patient).filter(
+        Patient.id == int(case.patient_id)).first() if case else None
+
+    lines = (db.query(BillingInvoiceLine).filter(
+        BillingInvoiceLine.invoice_id == int(inv.id)).order_by(
+            BillingInvoiceLine.id.asc()).all())
+
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    w, h = A4
+
+    left = 15 * mm
+    top = h - 15 * mm
+    y = top
+
+    # Header
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(left, y, "TAX INVOICE")
+    y -= 6 * mm
+
+    c.setFont("Helvetica", 9)
+    inv_no = inv.invoice_number or f"INV-{inv.id}"
+    c.drawString(left, y, f"Invoice No: {inv_no}")
+    c.drawRightString(
+        w - left, y,
+        f"Date: {(getattr(inv, 'created_at', None) or datetime.utcnow()).strftime('%d-%m-%Y')}"
+    )
+    y -= 6 * mm
+
+    # Patient / Case
+    pname = None
+    if patient:
+        first_col, last_col, full_col = _patient_name_cols()
+        if full_col is not None:
+            pname = (getattr(patient, full_col.key, None)
+                     or "").strip() or None
+        else:
+            fn = (getattr(patient, first_col.key, "")
+                  if first_col else "") or ""
+            ln = (getattr(patient, last_col.key, "") if last_col else "") or ""
+            pname = f"{fn} {ln}".strip() or None
+
+    c.drawString(
+        left, y,
+        f"Patient: {pname or ('#'+str(case.patient_id) if case else '-')}")
+    if case:
+        c.drawRightString(w - left, y, f"Case: {case.case_number}")
+    y -= 6 * mm
+
+    if case:
+        c.drawString(
+            left, y,
+            f"Encounter: {_enum_value(case.encounter_type)} / {case.encounter_id}"
+        )
+        c.drawRightString(w - left, y, f"Payer: {_enum_value(inv.payer_type)}")
+        y -= 8 * mm
+
+    # Table header
+    c.setFont("Helvetica-Bold", 9)
+    c.drawString(left, y, "S.No")
+    c.drawString(left + 12 * mm, y, "Description")
+    c.drawRightString(w - left - 45 * mm, y, "Qty")
+    c.drawRightString(w - left - 25 * mm, y, "Rate")
+    c.drawRightString(w - left, y, "Amount")
+    y -= 4 * mm
+    c.line(left, y, w - left, y)
+    y -= 5 * mm
+
+    c.setFont("Helvetica", 9)
+    sn = 1
+    for ln in lines:
+        if y < 25 * mm:
+            c.showPage()
+            y = top
+            c.setFont("Helvetica", 9)
+
+        desc_txt = (ln.description or "")[:70]
+        qty = _money(getattr(ln, "qty", 0))
+        rate = _money(getattr(ln, "unit_price", 0))
+        amt = _money(getattr(ln, "net_amount", 0))
+
+        c.drawString(left, y, str(sn))
+        c.drawString(left + 12 * mm, y, desc_txt)
+        c.drawRightString(w - left - 45 * mm, y, qty)
+        c.drawRightString(w - left - 25 * mm, y, rate)
+        c.drawRightString(w - left, y, amt)
+        y -= 6 * mm
+        sn += 1
+
+    # Totals
+    if y < 45 * mm:
+        c.showPage()
+        y = top
+
+    y -= 2 * mm
+    c.line(left, y, w - left, y)
+    y -= 8 * mm
+
+    c.setFont("Helvetica-Bold", 10)
+    c.drawRightString(w - left - 30 * mm, y, "Grand Total:")
+    c.drawRightString(w - left, y, _money(getattr(inv, "grand_total", 0)))
+    y -= 10 * mm
+
+    c.setFont("Helvetica", 8)
+    c.drawString(left, y, "This is a computer generated invoice.")
+    c.showPage()
+    c.save()
+
+    return buf.getvalue()
+
+
+@router.get("/invoices/{invoice_id}/print")
+def print_invoice_pdf(
+        invoice_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    try:
+        _require_perm_code(user, "billing.invoice.print")
+        _get_invoice_or_404(db, user, invoice_id)
+
+        pdf_bytes = _render_invoice_pdf_bytes(db, int(invoice_id))
+        return StreamingResponse(
+            io.BytesIO(pdf_bytes),
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition":
+                f'inline; filename="invoice_{invoice_id}.pdf"'
+            },
+        )
+    except Exception as e:
+        _err(e)
+
+
+@router.get("/invoices/{invoice_id}/export.csv")
+def export_invoice_csv(
+        invoice_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    try:
+        _require_perm_code(user, "billing.invoice.export")
+        inv = _get_invoice_or_404(db, user, invoice_id)
+
+        lines = (db.query(BillingInvoiceLine).filter(
+            BillingInvoiceLine.invoice_id == int(inv.id)).order_by(
+                BillingInvoiceLine.id.asc()).all())
+
+        output = io.StringIO()
+        wtr = csv.writer(output)
+        wtr.writerow([
+            "invoice_id", "invoice_number", "line_id", "service_group",
+            "description", "qty", "unit_price", "gst_rate", "discount_amount",
+            "tax_amount", "net_amount"
+        ])
+        for ln in lines:
+            wtr.writerow([
+                int(inv.id),
+                inv.invoice_number,
+                int(ln.id),
+                _enum_value(ln.service_group),
+                ln.description,
+                _money(getattr(ln, "qty", 0)),
+                _money(getattr(ln, "unit_price", 0)),
+                _money(getattr(ln, "gst_rate", 0)),
+                _money(getattr(ln, "discount_amount", 0)),
+                _money(getattr(ln, "tax_amount", 0)),
+                _money(getattr(ln, "net_amount", 0)),
+            ])
+
+        data = output.getvalue().encode("utf-8")
+        return Response(
+            content=data,
+            media_type="text/csv",
+            headers={
+                "Content-Disposition":
+                f'attachment; filename="invoice_{invoice_id}.csv"'
+            },
+        )
+    except Exception as e:
+        _err(e)
+
+
+# ============================================================
+# ✅ Case Statement Print (PDF)
+# ============================================================
+def _render_case_statement_pdf_bytes(db: Session, case_id: int) -> bytes:
+    cse = db.query(BillingCase).filter(BillingCase.id == int(case_id)).first()
+    if not cse:
+        raise HTTPException(status_code=404, detail="Billing case not found")
+
+    patient = db.query(Patient).filter(
+        Patient.id == int(cse.patient_id)).first()
+
+    invoices = (db.query(BillingInvoice).filter(
+        BillingInvoice.billing_case_id == int(case_id)).order_by(
+            desc(BillingInvoice.created_at)).all())
+
+    payments = (db.query(BillingPayment).filter(
+        BillingPayment.billing_case_id == int(case_id)).order_by(
+            desc(BillingPayment.received_at)).all())
+
+    advances = (db.query(BillingAdvance).filter(
+        BillingAdvance.billing_case_id == int(case_id)).order_by(
+            desc(BillingAdvance.entry_at)).all())
+
+    buf = io.BytesIO()
+    cv = canvas.Canvas(buf, pagesize=A4)
+    w, h = A4
+    left = 15 * mm
+    y = h - 15 * mm
+
+    cv.setFont("Helvetica-Bold", 12)
+    cv.drawString(left, y, "BILLING CASE STATEMENT")
+    y -= 8 * mm
+
+    cv.setFont("Helvetica", 9)
+    cv.drawString(
+        left, y,
+        f"Case: {cse.case_number}   Encounter: {_enum_value(cse.encounter_type)} / {cse.encounter_id}"
+    )
+    y -= 5 * mm
+    cv.drawString(left, y, f"Patient ID: {cse.patient_id}")
+    y -= 8 * mm
+
+    # Invoices
+    cv.setFont("Helvetica-Bold", 10)
+    cv.drawString(left, y, "Invoices")
+    y -= 6 * mm
+
+    cv.setFont("Helvetica-Bold", 9)
+    cv.drawString(left, y, "No")
+    cv.drawString(left + 20 * mm, y, "Invoice No")
+    cv.drawString(left + 55 * mm, y, "Module")
+    cv.drawString(left + 85 * mm, y, "Status")
+    cv.drawRightString(w - left, y, "Amount")
+    y -= 4 * mm
+    cv.line(left, y, w - left, y)
+    y -= 6 * mm
+
+    cv.setFont("Helvetica", 9)
+    total_invoice = Decimal("0")
+    for i, inv in enumerate(invoices, start=1):
+        if y < 25 * mm:
+            cv.showPage()
+            y = h - 15 * mm
+            cv.setFont("Helvetica", 9)
+
+        amt = Decimal(str(getattr(inv, "grand_total", 0) or 0))
+        total_invoice += amt
+        cv.drawString(left, y, str(i))
+        cv.drawString(left + 20 * mm, y, inv.invoice_number or f"#{inv.id}")
+        cv.drawString(left + 55 * mm, y, (inv.module or "MISC"))
+        cv.drawString(left + 85 * mm, y, str(_enum_value(inv.status)))
+        cv.drawRightString(w - left, y, str(amt))
+        y -= 6 * mm
+
+    y -= 4 * mm
+    cv.setFont("Helvetica-Bold", 10)
+    cv.drawRightString(w - left - 30 * mm, y, "Total Invoices:")
+    cv.drawRightString(w - left, y, str(total_invoice))
+    y -= 10 * mm
+
+    # Payments
+    cv.setFont("Helvetica-Bold", 10)
+    cv.drawString(left, y, "Payments")
+    y -= 6 * mm
+
+    cv.setFont("Helvetica", 9)
+    total_paid = Decimal("0")
+    for p in payments:
+        if y < 25 * mm:
+            cv.showPage()
+            y = h - 15 * mm
+            cv.setFont("Helvetica", 9)
+        amt = Decimal(str(getattr(p, "amount", 0) or 0))
+        total_paid += amt
+        cv.drawString(
+            left, y,
+            f"{(getattr(p, 'received_at', None) or getattr(p, 'created_at', None) or datetime.utcnow()).strftime('%d-%m-%Y')}  {_enum_value(p.mode)}  {amt}"
+        )
+        y -= 6 * mm
+
+    # Advances/Refunds
+    y -= 4 * mm
+    cv.setFont("Helvetica-Bold", 10)
+    cv.drawString(left, y, "Advances / Refunds")
+    y -= 6 * mm
+
+    cv.setFont("Helvetica", 9)
+    adv_total = Decimal("0")
+    ref_total = Decimal("0")
+    for a in advances:
+        if y < 25 * mm:
+            cv.showPage()
+            y = h - 15 * mm
+            cv.setFont("Helvetica", 9)
+        amt = Decimal(str(getattr(a, "amount", 0) or 0))
+        et = str(_enum_value(getattr(a, "entry_type", None)) or "")
+        if et.upper() == "ADVANCE":
+            adv_total += amt
+        elif et.upper() == "REFUND":
+            ref_total += amt
+        cv.drawString(
+            left, y,
+            f"{(getattr(a, 'entry_at', None) or datetime.utcnow()).strftime('%d-%m-%Y')}  {et}  {_enum_value(getattr(a,'mode',None))}  {amt}"
+        )
+        y -= 6 * mm
+
+    y -= 6 * mm
+    cv.setFont("Helvetica-Bold", 10)
+    cv.drawRightString(w - left - 30 * mm, y, "Total Paid:")
+    cv.drawRightString(w - left, y, str(total_paid))
+    y -= 6 * mm
+
+    cv.drawRightString(w - left - 30 * mm, y, "Net Deposit:")
+    cv.drawRightString(w - left, y, str(adv_total - ref_total))
+    y -= 6 * mm
+
+    cv.drawRightString(w - left - 30 * mm, y, "Balance:")
+    cv.drawRightString(w - left, y, str(total_invoice - total_paid))
+    y -= 10 * mm
+
+    cv.setFont("Helvetica", 8)
+    cv.drawString(left, y, "Statement generated by system.")
+    cv.showPage()
+    cv.save()
+
+    return buf.getvalue()
+
+
+@router.get("/cases/{case_id}/statement/print")
+def print_case_statement_pdf(
+        case_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    try:
+        _require_perm_code(user, "billing.case.statement.print")
+        _get_case_or_404(db, user, int(case_id))
+
+        pdf_bytes = _render_case_statement_pdf_bytes(db, int(case_id))
+        return StreamingResponse(
+            io.BytesIO(pdf_bytes),
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition":
+                f'inline; filename="case_statement_{case_id}.pdf"'
+            },
+        )
+    except Exception as e:
         _err(e)
 
 
@@ -2511,27 +3509,1282 @@ def upsert_insurance_case(
         user: User = Depends(current_user),
 ):
     try:
-        _get_case_or_404(db, user, case_id)
+        c = _get_case_or_404(db, user, case_id)
+
+        # ✅ REQUIRED validations based on payer_kind
+        pk = _enum_value(inp.payer_kind)
+        if pk == "INSURANCE" and not inp.insurance_company_id:
+            raise HTTPException(
+                status_code=422,
+                detail=
+                "insurance_company_id is required for payer_kind=INSURANCE")
+        if pk == "TPA" and not inp.tpa_id:
+            raise HTTPException(status_code=422,
+                                detail="tpa_id is required for payer_kind=TPA")
+        if pk == "CORPORATE" and not inp.corporate_id:
+            raise HTTPException(
+                status_code=422,
+                detail="corporate_id is required for payer_kind=CORPORATE")
+
         ins = db.query(BillingInsuranceCase).filter(
             BillingInsuranceCase.billing_case_id == int(case_id)).first()
         if not ins:
-            ins = BillingInsuranceCase(billing_case_id=int(case_id))
+            ins = BillingInsuranceCase(billing_case_id=int(case_id),
+                                       created_by=getattr(user, "id", None))
 
         ins.payer_kind = inp.payer_kind
         ins.insurance_company_id = inp.insurance_company_id
         ins.tpa_id = inp.tpa_id
         ins.corporate_id = inp.corporate_id
-        ins.policy_no = inp.policy_no
-        ins.member_id = inp.member_id
-        ins.plan_name = inp.plan_name
+        ins.policy_no = (inp.policy_no or "").strip() or None
+        ins.member_id = (inp.member_id or "").strip() or None
+        ins.plan_name = (inp.plan_name or "").strip() or None
         ins.status = inp.status
         ins.approved_limit = Decimal(str(inp.approved_limit or 0))
         ins.approved_at = inp.approved_at
 
+        # ✅ Auto adjust case payer_mode (real-world)
+        if pk in {"INSURANCE", "TPA"}:
+            c.payer_mode = PayerMode.INSURANCE
+        elif pk == "CORPORATE":
+            c.payer_mode = PayerMode.CORPORATE
+        else:
+            # fallback
+            c.payer_mode = c.payer_mode or PayerMode.SELF
+
         db.add(ins)
+        db.add(c)
         db.commit()
         db.refresh(ins)
         return {"insurance": _insurance_to_dict(ins)}
+    except Exception as e:
+        db.rollback()
+        _err(e)
+
+
+# ============================================================
+# ✅ Claims APIs (Lifecycle)
+# ============================================================
+class ClaimFromInvoiceIn(BaseModel):
+    invoice_id: int = Field(..., gt=0)
+
+
+@router.post("/cases/{case_id}/insurance/claims/from-invoice")
+def create_or_refresh_claim_from_invoice(
+        case_id: int,
+        inp: ClaimFromInvoiceIn,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    try:
+        c = _get_case_or_404(db, user, case_id)
+        inv = _get_invoice_or_404(db, user, int(inp.invoice_id))
+        if int(inv.billing_case_id) != int(c.id):
+            raise HTTPException(status_code=400,
+                                detail="Invoice does not belong to this case")
+
+        claim = upsert_draft_claim_from_invoice(db,
+                                                invoice_id=int(inv.id),
+                                                user=user)
+        db.commit()
+        return {"claim": claim_to_dict(claim) if claim else None}
+    except Exception as e:
+        db.rollback()
+        _err(e)
+
+
+@router.get("/cases/{case_id}/insurance/claims")
+def list_case_claims(
+        case_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    try:
+        _get_case_or_404(db, user, case_id)
+        ins = db.query(BillingInsuranceCase).filter(
+            BillingInsuranceCase.billing_case_id == int(case_id)).first()
+        if not ins:
+            return {"items": []}
+
+        rows = (db.query(BillingClaim).filter(
+            BillingClaim.insurance_case_id == int(ins.id)).order_by(
+                desc(BillingClaim.created_at), desc(BillingClaim.id)).all())
+        return {"items": [claim_to_dict(x) for x in rows]}
+    except Exception as e:
+        _err(e)
+
+
+@router.get("/claims/{claim_id}")
+def get_claim_detail(
+        claim_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    try:
+        c = get_claim(db, int(claim_id))
+        return {"claim": claim_to_dict(c)}
+    except Exception as e:
+        _err(e)
+
+
+class ClaimRemarksIn(BaseModel):
+    remarks: str = ""
+
+
+@router.post("/claims/{claim_id}/submit")
+def submit_claim(
+        claim_id: int,
+        inp: ClaimRemarksIn = Body(default=ClaimRemarksIn()),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    try:
+        c = claim_submit(db,
+                         claim_id=int(claim_id),
+                         user=user,
+                         remarks=(inp.remarks or "").strip())
+        db.commit()
+        return {"claim": claim_to_dict(c)}
+    except Exception as e:
+        db.rollback()
+        _err(e)
+
+
+@router.post("/claims/{claim_id}/acknowledge")
+def acknowledge_claim(
+        claim_id: int,
+        inp: ClaimRemarksIn = Body(default=ClaimRemarksIn()),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    try:
+        c = claim_acknowledge(db,
+                              claim_id=int(claim_id),
+                              user=user,
+                              remarks=(inp.remarks or "").strip())
+        db.commit()
+        return {"claim": claim_to_dict(c)}
+    except Exception as e:
+        db.rollback()
+        _err(e)
+
+
+class ClaimApproveIn(BaseModel):
+    approved_amount: Decimal = Field(..., gt=0)
+    remarks: str = ""
+
+
+@router.post("/claims/{claim_id}/approve")
+def approve_claim(
+        claim_id: int,
+        inp: ClaimApproveIn,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    try:
+        c = claim_approve(
+            db,
+            claim_id=int(claim_id),
+            user=user,
+            approved_amount=inp.approved_amount,
+            remarks=(inp.remarks or "").strip(),
+        )
+        db.commit()
+        return {"claim": claim_to_dict(c)}
+    except Exception as e:
+        db.rollback()
+        _err(e)
+
+
+class ClaimSettleIn(BaseModel):
+    settled_amount: Decimal = Field(..., gt=0)
+    remarks: str = ""
+
+
+@router.post("/claims/{claim_id}/settle")
+def settle_claim(
+        claim_id: int,
+        inp: ClaimSettleIn,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    try:
+        c = claim_settle(
+            db,
+            claim_id=int(claim_id),
+            user=user,
+            settled_amount=inp.settled_amount,
+            remarks=(inp.remarks or "").strip(),
+        )
+        db.commit()
+        return {"claim": claim_to_dict(c)}
+    except Exception as e:
+        db.rollback()
+        _err(e)
+
+
+# ============================================================
+# ✅ EXTRA HELPERS (Invoice totals, Insurance status mapping)
+# ============================================================
+
+
+def _invoice_status_name(inv: BillingInvoice) -> str:
+    return str(_enum_value(getattr(inv, "status", "") or "")).upper()
+
+
+def _case_status_name(c: BillingCase) -> str:
+    return str(_enum_value(getattr(c, "status", "") or "")).upper()
+
+
+def _require_invoice_editable(inv: BillingInvoice):
+    st = _invoice_status_name(inv)
+    if st not in {"DRAFT", "APPROVED"}:
+        raise HTTPException(
+            status_code=409,
+            detail="Invoice locked (only DRAFT/APPROVED can be edited).")
+
+
+def _require_invoice_not_void(inv: BillingInvoice):
+    st = _invoice_status_name(inv)
+    if st == "VOID":
+        raise HTTPException(status_code=409, detail="Invoice is VOID.")
+
+
+def _recalc_invoice_totals(db: Session, inv: BillingInvoice) -> BillingInvoice:
+    # sums from lines -> updates invoice totals
+    lines = db.query(BillingInvoiceLine).filter(
+        BillingInvoiceLine.invoice_id == int(inv.id)).all()
+
+    sub_total = Decimal("0")
+    discount_total = Decimal("0")
+    tax_total = Decimal("0")
+    grand_total = Decimal("0")
+
+    for ln in lines:
+        sub_total += Decimal(str(getattr(ln, "line_total", 0) or 0))
+        discount_total += Decimal(str(getattr(ln, "discount_amount", 0) or 0))
+        tax_total += Decimal(str(getattr(ln, "tax_amount", 0) or 0))
+        grand_total += Decimal(str(getattr(ln, "net_amount", 0) or 0))
+
+    inv.sub_total = sub_total
+    inv.discount_total = discount_total
+    inv.tax_total = tax_total
+
+    # Keep round_off simple; you can add rounding logic later
+    inv.round_off = Decimal("0")
+    inv.grand_total = grand_total
+
+    db.add(inv)
+    return inv
+
+
+def _get_insurance_case_or_409(db: Session,
+                               case_id: int) -> BillingInsuranceCase:
+    ins = db.query(BillingInsuranceCase).filter(
+        BillingInsuranceCase.billing_case_id == int(case_id)).first()
+    if not ins:
+        raise HTTPException(
+            status_code=409,
+            detail=
+            "Insurance not configured for this case. Please fill Insurance tab first."
+        )
+    return ins
+
+
+def _preauth_to_dict(p: BillingPreauthRequest) -> Dict[str, Any]:
+    return {
+        "id":
+        int(p.id),
+        "insurance_case_id":
+        int(p.insurance_case_id),
+        "requested_amount":
+        str(getattr(p, "requested_amount", 0) or 0),
+        "approved_amount":
+        str(getattr(p, "approved_amount", 0) or 0),
+        "status":
+        _enum_value(p.status),
+        "submitted_at":
+        p.submitted_at.isoformat() if p.submitted_at else None,
+        "approved_at":
+        p.approved_at.isoformat() if p.approved_at else None,
+        "remarks":
+        getattr(p, "remarks", None),
+        "attachments_json":
+        getattr(p, "attachments_json", None),
+        "created_at":
+        p.created_at.isoformat() if p.created_at else None,
+        "updated_at":
+        p.updated_at.isoformat() if getattr(p, "updated_at", None) else None,
+    }
+
+
+def _sync_ins_status_from_preauth(ins: BillingInsuranceCase,
+                                  preauth: BillingPreauthRequest):
+    ps = str(_enum_value(preauth.status) or "").upper()
+    if ps == "SUBMITTED":
+        ins.status = InsuranceStatus.PREAUTH_SUBMITTED
+    elif ps == "APPROVED":
+        ins.status = InsuranceStatus.PREAUTH_APPROVED
+        ins.approved_limit = Decimal(
+            str(getattr(preauth, "approved_amount", 0) or 0))
+        ins.approved_at = preauth.approved_at
+    elif ps == "PARTIAL":
+        ins.status = InsuranceStatus.PREAUTH_PARTIAL
+        ins.approved_limit = Decimal(
+            str(getattr(preauth, "approved_amount", 0) or 0))
+        ins.approved_at = preauth.approved_at
+    elif ps == "REJECTED":
+        ins.status = InsuranceStatus.PREAUTH_REJECTED
+    elif ps == "CANCELLED":
+        # fallback: keep initiated if cancelled
+        ins.status = InsuranceStatus.INITIATED
+
+
+def _sync_ins_status_from_claim(ins: BillingInsuranceCase,
+                                claim: BillingClaim):
+    cs = str(_enum_value(claim.status) or "").upper()
+    if cs == "SUBMITTED":
+        ins.status = InsuranceStatus.CLAIM_SUBMITTED
+    elif cs == "UNDER_QUERY":
+        ins.status = InsuranceStatus.QUERY
+    elif cs == "SETTLED":
+        ins.status = InsuranceStatus.SETTLED
+    elif cs == "DENIED":
+        ins.status = InsuranceStatus.DENIED
+    elif cs == "CLOSED":
+        ins.status = InsuranceStatus.CLOSED
+
+
+# ============================================================
+# ✅ Meta: enums + masters (read-only)
+# ============================================================
+
+
+@router.get("/meta/enums")
+def billing_meta_enums(user: User = Depends(current_user)):
+
+    def _enum_list(e):
+        return [{
+            "name": k,
+            "value": v.value
+        } for k, v in e.__members__.items()]
+
+    return {
+        "EncounterType": _enum_list(EncounterType),
+        "BillingCaseStatus": _enum_list(BillingCaseStatus),
+        "PayerMode": _enum_list(PayerMode),
+        "InvoiceType": _enum_list(InvoiceType),
+        "DocStatus": _enum_list(DocStatus),
+        "PayerType": _enum_list(PayerType),
+        "ServiceGroup": _enum_list(ServiceGroup),
+        "PayMode": _enum_list(PayMode),
+        "AdvanceType": _enum_list(AdvanceType),
+        "InsurancePayerKind": _enum_list(InsurancePayerKind),
+        "InsuranceStatus": _enum_list(InsuranceStatus),
+        "PreauthStatus": _enum_list(PreauthStatus),
+        "ClaimStatus": _enum_list(ClaimStatus),
+        "NumberResetPeriod": _enum_list(NumberResetPeriod),
+    }
+
+
+@router.get("/meta/tariff-plans")
+def billing_meta_tariff_plans(
+        q: str = Query(""),
+        active_only: bool = Query(True),
+        limit: int = Query(100),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    # Imported lazily to avoid import issues
+    from app.models.billing import BillingTariffPlan
+
+    limit = min(max(int(limit or 100), 1), 200)
+    t = (q or "").strip().lower()
+
+    qry = db.query(BillingTariffPlan)
+    if active_only and hasattr(BillingTariffPlan, "is_active"):
+        qry = qry.filter(BillingTariffPlan.is_active.is_(True))
+    if t:
+        qry = qry.filter(
+            or_(_lc_like(BillingTariffPlan.name, t),
+                _lc_like(BillingTariffPlan.code, t)))
+
+    rows = qry.order_by(BillingTariffPlan.name.asc()).limit(limit).all()
+    return {
+        "items": [{
+            "id": int(x.id),
+            "code": x.code,
+            "name": x.name,
+            "type": _enum_value(getattr(x, "type", None))
+        } for x in rows]
+    }
+
+
+@router.get("/meta/revenue-heads")
+def billing_meta_revenue_heads(
+        q: str = Query(""),
+        active_only: bool = Query(True),
+        limit: int = Query(200),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    from app.models.billing import BillingRevenueHead
+    limit = min(max(int(limit or 200), 1), 500)
+    t = (q or "").strip().lower()
+
+    qry = db.query(BillingRevenueHead)
+    if active_only and hasattr(BillingRevenueHead, "is_active"):
+        qry = qry.filter(BillingRevenueHead.is_active.is_(True))
+    if t:
+        qry = qry.filter(
+            or_(_lc_like(BillingRevenueHead.name, t),
+                _lc_like(BillingRevenueHead.code, t)))
+
+    rows = qry.order_by(BillingRevenueHead.name.asc()).limit(limit).all()
+    return {
+        "items": [{
+            "id": int(x.id),
+            "code": x.code,
+            "name": x.name
+        } for x in rows]
+    }
+
+
+@router.get("/meta/cost-centers")
+def billing_meta_cost_centers(
+        q: str = Query(""),
+        active_only: bool = Query(True),
+        limit: int = Query(200),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    from app.models.billing import BillingCostCenter
+    limit = min(max(int(limit or 200), 1), 500)
+    t = (q or "").strip().lower()
+
+    qry = db.query(BillingCostCenter)
+    if active_only and hasattr(BillingCostCenter, "is_active"):
+        qry = qry.filter(BillingCostCenter.is_active.is_(True))
+    if t:
+        qry = qry.filter(
+            or_(_lc_like(BillingCostCenter.name, t),
+                _lc_like(BillingCostCenter.code, t)))
+
+    rows = qry.order_by(BillingCostCenter.name.asc()).limit(limit).all()
+    return {
+        "items": [{
+            "id": int(x.id),
+            "code": x.code,
+            "name": x.name
+        } for x in rows]
+    }
+
+
+# ============================================================
+# ✅ Invoice: update header + recalc totals
+# ============================================================
+
+
+class InvoiceUpdateIn(BaseModel):
+    model_config = {"extra": "ignore"}
+
+    invoice_type: Optional[InvoiceType] = None
+    payer_type: Optional[PayerType] = None
+    payer_id: Optional[int] = None
+
+    service_date: Optional[datetime] = None
+    module: Optional[
+        str] = None  # normally do NOT change; allowed only in DRAFT if you want
+    meta_json: Optional[Dict[str, Any]] = None
+
+
+@router.put("/invoices/{invoice_id}")
+def update_invoice_header(
+        invoice_id: int,
+        inp: InvoiceUpdateIn,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    try:
+        inv = _get_invoice_or_404(db, user, invoice_id)
+        _require_invoice_not_void(inv)
+        _require_invoice_editable(inv)
+
+        # ✅ permission (optional)
+        _require_perm_code(user, "billing.invoice.edit")
+
+        if inp.module is not None:
+            inv.module = _normalize_module(inp.module)
+
+        if inp.invoice_type is not None:
+            inv.invoice_type = inp.invoice_type
+
+        if inp.payer_type is not None:
+            inv.payer_type = inp.payer_type
+
+        if inp.payer_id is not None:
+            inv.payer_id = int(inp.payer_id) if inp.payer_id else None
+
+        # ✅ payer validation
+        pt = str(_enum_value(inv.payer_type) or "").upper()
+        if pt != "PATIENT" and not inv.payer_id:
+            raise HTTPException(
+                status_code=422,
+                detail="payer_id required when payer_type is not PATIENT")
+
+        if inp.service_date is not None:
+            inv.service_date = inp.service_date
+
+        if inp.meta_json is not None and hasattr(inv, "meta_json"):
+            inv.meta_json = inp.meta_json
+
+        inv.updated_by = getattr(user, "id", None)
+
+        # recalc after header update (safe)
+        inv = _recalc_invoice_totals(db, inv)
+
+        db.commit()
+        db.refresh(inv)
+        return {"invoice": _invoice_to_dict(inv)}
+    except Exception as e:
+        db.rollback()
+        _err(e)
+
+
+@router.post("/invoices/{invoice_id}/recalculate")
+def recalc_invoice(
+        invoice_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    try:
+        inv = _get_invoice_or_404(db, user, invoice_id)
+        _require_invoice_not_void(inv)
+        _require_invoice_editable(inv)
+
+        _require_perm_code(user, "billing.invoice.recalculate")
+
+        inv = _recalc_invoice_totals(db, inv)
+        db.commit()
+        db.refresh(inv)
+        return {"invoice": _invoice_to_dict(inv)}
+    except Exception as e:
+        db.rollback()
+        _err(e)
+
+
+# ============================================================
+# ✅ Case lifecycle: cancel / close / reopen
+# ============================================================
+
+
+class CaseActionIn(BaseModel):
+    reason: str = Field(..., min_length=3, max_length=255)
+    allow_close_with_balance: bool = False  # safety
+
+
+@router.post("/cases/{case_id}/cancel")
+def cancel_case(
+        case_id: int,
+        inp: CaseActionIn,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    try:
+        c = _get_case_or_404(db, user, case_id)
+        _require_perm_code(user, "billing.case.cancel")
+
+        st = _case_status_name(c)
+        if st == "CANCELLED":
+            return {"ok": True, "status": "CANCELLED"}
+
+        if st == "CLOSED":
+            raise HTTPException(
+                status_code=409,
+                detail="Closed case cannot be cancelled. Reopen first.")
+
+        c.status = BillingCaseStatus.CANCELLED
+        c.notes = ((c.notes or "") + f"\n[CANCEL] {inp.reason}").strip()
+        c.updated_by = getattr(user, "id", None)
+
+        db.add(c)
+        db.commit()
+        db.refresh(c)
+        return {"ok": True, "case": _case_to_dict(c, None)}
+    except Exception as e:
+        db.rollback()
+        _err(e)
+
+
+@router.post("/cases/{case_id}/close")
+def close_case(
+        case_id: int,
+        inp: CaseActionIn,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    try:
+        c = _get_case_or_404(db, user, case_id)
+        _require_perm_code(user, "billing.case.close")
+
+        st = _case_status_name(c)
+        if st == "CLOSED":
+            return {"ok": True, "status": "CLOSED"}
+        if st == "CANCELLED":
+            raise HTTPException(
+                status_code=409,
+                detail="Cancelled case cannot be closed. Reopen first.")
+
+        posted_total = (db.query(
+            func.coalesce(func.sum(BillingInvoice.grand_total), 0)).filter(
+                BillingInvoice.billing_case_id == c.id).filter(
+                    BillingInvoice.status == DocStatus.POSTED).scalar()) or 0
+
+        paid_total = (db.query(
+            func.coalesce(func.sum(BillingPayment.amount), 0)
+        ).filter(BillingPayment.billing_case_id == c.id).filter(
+            BillingPayment.status == ReceiptStatus.ACTIVE).scalar()) or 0
+
+        balance = Decimal(str(posted_total)) - Decimal(str(paid_total))
+        if (not inp.allow_close_with_balance) and balance != 0:
+            raise HTTPException(
+                status_code=409,
+                detail=
+                f"Case has pending balance={balance}. Set allow_close_with_balance=true to force close."
+            )
+
+        c.status = BillingCaseStatus.CLOSED
+        c.notes = ((c.notes or "") + f"\n[CLOSE] {inp.reason}").strip()
+        c.updated_by = getattr(user, "id", None)
+
+        db.add(c)
+        db.commit()
+        db.refresh(c)
+        return {
+            "ok": True,
+            "case": _case_to_dict(c, None),
+            "balance": str(balance)
+        }
+    except Exception as e:
+        db.rollback()
+        _err(e)
+
+
+@router.post("/cases/{case_id}/reopen")
+def reopen_case(
+        case_id: int,
+        inp: CaseActionIn,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    try:
+        c = _get_case_or_404(db, user, case_id)
+        _require_perm_code(user, "billing.case.reopen")
+
+        st = _case_status_name(c)
+        if st not in {"CLOSED", "CANCELLED"}:
+            raise HTTPException(
+                status_code=409,
+                detail=
+                f"Only CLOSED/CANCELLED cases can be reopened (current={st})")
+
+        c.status = BillingCaseStatus.OPEN
+        c.notes = ((c.notes or "") + f"\n[REOPEN] {inp.reason}").strip()
+        c.updated_by = getattr(user, "id", None)
+
+        db.add(c)
+        db.commit()
+        db.refresh(c)
+        return {"ok": True, "case": _case_to_dict(c, None)}
+    except Exception as e:
+        db.rollback()
+        _err(e)
+
+
+# ============================================================
+# ✅ Payments: receipt print + void receipt
+# ============================================================
+
+
+class PaymentVoidIn(BaseModel):
+    reason: str = Field(..., min_length=3, max_length=255)
+
+
+def _render_receipt_pdf_bytes(db: Session, payment_id: int) -> bytes:
+    pay = db.query(BillingPayment).filter(
+        BillingPayment.id == int(payment_id)).first()
+    if not pay:
+        raise HTTPException(status_code=404, detail="Payment not found")
+
+    case = db.query(BillingCase).filter(
+        BillingCase.id == int(pay.billing_case_id)).first()
+    patient = db.query(Patient).filter(
+        Patient.id == int(case.patient_id)).first() if case else None
+    inv = db.query(BillingInvoice).filter(BillingInvoice.id == int(
+        pay.invoice_id)).first() if pay.invoice_id else None
+
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    w, h = A4
+    left = 15 * mm
+    top = h - 15 * mm
+    y = top
+
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(left, y, "PAYMENT RECEIPT")
+    y -= 7 * mm
+
+    c.setFont("Helvetica", 9)
+    rcpt = getattr(pay, "receipt_number", None) or f"RCPT-{pay.id}"
+    c.drawString(left, y, f"Receipt No: {rcpt}")
+    c.drawRightString(
+        w - left, y,
+        f"Date: {(getattr(pay, 'received_at', None) or getattr(pay, 'created_at', None) or datetime.utcnow()).strftime('%d-%m-%Y %H:%M')}"
+    )
+    y -= 6 * mm
+
+    pname = None
+    if patient:
+        first_col, last_col, full_col = _patient_name_cols()
+        if full_col is not None:
+            pname = (getattr(patient, full_col.key, None)
+                     or "").strip() or None
+        else:
+            fn = (getattr(patient, first_col.key, "")
+                  if first_col else "") or ""
+            ln = (getattr(patient, last_col.key, "") if last_col else "") or ""
+            pname = f"{fn} {ln}".strip() or None
+
+    c.drawString(
+        left, y,
+        f"Patient: {pname or (f'#{case.patient_id}' if case else '-')}")
+    if case:
+        c.drawRightString(w - left, y, f"Case: {case.case_number}")
+    y -= 6 * mm
+
+    if inv:
+        c.drawString(
+            left, y,
+            f"Invoice: {inv.invoice_number or f'#{inv.id}'}  ({_enum_value(inv.status)})"
+        )
+        y -= 6 * mm
+
+    c.line(left, y, w - left, y)
+    y -= 8 * mm
+
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(left, y, "Payment Details")
+    y -= 8 * mm
+
+    c.setFont("Helvetica", 10)
+    c.drawString(left, y, f"Amount: {_money(getattr(pay, 'amount', 0))} INR")
+    y -= 6 * mm
+    c.drawString(left, y, f"Mode: {_enum_value(pay.mode)}")
+    y -= 6 * mm
+    if getattr(pay, "txn_ref", None):
+        c.drawString(left, y, f"Txn Ref: {pay.txn_ref}")
+        y -= 6 * mm
+    if getattr(pay, "notes", None):
+        c.drawString(left, y, f"Notes: {pay.notes}")
+        y -= 6 * mm
+
+    y -= 10 * mm
+    c.setFont("Helvetica", 8)
+    c.drawString(left, y, "This is a computer generated receipt.")
+    y -= 18 * mm
+    c.setFont("Helvetica", 9)
+    c.drawRightString(w - left, y, "Authorised Signature")
+
+    c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+@router.get("/payments/{payment_id}/print")
+def print_payment_receipt_pdf(
+        payment_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    try:
+        _require_perm_code(user, "billing.receipt.print")
+        pdf_bytes = _render_receipt_pdf_bytes(db, int(payment_id))
+        return StreamingResponse(
+            io.BytesIO(pdf_bytes),
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition":
+                f'inline; filename="receipt_{payment_id}.pdf"'
+            },
+        )
+    except Exception as e:
+        _err(e)
+
+
+@router.post("/payments/{payment_id}/void")
+def void_payment_receipt(
+        payment_id: int,
+        inp: PaymentVoidIn,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    try:
+        _require_perm_code(user, "billing.receipt.void")
+
+        pay = db.query(BillingPayment).filter(
+            BillingPayment.id == int(payment_id)).first()
+        if not pay:
+            raise HTTPException(status_code=404, detail="Payment not found")
+
+        if str(_enum_value(getattr(pay, "status", ""))
+               or "").upper() == "VOID":
+            return {"ok": True, "status": "VOID"}
+
+        # ✅ safety: don't void allocations without a proper reversal workflow
+        alloc_count = 0
+        try:
+            alloc_count = db.query(BillingPaymentAllocation).filter(
+                BillingPaymentAllocation.payment_id == int(pay.id)).count()
+        except Exception:
+            alloc_count = 0
+        if alloc_count > 0:
+            raise HTTPException(
+                status_code=409,
+                detail=
+                "Receipt has allocations. Please implement reversal workflow before allowing void."
+            )
+
+        pay.status = ReceiptStatus.VOID
+        pay.voided_by = getattr(user, "id", None)
+        pay.voided_at = datetime.utcnow()
+        pay.void_reason = inp.reason
+
+        db.add(pay)
+        db.commit()
+        db.refresh(pay)
+
+        return {"ok": True, "payment": _payment_to_dict(pay)}
+    except Exception as e:
+        db.rollback()
+        _err(e)
+
+
+# ============================================================
+# ✅ Insurance: PREAUTH endpoints (full workflow)
+# ============================================================
+
+
+class PreauthCreateIn(BaseModel):
+    requested_amount: Decimal = Field(..., gt=0)
+    remarks: str = ""
+    attachments_json: Optional[Dict[str, Any]] = None
+
+
+class PreauthSubmitIn(BaseModel):
+    remarks: str = ""
+
+
+class PreauthApproveIn(BaseModel):
+    approved_amount: Decimal = Field(..., gt=0)
+    partial: bool = False
+    remarks: str = ""
+
+
+class PreauthDecisionIn(BaseModel):
+    remarks: str = ""
+
+
+@router.get("/cases/{case_id}/insurance/preauths")
+def list_case_preauths(
+        case_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    try:
+        _get_case_or_404(db, user, case_id)
+        ins = _get_insurance_case_or_409(db, int(case_id))
+        rows = db.query(BillingPreauthRequest).filter(
+            BillingPreauthRequest.insurance_case_id == int(ins.id)).order_by(
+                desc(BillingPreauthRequest.created_at),
+                desc(BillingPreauthRequest.id)).all()
+        return {"items": [_preauth_to_dict(x) for x in rows]}
+    except Exception as e:
+        _err(e)
+
+
+@router.post("/cases/{case_id}/insurance/preauths")
+def create_preauth(
+        case_id: int,
+        inp: PreauthCreateIn,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    try:
+        _require_perm_code(user, "billing.insurance.preauth.create")
+        _get_case_or_404(db, user, case_id)
+        ins = _get_insurance_case_or_409(db, int(case_id))
+
+        p = BillingPreauthRequest(
+            insurance_case_id=int(ins.id),
+            requested_amount=Decimal(str(inp.requested_amount)),
+            approved_amount=Decimal("0"),
+            status=PreauthStatus.DRAFT,
+            remarks=(inp.remarks or "").strip() or None,
+            attachments_json=inp.attachments_json if hasattr(
+                BillingPreauthRequest, "attachments_json") else None,
+            created_by=getattr(user, "id", None),
+        )
+        db.add(p)
+
+        # insurance baseline
+        if ins.status is None:
+            ins.status = InsuranceStatus.INITIATED
+        db.add(ins)
+
+        db.commit()
+        db.refresh(p)
+        return {"preauth": _preauth_to_dict(p)}
+    except Exception as e:
+        db.rollback()
+        _err(e)
+
+
+@router.get("/preauths/{preauth_id}")
+def get_preauth(
+        preauth_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    try:
+        p = db.query(BillingPreauthRequest).filter(
+            BillingPreauthRequest.id == int(preauth_id)).first()
+        if not p:
+            raise HTTPException(status_code=404, detail="Preauth not found")
+        return {"preauth": _preauth_to_dict(p)}
+    except Exception as e:
+        _err(e)
+
+
+@router.post("/preauths/{preauth_id}/submit")
+def submit_preauth(
+        preauth_id: int,
+        inp: PreauthSubmitIn = Body(default=PreauthSubmitIn()),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    try:
+        _require_perm_code(user, "billing.insurance.preauth.submit")
+
+        p = db.query(BillingPreauthRequest).filter(
+            BillingPreauthRequest.id == int(preauth_id)).first()
+        if not p:
+            raise HTTPException(status_code=404, detail="Preauth not found")
+
+        cur = str(_enum_value(p.status) or "").upper()
+        if cur not in {"DRAFT"}:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Preauth cannot be submitted from status={cur}")
+
+        p.status = PreauthStatus.SUBMITTED
+        p.submitted_at = datetime.utcnow()
+        if hasattr(p, "remarks"):
+            p.remarks = (inp.remarks or "").strip() or p.remarks
+
+        ins = db.query(BillingInsuranceCase).filter(
+            BillingInsuranceCase.id == int(p.insurance_case_id)).first()
+        if ins:
+            _sync_ins_status_from_preauth(ins, p)
+            db.add(ins)
+
+        db.add(p)
+        db.commit()
+        db.refresh(p)
+        return {
+            "preauth": _preauth_to_dict(p),
+            "insurance": _insurance_to_dict(ins) if ins else None
+        }
+    except Exception as e:
+        db.rollback()
+        _err(e)
+
+
+@router.post("/preauths/{preauth_id}/approve")
+def approve_preauth(
+        preauth_id: int,
+        inp: PreauthApproveIn,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    try:
+        _require_perm_code(user, "billing.insurance.preauth.approve")
+
+        p = db.query(BillingPreauthRequest).filter(
+            BillingPreauthRequest.id == int(preauth_id)).first()
+        if not p:
+            raise HTTPException(status_code=404, detail="Preauth not found")
+
+        cur = str(_enum_value(p.status) or "").upper()
+        if cur not in {"SUBMITTED"}:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Preauth cannot be approved from status={cur}")
+
+        p.approved_amount = Decimal(str(inp.approved_amount))
+        p.approved_at = datetime.utcnow()
+        if hasattr(p, "remarks"):
+            p.remarks = (inp.remarks or "").strip() or p.remarks
+
+        p.status = PreauthStatus.PARTIAL if bool(
+            inp.partial) else PreauthStatus.APPROVED
+
+        ins = db.query(BillingInsuranceCase).filter(
+            BillingInsuranceCase.id == int(p.insurance_case_id)).first()
+        if ins:
+            _sync_ins_status_from_preauth(ins, p)
+            db.add(ins)
+
+        db.add(p)
+        db.commit()
+        db.refresh(p)
+        return {
+            "preauth": _preauth_to_dict(p),
+            "insurance": _insurance_to_dict(ins) if ins else None
+        }
+    except Exception as e:
+        db.rollback()
+        _err(e)
+
+
+@router.post("/preauths/{preauth_id}/reject")
+def reject_preauth(
+        preauth_id: int,
+        inp: PreauthDecisionIn = Body(default=PreauthDecisionIn()),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    try:
+        _require_perm_code(user, "billing.insurance.preauth.reject")
+
+        p = db.query(BillingPreauthRequest).filter(
+            BillingPreauthRequest.id == int(preauth_id)).first()
+        if not p:
+            raise HTTPException(status_code=404, detail="Preauth not found")
+
+        cur = str(_enum_value(p.status) or "").upper()
+        if cur not in {"SUBMITTED"}:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Preauth cannot be rejected from status={cur}")
+
+        p.status = PreauthStatus.REJECTED
+        p.approved_amount = Decimal("0")
+        p.approved_at = datetime.utcnow()
+        if hasattr(p, "remarks"):
+            p.remarks = (inp.remarks or "").strip() or p.remarks
+
+        ins = db.query(BillingInsuranceCase).filter(
+            BillingInsuranceCase.id == int(p.insurance_case_id)).first()
+        if ins:
+            _sync_ins_status_from_preauth(ins, p)
+            db.add(ins)
+
+        db.add(p)
+        db.commit()
+        db.refresh(p)
+        return {
+            "preauth": _preauth_to_dict(p),
+            "insurance": _insurance_to_dict(ins) if ins else None
+        }
+    except Exception as e:
+        db.rollback()
+        _err(e)
+
+
+@router.post("/preauths/{preauth_id}/cancel")
+def cancel_preauth(
+        preauth_id: int,
+        inp: PreauthDecisionIn = Body(default=PreauthDecisionIn()),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    try:
+        _require_perm_code(user, "billing.insurance.preauth.cancel")
+
+        p = db.query(BillingPreauthRequest).filter(
+            BillingPreauthRequest.id == int(preauth_id)).first()
+        if not p:
+            raise HTTPException(status_code=404, detail="Preauth not found")
+
+        cur = str(_enum_value(p.status) or "").upper()
+        if cur not in {"DRAFT", "SUBMITTED"}:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Preauth cannot be cancelled from status={cur}")
+
+        p.status = PreauthStatus.CANCELLED
+        if hasattr(p, "remarks"):
+            p.remarks = (inp.remarks or "").strip() or p.remarks
+
+        ins = db.query(BillingInsuranceCase).filter(
+            BillingInsuranceCase.id == int(p.insurance_case_id)).first()
+        if ins:
+            _sync_ins_status_from_preauth(ins, p)
+            db.add(ins)
+
+        db.add(p)
+        db.commit()
+        db.refresh(p)
+        return {
+            "preauth": _preauth_to_dict(p),
+            "insurance": _insurance_to_dict(ins) if ins else None
+        }
+    except Exception as e:
+        db.rollback()
+        _err(e)
+
+
+# ============================================================
+# ✅ Claims: set query + close (missing lifecycle actions)
+# ============================================================
+
+
+class ClaimQueryIn(BaseModel):
+    remarks: str = ""
+
+
+@router.post("/claims/{claim_id}/set-query")
+def set_claim_under_query(
+        claim_id: int,
+        inp: ClaimQueryIn = Body(default=ClaimQueryIn()),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    try:
+        _require_perm_code(user, "billing.claims.set_query")
+        c = get_claim(db, int(claim_id))
+
+        cur = str(_enum_value(getattr(c, "status", "")) or "").upper()
+        if cur not in {"SUBMITTED", "APPROVED"}:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Claim cannot be moved to UNDER_QUERY from status={cur}"
+            )
+
+        c.status = ClaimStatus.UNDER_QUERY
+        if hasattr(c, "remarks"):
+            c.remarks = (inp.remarks or "").strip() or c.remarks
+
+        ins = db.query(BillingInsuranceCase).filter(
+            BillingInsuranceCase.id == int(c.insurance_case_id)).first()
+        if ins:
+            _sync_ins_status_from_claim(ins, c)
+            db.add(ins)
+
+        db.add(c)
+        db.commit()
+        db.refresh(c)
+        return {
+            "claim": claim_to_dict(c),
+            "insurance": _insurance_to_dict(ins) if ins else None
+        }
+    except Exception as e:
+        db.rollback()
+        _err(e)
+
+
+@router.post("/claims/{claim_id}/close")
+def close_claim(
+        claim_id: int,
+        inp: ClaimQueryIn = Body(default=ClaimQueryIn()),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    try:
+        _require_perm_code(user, "billing.claims.close")
+        c = get_claim(db, int(claim_id))
+
+        cur = str(_enum_value(getattr(c, "status", "")) or "").upper()
+        if cur not in {"SETTLED", "DENIED", "APPROVED", "UNDER_QUERY"}:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Claim cannot be CLOSED from status={cur}")
+
+        c.status = ClaimStatus.CLOSED
+        if hasattr(c, "remarks") and inp.remarks:
+            c.remarks = (inp.remarks or "").strip() or c.remarks
+
+        ins = db.query(BillingInsuranceCase).filter(
+            BillingInsuranceCase.id == int(c.insurance_case_id)).first()
+        if ins:
+            _sync_ins_status_from_claim(ins, c)
+            db.add(ins)
+
+        db.add(c)
+        db.commit()
+        db.refresh(c)
+        return {
+            "claim": claim_to_dict(c),
+            "insurance": _insurance_to_dict(ins) if ins else None
+        }
+    except Exception as e:
+        db.rollback()
+        _err(e)
+
+
+# ============================================================
+# ✅ Claim creation validation improvement (optional endpoint)
+# ============================================================
+
+
+@router.post("/cases/{case_id}/insurance/claims/from-invoice/validated")
+def create_or_refresh_claim_from_invoice_validated(
+        case_id: int,
+        inp: ClaimFromInvoiceIn,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    """
+    Same as /from-invoice but with real-world validations:
+    - invoice must belong to case
+    - invoice should be POSTED (recommended) for claim creation
+    - invoice payer_type must be INSURER/CORPORATE (not PATIENT)
+    """
+    try:
+        cse = _get_case_or_404(db, user, case_id)
+        _get_insurance_case_or_409(db, int(case_id))
+
+        inv = _get_invoice_or_404(db, user, int(inp.invoice_id))
+        if int(inv.billing_case_id) != int(cse.id):
+            raise HTTPException(status_code=400,
+                                detail="Invoice does not belong to this case")
+
+        st = str(_enum_value(inv.status) or "").upper()
+        if st != "POSTED":
+            raise HTTPException(
+                status_code=409,
+                detail="Claim can be created only from POSTED invoices")
+
+        pt = str(_enum_value(inv.payer_type) or "").upper()
+        if pt not in {"INSURER", "CORPORATE"}:
+            raise HTTPException(
+                status_code=409,
+                detail=
+                "Claim can be created only for INSURER/CORPORATE payer invoices"
+            )
+
+        claim = upsert_draft_claim_from_invoice(db,
+                                                invoice_id=int(inv.id),
+                                                user=user)
+        # sync insurance status from claim draft if needed
+        ins = db.query(BillingInsuranceCase).filter(
+            BillingInsuranceCase.billing_case_id == int(case_id)).first()
+        if ins and claim:
+            _sync_ins_status_from_claim(ins, claim)
+            db.add(ins)
+
+        db.commit()
+        return {"claim": claim_to_dict(claim) if claim else None}
     except Exception as e:
         db.rollback()
         _err(e)
