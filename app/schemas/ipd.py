@@ -354,10 +354,10 @@ class NursingNoteBase(BaseModel):
         description="Type of note: routine / incident / shift_handover",
     )
     # 🔹 NABH – core description fields
-    patient_condition: str = Field(
-        "",
-        description="Conscious / oriented / stable / drowsy / critical / breathless…",
-    )
+    # patient_condition: str = Field(
+    #     "",
+    #     description="Conscious / oriented / stable / drowsy / critical / breathless…",
+    # )
     significant_events: str = Field(
         "",
         description="Shifting, fall, vomiting, seizure, desaturation, transfusion, etc.",
@@ -376,26 +376,26 @@ class NursingNoteBase(BaseModel):
     )
 
     # 🔹 Structured clinical observation fields (replaces clinical_finding)
-    wound_status: str = Field(
-        "",
-        description="Clean / dry / soaked / oozing / dressing intact etc.",
-    )
-    oxygen_support: str = Field(
-        "",
-        description="Room air / NC 2L / NRBM 10L / BiPAP / Ventilator settings etc.",
-    )
-    urine_output: str = Field(
-        "",
-        description="E.g. '200 ml clear in last 4 hrs; catheter in situ'.",
-    )
-    drains_tubes: str = Field(
-        "",
-        description="Status of drains / tubes (ICD, RT, etc.).",
-    )
-    pain_score: str = Field(
-        "",
-        description="E.g. 'Pain 3/10 on VAS'.",
-    )
+    # wound_status: str = Field(
+    #     "",
+    #     description="Clean / dry / soaked / oozing / dressing intact etc.",
+    # )
+    # oxygen_support: str = Field(
+    #     "",
+    #     description="Room air / NC 2L / NRBM 10L / BiPAP / Ventilator settings etc.",
+    # )
+    # urine_output: str = Field(
+    #     "",
+    #     description="E.g. '200 ml clear in last 4 hrs; catheter in situ'.",
+    # )
+    # drains_tubes: str = Field(
+    #     "",
+    #     description="Status of drains / tubes (ICD, RT, etc.).",
+    # )
+    # pain_score: str = Field(
+    #     "",
+    #     description="E.g. 'Pain 3/10 on VAS'.",
+    # )
     other_findings: str = Field(
         "",
         description="Any other clinical findings not covered above.",

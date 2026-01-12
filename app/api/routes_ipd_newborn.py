@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, date
 from typing import Optional, Any, Dict, Set
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Body
 from fastapi.responses import Response
 from fastapi.encoders import jsonable_encoder
 from sqlalchemy.orm import Session
@@ -253,15 +253,22 @@ def get_by_admission(
     return {"status": True, "data": obj}
 
 
-@router.post("/admissions/{admission_id}/newborn/resuscitation", response_model=ApiResponse[NewbornOut])
+@router.post(
+    "/admissions/{admission_id}/newborn/resuscitation",
+    response_model=ApiResponse[NewbornOut],
+)
 def create_for_admission(
     admission_id: int,
-    payload: NewbornCreate,
-    request: Request,
+    payload: "NewbornCreate | None" = Body(default=None),   # ✅ allow missing/null body
+    request: Request = None,
     db: Session = Depends(get_db),
     user=Depends(current_user),
 ):
     _need_any(user, ["ipd.newborn.create", "ipd.newborn.manage", "ipd.nursing.manage"])
+
+    # ✅ if frontend sends nothing or null, treat as empty payload
+    if payload is None:
+        payload = NewbornCreate()
 
     exists = db.execute(
         select(IpdNewbornResuscitation).where(IpdNewbornResuscitation.admission_id == admission_id)
@@ -279,7 +286,7 @@ def create_for_admission(
         status="DRAFT",
     )
 
-    # Autofill from BirthRegister if you pass birth_register_id
+    # Autofill from BirthRegister
     if BirthRegister is not None and payload.birth_register_id:
         br = db.get(BirthRegister, payload.birth_register_id)
         if br and getattr(br, "birth_datetime", None):
@@ -299,10 +306,6 @@ def create_for_admission(
     data = payload.model_dump(exclude_unset=True)
 
     for k, v in data.items():
-        if k in ("admission_id",):
-            continue
-
-        # ✅ JSON columns must be JSON-safe
         if k in ("resuscitation", "vaccination") and v is not None:
             setattr(obj, k, _json_safe(_as_json(v)))
         else:
@@ -313,6 +316,7 @@ def create_for_admission(
     _audit(db, request, obj.id, "create", _uget(user, "id", None), after=_snap(obj))
     db.commit()
     db.refresh(obj)
+
     return {"status": True, "data": obj}
 
 

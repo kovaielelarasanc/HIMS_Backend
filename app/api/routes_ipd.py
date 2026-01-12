@@ -641,17 +641,17 @@ def create_nursing_note(
         nurse_id=user.id,
         entry_time=payload.entry_time or datetime.utcnow(),
         # Core NABH narrative fields
-        patient_condition=payload.patient_condition or "",
+        # patient_condition=payload.patient_condition or "",
         significant_events=payload.significant_events or "",
         nursing_interventions=payload.nursing_interventions or "",
         response_progress=payload.response_progress or "",
         handover_note=payload.handover_note or "",
         # Structured observation fields
-        wound_status=payload.wound_status or "",
-        oxygen_support=payload.oxygen_support or "",
-        urine_output=payload.urine_output or "",
-        drains_tubes=payload.drains_tubes or "",
-        pain_score=payload.pain_score or "",
+        # wound_status=payload.wound_status or "",
+        # oxygen_support=payload.oxygen_support or "",
+        # urine_output=payload.urine_output or "",
+        # drains_tubes=payload.drains_tubes or "",
+        # pain_score=payload.pain_score or "",
         other_findings=payload.other_findings or "",
         # Shift / ICU flags
         shift=payload.shift,

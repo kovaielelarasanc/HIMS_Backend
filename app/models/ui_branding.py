@@ -1,4 +1,5 @@
-# app/models/ui_branding.py
+from __future__ import annotations
+
 from datetime import datetime
 
 from sqlalchemy import (
@@ -8,6 +9,8 @@ from sqlalchemy import (
     ForeignKey,
     Integer,
     String,
+    UniqueConstraint,
+    Index,
 )
 from sqlalchemy.orm import relationship
 
@@ -17,8 +20,7 @@ from app.db.base import Base
 class UiBranding(Base):
     """
     Global UI + PDF customization for NABH HIMS.
-
-    This is SINGLETON-ish: we always work with the first row.
+    Singleton-ish: always use first row.
     """
 
     __tablename__ = "ui_branding"
@@ -35,14 +37,11 @@ class UiBranding(Base):
     org_gstin = Column(String(32), nullable=True)
 
     # --- Logos / icons ---
-    # main application logo (sidebar/topbar)
     logo_path = Column(String(255), nullable=True)
-    # optional login-page variant (white background etc.)
     login_logo_path = Column(String(255), nullable=True)
-    # favicon (for browser tab, future use)
     favicon_path = Column(String(255), nullable=True)
 
-    # --- UI Colors (frontend uses subset of these) ---
+    # --- UI Colors ---
     primary_color = Column(String(32), nullable=True)
     primary_color_dark = Column(String(32), nullable=True)
 
@@ -60,21 +59,59 @@ class UiBranding(Base):
     # --- PDF: header/footer artwork + behaviour ---
     pdf_header_path = Column(String(255), nullable=True)
     pdf_footer_path = Column(String(255), nullable=True)
-    
-    letterhead_path = Column(String(255), nullable=True)          # PDF or image
-    letterhead_type = Column(String(50), nullable=True)           # pdf / image
-    letterhead_position = Column(String(50), default="background")  
 
-    # space reserved for header/footer (millimetres).
-    # frontends never need this, only PDF code.
+    letterhead_path = Column(String(255), nullable=True)
+    letterhead_type = Column(String(50), nullable=True)  # pdf / image / doc / docx
+    letterhead_position = Column(String(50), default="background")  # background / none
+
     pdf_header_height_mm = Column(Integer, nullable=True)
     pdf_footer_height_mm = Column(Integer, nullable=True)
-
-    # show "Page X of Y" in footer
     pdf_show_page_number = Column(Boolean, default=True)
 
-    updated_at = Column(DateTime,
-                        default=datetime.utcnow,
-                        onupdate=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    updated_by = relationship("User")
+
+
+class UiBrandingContext(Base):
+    """
+    Context-specific overrides (e.g., pharmacy).
+    Only filled fields override the global UiBranding in /ui-branding/public?context=...
+    """
+
+    __tablename__ = "ui_branding_contexts"
+    __table_args__ = (
+        UniqueConstraint("code", name="uq_ui_branding_contexts_code"),
+        Index("ix_ui_branding_contexts_code", "code"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    code = Column(String(64), nullable=False)  # e.g. "pharmacy"
+
+    # Optional org override fields
+    org_name = Column(String(255), nullable=True)
+    org_tagline = Column(String(255), nullable=True)
+    org_address = Column(String(512), nullable=True)
+    org_phone = Column(String(64), nullable=True)
+    org_email = Column(String(255), nullable=True)
+    org_website = Column(String(255), nullable=True)
+    org_gstin = Column(String(32), nullable=True)
+
+    # Pharmacy legal extras (optional)
+    license_no = Column(String(64), nullable=True)
+    license_no2 = Column(String(64), nullable=True)
+    pharmacist_name = Column(String(255), nullable=True)
+    pharmacist_reg_no = Column(String(64), nullable=True)
+
+    # Assets (optional overrides)
+    logo_path = Column(String(255), nullable=True)
+    pdf_header_path = Column(String(255), nullable=True)
+    pdf_footer_path = Column(String(255), nullable=True)
+
+    letterhead_path = Column(String(255), nullable=True)
+    letterhead_type = Column(String(50), nullable=True)
+    letterhead_position = Column(String(50), default="background")
+
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     updated_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     updated_by = relationship("User")

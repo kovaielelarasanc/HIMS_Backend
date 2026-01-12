@@ -16,7 +16,6 @@ class ApiError(BaseModel):
     error: Dict[str, Any]
 
 Sex = Literal["Male", "Female", "Transgender", "Unknown"]
-
 _time_re = re.compile(r"^\d{2}:\d{2}$")
 
 def _strip(v: Optional[str]) -> Optional[str]:
@@ -48,9 +47,7 @@ class ResuscitationJSON(BaseModel):
     drugs: Optional[bool] = None
     notes: Optional[str] = None
 
-class NewbornCreate(BaseModel):
-    admission_id: int
-
+class NewbornBase(BaseModel):
     birth_register_id: Optional[int] = None
     baby_patient_id: Optional[int] = None
     mother_patient_id: Optional[int] = None
@@ -155,9 +152,66 @@ class NewbornCreate(BaseModel):
         if not _time_re.match(v):
             raise ValueError("time_of_birth must be HH:MM")
         return v
+    @field_validator(
+        "lmp_date", "edd_date", "date_of_birth",
+        mode="before"
+    )
+    @classmethod
+    def empty_str_to_none_date(cls, v: Any):
+        if v == "":
+            return None
+        return v
 
-class NewbornUpdate(NewbornCreate):
-    admission_id: Optional[int] = None  # not editable in update
+    @field_validator(
+        "vitamin_k_at",
+        mode="before"
+    )
+    @classmethod
+    def empty_str_to_none_dt(cls, v: Any):
+        if v == "":
+            return None
+        return v
+
+    @field_validator(
+        "mother_age_years", "gravida", "para", "living", "abortion",
+        "gestational_age_weeks", "apgar_1_min", "apgar_5_min", "apgar_10_min",
+        "hr", "rr", "sao2", "sugar_mgdl", "downes_score",
+        mode="before"
+    )
+    @classmethod
+    def empty_str_to_none_int(cls, v: Any):
+        if v == "":
+            return None
+        return v
+
+    @field_validator(
+        "birth_weight_kg", "length_cm", "head_circum_cm", "cft_seconds",
+        mode="before"
+    )
+    @classmethod
+    def empty_str_to_none_float(cls, v: Any):
+        if v == "":
+            return None
+        return v
+
+    @field_validator(
+        "pih", "gdm", "fever", "baby_cried_at_birth",
+        "icr", "scr", "grunting", "apnea",
+        "vitamin_k_given",
+        mode="before"
+    )
+    @classmethod
+    def empty_str_to_none_bool(cls, v: Any):
+        if v == "":
+            return None
+        return v
+
+class NewbornCreate(NewbornBase):
+    pass
+
+class NewbornUpdate(NewbornBase):
+    pass
+
 
 class ActionNote(BaseModel):
     note: Optional[str] = Field(default=None, max_length=300)

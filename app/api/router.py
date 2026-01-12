@@ -68,6 +68,7 @@ from app.api import (
     routes_ipd_admissions,
     routes_pharmacy_stock_alerts,
     routes_lab_integration,
+    routes_settings_branding
 )
 
 
@@ -193,6 +194,7 @@ api_router.include_router(routes_pharmacy_accounts.router)
 api_router.include_router(routes_pharmacy_stock_alerts.router)
 api_router.include_router(routes_inventory_indent.router)
 api_router.include_router(routes_inventory_consumption.router)
+api_router.include_router(routes_settings_branding.router)
 
  
 # Master database migrations
