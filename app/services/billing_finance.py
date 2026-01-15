@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Tuple
-
+from typing import Sequence
 from fastapi import HTTPException
 from sqlalchemy import case as sa_case, func, or_
 from sqlalchemy.orm import Session
@@ -38,6 +38,8 @@ try:
 except Exception:
     _BillingAdvanceAllocation = None  # fallback to BillingAdvanceApplication
 
+AUTO_APPLY_ADVANCE_ENABLED = False
+
 
 # -------------------------
 # Errors
@@ -48,6 +50,98 @@ class BillingError(RuntimeError):
 
 class BillingStateError(BillingError):
     pass
+
+
+from sqlalchemy import or_, exists
+
+
+def invoice_paid_total(db: Session, invoice_id: int) -> Decimal:
+    # ---- safe column getters (handles projects with different column names) ----
+    pay_status_col = getattr(BillingPayment, "status", None) or getattr(
+        BillingPayment, "receipt_status", None)
+    alloc_status_col = getattr(
+        BillingPaymentAllocation, "status", None) or getattr(
+            BillingPaymentAllocation, "receipt_status", None)
+    pay_dir_col = getattr(BillingPayment, "direction", None)  # optional
+    pay_kind_col = getattr(BillingPayment, "kind", None)
+
+    # -------------------------
+    # 1) Allocation-based paid (NEW / correct model)
+    # -------------------------
+    q_alloc = (db.query(
+        func.coalesce(func.sum(BillingPaymentAllocation.amount), 0)).join(
+            BillingPayment,
+            BillingPayment.id == BillingPaymentAllocation.payment_id).filter(
+                BillingPaymentAllocation.invoice_id == int(invoice_id)))
+
+    # payment must be active
+    if pay_status_col is not None:
+        q_alloc = q_alloc.filter(
+            or_(pay_status_col == ReceiptStatus.ACTIVE,
+                pay_status_col.is_(None)))
+
+    # allocation must be active (but allow NULL to avoid excluding rows)
+    if alloc_status_col is not None:
+        q_alloc = q_alloc.filter(
+            or_(alloc_status_col == ReceiptStatus.ACTIVE,
+                alloc_status_col.is_(None)))
+
+    # only count RECEIPT + ADVANCE_ADJUSTMENT
+    if pay_kind_col is not None:
+        q_alloc = q_alloc.filter(
+            pay_kind_col.in_(
+                [PaymentKind.RECEIPT, PaymentKind.ADVANCE_ADJUSTMENT]))
+
+    # optional: count only IN direction (prevents counting refunds if your system uses OUT)
+    if pay_dir_col is not None:
+        q_alloc = q_alloc.filter(
+            or_(pay_dir_col == PaymentDirection.IN, pay_dir_col.is_(None)))
+
+    alloc_paid = _d(q_alloc.scalar() or 0)
+
+    # -------------------------
+    # 2) Legacy direct payments (OLD data): BillingPayment.invoice_id set, but no allocations
+    #    (Avoid double counting by excluding payments that already have allocations)
+    # -------------------------
+    has_alloc = (db.query(BillingPaymentAllocation.id).filter(
+        BillingPaymentAllocation.payment_id == BillingPayment.id).exists())
+
+    q_direct = (db.query(func.coalesce(func.sum(
+        BillingPayment.amount), 0)).filter(
+            BillingPayment.invoice_id == int(invoice_id)).filter(~has_alloc))
+
+    if pay_status_col is not None:
+        q_direct = q_direct.filter(
+            or_(pay_status_col == ReceiptStatus.ACTIVE,
+                pay_status_col.is_(None)))
+
+    if pay_kind_col is not None:
+        q_direct = q_direct.filter(
+            pay_kind_col.in_(
+                [PaymentKind.RECEIPT, PaymentKind.ADVANCE_ADJUSTMENT]))
+
+    if pay_dir_col is not None:
+        q_direct = q_direct.filter(
+            or_(pay_dir_col == PaymentDirection.IN, pay_dir_col.is_(None)))
+
+    direct_paid = _d(q_direct.scalar() or 0)
+
+    return _d(alloc_paid + direct_paid)
+
+
+def invoice_outstanding_total(db: Session, invoice_id: int) -> Decimal:
+    inv = db.query(BillingInvoice).filter(
+        BillingInvoice.id == int(invoice_id)).first()
+    if not inv or inv.status == DocStatus.VOID:
+        return Decimal("0.00")
+
+    total = _d(getattr(inv, "grand_total", 0) or 0)
+    paid = _d(invoice_paid_total(db, invoice_id=int(invoice_id)))
+
+    out = _d(total - paid)
+    if out < 0:
+        out = Decimal("0.00")
+    return _d(out)
 
 
 # -------------------------
@@ -334,7 +428,10 @@ def case_financials(db: Session, *, case_id: int) -> Dict[str, Any]:
     if advance_balance_val < 0:
         advance_balance_val = Decimal("0")
 
-    patient_outstanding = patient_due - patient_paid - advance_balance_val
+    # ✅ IMPORTANT:
+    # Outstanding must NOT be reduced by advance balance.
+    # Outstanding reduces ONLY when ADVANCE_ADJUSTMENT allocations are created (apply-selected).
+    patient_outstanding = patient_due - patient_paid
     if patient_outstanding < 0:
         patient_outstanding = Decimal("0")
 
@@ -353,18 +450,29 @@ def case_financials(db: Session, *, case_id: int) -> Dict[str, Any]:
             "patient_paid": str(patient_paid),
             "insurer_paid": str(insurer_paid)
         },
+
+        # ✅ show advance wallet separately (deposit wallet)
         "advances": {
             "advance_in": str(adv_in),
             "advance_refund": str(adv_out),
-            "advance_applied": str(adv_applied),
+            "advance_applied":
+            str(adv_applied),  # this increases ONLY when you apply-selected
             "advance_balance": str(advance_balance_val),
         },
+
+        # ✅ real outstanding (NO advance subtraction)
         "outstanding": {
             "patient_outstanding": str(patient_outstanding),
             "insurer_outstanding": str(insurer_outstanding),
             "total_outstanding":
             str(patient_outstanding + insurer_outstanding),
         },
+
+        # ✅ optional helper for UI (show as “If you apply advance now…”)
+        "what_if": {
+            "patient_payable_after_using_all_advance":
+            str(max(patient_outstanding - advance_balance_val, Decimal("0")))
+        }
     }
 
 
@@ -651,55 +759,236 @@ def record_advance(
     return adv
 
 
-def apply_advances_to_case(
+def _enum_name(x) -> str:
+    """Return a stable name like 'APPROVED' from Enum/value/str."""
+    if x is None:
+        return ""
+    v = getattr(x, "value", None)
+    if v is not None:
+        return str(v).upper().strip()
+    s = str(x).upper().strip()
+    # handle 'DocStatus.APPROVED' etc
+    if "." in s:
+        s = s.split(".")[-1]
+    return s
+
+
+def _is_patient_invoice(inv: BillingInvoice) -> bool:
+    """
+    Decide whether this invoice should accept patient money (advance).
+    - If invoice_type exists and is not PATIENT -> NOT patient invoice.
+    - Else default to patient invoice.
+    """
+    it = getattr(inv, "invoice_type", None)
+    itn = _enum_name(it)
+    if itn and itn != "PATIENT":
+        return False
+    return True
+
+
+def patient_due_for_invoice(db: Session, *, invoice_id: int) -> Decimal:
+    """
+    ✅ Patient-due used by BOTH:
+    - outstanding list (UI)
+    - apply-selected (backend validation)
+
+    Assumption: advances are patient money, so apply only to PATIENT invoices.
+    Patient due = invoice_outstanding_total() for PATIENT invoices else 0.
+    """
+    inv = db.get(BillingInvoice, int(invoice_id))
+    if not inv:
+        return Decimal("0.00")
+
+    if inv.status in (DocStatus.VOID, ):
+        return Decimal("0.00")
+
+    if not _is_patient_invoice(inv):
+        return Decimal("0.00")
+
+    due = D(invoice_outstanding_total(db, invoice_id=int(inv.id)))
+    if due < 0:
+        due = Decimal("0.00")
+    return due
+
+
+def list_case_invoice_outstanding(
+    db: Session,
+    *,
+    billing_case_id: int,
+    status_names: Sequence[str] = ("APPROVED", "POSTED"),
+) -> List[Dict[str, Any]]:
+    allowed = []
+    for s in status_names:
+        s = str(s).upper().strip()
+        if s == "APPROVED":
+            allowed.append(DocStatus.APPROVED)
+        elif s == "POSTED":
+            allowed.append(DocStatus.POSTED)
+
+    q = db.query(BillingInvoice).filter(
+        BillingInvoice.billing_case_id == int(billing_case_id),
+        BillingInvoice.status != DocStatus.VOID,
+    )
+    if allowed:
+        q = q.filter(BillingInvoice.status.in_(allowed))
+
+    invoices = q.order_by(
+        func.coalesce(BillingInvoice.posted_at,
+                      BillingInvoice.created_at).asc(),
+        BillingInvoice.id.asc(),
+    ).all()
+
+    out: List[Dict[str, Any]] = []
+    for inv in invoices:
+        # ✅ total due (for debugging)
+        total_due = D(invoice_outstanding_total(db, invoice_id=int(inv.id)))
+        paid = D(invoice_paid_total(db, invoice_id=int(inv.id)))
+
+        # ✅ patient due (THIS is what Apply uses)
+        p_due = D(patient_due_for_invoice(db, invoice_id=int(inv.id)))
+
+        out.append({
+            "invoice_id":
+            int(inv.id),
+            "invoice_number":
+            inv.invoice_number,
+            "module":
+            inv.module,
+            "status":
+            _enum_name(inv.status),
+            "invoice_type":
+            _enum_name(getattr(inv, "invoice_type", None)) or None,
+            "grand_total":
+            str(_d(getattr(inv, "grand_total", 0))),
+            "paid_total":
+            str(_d(paid)),  # debug
+            "total_outstanding":
+            str(_d(total_due)),  # debug
+            "patient_outstanding":
+            str(_d(p_due)),  # ✅ UI checkbox must use THIS
+        })
+    return out
+
+
+def apply_advances_to_selected_invoices(
     db: Session,
     *,
     billing_case_id: int,
     user: User,
-    max_apply_amount: Optional[Decimal] = None,
+    invoice_ids: List[int],
+    apply_amount: Optional[Decimal] = None,
+    notes: Optional[str] = None,
     receipt_prefix: str = "RCPT-",
     receipt_reset_period: NumberResetPeriod = NumberResetPeriod.YEAR,
 ) -> Dict[str, Any]:
-    case = db.get(BillingCase, int(billing_case_id))
-    if not case:
-        raise HTTPException(status_code=404, detail="Billing case not found")
+    if not invoice_ids:
+        raise HTTPException(status_code=422, detail="invoice_ids required")
 
-    bal = advance_balance(db, billing_case_id=billing_case_id)
+    # Normalize ids
+    invoice_ids = [int(x) for x in invoice_ids]
+
+    # ✅ Lock/compute balance
+    bal = D(advance_balance(db, billing_case_id=int(billing_case_id)))
     if bal <= 0:
         raise HTTPException(status_code=409,
                             detail="No advance balance to apply")
 
-    apply_cap = _d(max_apply_amount) if max_apply_amount is not None else bal
-    if apply_cap <= 0:
-        raise HTTPException(status_code=400,
-                            detail="max_apply_amount must be > 0")
-    apply_amt = min(bal, apply_cap)
+    # ✅ Load selected invoices and lock them
+    inv_rows = (db.query(BillingInvoice).filter(
+        BillingInvoice.id.in_(invoice_ids)).with_for_update().all())
+    found = {int(x.id) for x in inv_rows}
+    missing = [int(x) for x in invoice_ids if int(x) not in found]
+    if missing:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "Invoice(s) not found",
+                "missing": missing
+            },
+        )
 
-    targets = (db.query(BillingInvoice).filter(
-        BillingInvoice.billing_case_id == int(billing_case_id),
-        BillingInvoice.status.in_([DocStatus.POSTED, DocStatus.APPROVED]),
-        BillingInvoice.status != DocStatus.VOID,
-    ).order_by(
-        func.coalesce(BillingInvoice.posted_at,
-                      BillingInvoice.created_at).asc(),
-        BillingInvoice.id.asc()).all())
+    payable: List[BillingInvoice] = []
+    for inv in inv_rows:
+        if int(inv.billing_case_id) != int(billing_case_id):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invoice {inv.id} does not belong to this case",
+            )
+        if inv.status in (DocStatus.VOID, ):
+            raise HTTPException(status_code=409,
+                                detail=f"Invoice {inv.id} is VOID")
+        if inv.status not in (DocStatus.APPROVED, DocStatus.POSTED):
+            raise HTTPException(
+                status_code=409,
+                detail=
+                f"Invoice {inv.id} is not payable (must be APPROVED/POSTED)",
+            )
+        payable.append(inv)
 
-    outs = []
-    total_out = Decimal("0")
-    for inv in targets:
-        out = outstanding_for_invoice_bucket(db,
-                                             invoice_id=int(inv.id),
-                                             bucket=PayerType.PATIENT)
+    # Keep exact UI order
+    inv_by_id = {int(x.id): x for x in payable}
+    ordered = [inv_by_id[i] for i in invoice_ids]
+
+    # ✅ Compute outstanding only for selected invoices (PATIENT bucket)
+    outs: List[Tuple[BillingInvoice, Decimal]] = []
+    total_out = Decimal("0.00")
+
+    for inv in ordered:
+        out = D(patient_due_for_invoice(db, invoice_id=int(inv.id)))
         if out > 0:
             outs.append((inv, out))
-            total_out += out
+            total_out = D(total_out + out)
 
     if total_out <= 0:
-        raise HTTPException(status_code=409,
-                            detail="No patient outstanding to apply advance")
+        # ✅ include debug so you can see why
+        dbg = []
+        for inv in ordered:
+            dbg.append({
+                "invoice_id":
+                int(inv.id),
+                "invoice_type":
+                _enum_name(getattr(inv, "invoice_type", None)) or None,
+                "status":
+                _enum_name(inv.status),
+                "patient_due":
+                str(_d(patient_due_for_invoice(db, invoice_id=int(inv.id)))),
+                "total_due":
+                str(_d(invoice_outstanding_total(db, invoice_id=int(inv.id)))),
+            })
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Selected invoices have no pending patient due",
+                "debug": dbg
+            },
+        )
 
-    apply_amt = min(apply_amt, total_out)
+    # ✅ Determine apply amount
+    if apply_amount is None:
+        raise HTTPException(status_code=422,
+                            detail="apply_amount is required (manual mode)")
+    apply_amt = D(apply_amount)
 
+    if apply_amt <= 0:
+        raise HTTPException(status_code=400, detail="apply_amount must be > 0")
+    if apply_amt > bal:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Apply amount exceeds advance balance",
+                "advance_balance": str(bal)
+            },
+        )
+    if apply_amt > total_out:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Apply amount exceeds selected invoices due",
+                "selected_due": str(total_out)
+            },
+        )
+
+    # ✅ Create payment row representing advance adjustment
     receipt_no = next_receipt_number(
         db,
         prefix=receipt_prefix,
@@ -714,26 +1003,34 @@ def apply_advances_to_case(
         payer_type=PayerType.PATIENT,
         payer_id=None,
         mode=PayMode.CASH,
-        amount=apply_amt,
+        amount=D(apply_amt),
         txn_ref=None,
-        notes="Advance adjusted to invoices",
+        notes=(notes or "Advance applied to selected invoices").strip(),
         kind=PaymentKind.ADVANCE_ADJUSTMENT,
         direction=PaymentDirection.IN,
         status=ReceiptStatus.ACTIVE,
         receipt_number=receipt_no,
         received_by=getattr(user, "id", None),
-        meta_json={"source": "ADVANCE_WALLET"},
+        meta_json={
+            "source": "ADVANCE_WALLET",
+            "apply_mode": "SELECTED_INVOICES",
+            "invoice_ids": invoice_ids,
+        },
     )
     db.add(pay)
     db.flush()
 
-    remaining = apply_amt
-    allocs_out = []
+    # ✅ Allocate only to selected invoices (NO rounding leftovers)
+    remaining = D(apply_amt)
+    allocations_out: List[Dict[str, Any]] = []
 
     for inv, out in outs:
         if remaining <= 0:
             break
-        take = out if remaining >= out else remaining
+        take = min(D(out), D(remaining))
+        take = D(take)
+        if take <= 0:
+            continue
 
         alloc = BillingPaymentAllocation(
             billing_case_id=int(billing_case_id),
@@ -745,46 +1042,61 @@ def apply_advances_to_case(
         _set_if_has(alloc, "status", ReceiptStatus.ACTIVE)
         db.add(alloc)
 
-        allocs_out.append({
+        allocations_out.append({
             "invoice_id": int(inv.id),
             "invoice_number": inv.invoice_number,
-            "amount": str(take)
+            "amount": str(take),
         })
-        remaining -= take
 
-    if remaining > 0:
-        raise HTTPException(status_code=500,
-                            detail="Advance allocation error: leftover amount")
+        remaining = D(remaining - take)
 
-    # Consume advances oldest-first into BillingAdvanceApplication
+    if D(remaining) != Decimal("0.00"):
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "Allocation error: leftover amount",
+                "leftover": str(remaining)
+            },
+        )
+
+    # ✅ Consume advances oldest-first into BillingAdvanceApplication (history + balance calc)
+    # Order column safe
+    order_col = getattr(BillingAdvance, "entry_at", None)
+    if order_col is None:
+        order_col = getattr(BillingAdvance, "created_at", None)
+    if order_col is None:
+        order_col = BillingAdvance.id
+
     advances = (db.query(BillingAdvance).filter(
         BillingAdvance.billing_case_id == int(billing_case_id)).order_by(
-            BillingAdvance.entry_at.asc(), BillingAdvance.id.asc()).all())
+            order_col.asc(), BillingAdvance.id.asc()).with_for_update().all())
 
     applied_map: Dict[int, Decimal] = {}
     rows = (db.query(
         BillingAdvanceApplication.advance_id,
-        func.coalesce(
-            func.sum(BillingAdvanceApplication.amount),
-            0)).filter(BillingAdvanceApplication.billing_case_id == int(
-                billing_case_id)).group_by(
-                    BillingAdvanceApplication.advance_id).all())
+        func.coalesce(func.sum(BillingAdvanceApplication.amount), 0),
+    ).filter(BillingAdvanceApplication.billing_case_id == int(
+        billing_case_id)).group_by(BillingAdvanceApplication.advance_id).all())
     for aid, s in rows:
-        applied_map[int(aid)] = _d(s)
+        applied_map[int(aid)] = D(s)
 
-    need = apply_amt
+    need = D(apply_amt)
+    consumed_out: List[Dict[str, Any]] = []
+
     for adv in advances:
         if need <= 0:
             break
         if adv.entry_type != AdvanceType.ADVANCE:
             continue
 
-        already = applied_map.get(int(adv.id), Decimal("0"))
-        avail = _d(adv.amount) - already
+        already = applied_map.get(int(adv.id), Decimal("0.00"))
+        avail = D(D(getattr(adv, "amount", 0)) - D(already))
         if avail <= 0:
             continue
 
-        take = avail if need >= avail else need
+        take = min(avail, need)
+        take = D(take)
+
         app = BillingAdvanceApplication(
             billing_case_id=int(billing_case_id),
             advance_id=int(adv.id),
@@ -792,13 +1104,25 @@ def apply_advances_to_case(
             amount=take,
         )
         db.add(app)
-        need -= take
 
-    if need > 0:
+        consumed_out.append({
+            "advance_id": int(adv.id),
+            "amount": str(take),
+            "mode": str(getattr(adv, "mode", "") or ""),
+            "txn_ref": getattr(adv, "txn_ref", None),
+            "entry_at": getattr(adv, "entry_at", None),
+        })
+
+        need = D(need - take)
+
+    if D(need) != Decimal("0.00"):
         raise HTTPException(
             status_code=500,
-            detail=
-            "Advance consumption error: not enough advances to cover apply")
+            detail={
+                "message": "Advance consumption error: insufficient advances",
+                "leftover": str(need)
+            },
+        )
 
     db.flush()
 
@@ -808,9 +1132,48 @@ def apply_advances_to_case(
         "receipt_number":
         pay.receipt_number,
         "applied_amount":
-        str(apply_amt),
+        str(D(apply_amt)),
+        "selected_due":
+        str(D(total_out)),
         "allocations":
-        allocs_out,
+        allocations_out,
+        "consumed_advances":
+        consumed_out,
         "advance_balance_after":
-        str(advance_balance(db, billing_case_id=billing_case_id)),
+        str(D(advance_balance(db, billing_case_id=billing_case_id))),
     }
+
+
+def apply_advances_to_case(
+    db: Session,
+    *,
+    billing_case_id: int,
+    user: User,
+    max_apply_amount: Optional[Decimal] = None,
+    receipt_prefix: str = "RCPT-",
+    receipt_reset_period: NumberResetPeriod = NumberResetPeriod.YEAR,
+) -> Dict[str, Any]:
+    """
+    🔒 AUTO APPLY DISABLED (PERMANENT)
+    - This function used to auto-apply advances to all case invoices.
+    - Some workflows may still call it (post_invoice, etc).
+    - Now it returns a safe NO-OP so NOTHING auto applies.
+    - Manual apply must be done only via apply_advances_to_selected_invoices().
+    """
+    if not AUTO_APPLY_ADVANCE_ENABLED:
+        bal = advance_balance(db, billing_case_id=int(billing_case_id))
+        return {
+            "skipped": True,
+            "reason": "AUTO_APPLY_DISABLED",
+            "payment_id": None,
+            "receipt_number": None,
+            "applied_amount": "0.00",
+            "allocations": [],
+            "advance_balance_after": str(_d(bal)),
+        }
+
+    # If you ever want to re-enable in future, restore old implementation here.
+    raise HTTPException(
+        status_code=410,
+        detail="Auto-apply is disabled. Use apply-selected endpoint.",
+    )

@@ -1323,6 +1323,9 @@ def update_invoice_line(
     intra_state_gst: bool = True,
     service_date: Optional[datetime] = None,
     item_code: Optional[str] = None,
+
+    # ✅ NEW: accept meta_json (patch/merge)
+    meta_json: Optional[Dict[str, Any]] = None,
     reason: Optional[str] = None,
 ) -> BillingInvoiceLine:
     ln = db.get(BillingInvoiceLine, int(line_id))
@@ -1346,12 +1349,19 @@ def update_invoice_line(
         ln.unit_price = _d(unit_price)
     if gst_rate is not None:
         ln.gst_rate = _d(gst_rate)
+
     if item_code is not None and hasattr(ln, "item_code"):
         ln.item_code = (str(item_code)[:64] if item_code is not None else None)
+
     if doctor_id is not None and hasattr(ln, "doctor_id"):
         ln.doctor_id = doctor_id
+
     if hasattr(ln, "service_date") and service_date is not None:
         ln.service_date = _to_local_naive(service_date)
+
+    # ✅ Merge incoming meta_json patch (pharmacy batch / extra fields)
+    if meta_json:
+        _merge_meta(ln, meta_json)
 
     dp = _d(discount_percent) if discount_percent is not None else _d(
         getattr(ln, "discount_percent", 0))
@@ -1359,9 +1369,12 @@ def update_invoice_line(
         getattr(ln, "discount_amount", 0))
 
     line_total = _d(getattr(ln, "qty", 0)) * _d(getattr(ln, "unit_price", 0))
+
+    # if percent provided but amount not, compute
     if (discount_amount is None) and (discount_percent
                                       is not None) and da <= 0 and dp > 0:
         da = (line_total * dp) / Decimal("100")
+
     if da < 0:
         da = Decimal("0")
     if da > line_total:
@@ -1381,6 +1394,7 @@ def update_invoice_line(
 
     split_rates = _gst_split(gr, intra_state=intra_state_gst)
     split_amt = _gst_amount_split(tax_amount, split_rates)
+
     _merge_meta(
         ln,
         {
@@ -1637,6 +1651,7 @@ def void_invoice(db: Session, *, invoice_id: int, reason: str,
     db.flush()
     return inv
 
+
 def _session_get(db: Session, model, pk: Any):
     """
     SQLAlchemy-safe get (works for SA 1.4/2.x style).
@@ -1646,6 +1661,7 @@ def _session_get(db: Session, model, pk: Any):
         return getter(model, pk)
     # fallback
     return db.query(model).get(pk)
+
 
 # ============================================================
 # Payments / Advances (wrappers to v2)
@@ -1684,16 +1700,21 @@ def _unwrap_payment_v2_result(
             pid = int(pay_obj)
             row = _session_get(db, BillingPayment, pid)
             if not row:
-                raise HTTPException(status_code=500, detail=f"Payment row not found for id={pid}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Payment row not found for id={pid}")
             return row, allocations
 
         # 2c) payment is dict (serialized)
         if isinstance(pay_obj, dict):
-            pid = pay_obj.get("id") or pay_obj.get("payment_id") or res.get("id") or res.get("payment_id")
+            pid = pay_obj.get("id") or pay_obj.get("payment_id") or res.get(
+                "id") or res.get("payment_id")
             if pid:
                 row = _session_get(db, BillingPayment, int(pid))
                 if not row:
-                    raise HTTPException(status_code=500, detail=f"Payment row not found for id={pid}")
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Payment row not found for id={pid}")
                 return row, allocations
 
         # 2d) dict itself contains id/payment_id
@@ -1701,19 +1722,23 @@ def _unwrap_payment_v2_result(
         if pid:
             row = _session_get(db, BillingPayment, int(pid))
             if not row:
-                raise HTTPException(status_code=500, detail=f"Payment row not found for id={pid}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Payment row not found for id={pid}")
             return row, allocations
 
         # if dict has no usable id -> this is the real bug upstream
         raise HTTPException(
             status_code=500,
-            detail=f"record_payment_v2() returned dict without payment id keys: keys={list(res.keys())}",
+            detail=
+            f"record_payment_v2() returned dict without payment id keys: keys={list(res.keys())}",
         )
 
     # 3) unsupported
     raise HTTPException(
         status_code=500,
-        detail=f"record_payment_v2() returned unsupported type: {type(res).__name__}",
+        detail=
+        f"record_payment_v2() returned unsupported type: {type(res).__name__}",
     )
 
 

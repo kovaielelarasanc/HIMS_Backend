@@ -743,6 +743,10 @@ class BillingInvoiceLine(Base):
 
     doctor = relationship("User", foreign_keys=[doctor_id])
     created_by_user = relationship("User", foreign_keys=[created_by])
+    service_date = Column(DateTime, nullable=True)
+
+    # per-line meta (pharmacy batch_id/expiry/hsn_sac etc.)
+    meta_json = Column(JSON, nullable=True)
 
 
 # ============================================================
