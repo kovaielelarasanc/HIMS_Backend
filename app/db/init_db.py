@@ -29,6 +29,7 @@ def seed_permissions(db: Session) -> None:
         ("roles", ["view", "create", "update", "delete"]),
         ("permissions", ["view", "create", "update", "delete"]),
         ("users", ["view", "create", "update", "delete"]),
+        ("doctors", ["view"]),
 
         # -------- PATIENTS ----------
         ("patients", ["view", "create", "update", "deactivate",]),
@@ -151,6 +152,7 @@ def seed_permissions(db: Session) -> None:
         ("ipd.transfusion",["create", "view", "update"]),
         
         # -------- Pharmacy Inventory ----------
+
         ("pharmacy.inventory.locations", ["view", "manage"]),
         ("pharmacy.inventory.suppliers", ["view", "manage"]),
         ("pharmacy.inventory.items", ["view", "manage"]),
@@ -159,7 +161,7 @@ def seed_permissions(db: Session) -> None:
         ("pharmacy.inventory.po", ["view", "manage","approve","cancel"]),
         ("pharmacy.inventory.grn", ["view", "manage"]),
         ("pharmacy.inventory.returns", ["view", "manage"]),
-        ("pharmacy.inventory", ["dispense"]),
+        ("pharmacy.inventory", ["dispense","view"]),
         ("pharmacy.inventory.txns", ["view"]),
         ("pharmacy.accounts.supplier_ledger", ["view", "manage", "export"]),
         ("pharmacy.accounts.supplier_payments", ["view", "manage", "export"]),
@@ -244,8 +246,9 @@ def seed_permissions(db: Session) -> None:
         ("mis.radiology", ["view"]),
  
         # -------- Pharmacy Rx & Billing ----------
-        ("pharmacy.rx", ["view", "dispense", "override", "cancel"]),
-        ("pharmacy.sales", ["view", "create", "return"]),
+        ("pharmacy.rx", ["view", "dispense", "override", "cancel","manage","sign","print"]),
+        ("pharmacy.rx_queue", ["view"]),
+        ("pharmacy.sales", ["view", "create", "return","finalize","cancel"]),
         ("pharmacy.billing", ["view", "create", "refund"]),
         ("pharmacy.returns", ["view", "manage"]),
         ("pharmacy.prescriptions", ["view", "create", "update", "sign","cancel"]),
@@ -253,6 +256,10 @@ def seed_permissions(db: Session) -> None:
         ("pharmacy.sales", ["view", "create","update"]),
         ("pharmacy.payments", ["view", "create"]),
         ("pharmacy.stock", ["view"]),
+        ("pharmacy", ["view","dispense"]),
+        ("pharmacy.batch_picks", ["view"]),
+        ("pharmacy.reports.schedule_medicine", ["view"]),
+
         ("pharmacy.reports", ["view"]),
     
 

@@ -9,7 +9,7 @@ import traceback
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, Request, Response
 from jose import jwt, JWTError
 from sqlalchemy.orm import Session
-
+import logging
 from app.api.deps import get_master_db, get_current_user_and_tenant_from_token
 from app.core.config import settings
 from app.core.security import verify_password
@@ -28,6 +28,7 @@ MULTI_LOGIN_BLOCK_MESSAGE = (
     "to change your password immediately to protect your data."
 )
 
+logger = logging.getLogger(__name__)
 # -------------------------
 # Helpers (safe)
 # -------------------------
@@ -724,6 +725,8 @@ def me(
     }
 
 
+
+
 @router.get("/me/permissions")
 def my_permissions(
     authorization: Optional[str] = Header(None),
@@ -733,10 +736,16 @@ def my_permissions(
     raw = _extract_bearer(authorization) or token
     user, tenant = get_current_user_and_tenant_from_token(raw, master_db)
 
+    # ✅ Admin: return all perms in tenant
     if user.is_admin and settings.ADMIN_ALL_ACCESS:
         tenant_db = create_tenant_session(tenant.db_uri)
         try:
             rows = tenant_db.query(Permission).all()
+
+            # ✅ LOG: only permission codes
+            codes = sorted({p.code for p in rows})
+            logger.info("PERMS user_id=%s tenant_id=%s codes=%s", user.id, tenant.id, codes)
+
             modules = {}
             for p in rows:
                 modules.setdefault(p.module, []).append({"code": p.code, "label": p.label})
@@ -744,10 +753,15 @@ def my_permissions(
         finally:
             tenant_db.close()
 
+    # ✅ Non-admin: from roles
     perms = set()
     for role in (user.roles or []):
         for p in (role.permissions or []):
             perms.add((p.code, p.label, p.module))
+
+    # ✅ LOG: only permission codes
+    codes = sorted({code for code, _, _ in perms})
+    logger.info("PERMS user_id=%s tenant_id=%s codes=%s", user.id, tenant.id, codes)
 
     modules = {}
     for code, label, module in perms:

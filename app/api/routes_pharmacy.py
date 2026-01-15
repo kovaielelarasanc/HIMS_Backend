@@ -58,6 +58,26 @@ from types import SimpleNamespace
 router = APIRouter(prefix="/pharmacy", tags=["pharmacy"])
 
 
+# ✅ Keep codes consistent across backend + frontend PermGate/useCan
+PERM_RX_VIEW = "pharmacy.rx.view"
+PERM_RX_MANAGE = "pharmacy.rx.manage"          # create/update/lines
+PERM_RX_SIGN = "pharmacy.rx.sign"
+PERM_RX_CANCEL = "pharmacy.rx.cancel"
+PERM_RX_PRINT = "pharmacy.rx.print"
+PERM_RX_QUEUE_VIEW = "pharmacy.rx_queue.view"
+PERM_RX_DISPENSE = "pharmacy.dispense"
+
+PERM_SALE_VIEW = "pharmacy.sales.view"
+PERM_SALE_CREATE = "pharmacy.sales.create"     # counter sales
+PERM_SALE_FINALIZE = "pharmacy.sales.finalize"
+PERM_SALE_CANCEL = "pharmacy.sales.cancel"
+
+PERM_PAYMENT_VIEW = "pharmacy.payments.view"
+PERM_PAYMENT_CREATE = "pharmacy.payments.create"
+
+PERM_BATCH_PICKS_VIEW = "pharmacy.batch_picks.view"
+PERM_REPORT_SCHEDULE_MEDICINE = "pharmacy.reports.schedule_medicine.view"
+
 # ------------------------------------------------------------------
 # INTERNAL HELPERS – for display fields (patient / doctor / items)
 # ------------------------------------------------------------------
@@ -70,6 +90,25 @@ def has_perm(user: User, code: str) -> bool:
             if getattr(p, "code", None) == code:
                 return True
     return False
+
+def _need_perm(user: User, code: str) -> None:
+    if not has_perm(user, code):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Missing permission: {code}",
+        )
+
+
+def _need_any_perm(user: User, codes: List[str]) -> None:
+    if getattr(user, "is_admin", False):
+        return
+    for c in codes:
+        if has_perm(user, c):
+            return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail=f"Missing permission (need any): {', '.join(codes)}",
+    )
 
 
 def _ensure_rx_numbers(db: Session, rx: PharmacyPrescription) -> None:
@@ -175,6 +214,7 @@ def list_prescriptions(
     date_to: Optional[date] = None,
     current_user: User = Depends(auth_current_user),
 ):
+    _need_perm(current_user, PERM_RX_VIEW)
     q = _rx_base_options(db.query(PharmacyPrescription))
 
     if type:
@@ -209,6 +249,7 @@ def get_prescription_details(
     db: Session = Depends(get_db),
     user: User = Depends(auth_current_user),
 ):
+    _need_perm(user, PERM_RX_VIEW)
     rx = _rx_base_options(db.query(PharmacyPrescription)).filter(PharmacyPrescription.id == rx_id).first()
     if not rx:
         raise HTTPException(status_code=404, detail="Prescription not found")
@@ -318,6 +359,7 @@ def prescription_pdf(
     db: Session = Depends(get_db),
     user: User = Depends(auth_current_user),
 ):
+    _need_any_perm(user, [PERM_RX_PRINT, PERM_RX_VIEW])
     rx = _rx_base_options(db.query(PharmacyPrescription)).filter(PharmacyPrescription.id == rx_id).first()
     if not rx:
         raise HTTPException(status_code=404, detail="Prescription not found")
@@ -426,6 +468,7 @@ def create_prescription(
     db: Session = Depends(get_db),
     current_user: User = Depends(auth_current_user),
 ):
+    _need_perm(current_user, PERM_RX_MANAGE)
     rx = pharmacy_service.create_prescription(db, payload, current_user)
     rx = _rx_base_options(db.query(PharmacyPrescription)).filter(PharmacyPrescription.id == rx.id).first()
 
@@ -445,6 +488,7 @@ def update_prescription(
     db: Session = Depends(get_db),
     current_user: User = Depends(auth_current_user),
 ):
+    _need_perm(current_user, PERM_RX_MANAGE)
     rx = pharmacy_service.update_prescription(db, rx_id, payload, current_user)
     rx = _rx_base_options(db.query(PharmacyPrescription)).filter(PharmacyPrescription.id == rx.id).first()
 
@@ -464,6 +508,7 @@ def add_rx_line(
     db: Session = Depends(get_db),
     current_user: User = Depends(auth_current_user),
 ):
+    _need_perm(current_user, PERM_RX_MANAGE)
     rx = pharmacy_service.add_rx_line(db, rx_id, payload, current_user)
     rx = _rx_base_options(db.query(PharmacyPrescription)).filter(PharmacyPrescription.id == rx.id).first()
     _attach_display_fields(rx)
@@ -477,6 +522,7 @@ def update_rx_line(
     db: Session = Depends(get_db),
     current_user: User = Depends(auth_current_user),
 ):
+    _need_perm(current_user, PERM_RX_MANAGE)
     rx = pharmacy_service.update_rx_line(db, line_id, payload, current_user)
     rx = _rx_base_options(db.query(PharmacyPrescription)).filter(PharmacyPrescription.id == rx.id).first()
     _attach_display_fields(rx)
@@ -489,6 +535,7 @@ def delete_rx_line(
     db: Session = Depends(get_db),
     current_user: User = Depends(auth_current_user),
 ):
+    _need_perm(current_user, PERM_RX_MANAGE)
     rx = pharmacy_service.delete_rx_line(db, line_id, current_user)
     rx = _rx_base_options(db.query(PharmacyPrescription)).filter(PharmacyPrescription.id == rx.id).first()
     _attach_display_fields(rx)
@@ -501,6 +548,7 @@ def sign_prescription(
     db: Session = Depends(get_db),
     current_user: User = Depends(auth_current_user),
 ):
+    _need_any_perm(current_user, [PERM_RX_SIGN, PERM_RX_MANAGE])
     rx = pharmacy_service.sign_prescription(db, rx_id, current_user)
     rx = _rx_base_options(db.query(PharmacyPrescription)).filter(PharmacyPrescription.id == rx.id).first()
 
@@ -521,6 +569,7 @@ def cancel_prescription(
     db: Session = Depends(get_db),
     current_user: User = Depends(auth_current_user),
 ):
+    _need_any_perm(current_user, [PERM_RX_CANCEL, PERM_RX_MANAGE])
     rx = pharmacy_service.cancel_prescription(db, rx_id, reason, current_user)
     rx = _rx_base_options(db.query(PharmacyPrescription)).filter(PharmacyPrescription.id == rx.id).first()
     _attach_display_fields(rx)
@@ -540,6 +589,7 @@ def get_rx_queue(
     limit: int = Query(100, ge=1, le=500),
     current_user: User = Depends(auth_current_user),
 ):
+    _need_any_perm(current_user, [PERM_RX_QUEUE_VIEW, PERM_RX_DISPENSE, PERM_RX_VIEW])
     """
     Queue for pharmacy dispense.
 
@@ -586,6 +636,7 @@ def dispense_from_rx(
     db: Session = Depends(get_db),
     current_user: User = Depends(auth_current_user),
 ):
+    _need_perm(current_user, PERM_RX_DISPENSE)
     # ✅ IMPORTANT:
     # Your pharmacy_service.dispense_from_rx() ALREADY:
     # - updates batch stock with FOR UPDATE locks
@@ -617,6 +668,7 @@ def create_counter_sale(
     db: Session = Depends(get_db),
     current_user: User = Depends(auth_current_user),
 ):
+    _need_perm(current_user, PERM_SALE_CREATE)
     rx, sale = pharmacy_service.create_counter_sale(db, payload, current_user)
 
     # reload with items
@@ -647,6 +699,7 @@ def list_sales(
     payment_status: Optional[str] = None,
     current_user: User = Depends(auth_current_user),
 ):
+    _need_perm(current_user, PERM_SALE_VIEW)
     q = db.query(PharmacySale)
 
     if context_type:
@@ -674,6 +727,7 @@ def get_sale(
     db: Session = Depends(get_db),
     current_user: User = Depends(auth_current_user),
 ):
+    _need_perm(current_user, PERM_SALE_VIEW)
     sale = (
         db.query(PharmacySale)
         .options(selectinload(PharmacySale.items))
@@ -695,6 +749,7 @@ def finalize_sale(
     db: Session = Depends(get_db),
     current_user: User = Depends(auth_current_user),
 ):
+    _need_perm(current_user, PERM_SALE_FINALIZE)
     sale = pharmacy_service.finalize_sale(db, sale_id, current_user)
     sale = (
         db.query(PharmacySale)
@@ -714,6 +769,7 @@ def cancel_sale(
     db: Session = Depends(get_db),
     current_user: User = Depends(auth_current_user),
 ):
+    _need_perm(current_user, PERM_SALE_CANCEL)
     sale = pharmacy_service.cancel_sale(db, sale_id, reason, current_user)
     sale = (
         db.query(PharmacySale)
@@ -741,6 +797,7 @@ def add_payment(
     db: Session = Depends(get_db),
     current_user: User = Depends(auth_current_user),
 ):
+    _need_perm(current_user, PERM_PAYMENT_CREATE)
     payment = pharmacy_service.add_payment_to_sale(db, sale_id, payload, current_user)
     return payment
 
@@ -751,6 +808,7 @@ def list_payments(
     db: Session = Depends(get_db),
     current_user: User = Depends(auth_current_user),
 ):
+    _need_perm(current_user, PERM_PAYMENT_VIEW)
     q = db.query(PharmacyPayment).filter(PharmacyPayment.sale_id == sale_id)
     q = q.order_by(PharmacyPayment.paid_on.asc())
     return q.all()
@@ -767,6 +825,7 @@ def list_batch_picks(
     db: Session = Depends(get_db),
     user: User = Depends(auth_current_user),
 ):
+    _need_perm(user, PERM_BATCH_PICKS_VIEW)
     today = date.today()
 
     q = (
@@ -836,6 +895,7 @@ def schedule_medicine_report_pdf(
     db: Session = Depends(get_db),
     user: User = Depends(auth_current_user),
 ):
+    _need_perm(user, PERM_REPORT_SCHEDULE_MEDICINE)
     if date_to < date_from:
         raise HTTPException(status_code=400, detail="date_to must be >= date_from")
 

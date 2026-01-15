@@ -6,7 +6,7 @@ from datetime import date as dt_date, datetime
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, Query, Request, HTTPException, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, func
@@ -47,38 +47,21 @@ from openpyxl.utils import get_column_letter
 router = APIRouter(prefix="/pharmacy/stock", tags=["Pharmacy Stock & Alerts"])
 
 logger = logging.getLogger("app.api.stock_alerts")
-# -------------------------
-# Permission helper (robust)
-# -------------------------
-def _need_any(user: User, perms: List[str]) -> None:
-    """
-    Robust permission check:
-    - Passes if superuser/admin flags exist
-    - Else checks common permission storage patterns:
-        user.has_permission("x")
-        "x" in user.permissions
-    If your project already has a standard _need_any, you can remove this and import yours.
-    """
-    try:
-        if getattr(user, "is_superuser", False) or getattr(user, "is_admin", False):
-            return
-        has_fn = getattr(user, "has_permission", None)
-        if callable(has_fn):
-            for p in perms:
-                if has_fn(p):
-                    return
-        perms_list = getattr(user, "permissions", None) or []
-        for p in perms:
-            if p in perms_list:
-                return
-    except Exception:
-        # If user object doesn't support perms, do not hard-fail here.
-        return
 
-    # If we can check perms and none match, block
-    # (If you prefer open access, comment this out.)
-    from fastapi import HTTPException
-    raise HTTPException(status_code=403, detail="Not permitted")
+
+def _need_any(user: User, codes: list[str]) -> None:
+    """Enforce that user has at least ONE of the given permission codes. Admins bypass."""
+    if getattr(user, "is_admin", False):
+        return
+    have = {p.code for r in (user.roles or []) for p in (r.permissions or [])}
+    if have.intersection(set(codes)):
+        return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="You do not have permission to perform this action.",
+    )
+
+  
 
 
 # -------------------------

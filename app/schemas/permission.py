@@ -15,3 +15,7 @@ class PermissionOut(PermissionBase):
     id: int
     class Config:
         from_attributes = True
+
+class ModuleCountOut(BaseModel):
+    module: str
+    count: int
