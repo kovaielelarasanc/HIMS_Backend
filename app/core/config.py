@@ -12,6 +12,7 @@ load_dotenv()
 def _split_csv(value: str) -> List[str]:
     return [v.strip() for v in (value or "").split(",") if v.strip()]
 
+MEDIA_URL: str = "/media"
 
 class Settings(BaseModel):
     PROJECT_NAME: str = os.getenv("PROJECT_NAME", "NABH HIMS & EMR")

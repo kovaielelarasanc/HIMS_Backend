@@ -26,6 +26,7 @@ app = FastAPI(
 )
 register_exception_handlers(app)
 
+
 # CORS
 app.add_middleware(
     CORSMiddleware,
@@ -227,7 +228,6 @@ MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
 app.mount(settings.MEDIA_URL,
           StaticFiles(directory=str(MEDIA_ROOT)),
           name="media")
-
 
 # Health
 @app.get("/")

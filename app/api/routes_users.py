@@ -285,49 +285,92 @@ def update_user(
     if not u:
         raise HTTPException(status_code=404, detail="User not found")
 
+    # name required (as your existing rule)
     name = (payload.name or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="Name is required")
 
-    new_email = _norm_email(payload.email)
-    _enforce_doctor_department(bool(payload.is_doctor), payload.department_id)
-    _enforce_2fa_email(bool(payload.two_fa_enabled), new_email)
+    # ---------
+    # compute "next" state safely (PATCH-like)
+    # ---------
+    next_email = u.email
+    if payload.email is not None:
+        next_email = _norm_email(payload.email)
 
-    email_changed = (new_email or None) != (u.email or None)
+    next_is_doctor = bool(u.is_doctor)
+    if payload.is_doctor is not None:
+        next_is_doctor = bool(payload.is_doctor)
 
-    if new_email and email_changed and _email_exists(db, new_email, exclude_user_id=u.id):
+    next_department_id = u.department_id
+    if payload.department_id is not None:
+        next_department_id = payload.department_id
+
+    next_two_fa = bool(getattr(u, "two_fa_enabled", False))
+    if payload.two_fa_enabled is not None:
+        next_two_fa = bool(payload.two_fa_enabled)
+
+    next_multi = bool(getattr(u, "multi_login_enabled", True))
+    if payload.multi_login_enabled is not None:
+        next_multi = bool(payload.multi_login_enabled)
+
+    # validations based on NEXT values
+    _enforce_doctor_department(next_is_doctor, next_department_id)
+    _enforce_2fa_email(next_two_fa, next_email)
+
+    email_changed = (next_email or None) != (u.email or None)
+
+    if next_email and email_changed and _email_exists(db, next_email, exclude_user_id=u.id):
         raise HTTPException(status_code=409, detail="Email already exists")
 
     prev_two_fa = bool(getattr(u, "two_fa_enabled", False))
     prev_multi = bool(getattr(u, "multi_login_enabled", True))
-    
-    doc_qual = _norm_text(getattr(payload, "doctor_qualification", None), max_len=255)
-    doc_reg = _norm_text(getattr(payload, "doctor_registration_no", None), max_len=64)
 
+    # ---------
     # apply updates
+    # ---------
     u.name = name
-    u.email = new_email
-    u.is_active = bool(payload.is_active)
-    u.is_doctor = bool(payload.is_doctor)
-    u.department_id = (payload.department_id if payload.is_doctor else None)
-    u.two_fa_enabled = bool(payload.two_fa_enabled)
-    u.multi_login_enabled = bool(payload.multi_login_enabled)
-    u.is_doctor = bool(payload.is_doctor)
-    u.department_id = (payload.department_id if payload.is_doctor else None)
 
-    # ✅ NEW: if not doctor -> clear fields
-    if u.is_doctor:
-        u.doctor_qualification = doc_qual
-        u.doctor_registration_no = doc_reg
+    if payload.email is not None:
+        u.email = next_email
+
+    if payload.is_active is not None:
+        u.is_active = bool(payload.is_active)
+
+    # doctor flags
+    if payload.is_doctor is not None:
+        u.is_doctor = next_is_doctor
+
+    # department depends on next_is_doctor
+    if payload.department_id is not None or payload.is_doctor is not None:
+        u.department_id = (next_department_id if next_is_doctor else None)
+
+    if payload.two_fa_enabled is not None:
+        u.two_fa_enabled = next_two_fa
+
+    if payload.multi_login_enabled is not None:
+        u.multi_login_enabled = next_multi
+
+    # doctor qualification/reg: update ONLY if field provided
+    doc_qual = _norm_text(payload.doctor_qualification, max_len=255) if payload.doctor_qualification is not None else None
+    doc_reg = _norm_text(payload.doctor_registration_no, max_len=64) if payload.doctor_registration_no is not None else None
+
+    if next_is_doctor:
+        if payload.doctor_qualification is not None:
+            u.doctor_qualification = doc_qual
+        if payload.doctor_registration_no is not None:
+            u.doctor_registration_no = doc_reg
     else:
         u.doctor_qualification = None
         u.doctor_registration_no = None
 
-    # password update (optional)
-    if payload.password and payload.password.strip():
-        u.password_hash = hash_password(payload.password.strip())
-        u.token_version = int(getattr(u, "token_version", 1) or 1) + 1
-        _revoke_all_sessions(db, u.id, reason="password_changed_by_admin")
+    # password update (ONLY if actually provided + not placeholder)
+    if payload.password is not None:
+        pwd = (payload.password or "").strip()
+        # avoid common UI placeholders that would trigger logout
+        if pwd and pwd not in {"********", "**********", "••••••••", "••••••"}:
+            u.password_hash = hash_password(pwd)
+            u.token_version = int(getattr(u, "token_version", 1) or 1) + 1
+            _revoke_all_sessions(db, u.id, reason="password_changed_by_admin")
 
     # roles update (optional)
     if payload.role_ids is not None:
@@ -336,18 +379,16 @@ def update_user(
 
     needs_email_verify = False
 
-    # 2FA rules
-    if u.two_fa_enabled:
-        # If turning ON or email changed -> verify again
+    # 2FA rules: only evaluate if 2FA is ON after update
+    if next_two_fa:
         if (not prev_two_fa) or email_changed:
             u.email_verified = False
             needs_email_verify = True
 
-    # multi-login turned OFF -> revoke all sessions (so it won't block wrongly)
-    if prev_multi and (u.multi_login_enabled is False):
+    # multi-login turned OFF: only revoke if the field was sent and changed
+    if payload.multi_login_enabled is not None and prev_multi and (next_multi is False):
         _revoke_all_sessions(db, u.id, reason="multi_login_disabled")
-    
-    
+
     try:
         db.commit()
         db.refresh(u)
@@ -364,6 +405,7 @@ def update_user(
         otp_sent_to=u.email if needs_email_verify else None,
         otp_purpose="email_verify" if needs_email_verify else None,
     )
+
 
 
 @router.delete("/{user_id}")

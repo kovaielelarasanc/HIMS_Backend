@@ -50,6 +50,7 @@ class UiBrandingOut(UiBrandingBase):
 
     id: int
 
+    # asset URLs (computed)
     logo_url: Optional[str] = None
     login_logo_url: Optional[str] = None
     favicon_url: Optional[str] = None
@@ -61,6 +62,7 @@ class UiBrandingOut(UiBrandingBase):
     letterhead_type: Optional[str] = None
     letterhead_position: Optional[str] = None
 
+    # cache buster
     asset_version: Optional[str] = None
 
     updated_at: Optional[str] = None

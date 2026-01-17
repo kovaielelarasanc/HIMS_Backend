@@ -54,8 +54,8 @@ class UserUpdate(BaseModel):
     name: str = Field(..., min_length=2, max_length=120)
     email: Optional[str] = None
 
-    is_active: bool = True
-    is_doctor: bool = False
+    is_active: Optional[bool] = None
+    is_doctor: Optional[bool] = None
     department_id: Optional[int] = None
 
     # ✅ NEW (optional)
@@ -63,8 +63,8 @@ class UserUpdate(BaseModel):
     doctor_registration_no: Optional[str] = Field(default=None, max_length=64)
 
     # toggles
-    two_fa_enabled: bool = False
-    multi_login_enabled: bool = True
+    two_fa_enabled: Optional[bool] = None
+    multi_login_enabled: Optional[bool] = None
 
     # password change (admin)
     password: Optional[str] = None
