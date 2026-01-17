@@ -60,6 +60,60 @@ router = APIRouter()
 UPLOAD_DIR = Path(settings.STORAGE_DIR).joinpath("patient_docs")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+def _is_female_gender(gender: Optional[str]) -> bool:
+    g = (gender or "").strip().lower()
+    return g in {"female", "f", "woman", "women", "girl"}
+
+
+def _enforce_pregnancy_rch_rules(
+    *,
+    gender: Optional[str],
+    is_pregnant: Optional[bool],
+    rch_id: Optional[str],
+) -> Dict[str, Any]:
+    """
+    Rules:
+      - RCH ID allowed only for pregnancy patient.
+      - RCH ID is OPTIONAL even if pregnant.
+      - If rch_id is given but is_pregnant is not True -> auto mark pregnant.
+      - If is_pregnant is False -> rch_id must be None.
+      - Pregnancy allowed only for Female.
+    """
+
+    # normalize rch_id
+    rid = (rch_id or "").strip()
+    rid = rid.replace(" ", "").replace("-", "").upper()
+    rid = rid or None
+
+    preg = bool(is_pregnant)
+
+    # If RCH provided, auto-mark pregnant
+    if rid and not preg:
+        preg = True
+
+    # If explicitly NOT pregnant, RCH must be empty
+    if is_pregnant is False and rid:
+        raise HTTPException(
+            status_code=422,
+            detail="RCH ID is allowed only for pregnancy patients. Clear RCH ID or set is_pregnant=true.",
+        )
+
+    # Pregnancy only for female
+    if preg and not _is_female_gender(gender):
+        raise HTTPException(
+            status_code=422,
+            detail="Pregnancy/RCH fields are allowed only for Female patients.",
+        )
+
+    # Basic RCH validation (optional but safe)
+    if rid and (len(rid) > 32 or not rid.isalnum()):
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid RCH ID. Use only letters and digits (max 32).",
+        )
+
+    return {"is_pregnant": preg, "rch_id": rid}
+
 
 def _acronym_from_org_name(org_name: str, max_len: int = 3) -> str:
     """
@@ -343,19 +397,22 @@ def create_patient(
         payload.ref_doctor_id,
     )
 
+    # Pregnancy + RCH rule
+    preg_info = _enforce_pregnancy_rch_rules(
+        gender=payload.gender,
+        is_pregnant=getattr(payload, "is_pregnant", False),
+        rch_id=getattr(payload, "rch_id", None),
+    )
+
     # uniqueness checks (phone/email)
     if payload.phone:
-        exists = db.query(Patient).filter(
-            Patient.phone == payload.phone).first()
+        exists = db.query(Patient).filter(Patient.phone == payload.phone).first()
         if exists:
-            raise HTTPException(status_code=400,
-                                detail="Phone already registered")
+            raise HTTPException(status_code=400, detail="Phone already registered")
     if payload.email:
-        exists = db.query(Patient).filter(
-            Patient.email == payload.email).first()
+        exists = db.query(Patient).filter(Patient.email == payload.email).first()
         if exists:
-            raise HTTPException(status_code=400,
-                                detail="Email already registered")
+            raise HTTPException(status_code=400, detail="Email already registered")
 
     p = Patient(
         uhid="TEMP",
@@ -366,32 +423,46 @@ def create_patient(
         dob=payload.dob,
         phone=payload.phone,
         email=payload.email,
-        # aadhar_last4=(payload.aadhar_last4 or "")[:4] or None,
+
         blood_group=payload.blood_group,
         marital_status=payload.marital_status,
+        is_pregnant=preg_info["is_pregnant"],
+        rch_id=preg_info["rch_id"],
+
         ref_source=payload.ref_source,
         ref_doctor_id=final_ref_doctor_id,
         ref_details=payload.ref_details,
+
         id_proof_type=payload.id_proof_type,
         id_proof_no=payload.id_proof_no,
+
         guardian_name=payload.guardian_name,
         guardian_phone=payload.guardian_phone,
         guardian_relation=payload.guardian_relation,
+
         patient_type=payload.patient_type,
         tag=payload.tag,
         religion=payload.religion,
         occupation=payload.occupation,
+
         file_number=payload.file_number,
         file_location=payload.file_location,
+
         credit_type=payload.credit_type,
         credit_payer_id=payload.credit_payer_id,
         credit_tpa_id=payload.credit_tpa_id,
         credit_plan_id=payload.credit_plan_id,
+
         principal_member_name=payload.principal_member_name,
         principal_member_address=payload.principal_member_address,
+
         policy_number=payload.policy_number,
         policy_name=payload.policy_name,
+
         family_id=payload.family_id,
+
+        # ✅ new fields
+        
         is_active=True,
     )
     db.add(p)
@@ -418,12 +489,11 @@ def create_patient(
         db.rollback()
         msg = str(e.orig).lower()
         if "phone" in msg:
-            raise HTTPException(status_code=400,
-                                detail="Phone already registered")
+            raise HTTPException(status_code=400, detail="Phone already registered")
         if "email" in msg:
-            raise HTTPException(status_code=400,
-                                detail="Email already registered")
+            raise HTTPException(status_code=400, detail="Email already registered")
         raise
+
     db.refresh(p)
 
     # --- Audit log (CREATE) ---
@@ -442,6 +512,7 @@ def create_patient(
     )
 
     return serialize_patient(p, db)
+
 
 
 @router.get("", response_model=List[PatientOut])
@@ -468,11 +539,14 @@ def list_patients(
     qry = db.query(Patient).filter(Patient.is_active.is_(True))
     if q:
         ql = f"%{q.lower()}%"
-        qry = qry.filter((Patient.uhid.like(ql))
-                         | (Patient.phone.like(ql))
-                         | (Patient.email.like(ql))
-                         | (Patient.first_name.like(ql))
-                         | (Patient.last_name.like(ql)))
+        qry = qry = qry.filter(
+            (Patient.uhid.like(ql))
+            | (Patient.phone.like(ql))
+            | (Patient.email.like(ql))
+            | (Patient.first_name.like(ql))
+            | (Patient.last_name.like(ql))
+            | (Patient.rch_id.like(ql))  # ✅ add
+        )
 
     if patient_type:
         qry = qry.filter(Patient.patient_type == patient_type)
@@ -487,11 +561,11 @@ def list_patients(
 
 @router.get("/export", summary="Export patients to Excel")
 def export_patients_report(
-        from_date: Optional[date] = Query(None, alias="from_date"),
-        to_date: Optional[date] = Query(None, alias="to_date"),
-        patient_type: Optional[str] = None,
-        db: Session = Depends(get_db),
-        user: User = Depends(auth_current_user),
+    from_date: Optional[date] = Query(None, alias="from_date"),
+    to_date: Optional[date] = Query(None, alias="to_date"),
+    patient_type: Optional[str] = Query(None, alias="patient_type"),
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
 ):
     """
     Generate Excel report based on:
@@ -507,26 +581,24 @@ def export_patients_report(
     today = date.today()
     if to_date is None:
         to_date = today
-
     if from_date is None:
-        # default: last 30 days window
         from_date = to_date - timedelta(days=30)
 
     if to_date < from_date:
-        raise HTTPException(
-            status_code=422,
-            detail="To Date must be on or after From Date",
-        )
+        raise HTTPException(status_code=422, detail="To Date must be on or after From Date")
 
     start_dt = datetime.combine(from_date, datetime.min.time())
     end_dt = datetime.combine(to_date + timedelta(days=1), datetime.min.time())
 
     try:
         # ---- Query patients ----
-        qry = db.query(Patient).filter(
-            Patient.is_active.is_(True),
-            Patient.created_at >= start_dt,
-            Patient.created_at < end_dt,
+        qry = (
+            db.query(Patient)
+            .filter(
+                Patient.is_active.is_(True),
+                Patient.created_at >= start_dt,
+                Patient.created_at < end_dt,
+            )
         )
 
         if patient_type:
@@ -548,6 +620,8 @@ def export_patients_report(
             "DOB",
             "Age",
             "Marital Status",
+            "Pregnant",
+            "RCH ID",
             "Mobile",
             "Email",
             "Patient Type",
@@ -556,29 +630,41 @@ def export_patients_report(
         ws.append(headers)
 
         for p in patients:
-            _, _, _, age_text, _ = calc_age(p.dob)
-            ws.append([
-                p.uhid,
-                p.prefix or "",
-                p.first_name or "",
-                p.last_name or "",
-                p.gender or "",
-                p.dob.isoformat() if p.dob else "",
-                age_text or "",
-                p.marital_status or "",
-                p.phone or "",
-                p.email or "",
-                p.patient_type or "",
-                p.created_at.isoformat()
-                if getattr(p, "created_at", None) else "",
-            ])
+            # calc_age returns something like (..., age_text, ...) in your project
+            age_text = ""
+            try:
+                if p.dob:
+                    age_text = calc_age(p.dob)[3] or ""
+            except Exception:
+                age_text = ""
 
-        # simple column width auto-fit
+            ws.append(
+                [
+                    p.uhid or "",
+                    p.prefix or "",
+                    p.first_name or "",
+                    p.last_name or "",
+                    p.gender or "",
+                    p.dob.isoformat() if p.dob else "",
+                    age_text,
+                    p.marital_status or "",
+                    "Yes" if getattr(p, "is_pregnant", False) else "No",  # ✅ correct column
+                    getattr(p, "rch_id", None) or "",                      # ✅ correct column
+                    p.phone or "",                                         # ✅ correct column
+                    p.email or "",                                         # ✅ correct column
+                    p.patient_type or "",
+                    p.created_at.isoformat() if getattr(p, "created_at", None) else "",
+                ]
+            )
+
+        # ---- Simple column width auto-fit ----
         for col_idx in range(1, len(headers) + 1):
             col_letter = get_column_letter(col_idx)
-            max_len = max(
-                len(str(cell.value)) if cell.value is not None else 0
-                for cell in ws[col_letter])
+            max_len = 0
+            for cell in ws[col_letter]:
+                v = "" if cell.value is None else str(cell.value)
+                if len(v) > max_len:
+                    max_len = len(v)
             ws.column_dimensions[col_letter].width = max(max_len + 2, 12)
 
         buf = io.BytesIO()
@@ -586,22 +672,16 @@ def export_patients_report(
         buf.seek(0)
 
     except Exception as e:
-        # IMPORTANT: this will bubble proper error msg to frontend
         import traceback
+
         traceback.print_exc()
-        raise HTTPException(
-            status_code=500,
-            detail=f"Excel export failed: {e}",
-        )
+        raise HTTPException(status_code=500, detail=f"Excel export failed: {e}")
 
     filename = f"patients_{from_date.isoformat()}_to_{to_date.isoformat()}.xlsx"
     return StreamingResponse(
         buf,
-        media_type=
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={
-            "Content-Disposition": f'attachment; filename=\"{filename}\"'
-        },
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
@@ -635,7 +715,6 @@ def update_patient(
         raise HTTPException(status_code=404, detail="Not found")
 
     old_data = instance_to_audit_dict(p)
-
     data = payload.dict(exclude_unset=True)
 
     # uniqueness when changing phone/email
@@ -647,8 +726,7 @@ def update_patient(
                 Patient.id != patient_id,
             ).first())
             if exists:
-                raise HTTPException(status_code=400,
-                                    detail="Phone already registered")
+                raise HTTPException(status_code=400, detail="Phone already registered")
 
     if "email" in data:
         new_email = data["email"]
@@ -658,8 +736,7 @@ def update_patient(
                 Patient.id != patient_id,
             ).first())
             if exists:
-                raise HTTPException(status_code=400,
-                                    detail="Email already registered")
+                raise HTTPException(status_code=400, detail="Email already registered")
 
     # validate patient_type if changed
     if "patient_type" in data and data["patient_type"] is not None:
@@ -686,6 +763,20 @@ def update_patient(
     if "last_name" in data and isinstance(data["last_name"], str):
         data["last_name"] = data["last_name"].strip()
 
+    # ✅ pregnancy + RCH rule (based on final values)
+    final_gender = data.get("gender", p.gender)
+    final_is_pregnant = data.get("is_pregnant", getattr(p, "is_pregnant", False))
+    final_rch_id = data.get("rch_id", getattr(p, "rch_id", None))
+
+    preg_info = _enforce_pregnancy_rch_rules(
+        gender=final_gender,
+        is_pregnant=final_is_pregnant,
+        rch_id=final_rch_id,
+    )
+
+    data["is_pregnant"] = preg_info["is_pregnant"]
+    data["rch_id"] = preg_info["rch_id"]
+
     for k, v in data.items():
         setattr(p, k, v)
 
@@ -695,12 +786,11 @@ def update_patient(
         db.rollback()
         msg = str(e.orig).lower()
         if "phone" in msg:
-            raise HTTPException(status_code=400,
-                                detail="Phone already registered")
+            raise HTTPException(status_code=400, detail="Phone already registered")
         if "email" in msg:
-            raise HTTPException(status_code=400,
-                                detail="Email already registered")
+            raise HTTPException(status_code=400, detail="Email already registered")
         raise
+
     db.refresh(p)
 
     # --- Audit log (UPDATE) ---
@@ -719,6 +809,7 @@ def update_patient(
     )
 
     return serialize_patient(p, db)
+
 
 
 @router.patch("/{patient_id}/deactivate")

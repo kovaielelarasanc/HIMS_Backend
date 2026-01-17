@@ -25,7 +25,7 @@ class Patient(Base):
     id = Column(Integer, primary_key=True, index=True)
     uhid = Column(String(32), index=True, nullable=False)
     abha_number = Column(String(32), index=True, nullable=True)
-
+    
     # prefix (Mr, Ms, Mrs, etc.)
     prefix = Column(String(16), nullable=True)
 
@@ -43,7 +43,8 @@ class Patient(Base):
     blood_group = Column(String(8), nullable=True)
 
     marital_status = Column(String(32), nullable=True)
-
+    is_pregnant = Column(Boolean, nullable=False, default=False)
+    rch_id = Column(String(32), index=True, nullable=True)
     # reference / marketing
     ref_source = Column(
         String(32),

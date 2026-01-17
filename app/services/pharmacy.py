@@ -67,6 +67,64 @@ from app.models.billing import (
 # ============================================================
 MONEY = Decimal("0.01")
 
+PHARM_MODULE_CODE = "PHARM"
+PHARM_LEGACY_MODULE_CODES = ("PHARM", "PHM")   # keep legacy support
+PHARM_SOURCE_CODE = "PHARM"
+PHARM_LEGACY_SOURCE_CODES = ("PHARM", "PHM")
+
+
+def _safe_service_group_pharm() -> ServiceGroup:
+    # Avoid runtime crash if enum name differs in your project
+    return getattr(ServiceGroup, "PHARM", getattr(ServiceGroup, "PHARMACY", ServiceGroup.MISC))
+
+
+def _pick_hsn_sac(item: InventoryItem | None, batch: ItemBatch | None) -> str | None:
+    # Try item fields first (common variants), then batch fields
+    candidates = ("hsn_sac", "hsn", "hsn_code", "hsn_sac_code", "sac_code")
+    if item is not None:
+        for f in candidates:
+            v = getattr(item, f, None)
+            if v:
+                return str(v).strip() or None
+    if batch is not None:
+        for f in candidates:
+            v = getattr(batch, f, None)
+            if v:
+                return str(v).strip() or None
+    return None
+
+
+def _iso_date(v) -> str | None:
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v.date().isoformat()
+    if isinstance(v, dt_date):
+        return v.isoformat()
+    # if already a string
+    s = str(v).strip()
+    return s or None
+
+
+def _build_pharm_line_meta(
+    *,
+    sale_item: "PharmacySaleItem",
+    item: InventoryItem | None,
+    batch: ItemBatch | None,
+) -> dict[str, Any]:
+    hsn = _pick_hsn_sac(item, batch)
+    exp = getattr(sale_item, "expiry_date", None) or (getattr(batch, "expiry_date", None) if batch else None)
+
+    meta = {
+        "batch_id": int(sale_item.batch_id) if getattr(sale_item, "batch_id", None) else None,
+        "batch_no": (getattr(sale_item, "batch_no", None) or (getattr(batch, "batch_no", None) if batch else None)),
+        "expiry_date": _iso_date(exp),
+        "hsn_sac": hsn,
+    }
+
+    # Optional: keep only meaningful keys (clean JSON)
+    return {k: v for k, v in meta.items() if v is not None}
+
 
 def _d(v) -> Decimal:
     try:
@@ -974,35 +1032,58 @@ def _upsert_invoice_lines_from_sale(
 ) -> None:
     """
     Idempotency key:
-      (billing_case_id, source_module='PHARM', source_ref_id=sale.id, source_line_key='SALEITEM:<sale_item_id>')
+      (billing_case_id, source_module in {PHARM/PHM}, source_ref_id=sale.id, source_line_key='SALEITEM:<sale_item_id>')
+    Stores per-line pharmacy meta into BillingInvoiceLine.meta_json:
+      - batch_id
+      - expiry_date (ISO string)
+      - hsn_sac
     """
     if invoice.status != DocStatus.DRAFT:
-        # Safety: do not mutate posted/approved/void docs from pharmacy module
         raise HTTPException(status_code=400, detail=f"Invoice is {invoice.status} and cannot be modified from Pharmacy.")
 
     sale_items: List[PharmacySaleItem] = (
-        db.query(PharmacySaleItem).filter(PharmacySaleItem.sale_id == sale.id).all()
+        db.query(PharmacySaleItem)
+        .filter(PharmacySaleItem.sale_id == sale.id)
+        .all()
     )
 
+    # Prefetch items/batches (avoid N+1)
+    item_ids = {int(it.item_id) for it in sale_items if getattr(it, "item_id", None)}
+    batch_ids = {int(it.batch_id) for it in sale_items if getattr(it, "batch_id", None)}
+
+    items_by_id: dict[int, InventoryItem] = {}
+    if item_ids:
+        rows = db.query(InventoryItem).filter(InventoryItem.id.in_(sorted(item_ids))).all()
+        items_by_id = {int(r.id): r for r in rows}
+
+    batches_by_id: dict[int, ItemBatch] = {}
+    if batch_ids:
+        rows = db.query(ItemBatch).filter(ItemBatch.id.in_(sorted(batch_ids))).all()
+        batches_by_id = {int(r.id): r for r in rows}
+
+    # Load existing invoice lines for this sale (support legacy source codes)
     existing_lines: List[BillingInvoiceLine] = (
         db.query(BillingInvoiceLine)
         .filter(
-            BillingInvoiceLine.invoice_id == invoice.id,
+            BillingInvoiceLine.invoice_id == int(invoice.id),
             BillingInvoiceLine.billing_case_id == int(billing_case_id),
-            BillingInvoiceLine.source_module == "PHM",
             BillingInvoiceLine.source_ref_id == int(sale.id),
+            BillingInvoiceLine.source_module.in_(PHARM_LEGACY_SOURCE_CODES),
         )
         .all()
     )
     existing_by_key = {str(l.source_line_key): l for l in existing_lines if l.source_line_key}
 
     seen_keys: set[str] = set()
+    pharm_group = _safe_service_group_pharm()
 
     for it in sale_items:
         key = f"SALEITEM:{int(it.id)}"
         seen_keys.add(key)
 
-        item: InventoryItem | None = db.get(InventoryItem, int(it.item_id)) if getattr(it, "item_id", None) else None
+        item = items_by_id.get(int(it.item_id)) if getattr(it, "item_id", None) else None
+        batch = batches_by_id.get(int(it.batch_id)) if getattr(it, "batch_id", None) else None
+
         item_type = _item_type_str(item) if item else "DRUG"
 
         qty = _d(it.quantity)
@@ -1015,12 +1096,14 @@ def _upsert_invoice_lines_from_sale(
         tax_amount = _compute_tax(taxable, gst_rate)
         net_amount = _round_money(taxable + tax_amount)
 
+        meta = _build_pharm_line_meta(sale_item=it, item=item, batch=batch)
+
         ln = existing_by_key.get(key)
         if ln is None:
             ln = BillingInvoiceLine(
                 billing_case_id=int(billing_case_id),
                 invoice_id=int(invoice.id),
-                service_group="PHM",
+                service_group=pharm_group,
                 item_type=item_type,
                 item_id=int(it.item_id) if getattr(it, "item_id", None) else None,
                 item_code=getattr(item, "code", None) if item else None,
@@ -1033,15 +1116,17 @@ def _upsert_invoice_lines_from_sale(
                 tax_amount=tax_amount,
                 line_total=line_total,
                 net_amount=net_amount,
-                source_module="PHM",
+                source_module=PHARM_SOURCE_CODE,      # new standard
                 source_ref_id=int(sale.id),
                 source_line_key=key,
                 is_manual=False,
                 created_by=getattr(current_user, "id", None),
+                meta_json=meta,
             )
             db.add(ln)
         else:
-            ln.service_group = "PHM"
+            # keep source_module as-is (legacy safe), but always update values
+            ln.service_group = pharm_group
             ln.item_type = item_type
             ln.item_id = int(it.item_id) if getattr(it, "item_id", None) else None
             ln.item_code = getattr(item, "code", None) if item else None
@@ -1054,13 +1139,15 @@ def _upsert_invoice_lines_from_sale(
             ln.tax_amount = tax_amount
             ln.line_total = line_total
             ln.net_amount = net_amount
+            ln.meta_json = meta
 
-    # remove stale lines (if any) for this sale
+    # Delete stale lines for this sale (if any items were removed)
     for ln in existing_lines:
         if ln.source_line_key and str(ln.source_line_key) not in seen_keys:
             db.delete(ln)
 
     db.flush()
+
 
 
 def _ensure_billing_invoice_for_sale(db: Session, sale: PharmacySale, current_user: User) -> BillingInvoice:

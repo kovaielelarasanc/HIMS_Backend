@@ -73,8 +73,22 @@ def _build_user_out(u: User) -> UserOut:
         is_admin=bool(getattr(u, "is_admin", False)),
         is_doctor=bool(getattr(u, "is_doctor", False)),
         department_id=getattr(u, "department_id", None),
+
+        # ✅ NEW
+        doctor_qualification=getattr(u, "doctor_qualification", None),
+        doctor_registration_no=getattr(u, "doctor_registration_no", None),
+
         role_ids=[r.id for r in (u.roles or [])],
     )
+
+def _norm_text(s: Optional[str], *, max_len: int) -> Optional[str]:
+    if s is None:
+        return None
+    s = str(s).strip()
+    if not s:
+        return None
+    return s[:max_len]
+
 
 
 def _email_exists(db: Session, email: str, *, exclude_user_id: Optional[int] = None) -> bool:
@@ -204,6 +218,8 @@ def create_user(payload: UserCreate, db: Session = Depends(get_db), me: User = D
     for _ in range(5):
         try:
             login_id = _generate_login_id(db)
+            doc_qual = _norm_text(getattr(payload, "doctor_qualification", None), max_len=255)
+            doc_reg = _norm_text(getattr(payload, "doctor_registration_no", None), max_len=64)
 
             u = User(
                 login_id=login_id,
@@ -218,6 +234,10 @@ def create_user(payload: UserCreate, db: Session = Depends(get_db), me: User = D
                 is_admin=False,
                 is_doctor=bool(payload.is_doctor),
                 department_id=(payload.department_id if payload.is_doctor else None),
+
+                # ✅ NEW: only store when doctor
+                doctor_qualification=(doc_qual if payload.is_doctor else None),
+                doctor_registration_no=(doc_reg if payload.is_doctor else None),
             )
             u.roles = roles
 
@@ -280,6 +300,9 @@ def update_user(
 
     prev_two_fa = bool(getattr(u, "two_fa_enabled", False))
     prev_multi = bool(getattr(u, "multi_login_enabled", True))
+    
+    doc_qual = _norm_text(getattr(payload, "doctor_qualification", None), max_len=255)
+    doc_reg = _norm_text(getattr(payload, "doctor_registration_no", None), max_len=64)
 
     # apply updates
     u.name = name
@@ -289,6 +312,16 @@ def update_user(
     u.department_id = (payload.department_id if payload.is_doctor else None)
     u.two_fa_enabled = bool(payload.two_fa_enabled)
     u.multi_login_enabled = bool(payload.multi_login_enabled)
+    u.is_doctor = bool(payload.is_doctor)
+    u.department_id = (payload.department_id if payload.is_doctor else None)
+
+    # ✅ NEW: if not doctor -> clear fields
+    if u.is_doctor:
+        u.doctor_qualification = doc_qual
+        u.doctor_registration_no = doc_reg
+    else:
+        u.doctor_qualification = None
+        u.doctor_registration_no = None
 
     # password update (optional)
     if payload.password and payload.password.strip():
@@ -313,7 +346,8 @@ def update_user(
     # multi-login turned OFF -> revoke all sessions (so it won't block wrongly)
     if prev_multi and (u.multi_login_enabled is False):
         _revoke_all_sessions(db, u.id, reason="multi_login_disabled")
-
+    
+    
     try:
         db.commit()
         db.refresh(u)
@@ -465,9 +499,14 @@ def list_doctors(
                 "name": d.name,
                 "email": d.email,
                 "is_active": bool(d.is_active),
-                "department_id": d.department_id,  # keep if you want, but no join
+                "department_id": d.department_id,
+
+                # ✅ NEW
+                "doctor_qualification": getattr(d, "doctor_qualification", None),
+                "doctor_registration_no": getattr(d, "doctor_registration_no", None),
             }
         )
+
 
     # ✅ IMPORTANT: frontend expects res.data.doctors
     return {"status": True, "doctors": doctors}

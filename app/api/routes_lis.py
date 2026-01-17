@@ -7,14 +7,13 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
-from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import mm
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfgen import canvas
+from reportlab.lib.units import mm
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -39,8 +38,9 @@ from app.schemas.lis import (
 )
 
 from app.services.ui_branding import get_ui_branding
-from app.services.lab_pdf_branding import draw_clean_brand_header
-from app.services.pdf_lab_report_weasy import build_lab_report_pdf_bytes
+# ✅ IMPORTANT: use pdf_lis_report (safe import; weasy is inside try)
+from app.services.pdf_lab_report_weasy import build_lab_report_pdf_bytes, _lab_report_pdf_url
+
 from app.services.billing_hooks import autobill_lis_order
 from app.services.billing_service import BillingError
 
@@ -71,7 +71,6 @@ def _infer_context_type(db: Session, context_id: int | None) -> str | None:
 
 # ---------------- Real-time (WebSocket) ----------------
 class _WSManager:
-
     def __init__(self):
         self.connections: set[WebSocket] = set()
 
@@ -161,24 +160,19 @@ def format_reference_ranges_display(ranges: list[dict] | None) -> str:
             label = (r.get("label") or "Range").strip()
             out.append(f"{label}{age_text(r)}: {val_text(r)}")
 
-    # If you have sex-specific ranges, print WOMEN/MEN headings like your sample
     has_sex = bool(groups["F"] or groups["M"])
     if groups["F"]:
         add_group("WOMEN", groups["F"], add_heading=True)
     if groups["M"]:
         add_group("MEN", groups["M"], add_heading=True)
     if groups["ANY"]:
-        add_group("GENERAL" if has_sex else "",
-                  groups["ANY"],
-                  add_heading=has_sex)
+        add_group("GENERAL" if has_sex else "", groups["ANY"], add_heading=has_sex)
 
-    # remove empty headings
     out = [x for x in out if x.strip()]
     return "\n".join(out) if out else "-"
 
 
-def _split_text_to_lines(txt: str, font_name: str, font_size: float,
-                         max_w: float) -> list[str]:
+def _split_text_to_lines(txt: str, font_name: str, font_size: float, max_w: float) -> list[str]:
     """
     ReportLab wrap with newline support.
     """
@@ -201,7 +195,6 @@ def _split_text_to_lines(txt: str, font_name: str, font_size: float,
             if line:
                 out.append(line)
                 line = ""
-            # hard-wrap long token
             if stringWidth(w, font_name, font_size) <= max_w:
                 line = w
             else:
@@ -222,14 +215,11 @@ def _split_text_to_lines(txt: str, font_name: str, font_size: float,
 
 
 # ---------------- Letterhead background (optional) ----------------
-def _draw_letterhead_background(c: canvas.Canvas,
-                                branding: Any,
-                                page_num: int = 1) -> None:
+def _draw_letterhead_background(c: canvas.Canvas, branding: Any, page_num: int = 1) -> None:
     if not branding or not getattr(branding, "letterhead_path", None):
         return
 
-    position = getattr(branding, "letterhead_position",
-                       "background") or "background"
+    position = getattr(branding, "letterhead_position", "background") or "background"
     if position == "none":
         return
     if position == "first_page_only" and page_num != 1:
@@ -245,22 +235,14 @@ def _draw_letterhead_background(c: canvas.Canvas,
     try:
         img = ImageReader(str(full_path))
         w, h = A4
-        c.drawImage(img,
-                    0,
-                    0,
-                    width=w,
-                    height=h,
-                    preserveAspectRatio=True,
-                    mask="auto")
+        c.drawImage(img, 0, 0, width=w, height=h, preserveAspectRatio=True, mask="auto")
     except Exception:
         logger.exception("Failed to draw letterhead background")
 
 
 # ---------------- Orders ----------------
 @router.post("/orders")
-def create_order(payload: LisOrderCreate,
-                 db: Session = Depends(get_db),
-                 user: User = Depends(current_user)):
+def create_order(payload: LisOrderCreate, db: Session = Depends(get_db), user: User = Depends(current_user)):
     _need_any(user, ["orders.lab.create", "lab.orders.create"])
     if not payload.items:
         raise HTTPException(422, "At least one test is required")
@@ -294,22 +276,19 @@ def create_order(payload: LisOrderCreate,
                 test_code=m.code,
                 status="ordered",
                 created_by=user.id,
-            ))
+            )
+        )
 
     db.commit()
-    return {
-        "id": order.id,
-        "context_type": order.context_type,
-        "message": "LIS order created"
-    }
+    return {"id": order.id, "context_type": order.context_type, "message": "LIS order created"}
 
 
 @router.get("/orders", response_model=list[LisOrderOut])
 def list_orders(
-        status: str | None = None,
-        patient_id: int | None = None,
-        db: Session = Depends(get_db),
-        user: User = Depends(current_user),
+    status: str | None = None,
+    patient_id: int | None = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
 ):
     _need_any(user, ["lab.orders.view", "orders.lab.view"])
     q = db.query(LisOrder)
@@ -321,8 +300,7 @@ def list_orders(
     orders = q.order_by(LisOrder.id.desc()).all()
     out: List[LisOrderOut] = []
     for o in orders:
-        items = db.query(LisOrderItem).filter(
-            LisOrderItem.order_id == o.id).all()
+        items = db.query(LisOrderItem).filter(LisOrderItem.order_id == o.id).all()
         out.append(
             LisOrderOut(
                 id=o.id,
@@ -347,23 +325,22 @@ def list_orders(
                         normal_range=i.normal_range,
                         is_critical=bool(i.is_critical),
                         result_at=i.result_at,
-                    ) for i in items
+                    )
+                    for i in items
                 ],
-            ))
+            )
+        )
     return out
 
 
 @router.get("/orders/{order_id}", response_model=LisOrderOut)
-def get_order(order_id: int,
-              db: Session = Depends(get_db),
-              user: User = Depends(current_user)):
+def get_order(order_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
     _need_any(user, ["lab.orders.view", "orders.lab.view"])
     o = db.query(LisOrder).get(order_id)
     if not o:
         raise HTTPException(404, "Order not found")
 
-    items = db.query(LisOrderItem).filter(
-        LisOrderItem.order_id == order_id).all()
+    items = db.query(LisOrderItem).filter(LisOrderItem.order_id == order_id).all()
     return LisOrderOut(
         id=o.id,
         patient_id=o.patient_id,
@@ -387,7 +364,8 @@ def get_order(order_id: int,
                 normal_range=i.normal_range,
                 is_critical=bool(i.is_critical),
                 result_at=i.result_at,
-            ) for i in items
+            )
+            for i in items
         ],
     )
 
@@ -395,11 +373,11 @@ def get_order(order_id: int,
 # ---------------- Panel services (Result entry rows) ----------------
 @router.get("/orders/{order_id}/panel", response_model=List[LisResultLineOut])
 def get_order_panel_services(
-        order_id: int,
-        department_id: int = Query(...),
-        sub_department_id: Optional[int] = Query(None),
-        db: Session = Depends(get_db),
-        user: User = Depends(current_user),
+    order_id: int,
+    department_id: int = Query(...),
+    sub_department_id: Optional[int] = Query(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
 ):
     _need_any(user, ["lab.results.enter", "lab.orders.view"])
 
@@ -409,15 +387,20 @@ def get_order_panel_services(
 
     leaf_dept_id = sub_department_id or department_id
 
-    services = (db.query(LabService).filter(
-        LabService.department_id == leaf_dept_id).filter(
-            LabService.is_active.is_(True)).order_by(
-                LabService.display_order.asc(), LabService.name.asc()).all())
+    services = (
+        db.query(LabService)
+        .filter(LabService.department_id == leaf_dept_id)
+        .filter(LabService.is_active.is_(True))
+        .order_by(LabService.display_order.asc(), LabService.name.asc())
+        .all()
+    )
 
-    existing = (db.query(LisResultLine).filter(
-        LisResultLine.order_id == order_id).filter(
-            LisResultLine.service_id.in_([s.id for s in services]
-                                         or [0])).all())
+    existing = (
+        db.query(LisResultLine)
+        .filter(LisResultLine.order_id == order_id)
+        .filter(LisResultLine.service_id.in_([s.id for s in services] or [0]))
+        .all()
+    )
     existing_map = {r.service_id: r for r in existing}
 
     out: List[LisResultLineOut] = []
@@ -438,9 +421,11 @@ def get_order_panel_services(
             sub_dept_id = None
             sub_dept_name = None
 
-        rr_display = (format_reference_ranges_display(
-            getattr(svc, "reference_ranges", None)) if getattr(
-                svc, "reference_ranges", None) else (svc.normal_range or "-"))
+        rr_display = (
+            format_reference_ranges_display(getattr(svc, "reference_ranges", None))
+            if getattr(svc, "reference_ranges", None)
+            else (svc.normal_range or "-")
+        )
 
         out.append(
             LisResultLineOut(
@@ -453,44 +438,40 @@ def get_order_panel_services(
                 sub_department_name=sub_dept_name,
                 service_name=(saved.service_name if saved else svc.name),
                 unit=(saved.unit if saved else (svc.unit or "-")),
-                # IMPORTANT: always show display range (even if saved.normal_range was just "-")
                 normal_range=rr_display,
                 result_value=(saved.result_value if saved else None),
                 flag=(saved.flag if saved else None),
                 comments=(saved.comments if saved else None),
-            ))
+            )
+        )
 
     return out
 
 
 @router.post("/orders/{order_id}/panel/results")
 async def save_panel_results(
-        order_id: int,
-        payload: LisPanelResultSaveIn,
-        db: Session = Depends(get_db),
-        user: User = Depends(current_user),
+    order_id: int,
+    payload: LisPanelResultSaveIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
 ):
     _need_any(user, ["lab.results.enter"])
 
-    # debug: which DB
     try:
         current_db = db.execute(text("SELECT DATABASE()")).scalar()
-        logger.info("[LIS] save_panel_results DB=%s order_id=%s", current_db,
-                    order_id)
+        logger.info("[LIS] save_panel_results DB=%s order_id=%s", current_db, order_id)
     except Exception:
         logger.exception("[LIS] failed to read current DB")
 
     order = db.query(LisOrder).get(order_id)
     if not order:
-        raise HTTPException(status_code=404,
-                            detail=f"Order not found in this DB: {order_id}")
+        raise HTTPException(status_code=404, detail=f"Order not found in this DB: {order_id}")
 
     service_ids = [r.service_id for r in payload.results]
     if not service_ids:
         raise HTTPException(status_code=400, detail="No results provided")
 
-    services = db.query(LabService).filter(
-        LabService.id.in_(service_ids)).all()
+    services = db.query(LabService).filter(LabService.id.in_(service_ids)).all()
     svc_map = {s.id: s for s in services}
 
     now = datetime.utcnow()
@@ -499,9 +480,7 @@ async def save_panel_results(
     for row in payload.results:
         svc = svc_map.get(row.service_id)
         if not svc:
-            raise HTTPException(
-                status_code=404,
-                detail=f"LabService not found: {row.service_id}")
+            raise HTTPException(status_code=404, detail=f"LabService not found: {row.service_id}")
 
         dept = svc.department
         if dept and dept.parent_id:
@@ -512,13 +491,14 @@ async def save_panel_results(
             main_dept_id = dept.id if dept else payload.department_id
             sub_dept_id = payload.sub_department_id
 
-        existing: Optional[LisResultLine] = (db.query(LisResultLine).filter(
-            LisResultLine.order_id == order_id).filter(
-                LisResultLine.service_id == svc.id).first())
+        existing: Optional[LisResultLine] = (
+            db.query(LisResultLine)
+            .filter(LisResultLine.order_id == order_id)
+            .filter(LisResultLine.service_id == svc.id)
+            .first()
+        )
 
         if not existing:
-            # NOTE: store SHORT normal_range only (DB safe),
-            # display is computed from svc.reference_ranges during fetch/print.
             existing = LisResultLine(
                 order_id=order_id,
                 service_id=svc.id,
@@ -547,24 +527,23 @@ async def save_panel_results(
         db.commit()
     except IntegrityError:
         db.rollback()
-        raise HTTPException(
-            status_code=400,
-            detail="Cannot save results: order not found or data inconsistent.",
-        )
+        raise HTTPException(status_code=400, detail="Cannot save results: order not found or data inconsistent.")
 
-    await _notify("panel_results_saved",
-                  order_id=order_id,
-                  department_id=payload.department_id,
-                  sub_department_id=payload.sub_department_id)
+    await _notify(
+        "panel_results_saved",
+        order_id=order_id,
+        department_id=payload.department_id,
+        sub_department_id=payload.sub_department_id,
+    )
     return {"message": "Panel results saved", "count": saved_count}
 
 
 # ---------------- Structured report data ----------------
 @router.get("/orders/{order_id}/report-data", response_model=LabReportOut)
 def get_lab_report_data(
-        order_id: int,
-        db: Session = Depends(get_db),
-        user: User = Depends(current_user),
+    order_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
 ):
     _need_any(user, ["lab.results.report", "lab.orders.view"])
 
@@ -574,12 +553,16 @@ def get_lab_report_data(
 
     patient: Optional[Patient] = db.query(Patient).get(order.patient_id)
 
-    lines: List[LisResultLine] = (db.query(LisResultLine).filter(
-        LisResultLine.order_id == order_id).order_by(
+    lines: List[LisResultLine] = (
+        db.query(LisResultLine)
+        .filter(LisResultLine.order_id == order_id)
+        .order_by(
             LisResultLine.department_id.asc(),
             LisResultLine.sub_department_id.asc(),
             LisResultLine.id.asc(),
-        ).all())
+        )
+        .all()
+    )
 
     sections_map: Dict[Tuple[int, Optional[int]], LabReportSectionOut] = {}
 
@@ -619,8 +602,7 @@ def get_lab_report_data(
         svc_obj = getattr(line, "service", None)
         rr_display = None
         if svc_obj and getattr(svc_obj, "reference_ranges", None):
-            rr_display = format_reference_ranges_display(
-                svc_obj.reference_ranges)
+            rr_display = format_reference_ranges_display(svc_obj.reference_ranges)
 
         sections_map[key].rows.append(
             LabReportRowOut(
@@ -630,13 +612,12 @@ def get_lab_report_data(
                 normal_range=(rr_display or line.normal_range or "-"),
                 flag=line.flag,
                 comments=line.comments,
-            ))
+            )
+        )
 
     sections = list(sections_map.values())
-    sections.sort(
-        key=lambda s: (s.department_id or 0, s.sub_department_id or 0))
+    sections.sort(key=lambda s: (s.department_id or 0, s.sub_department_id or 0))
 
-    # Age text
     age_text = None
     if patient and getattr(patient, "dob", None):
         try:
@@ -651,14 +632,11 @@ def get_lab_report_data(
         lab_no=str(order.id),
         patient_id=order.patient_id,
         patient_uhid=getattr(patient, "uhid", None),
-        patient_name=getattr(patient, "full_name", None)
-        or getattr(patient, "first_name", None),
+        patient_name=getattr(patient, "full_name", None) or getattr(patient, "first_name", None),
         patient_gender=getattr(patient, "gender", None),
-        patient_dob=patient.dob
-        if patient and getattr(patient, "dob", None) else None,
+        patient_dob=patient.dob if patient and getattr(patient, "dob", None) else None,
         patient_age_text=age_text,
-        patient_type=(order.context_type.upper()
-                      if order.context_type else None),
+        patient_type=(order.context_type.upper() if order.context_type else None),
         bill_no=None,
         received_on=order.collected_at,
         reported_on=order.reported_at,
@@ -669,9 +647,11 @@ def get_lab_report_data(
 
 @router.get("/orders/{order_id}/report-pdf")
 def get_lab_report_pdf(
-        order_id: int,
-        db: Session = Depends(get_db),
-        user: User = Depends(current_user),
+    order_id: int,
+    request: Request,
+    download: int = Query(0),  # ✅ if download=1 -> attachment
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
 ):
     _need_any(user, ["lab.results.report", "lab.orders.view"])
 
@@ -688,11 +668,13 @@ def get_lab_report_pdf(
     if collected_by_id:
         staff = db.query(User).get(collected_by_id)
         if staff:
-            collected_by_name = getattr(staff, "full_name", None) or getattr(
-                staff, "first_name", None)
+            collected_by_name = getattr(staff, "full_name", None) or getattr(staff, "first_name", None)
 
-    lab_no = f"LAB-{report.order_id:06d}"
+    lab_no = f"LAB-{int(report.order_id):06d}"
     order_date = getattr(order, "created_at", None)
+
+    # ✅ QR must open direct download
+    download_url_for_qr = _lab_report_pdf_url(request, order_id, download=True)
 
     pdf_bytes = build_lab_report_pdf_bytes(
         branding=branding,
@@ -701,29 +683,24 @@ def get_lab_report_pdf(
         lab_no=lab_no,
         order_date=order_date,
         collected_by_name=collected_by_name,
+        request=request,  # ✅ key
     )
 
     buf = BytesIO(pdf_bytes)
     buf.seek(0)
+
+    disp = "attachment" if int(download or 0) == 1 else "inline"
     return StreamingResponse(
         buf,
         media_type="application/pdf",
-        headers={
-            "Content-Disposition":
-            f'inline; filename="lab-report-{order_id}.pdf"'
-        },
+        headers={"Content-Disposition": f'{disp}; filename="lab-report-{order_id}.pdf"'},
     )
 
 
 # ---------------- Finalize ----------------
 @router.post("/orders/{order_id}/finalize")
-async def finalize(
-        order_id: int,
-        db: Session = Depends(get_db),
-        user: User = Depends(current_user),
-):
-    _need_any(user,
-              ["lab.results.report", "lab.orders.update", "orders.lab.update"])
+async def finalize(order_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    _need_any(user, ["lab.results.report", "lab.orders.update", "orders.lab.update"])
 
     o = db.query(LisOrder).get(order_id)
     if not o:
@@ -735,7 +712,6 @@ async def finalize(
     o.updated_by = user.id
     o.updated_at = now
 
-    # ✅ NEW BILLING (idempotent)
     try:
         if (getattr(o, "billing_status", None) or "not_billed") != "billed":
             res = autobill_lis_order(db, lis_order_id=o.id, user=user)
@@ -749,24 +725,14 @@ async def finalize(
         raise HTTPException(status_code=500, detail=f"Billing failed: {e}")
 
     db.commit()
-    await _notify("finalized",
-                  order_id=o.id,
-                  billing_invoice_id=o.billing_invoice_id)
+    await _notify("finalized", order_id=o.id, billing_invoice_id=o.billing_invoice_id)
 
-    return {
-        "message": "Finalized",
-        "billing_invoice_id": o.billing_invoice_id,
-        "billing_status": o.billing_status,
-    }
+    return {"message": "Finalized", "billing_invoice_id": o.billing_invoice_id, "billing_status": o.billing_status}
 
 
 # ---------------- Attachments ----------------
 @router.post("/attachments")
-def add_attachment(
-        payload: LisAttachmentIn,
-        db: Session = Depends(get_db),
-        user: User = Depends(current_user),
-):
+def add_attachment(payload: LisAttachmentIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
     _need_any(user, ["lab.attachments.add"])
     it = db.query(LisOrderItem).get(payload.item_id)
     if not it:

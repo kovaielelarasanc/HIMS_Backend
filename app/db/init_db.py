@@ -163,6 +163,7 @@ def seed_permissions(db: Session) -> None:
         ("pharmacy.inventory.returns", ["view", "manage"]),
         ("pharmacy.inventory", ["dispense","view"]),
         ("pharmacy.inventory.txns", ["view"]),
+        ("pharmacy.batch_picks", ["view"]),
         ("pharmacy.accounts.supplier_ledger", ["view", "manage", "export"]),
         ("pharmacy.accounts.supplier_payments", ["view", "manage", "export"]),
         ("pharmacy.accounts.supplier_invoices", ["view", "manage", "export"]),
@@ -173,6 +174,9 @@ def seed_permissions(db: Session) -> None:
         ("inventory.items", ["view"]),
         ("inventory.stock", ["view"]),
         ("inventory.batches", ["view"]),
+        ("inventory.consume", ["create","view"]),
+        ("inventory", ["manage","view"]),
+        ("inventory.reconcile", ["create"]),
         
         # -------- LIS ----------
         ("lab.masters", ["view", "manage"]),
@@ -188,7 +192,7 @@ def seed_permissions(db: Session) -> None:
         ("lab.device_results", ["review",
                                 "import"]),  # review staging, import to LIS
         ("lab.device_logs", ["view"]),  # view raw message logs
-
+        ("lab.integration",["view","manage"])
         # LIS masters (new LIS service master screens)
         ("lis.masters.departments", ["view", "create", "update", "delete"]),
         ("lis.masters.services", ["view", "create", "update", "delete"]),
@@ -261,7 +265,7 @@ def seed_permissions(db: Session) -> None:
         ("pharmacy.reports.schedule_medicine", ["view"]),
 
         ("pharmacy.reports", ["view"]),
-    
+        ("quickorder",["radiology","pharmacy","laboratory","ot","consumables"])
 
         # -------- Settings / Customization ----------
         ("settings.customization", ["view", "manage"]),

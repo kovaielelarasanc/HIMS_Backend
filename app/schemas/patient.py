@@ -7,6 +7,29 @@ from typing import Optional, List
 from pydantic import BaseModel, ConfigDict, EmailStr, field_validator
 
 
+def _norm_str(v: Optional[str]) -> Optional[str]:
+    if v is None:
+        return None
+    if isinstance(v, str):
+        v = v.strip()
+        return v or None
+    return v
+
+
+def _norm_rch_id(v: Optional[str]) -> Optional[str]:
+    v = _norm_str(v)
+    if not v:
+        return None
+    # remove spaces and hyphens, uppercase
+    v = v.replace(" ", "").replace("-", "").upper()
+    return v or None
+
+
+def _is_female(gender: Optional[str]) -> bool:
+    g = (gender or "").strip().lower()
+    return g in {"female", "f", "woman", "women", "girl"}
+
+
 class AddressBase(BaseModel):
     type: Optional[str] = "current"
     line1: Optional[str] = None
@@ -58,7 +81,6 @@ class ConsentOut(BaseModel):
 
 # ---------- Patient Type master ----------
 
-
 class PatientTypeBase(BaseModel):
     code: str
     name: str
@@ -80,12 +102,10 @@ class PatientTypeUpdate(BaseModel):
 
 class PatientTypeOut(PatientTypeBase):
     id: int
-
     model_config = ConfigDict(from_attributes=True)
 
 
 # ---------- Patient core ----------
-
 
 class PatientCreate(BaseModel):
     # mandatory core fields
@@ -96,7 +116,7 @@ class PatientCreate(BaseModel):
     dob: date
     marital_status: str
     phone: str
-    email: Optional [EmailStr] = None
+    email: Optional[EmailStr] = None
     patient_type: str  # value should come from Patient Type master
 
     # optional
@@ -136,6 +156,10 @@ class PatientCreate(BaseModel):
 
     # only for create
     address: Optional[AddressIn] = None
+
+    # --- Pregnancy (optional) ---
+    is_pregnant: Optional[bool] = False
+    rch_id: Optional[str] = None  # optional even if pregnant
 
     # --------- validators for mandatory & formats ----------
 
@@ -188,25 +212,43 @@ class PatientCreate(BaseModel):
         if today.year - v.year > 120:
             raise ValueError("DOB is too far in the past")
         return v
+
     @field_validator("email", mode="before")
     @classmethod
-    def normalize_email_update(cls, v):
-        if v is None:
-            return None
-        if isinstance(v, str):
-            v = v.strip()
-            return v or None
-        return v
+    def normalize_email(cls, v):
+        return _norm_str(v)
 
     @field_validator("ref_source", "ref_details", mode="before")
     @classmethod
-    def normalize_reference_fields_update(cls, v):
-        if v is None:
+    def normalize_reference_fields(cls, v):
+        return _norm_str(v)
+
+    @field_validator("rch_id", mode="before")
+    @classmethod
+    def normalize_rch_id(cls, v):
+        return _norm_rch_id(v)
+
+    @field_validator("rch_id")
+    @classmethod
+    def validate_rch_id_chars(cls, v: Optional[str]) -> Optional[str]:
+        if not v:
             return None
-        if isinstance(v, str):
-            v = v.strip()
-            return v or None
+        # allow only letters+digits (after normalization)
+        if not all(ch.isalnum() for ch in v):
+            raise ValueError("RCH ID must contain only letters and digits")
+        if len(v) > 32:
+            raise ValueError("RCH ID is too long (max 32)")
         return v
+
+    @field_validator("is_pregnant")
+    @classmethod
+    def validate_pregnancy_with_gender(cls, is_pregnant: Optional[bool], info):
+        # If pregnant True, gender must be female (strong rule)
+        # Note: info.data contains already-validated fields in v2
+        gender = info.data.get("gender") if hasattr(info, "data") else None
+        if is_pregnant and not _is_female(gender):
+            raise ValueError("Pregnancy can be marked only for Female patients")
+        return is_pregnant
 
 
 class PatientUpdate(BaseModel):
@@ -254,6 +296,10 @@ class PatientUpdate(BaseModel):
 
     family_id: Optional[int] = None
 
+    # --- Pregnancy (optional) ---
+    is_pregnant: Optional[bool] = None
+    rch_id: Optional[str] = None
+
     @field_validator("phone")
     @classmethod
     def validate_phone_update(cls, v: Optional[str]) -> Optional[str]:
@@ -276,6 +322,32 @@ class PatientUpdate(BaseModel):
             raise ValueError("DOB is too far in the past")
         return v
 
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalize_email_update(cls, v):
+        return _norm_str(v)
+
+    @field_validator("ref_source", "ref_details", mode="before")
+    @classmethod
+    def normalize_reference_fields_update(cls, v):
+        return _norm_str(v)
+
+    @field_validator("rch_id", mode="before")
+    @classmethod
+    def normalize_rch_id_update(cls, v):
+        return _norm_rch_id(v)
+
+    @field_validator("rch_id")
+    @classmethod
+    def validate_rch_id_chars_update(cls, v: Optional[str]) -> Optional[str]:
+        if not v:
+            return None
+        if not all(ch.isalnum() for ch in v):
+            raise ValueError("RCH ID must contain only letters and digits")
+        if len(v) > 32:
+            raise ValueError("RCH ID is too long (max 32)")
+        return v
+
 
 class PatientOut(BaseModel):
     id: int
@@ -291,7 +363,6 @@ class PatientOut(BaseModel):
 
     phone: Optional[str] = None
     email: Optional[EmailStr] = None
-    # aadhar_last4: Optional[str] = None
 
     marital_status: Optional[str] = None
 
@@ -326,6 +397,10 @@ class PatientOut(BaseModel):
     policy_name: Optional[str] = None
 
     family_id: Optional[int] = None
+
+    # --- Pregnancy / RCH ---
+    is_pregnant: Optional[bool] = False
+    rch_id: Optional[str] = None
 
     is_active: bool
     created_at: Optional[datetime] = None

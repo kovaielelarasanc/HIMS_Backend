@@ -1,13 +1,16 @@
 # FILE: app/services/pdf_lis_report.py
 from __future__ import annotations
 
+import os
 import logging
-from datetime import datetime, date, timezone, timedelta
+import re
+from datetime import datetime, date, timezone
 from zoneinfo import ZoneInfo
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Optional, List
+from typing import Any, Optional, List, Tuple
 
+from fastapi import Request
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.lib import colors
@@ -24,13 +27,21 @@ from app.core.config import settings
 from app.services.pdf_branding import brand_header_css
 
 logger = logging.getLogger(__name__)
+IST_TZ = ZoneInfo("Asia/Kolkata")  # IST
+
 
 # ============================================================
 # Common helpers
 # ============================================================
 def _norm_rel_path(p: str) -> str:
-    # make "/uploads/a.png" -> "uploads/a.png"
     return (p or "").strip().lstrip("/\\")
+
+
+def _clean_inline(s: Any) -> str:
+    if s is None:
+        return ""
+    return re.sub(r"\s+", " ", str(s).strip())
+
 
 def _h(x: Any) -> str:
     s = "" if x is None else str(x)
@@ -42,31 +53,32 @@ def _h(x: Any) -> str:
         .replace("'", "&#39;")
     )
 
-IST_TZ = ZoneInfo("Asia/Kolkata")  # IST
+
+def _pick(obj: Any, *names: str, default: Any = None) -> Any:
+    for n in names:
+        try:
+            v = getattr(obj, n, None)
+        except Exception:
+            v = None
+        if v is not None and str(v).strip() != "":
+            return v
+    return default
+
 
 def _name_with_prefix(report: Any, fallback_name: str) -> str:
-    """
-    Build: 'Mr. Arun' / 'Dr. Arun' etc.
-    Reads common fields: prefix, title, salutation.
-    If already present in name, won't duplicate.
-    """
-    raw_name = (fallback_name or "").strip()
+    raw_name = _clean_inline(fallback_name)
     if not raw_name:
         return "-"
 
-    pref = str(_pick(report, "prefix", "salutation", "title", "name_prefix", default="") or "").strip()
+    pref = _clean_inline(_pick(report, "prefix", "salutation", "title", "name_prefix", default="") or "")
     if not pref:
         return raw_name
 
-    # Normalize prefix
     pref_clean = pref.replace(".", "").strip()
     if not pref_clean:
         return raw_name
 
-    # Standard dot format
     pref_fmt = f"{pref_clean}."
-
-    # Avoid duplicates if name already starts with prefix
     low_name = raw_name.lower()
     low_pref1 = pref_clean.lower() + " "
     low_pref2 = pref_fmt.lower() + " "
@@ -77,14 +89,10 @@ def _name_with_prefix(report: Any, fallback_name: str) -> str:
 
 
 def _to_ist(dt: datetime) -> datetime:
-    """
-    Convert datetime to IST.
-    - If dt is naive, assume it's UTC (common for datetime.utcnow()).
-    - If dt is aware, convert timezone properly.
-    """
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(IST_TZ)
+
 
 def _fmt_date_only(v: Any) -> str:
     if not v:
@@ -104,7 +112,7 @@ def _fmt_datetime(v: Any) -> str:
     if not v:
         return "-"
     if isinstance(v, datetime):
-        return _to_ist(v).strftime("%d %b %Y, %I:%M %p")  # ✅ IST
+        return _to_ist(v).strftime("%d %b %Y, %I:%M %p")
     try:
         if isinstance(v, date):
             return datetime(v.year, v.month, v.day).strftime("%d %b %Y")
@@ -113,23 +121,10 @@ def _fmt_datetime(v: Any) -> str:
     try:
         dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
         if isinstance(dt, datetime):
-            return _to_ist(dt).strftime("%d %b %Y, %I:%M %p")  # ✅ IST
+            return _to_ist(dt).strftime("%d %b %Y, %I:%M %p")
         return str(v)
     except Exception:
         return str(v)
-
-
-
-
-def _pick(obj: Any, *names: str, default: Any = None) -> Any:
-    for n in names:
-        try:
-            v = getattr(obj, n, None)
-        except Exception:
-            v = None
-        if v is not None and str(v).strip() != "":
-            return v
-    return default
 
 
 def _split_text_to_lines(txt: str, font_name: str, font_size: float, max_w: float) -> list[str]:
@@ -211,11 +206,27 @@ def _flag_label(flag: str) -> str:
     return ""
 
 
-# ============================================================
-# QR + Barcode helpers (WeasyPrint inline SVG)
-# ============================================================
+def _extract_order_id(report: Any) -> Tuple[Optional[int], str]:
+    order_id_val = _pick(report, "order_id", "lis_order_id", "id", default="")
+    order_id_int: Optional[int] = None
+    order_id_str = ""
+    try:
+        order_id_int = int(order_id_val)
+        order_id_str = str(order_id_int)
+        return order_id_int, order_id_str
+    except Exception:
+        order_id_str = _clean_inline(order_id_val) or ""
+        if order_id_str.isdigit():
+            try:
+                order_id_int = int(order_id_str)
+            except Exception:
+                order_id_int = None
+        return order_id_int, order_id_str
 
 
+# ============================================================
+# QR + Barcode helpers (inline SVG for WeasyPrint)
+# ============================================================
 def _svg_clean(svg: str) -> str:
     s = svg or ""
     for token in ["<?xml", "<!DOCTYPE"]:
@@ -227,7 +238,22 @@ def _svg_clean(svg: str) -> str:
     return s.strip()
 
 
-def _qr_svg_from_text(data: str, size_mm: float = 22.0) -> str:
+def _to_str_maybe(v: Any) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, bytes):
+        try:
+            return v.decode("utf-8", "ignore")
+        except Exception:
+            return ""
+    return str(v)
+
+
+def _qr_svg_from_text(data: str, size_mm: float = 26.0) -> str:
+    """
+    FIX: translate QR bounds to (0,0) before scaling.
+    Without translation, QR often shifts/crops and looks "left misaligned".
+    """
     data = (data or "").strip()
     if not data:
         return ""
@@ -236,9 +262,14 @@ def _qr_svg_from_text(data: str, size_mm: float = 22.0) -> str:
     x1, y1, x2, y2 = qr.getBounds()
     w = max(1.0, x2 - x1)
     h = max(1.0, y2 - y1)
-    d = Drawing(size, size, transform=[size / w, 0, 0, size / h, 0, 0])
+    sx = size / w
+    sy = size / h
+    tx = -x1 * sx
+    ty = -y1 * sy
+    d = Drawing(size, size, transform=[sx, 0, 0, sy, tx, ty])
     d.add(qr)
-    return _svg_clean(renderSVG.drawToString(d))
+    raw = renderSVG.drawToString(d)
+    return _svg_clean(_to_str_maybe(raw))
 
 
 def _code128_svg_from_text(data: str, width_mm: float = 55.0, height_mm: float = 10.0) -> str:
@@ -246,31 +277,93 @@ def _code128_svg_from_text(data: str, width_mm: float = 55.0, height_mm: float =
     if not data:
         return ""
     try:
-        d = createBarcodeDrawing(
-            "Code128",
-            value=data,
-            barHeight=height_mm * mm,
-            humanReadable=False,
-        )
+        d = createBarcodeDrawing("Code128", value=data, barHeight=height_mm * mm, humanReadable=False)
         if d.width and d.width > 0:
             sx = (width_mm * mm) / d.width
             d.scale(sx, 1.0)
-        return _svg_clean(renderSVG.drawToString(d))
+        raw = renderSVG.drawToString(d)
+        return _svg_clean(_to_str_maybe(raw))
     except Exception:
         return ""
 
 
-def _best_qr_payload(report: Any, *, lab_no: str, uhid: str) -> str:
+def _public_base_url(request: Optional[Request] = None) -> str:
     """
-    ✅ Always returns something so QR will never be empty.
+    Returns absolute base URL with scheme.
     Priority:
-    1) url fields
-    2) explicit qr payload fields
-    3) fallback to LAB_NO / UHID
+      1) settings.PUBLIC_BASE_URL
+      2) env PUBLIC_BASE_URL
+      3) request.base_url (if request given)
     """
+    base = ""
+    try:
+        base = (getattr(settings, "PUBLIC_BASE_URL", "") or "").strip()
+    except Exception:
+        base = ""
+
+    if not base:
+        base = (os.getenv("PUBLIC_BASE_URL") or "").strip()
+
+    if not base and request is not None:
+        try:
+            base = str(request.base_url).strip()
+        except Exception:
+            base = ""
+
+    base = base.rstrip("/")
+    if base and not base.startswith(("http://", "https://")):
+        base = "https://" + base.lstrip("/")
+    return base
+
+
+def _lab_report_pdf_url(request: Optional[Request], order_id: int, download: bool = True) -> str:
+    base = _public_base_url(request)
+    if not base:
+        return ""
+    url = f"{base}/api/lab/orders/{int(order_id)}/report-pdf"
+    if download:
+        url = url + "?download=1"
+    return url
+
+
+def _best_qr_payload(
+    report: Any,
+    *,
+    lab_no: str,
+    uhid: str,
+    order_id: Optional[int] = None,
+    pdf_url: Optional[str] = None,
+    base_url: str = "",
+) -> str:
+    """
+    QR should ideally be an HTTP(s) URL. blob: URLs are browser-only and won't work when scanned.
+    This prefers:
+      1) pdf_url (if http(s) or relative -> made absolute using base_url)
+      2) report-provided URL fields (also normalized)
+      3) report-provided qr_text payload
+      4) fallback labels
+    """
+    def _fix_url(u: str) -> str:
+        u = (u or "").strip()
+        if not u:
+            return ""
+        if u.startswith(("http://", "https://")):
+            return u
+        if u.startswith("/") and base_url:
+            return base_url.rstrip("/") + u
+        # ignore blob:, file:, data:, etc for QR scanning use-cases
+        return ""
+
+    if pdf_url:
+        u = _fix_url(str(pdf_url))
+        if u:
+            return u
+
     url = str(
         _pick(
             report,
+            "download_pdf_url",
+            "report_pdf_url",
             "qr_url",
             "report_url",
             "portal_url",
@@ -279,7 +372,8 @@ def _best_qr_payload(report: Any, *, lab_no: str, uhid: str) -> str:
             default="",
         )
         or ""
-    ).strip()
+    )
+    url = _fix_url(url)
     if url:
         return url
 
@@ -298,28 +392,22 @@ def _best_qr_payload(report: Any, *, lab_no: str, uhid: str) -> str:
     if payload:
         return payload
 
-    # fallback (still scannable)
     lab_no = (lab_no or "").strip()
     uhid = (uhid or "").strip()
-    if lab_no and uhid:
+    if uhid and lab_no:
         return f"UHID:{uhid} | LAB:{lab_no}"
     if lab_no:
         return f"LAB:{lab_no}"
     if uhid:
         return f"UHID:{uhid}"
+    if order_id is not None:
+        return f"ORDER:{int(order_id)}"
     return ""
 
 
 # ============================================================
-# WeasyPrint (Optional) UI
-# - barcode moved under "Sample Collected At"
-# - QR always generated (payload fallback)
-# - Lab No moved under "Sample Collected At"
-# - Removed header bar line
-# - Website moved below email
+# WeasyPrint HTML/CSS (tight header + logo top-left)
 # ============================================================
-
-
 def _css() -> str:
     return f"""
     {brand_header_css()}
@@ -327,17 +415,12 @@ def _css() -> str:
     :root {{
       --ink:#0f172a;
       --muted:#475569;
-      --line:#e2e8f0;
+      --line:#000000;
       --soft:#f8fafc;
       --soft2:#f1f5f9;
-
-      --blue:#0B5CAD;
-      --blue2:#0A4C92;
-
+      --radius:10px;
       --red:#dc2626;
       --low:#2563eb;
-
-      --radius:10px;
     }}
 
     *{{box-sizing:border-box}}
@@ -349,140 +432,90 @@ def _css() -> str:
       padding:0;
     }}
 
-    header{{ position: running(pageHeader); }}
-    footer{{ position: running(pageFooter); }}
+    header{{ position: running(pageHeader); margin:0; padding:0; }}
+    footer{{ position: running(pageFooter); margin:0; padding:0; }}
 
     @page {{
       size: A4;
-      margin: 10mm 12mm 14mm 12mm;
-      @top-center {{ content: element(pageHeader); }}
-      @bottom-center {{ content: element(pageFooter); }}
+      margin: 6mm 12mm 14mm 12mm;
+      @top-center {{
+        content: element(pageHeader);
+        vertical-align: top;
+        padding-top: 0;
+      }}
+      @bottom-center {{
+        content: element(pageFooter);
+        vertical-align: bottom;
+        padding-bottom: 0;
+      }}
     }}
 
-    /* =========================================================
-       HEADER
-       Left (Logo only) 50%  |  Right (Org + Contacts) 50%
-       Top-start aligned
-       ========================================================= */
+    .hdr, .hdr * {{ margin:0 !important; padding:0 !important; }}
     .hdr {{
       width:100%;
-      border-bottom:1px solid var(--line);
-      padding: 3.5mm 0 3mm;
+      border-bottom: 1px solid var(--line);
+      padding: 0 0 2mm 0 !important;
     }}
-
     .hdr-top {{
       display:flex;
-      align-items:flex-start;     /* ✅ top */
-      justify-content:flex-start;
-      gap: 10px;
+      align-items:flex-start;
+      justify-content:space-between;
+      gap: 6mm;
+      width:100%;
     }}
-
     .hdr-left {{
-      flex: 0 0 50%;
-      max-width: 50%;
+      flex: 0 0 auto;
+      width: 70mm;
       display:flex;
-      align-items:flex-start;     /* ✅ top */
-      justify-content:flex-start; /* ✅ start */
-    }}
-
-    .hdr-right {{
-      flex: 0 0 50%;
-      max-width: 50%;
-      display:flex;
-      flex-direction:column;
-      align-items:flex-start;     /* ✅ top-start */
+      align-items:flex-start;
       justify-content:flex-start;
-      text-align:left;            /* ✅ start */
-      color: var(--muted);
-      font-size: 9.2px;
-      line-height: 1.35;
-      white-space: normal;        /* allow address wrap */
-      padding-top: 0.3mm;
     }}
-
-    /* ✅ If no logo: hide left and expand right */
-    .hdr-top.no-logo .hdr-left {{
-      display:none;
-    }}
-    .hdr-top.no-logo .hdr-right {{
-      flex: 1 1 100%;
-      max-width: 100%;
-    }}
-
-    /* ✅ Bigger logo (left only) */
     .logo {{
-      width: 92mm;        /* BIG */
-      height: 34mm;       /* BIG */
+      width: 70mm;
+      height: 22mm;
       display:flex;
       align-items:flex-start;
       justify-content:flex-start;
       overflow:hidden;
-      background: transparent;
-      border-radius: 0;
     }}
     .logo img {{
       width:100%;
       height:100%;
-      object-fit:contain;
+      object-fit: contain;
+      object-position: left top;
       display:block;
     }}
-
-    /* Right side org name */
-    .org-name {{
-      font-size: 16.5px;
-      font-weight: 1000;
-      letter-spacing: .2px;
-      line-height: 1.05;
-      color: var(--ink);
-      margin-bottom: 1.1mm;
-    }}
-    .org-name .accent {{
-      color: var(--blue);
-    }}
-
-    /* contact lines */
-    .contact-line {{
+    .hdr-right {{
+      flex: 1 1 auto;
+      text-align:right;
       display:flex;
+      flex-direction:column;
+      align-items:flex-end;
       justify-content:flex-start;
-      gap:6px;
-      align-items:center;
-      white-space:nowrap;
-      margin-top: 0.6mm;
+      line-height: 1.18;
+      color: #000;
+      padding-top: 0;
     }}
-
-    .addr-right {{
-      margin-top: 1.4mm;
-      font-size: 9px;
-      color: var(--muted);
-      font-weight: 650;
-      line-height: 1.25;
-      white-space: normal;
-      max-width: 95mm;
+    .org-name {{ font-size: 12.5px; font-weight: 900; line-height: 1.05; }}
+    .org-tag {{ font-size: 9px; margin-top: 1mm !important; line-height: 1.15; }}
+    .org-meta {{
+      font-size: 8px;
+      margin-top: 1mm !important;
+      line-height: 1.2;
+      max-width: 115mm;
+      word-break: break-word;
     }}
+    .org-meta .addr {{ margin-top: .8mm !important; }}
 
-    .dot {{
-      width: 14px;
-      height: 14px;
-      border-radius: 999px;
-      background: #e6f0ff;
-      color: var(--blue2);
-      display:inline-flex;
-      align-items:center;
-      justify-content:center;
-      font-weight: 900;
-      font-size: 9px;
-      flex: 0 0 auto;
-    }}
+    .hdr-top.no-logo .hdr-left {{ display:none; }}
 
-    /* =========================================================
-       PATIENT STRIP
-       ========================================================= */
+    .sheet {{ padding: 0; }}
     .patient-strip {{
       width:100%;
       display:grid;
       grid-template-columns: 1.05fr .55fr 1.1fr .9fr;
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
+      border: 1px solid #e2e8f0;
+      border-radius: 10px;
       overflow:hidden;
       margin: 2mm 0 3mm;
     }}
@@ -491,66 +524,40 @@ def _css() -> str:
       background:#fff;
       min-height: 26mm;
     }}
-    .ps + .ps {{
-      border-left: 1px solid var(--line);
-    }}
-    .ps .label {{
-      color: var(--muted);
-      font-weight: 800;
-      font-size: 9px;
-    }}
-    .ps .val {{
-      color: var(--ink);
-      font-weight: 900;
-      font-size: 10px;
-    }}
-    .pname {{
-      font-size: 14px;
-      font-weight: 1000;
-      margin-bottom: 2mm;
-    }}
-    .kv {{
-      display:flex;
-      gap: 8px;
-      padding: 2px 0;
-      font-size: 10px;
-    }}
-    .kv .k {{
-      width: 18mm;
-      color: var(--muted);
-      font-weight: 800;
-    }}
-    .kv .v {{
-      color: var(--ink);
-      font-weight: 900;
-    }}
+    .ps + .ps {{ border-left: 1px solid #e2e8f0; }}
+
+    .ps .label {{ color: #475569; font-weight: 800; font-size: 9px; }}
+    .ps .val {{ color: #0f172a; font-weight: 900; font-size: 10px; }}
+
+    .pname {{ font-size: 14px; font-weight: 1000; margin-bottom: 2mm; }}
+
+    .kv {{ display:flex; gap: 8px; padding: 2px 0; font-size: 10px; }}
+    .kv .k {{ width: 18mm; color: #475569; font-weight: 800; }}
+    .kv .v {{ color: #0f172a; font-weight: 900; }}
 
     .barcode {{
       margin-top: 2mm;
-      background: var(--soft);
-      border: 1px solid var(--line);
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
       border-radius: 8px;
       padding: 2mm 2mm;
     }}
-    .barcode svg {{
-      width: 100%;
-      height: 11mm;
-      display:block;
-    }}
+    .barcode svg {{ width: 100%; height: 11mm; display:block; }}
     .barcode .txt {{
       margin-top:1mm;
       font-size:9px;
       font-weight:900;
-      color:var(--muted);
+      color:#475569;
       text-align:center;
       letter-spacing:.2px;
     }}
 
     .qrbox {{
       display:flex;
+      flex-direction:column;
       align-items:center;
       justify-content:center;
-      background: var(--soft);
+      background: #f8fafc;
     }}
     .qrsvg {{
       width: 22mm;
@@ -558,17 +565,30 @@ def _css() -> str:
       background:#fff;
       padding: 2mm;
       border-radius: 6px;
-      border: 1px solid var(--line);
+      border: 1px solid #e2e8f0;
+      display:flex;
+      align-items:center;
+      justify-content:center;
     }}
-    .qrsvg svg {{
-      width: 100%;
-      height: 100%;
-      display:block;
-    }}
+    .qrsvg svg {{ width: 100%; height: 100%; display:block; }}
 
-    /* =========================================================
-       TITLE + LOGO WATERMARK ONLY (NO TEXT)
-       ========================================================= */
+    .inv {{ font-weight: 900; }}
+    .sub {{ display:block; font-size: 9px; color: var(--muted); font-style: italic; margin-top: 1px; }}
+    .res {{ font-weight: 1000; }}
+
+    .flag {{
+      margin-left: 6px;
+      font-size: 8px;
+      font-weight: 900;
+      padding: 1px 6px;
+      border-radius: 999px;
+      border: 1px solid #e2e8f0;
+      background: #fff;
+      color: #0f172a;
+    }}
+    .flag.high {{ color: var(--red); border-color: #fecaca; background: #fff1f2; }}
+    .flag.low  {{ color: var(--low); border-color: #bfdbfe; background: #eff6ff; }}
+
     .test-title {{
       text-align:center;
       font-size: 13px;
@@ -577,136 +597,33 @@ def _css() -> str:
       margin: 2mm 0 1mm;
       text-transform: uppercase;
     }}
-    .test-rule {{
-      border-top: 1px solid var(--line);
-      margin: 1mm 0 2mm;
-    }}
+    .test-rule {{ border-top: 1px solid #e2e8f0; margin: 1mm 0 2mm; }}
 
-    .sheet {{
-      position:relative;
-    }}
-
-    /* ✅ WeasyPrint-friendly watermark repeated per page */
-    .watermark {{
-      position: fixed;
-      left: 50%;
-      top: 55%;
-      transform: translate(-50%, -50%);
-      pointer-events:none;
-      user-select:none;
-      z-index: 0;
-      opacity: .07;
-    }}
-    .watermark img {{
-      width: 120mm;
-      max-width: 70vw;
-      height: auto;
-      object-fit: contain;
-      display:block;
-    }}
-
-    /* keep content above watermark */
-    table, .patient-strip, .test-title, .test-rule, .notes, .sigs {{
-      position: relative;
-      z-index: 1;
-    }}
-
-    /* =========================================================
-       TABLE
-       ========================================================= */
-    table {{
-      width:100%;
-      border-collapse: collapse;
-    }}
+    table {{ width:100%; border-collapse: collapse; }}
     thead th {{
       font-size: 10px;
       text-align:left;
       padding: 6px 6px;
       color: #0b1220;
-      border-bottom: 1px solid var(--line);
+      border-bottom: 1px solid #e2e8f0;
       font-weight: 1000;
     }}
     tbody td {{
       padding: 6px 6px;
       vertical-align:top;
-      border-bottom: 1px solid var(--soft2);
+      border-bottom: 1px solid #f1f5f9;
       font-size: 10px;
     }}
-    tbody tr:last-child td {{
-      border-bottom: 1px solid var(--line);
-    }}
-
-    .inv {{
-      font-weight: 950;
-    }}
-    .inv .sub {{
-      display:block;
-      font-size: 8.8px;
-      color: var(--muted);
-      font-weight: 750;
-      margin-top: 1px;
-    }}
-
-    .res {{
-      font-weight: 1000;
-    }}
-    .flag {{
-      display:block;
-      font-size: 9px;
-      font-weight: 1000;
-      margin-top: 1px;
-    }}
-    .flag.high {{ color: var(--red); }}
-    .flag.low {{ color: var(--low); }}
-
-    /* =========================================================
-       NOTES + SIGNATURES + FOOTER
-       ========================================================= */
-    .notes {{
-      margin-top: 3mm;
-      font-size: 9.6px;
-      color: #111827;
-    }}
-    .notes .ntitle {{
-      font-weight: 1000;
-      margin-bottom: 2mm;
-    }}
-    .notes ol {{
-      margin: 0 0 0 4.5mm;
-      padding: 0;
-      line-height: 1.35;
-    }}
-
-    .sigs {{
-      margin-top: 7mm;
-      display:grid;
-      grid-template-columns: 1fr 1fr 1fr;
-      gap: 10mm;
-      font-size: 9px;
-      color: var(--muted);
-      align-items:end;
-    }}
-    .sig {{
-      text-align:center;
-    }}
-    .sig .line {{
-      border-top: 1px solid var(--line);
-      margin: 10mm 0 2mm;
-    }}
-    .sig .name {{
-      color: var(--ink);
-      font-weight: 900;
-      font-size: 9.6px;
-    }}
+    tbody tr:last-child td {{ border-bottom: 1px solid #e2e8f0; }}
 
     footer .foot {{
       width:100%;
-      border-top:1px solid var(--line);
+      border-top:1px solid #e2e8f0;
       padding-top: 2mm;
       display:flex;
       justify-content:space-between;
       align-items:center;
-      color: var(--muted);
+      color:#475569;
       font-size: 9px;
     }}
     .pagenum:before {{ content: "Page " counter(page) " of " counter(pages); }}
@@ -714,15 +631,13 @@ def _css() -> str:
 
 
 def _build_header_html(branding: Any) -> str:
-    # ✅ Right side: org_name + phone/email/web + address
     org_name = (getattr(branding, "org_name", None) or "").strip()
-    
+    org_tag = (getattr(branding, "org_tagline", None) or "").strip()
     addr = (getattr(branding, "org_address", None) or "").strip()
     phone = (getattr(branding, "org_phone", None) or "").strip()
     email = (getattr(branding, "org_email", None) or "").strip()
     web = (getattr(branding, "org_website", None) or "").strip()
 
-    # ✅ Logo: show ONLY if exists or url/data uri
     logo_raw = (getattr(branding, "logo_path", None) or "").strip()
     logo_src = ""
     logo_ok = False
@@ -736,49 +651,34 @@ def _build_header_html(branding: Any) -> str:
             abs_path = Path(settings.STORAGE_DIR).joinpath(logo_rel)
             if abs_path.exists() and abs_path.is_file():
                 logo_ok = True
-                logo_src = logo_rel  # relative works with base_url=STORAGE_DIR
-
-    # split phone if multiple
-    phone2 = ""
-    if phone and ("/" in phone or "," in phone or "|" in phone):
-        phone2 = phone
-        phone = ""
-
-    # org_name accent last word (optional)
-    name_html = ""
-    if org_name:
-        parts = org_name.split()
-        if len(parts) >= 2:
-            p1 = " ".join(parts[:-1])
-            p2 = parts[-1]
-            name_html = f"{_h(p1)} <span class='accent'>{_h(p2)}</span>"
-        else:
-            name_html = f"<span class='accent'>{_h(org_name)}</span>"
+                logo_src = logo_rel
 
     hdr_top_cls = "hdr-top" + ("" if logo_ok else " no-logo")
 
-    # ✅ Left: logo only (big size handled in CSS)
+    left_html = ""
     if logo_ok:
         left_html = f"""
         <div class="hdr-left">
-          <div class="logo"><img src="{_h(logo_src)}" alt="logo"/></div>
+          <div class="logo">
+            <img src="{_h(logo_src)}" alt="logo"/>
+          </div>
         </div>
         """.strip()
-    else:
-        left_html = '<div class="hdr-left"></div>'
 
-    # ✅ Right: org + contacts + address (top-start)
+    meta_line = " | ".join([x for x in [
+        (f"Ph: {phone}" if phone else ""),
+        (email if email else ""),
+        (web if web else ""),
+    ] if x]).strip()
+
     right_html = f"""
     <div class="hdr-right">
-      {"<div class='org-name'>" + name_html + "</div>" if name_html else ""}
-
-      {"<div class='contact-line'><span class='dot'>☎</span><span>" + _h(org_name) + "</span></div>" if org_name else ""}
-      {"<div class='contact-line'><span class='dot'>☎</span><span>" + _h(phone) + "</span></div>" if phone else ""}
-      {"<div class='contact-line'><span class='dot'>☎</span><span>" + _h(phone2) + "</span></div>" if phone2 else ""}
-      {"<div class='contact-line'><span class='dot'>@</span><span>" + _h(email) + "</span></div>" if email else ""}
-      {"<div class='contact-line'><span class='dot'>🌐</span><span>" + _h(web) + "</span></div>" if web else ""}
-
-      {"<div class='addr-right'>" + _h(addr) + "</div>" if addr else ""}
+      {"<div class='org-name'>" + _h(org_name) + "</div>" if org_name else ""}
+      {"<div class='org-tag'>" + _h(org_tag) + "</div>" if org_tag else ""}
+      <div class="org-meta">
+        {"<div>" + _h(meta_line) + "</div>" if meta_line else ""}
+        {"<div class='addr'>" + _h(addr) + "</div>" if addr else ""}
+      </div>
     </div>
     """.strip()
 
@@ -792,7 +692,6 @@ def _build_header_html(branding: Any) -> str:
     """.strip()
 
 
-
 def _build_lab_report_html(
     *,
     branding: Any,
@@ -801,35 +700,41 @@ def _build_lab_report_html(
     lab_no: str,
     order_date: Any,
     collected_by_name: Optional[str],
+    pdf_url: Optional[str] = None,
+    base_url: str = "",
 ) -> str:
-    raw_pname = str(_pick(report, "patient_name", "name", default="-") or "-")
+    raw_pname = _clean_inline(_pick(report, "patient_name", "name", default="-") or "-")
     pname = _h(_name_with_prefix(report, raw_pname))
 
-    age_text = _pick(report, "patient_age_text", "age_text", default="-")
-    gender = _pick(report, "patient_gender", "gender", default="-")
-    pid = _pick(report, "patient_uhid", "patient_id", "uhid", default="-")
-    pid_str = str(pid or "-").strip() or "-"
+    age_text = _clean_inline(_pick(report, "patient_age_text", "age_text", default="-") or "-")
+    gender = _clean_inline(_pick(report, "patient_gender", "gender", default="-") or "-")
+    pid = _clean_inline(_pick(report, "patient_uhid", "patient_id", "uhid", default="-") or "-")
+    pid_str = pid or "-"
 
-    # ✅ QR payload (always)
+    order_id_int, order_id_str = _extract_order_id(report)
+
+    # Ensure we have a real http(s) pdf_url for QR (NOT blob:)
+    if not pdf_url and order_id_int is not None and base_url:
+        pdf_url = _lab_report_pdf_url(None, order_id_int, download=True) or ""
+        if pdf_url.startswith("/") and base_url:
+            pdf_url = base_url.rstrip("/") + pdf_url
+
     qr_payload = _best_qr_payload(
-        report, lab_no=str(lab_no or ""), uhid=pid_str if pid_str != "-" else ""
+        report,
+        order_id=order_id_int,
+        lab_no=_clean_inline(lab_no),
+        uhid=pid_str if pid_str != "-" else "",
+        pdf_url=pdf_url,
+        base_url=base_url,
     )
-    qr_svg = _qr_svg_from_text(qr_payload) if qr_payload else ""
+    qr_svg = _qr_svg_from_text(qr_payload, size_mm=26.0) if qr_payload else ""
+    barcode_svg = _code128_svg_from_text(order_id_str, width_mm=55.0, height_mm=10.0) if order_id_str else ""
 
-    # ✅ Barcode (UHID)
-    barcode_svg = (
-        _code128_svg_from_text(pid_str, width_mm=55.0, height_mm=10.0)
-        if pid_str and pid_str != "-"
-        else ""
+    sample_collected_at = _clean_inline(
+        _pick(report, "sample_collected_at", "collection_site", "collection_location", default="") or ""
     )
-
-    sample_collected_at = _pick(
-        report, "sample_collected_at", "collection_site", "collection_location", default=""
-    )
-    sample_address = _pick(
-        report, "sample_collected_address", "collection_address", "patient_address", default=""
-    )
-    ref_by = _pick(report, "ref_by", "referred_by", "ref_doctor", "doctor_name", default="")
+    sample_address = (str(_pick(report, "sample_collected_address", "collection_address", "patient_address", default="") or "")).strip()
+    ref_by = _clean_inline(_pick(report, "ref_by", "referred_by", "ref_doctor", "doctor_name", default="") or "")
 
     registered_on = _pick(report, "registered_on", "created_at", default=order_date)
     collected_on = _pick(report, "collected_on", "received_on", "sample_received_on", default=None)
@@ -842,7 +747,7 @@ def _build_lab_report_html(
     sections = getattr(report, "sections", None) or []
     if len(sections) == 1:
         sec0 = sections[0]
-        sec_title = (_pick(sec0, "panel_name", "department_name", default="Laboratory Report") or "").strip()
+        sec_title = _clean_inline(_pick(sec0, "panel_name", "department_name", default="Laboratory Report") or "")
         test_title = _h(sec_title.upper()) if sec_title else "LABORATORY REPORT"
     else:
         test_title = "LABORATORY REPORT"
@@ -850,18 +755,14 @@ def _build_lab_report_html(
     rows_html = ""
     for sec in sections:
         for r in (getattr(sec, "rows", None) or []):
-            inv = _h(_pick(r, "service_name", "test_name", default="-"))
-            result_val = _h(_pick(r, "result_value", "value", default="-"))
-            unit = _h(_pick(r, "unit", default="-"))
-            ref = _h(_pick(r, "normal_range", "reference_range", default="-"))
+            inv = _h(_clean_inline(_pick(r, "service_name", "test_name", default="-") or "-"))
+            result_val = _h(_clean_inline(_pick(r, "result_value", "value", default="-") or "-"))
+            unit = _h(_clean_inline(_pick(r, "unit", default="-") or "-"))
+            ref = _h(_clean_inline(_pick(r, "normal_range", "reference_range", default="-") or "-"))
             flag = str(_pick(r, "flag", "abnormal_flag", default="") or "")
             ftxt = _flag_label(flag)
-            fclass = (
-                "high"
-                if (flag or "").strip().upper() in {"H", "HIGH"}
-                else ("low" if (flag or "").strip().upper() in {"L", "LOW"} else "")
-            )
-            comments = (str(_pick(r, "comments", "comment", default="") or "")).strip()
+            fclass = "high" if (flag or "").strip().upper() in {"H", "HIGH"} else ("low" if (flag or "").strip().upper() in {"L", "LOW"} else "")
+            comments = _clean_inline(_pick(r, "comments", "comment", default="") or "")
 
             res_style = ""
             if fclass == "high":
@@ -899,52 +800,34 @@ def _build_lab_report_html(
     header_html = _build_header_html(branding)
     gen_on = _fmt_datetime(datetime.utcnow())
 
-    # QR cell
-    qr_cell = f"<div class='qrsvg'>{qr_svg}</div>" if qr_svg else "<div class='qrsvg'></div>"
+    qr_cell = (
+        f"<div class='qrsvg'>{qr_svg}</div>"
+        f"<div style='margin-top:3px;font-size:8px;color:#475569;font-weight:800;text-align:center;'>Scan to download</div>"
+        if qr_svg else "<div class='qrsvg'></div>"
+    )
 
-    # ✅ Barcode under Sample Collected
     barcode_html = ""
     if barcode_svg:
         barcode_html = f"""
         <div class="barcode">
           {barcode_svg}
-          <div class="txt">UHID: {_h(pid_str)}</div>
+          <div class="txt">ORDER ID: {_h(order_id_str)}</div>
         </div>
         """.strip()
 
-    # ✅ Lab No under Sample Collected
     labno_html = f"""
       <div style="margin-top:6px;font-size:10px;">
-        <span class="label">Lab No:</span> <span class="val">{_h(lab_no)}</span>
+        <span class="label">Lab No:</span> <span class="val">{_h(_clean_inline(lab_no))}</span>
       </div>
     """.strip()
 
-        # =========================================================
-    # ✅ Watermark = LOGO only (center). If no logo → hidden
-    # =========================================================
-    logo_raw = (getattr(branding, "logo_path", None) or "").strip()
-    logo_src = ""
-    logo_ok = False
-
-    if logo_raw.startswith(("http://", "https://", "data:")):
-        logo_ok = True
-        logo_src = logo_raw
-    else:
-        logo_rel = _norm_rel_path(logo_raw)
-        if logo_rel:
-            abs_path = Path(settings.STORAGE_DIR).joinpath(logo_rel)
-            if abs_path.exists() and abs_path.is_file():
-                logo_ok = True
-                logo_src = logo_rel
-
-    watermark_html = ""
-    if logo_ok:
-        watermark_html = f"""
-        <div class="watermark">
-          <img src="{_h(logo_src)}" alt="watermark"/>
-        </div>
-        """.strip()
-
+    sample_address_html = ""
+    if sample_address.strip():
+        sample_address_html = (
+            "<div style='margin-top:6px;font-size:9.4px;color:var(--muted);font-weight:750;line-height:1.25;'>"
+            + _h(sample_address.strip())
+            + "</div>"
+        )
 
     return f"""
     <html>
@@ -977,9 +860,9 @@ def _build_lab_report_html(
               {"<div style='margin-top:2px;font-size:10px;font-weight:900;'>" + _h(sample_collected_at) + "</div>" if sample_collected_at else ""}
               {barcode_html}
               {labno_html}
-              {"<div style='margin-top:6px;font-size:9.4px;color:var(--muted);font-weight:750;line-height:1.25;'>" + _h(sample_address) + "</div>" if sample_address else ""}
+              {sample_address_html}
               {"<div style='margin-top:6px;font-size:10px;'><span class='label'>Ref. By:</span> <span class='val'>" + _h(ref_by) + "</span></div>" if ref_by else ""}
-              {"<div style='margin-top:2px;font-size:10px;'><span class='label'>Collected By:</span> <span class='val'>" + _h(collected_by_name) + "</span></div>" if collected_by_name else ""}
+              {"<div style='margin-top:2px;font-size:10px;'><span class='label'>Collected By:</span> <span class='val'>" + _h(_clean_inline(collected_by_name)) + "</span></div>" if collected_by_name else ""}
             </div>
 
             <div class="ps">
@@ -991,8 +874,6 @@ def _build_lab_report_html(
 
           <div class="test-title">{test_title}</div>
           <div class="test-rule"></div>
-
-          {watermark_html}
 
           <table>
             <thead>
@@ -1009,24 +890,6 @@ def _build_lab_report_html(
           </table>
 
           {notes_html}
-
-          <div class="sigs">
-            <div class="sig">
-              <div class="line"></div>
-              <div class="name">Medical Lab Technician</div>
-              <div>(DMLT, BMLT)</div>
-            </div>
-            <div class="sig">
-              <div class="line"></div>
-              <div class="name">Dr. / Pathologist</div>
-              <div>(Verified)</div>
-            </div>
-            <div class="sig">
-              <div class="line"></div>
-              <div class="name">Authorized Signatory</div>
-              <div>(MD)</div>
-            </div>
-          </div>
         </div>
       </body>
     </html>
@@ -1035,12 +898,7 @@ def _build_lab_report_html(
 
 # ============================================================
 # ReportLab fallback (Always)
-# - barcode moved under "Sample Collected At"
-# - QR always generated (payload fallback)
-# - Lab No moved under "Sample Collected At"
 # ============================================================
-
-
 def _draw_letterhead_background(c: canvas.Canvas, branding: Any, page_num: int = 1) -> None:
     if not branding or not getattr(branding, "letterhead_path", None):
         return
@@ -1066,11 +924,9 @@ def _draw_letterhead_background(c: canvas.Canvas, branding: Any, page_num: int =
 
 
 def _logo_reader(branding: Any) -> Optional[ImageReader]:
-    rel_raw = (getattr(branding, "logo_path", None) or "").strip()
+    rel_raw = _clean_inline(getattr(branding, "logo_path", None) or "")
     if not rel_raw:
         return None
-
-    # ReportLab can't load http/data URIs safely here
     if rel_raw.startswith(("http://", "https://", "data:")):
         return None
 
@@ -1087,7 +943,6 @@ def _logo_reader(branding: Any) -> Optional[ImageReader]:
     return None
 
 
-
 def _draw_brand_header_reportlab(
     c: canvas.Canvas,
     branding: Any,
@@ -1098,76 +953,82 @@ def _draw_brand_header_reportlab(
     right: float,
     top: float,
 ) -> float:
-    MUTED = colors.HexColor("#475569")
-    LINE = colors.HexColor("#E2E8F0")
+    LINE = colors.black
+    TEXT = colors.black
 
+    org_name = (getattr(branding, "org_name", None) or "").strip()
+    org_tag = (getattr(branding, "org_tagline", None) or "").strip()
     addr = (getattr(branding, "org_address", None) or "").strip()
     phone = (getattr(branding, "org_phone", None) or "").strip()
     email = (getattr(branding, "org_email", None) or "").strip()
     web = (getattr(branding, "org_website", None) or "").strip()
 
-    y_top = page_h - top
-
-    # ✅ Big logo box (70mm width)
     LOGO_W = 70 * mm
-    LOGO_H = 28 * mm
+    pad_top = 2 * mm
+    pad_bottom = 1 * mm
 
-    # --- LEFT: logo only (if available) ---
+    y_top = page_h - top
+    header_box_h = 28 * mm
+    header_bottom = y_top - header_box_h
+
+    c.saveState()
+    c.setStrokeColor(LINE)
+    c.setLineWidth(1)
+    c.line(left, header_bottom, page_w - right, header_bottom)
+    c.restoreState()
+
     lr = _logo_reader(branding)
-    logo_bottom_y = y_top  # if no logo, doesn't affect header height
-
     if lr:
         try:
-            # drawImage uses bottom-left origin
+            logo_box_h = max(1, header_box_h - (pad_top + pad_bottom))
             c.drawImage(
                 lr,
                 left,
-                y_top - LOGO_H,
+                y_top - pad_top - logo_box_h,
                 width=LOGO_W,
-                height=LOGO_H,
+                height=logo_box_h,
                 preserveAspectRatio=True,
                 mask="auto",
             )
-            logo_bottom_y = y_top - LOGO_H
         except Exception:
-            lr = None
+            logger.exception("drawImage failed for branding logo")
 
-    # --- RIGHT: phone/email/web/address ---
-    xr = page_w - right
-    yy = y_top - 2.5 * mm
+    gap = 6 * mm
+    text_x = left + LOGO_W + gap
+    text_w = max(0, (page_w - right) - text_x)
 
-    c.setFillColor(MUTED)
-    c.setFont("Helvetica", 8.4)
+    y = y_top - pad_top
+    c.setFillColor(TEXT)
 
-    def rline(text: str, gap: float = 3.8):
-        nonlocal yy
-        if text:
-            c.drawRightString(xr, yy, text)
-            yy -= gap * mm
+    if org_name:
+        c.setFont("Helvetica-Bold", 12)
+        c.drawRightString(page_w - right, y, org_name)
+        y -= 5.2 * mm
 
-    rline(phone)
-    rline(email)
-    rline(web)
+    if org_tag:
+        c.setFont("Helvetica", 9)
+        c.drawRightString(page_w - right, y, org_tag)
+        y -= 4.6 * mm
 
-    # address can wrap
+    meta = " | ".join([x for x in [
+        (f"Ph: {phone}" if phone else ""),
+        (email if email else ""),
+        (web if web else ""),
+    ] if x])
+
+    c.setFont("Helvetica", 8)
+    if meta:
+        c.drawRightString(page_w - right, y, meta)
+        y -= 3.8 * mm
+
     if addr:
-        c.setFont("Helvetica", 7.8)
-        addr_lines = _wrap_simple(addr, "Helvetica", 7.8, 95 * mm)[:2]
+        c.setFont("Helvetica", 8)
+        addr_lines = _wrap_simple(addr, "Helvetica", 8, text_w)[:2]
         for ln in addr_lines:
-            c.drawRightString(xr, yy, ln)
-            yy -= 3.4 * mm
+            c.drawRightString(page_w - right, y, ln)
+            y -= 3.6 * mm
 
-    right_bottom_y = yy
-
-    # header bottom = lower of (logo bottom) and (right content bottom)
-    y_line = min(logo_bottom_y, right_bottom_y) - 2.5 * mm
-
-    c.setStrokeColor(LINE)
-    c.setLineWidth(0.9)
-    c.line(left, y_line, page_w - right, y_line)
-
-    return y_line - 6.0 * mm
-
+    return header_bottom - 6 * mm
 
 
 def _build_lab_report_pdf_reportlab(
@@ -1178,14 +1039,17 @@ def _build_lab_report_pdf_reportlab(
     lab_no: str,
     order_date: Any,
     collected_by_name: Optional[str],
+    pdf_url: Optional[str] = None,
+    request: Optional[Request] = None,
 ) -> bytes:
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     page_w, page_h = A4
 
+    # FIX: Match WeasyPrint margins (left was 4mm -> caused "left alignment wrong")
     LEFT = 12 * mm
     RIGHT = 12 * mm
-    TOP = 8 * mm
+    TOP = 6 * mm
     BOTTOM = 14 * mm
 
     INK = colors.HexColor("#0F172A")
@@ -1207,16 +1071,29 @@ def _build_lab_report_pdf_reportlab(
 
     PAD = 1.8 * mm
 
-    pname = str(_pick(report, "patient_name", default="-") or "-")
-    age_text = str(_pick(report, "patient_age_text", "age_text", default="-") or "-")
-    gender = str(_pick(report, "patient_gender", "gender", default="-") or "-")
-    pid = str(_pick(report, "patient_uhid", "patient_id", "uhid", default="-") or "-").strip() or "-"
+    pname = _clean_inline(_pick(report, "patient_name", default="-") or "-")
+    age_text = _clean_inline(_pick(report, "patient_age_text", "age_text", default="-") or "-")
+    gender = _clean_inline(_pick(report, "patient_gender", "gender", default="-") or "-")
+    pid = _clean_inline(_pick(report, "patient_uhid", "patient_id", "uhid", default="-") or "-") or "-"
 
-    qr_payload = _best_qr_payload(report, lab_no=str(lab_no or ""), uhid=pid if pid != "-" else "")
+    order_id_int, order_id_str = _extract_order_id(report)
 
-    sample_collected_at = str(_pick(report, "sample_collected_at", "collection_site", "collection_location", default="") or "")
-    sample_address = str(_pick(report, "sample_collected_address", "collection_address", "patient_address", default="") or "")
-    ref_by = str(_pick(report, "ref_by", "referred_by", "ref_doctor", "doctor_name", default="") or "")
+    base_url = _public_base_url(request)
+    if not pdf_url and order_id_int is not None and base_url:
+        pdf_url = _lab_report_pdf_url(request, order_id_int, download=True) or ""
+
+    qr_payload = _best_qr_payload(
+        report,
+        order_id=order_id_int,
+        lab_no=_clean_inline(lab_no),
+        uhid=pid if pid != "-" else "",
+        pdf_url=pdf_url,
+        base_url=base_url,
+    )
+
+    sample_collected_at = _clean_inline(_pick(report, "sample_collected_at", "collection_site", "collection_location", default="") or "")
+    sample_address = str(_pick(report, "sample_collected_address", "collection_address", "patient_address", default="") or "").strip()
+    ref_by = _clean_inline(_pick(report, "ref_by", "referred_by", "ref_doctor", "doctor_name", default="") or "")
 
     registered_on = _pick(report, "registered_on", "created_at", default=order_date)
     collected_on = _pick(report, "collected_on", "received_on", "sample_received_on", default=None)
@@ -1229,7 +1106,7 @@ def _build_lab_report_pdf_reportlab(
     sections = getattr(report, "sections", None) or []
     if len(sections) == 1:
         sec0 = sections[0]
-        title_text = (str(_pick(sec0, "panel_name", "department_name", default="Laboratory Report") or "")).strip()
+        title_text = _clean_inline(_pick(sec0, "panel_name", "department_name", default="Laboratory Report") or "")
         title_text = title_text.upper() if title_text else "LABORATORY REPORT"
     else:
         title_text = "LABORATORY REPORT"
@@ -1242,45 +1119,6 @@ def _build_lab_report_pdf_reportlab(
         c.setFillColor(MUTED)
         c.drawString(LEFT, BOTTOM - 9 * mm, f"Generated on: {_fmt_datetime(datetime.utcnow())}")
         c.drawRightString(page_w - RIGHT, BOTTOM - 9 * mm, f"Page {page_no}")
-
-    def draw_watermark(y_mid: float) -> None:
-        # ✅ watermark = logo only (no text). If no logo → skip.
-        lr = _logo_reader(branding)
-        if not lr:
-            return
-
-        try:
-            c.saveState()
-
-            # try transparency (not always available depending on reportlab build)
-            try:
-                c.setFillAlpha(0.08)
-                c.setStrokeAlpha(0.08)
-            except Exception:
-                pass
-
-            # draw centered
-            wm_w = 120 * mm
-            wm_h = 45 * mm
-            x = (page_w - wm_w) / 2
-            y = y_mid - (wm_h / 2)
-
-            c.drawImage(
-                lr,
-                x,
-                y,
-                width=wm_w,
-                height=wm_h,
-                preserveAspectRatio=True,
-                mask="auto",
-            )
-            c.restoreState()
-        except Exception:
-            try:
-                c.restoreState()
-            except Exception:
-                pass
-
 
     def draw_patient_strip(y_top: float) -> float:
         strip_h = 28 * mm
@@ -1303,12 +1141,11 @@ def _build_lab_report_pdf_reportlab(
         c.line(x0 + col1 + col2, y0, x0 + col1 + col2, y_top)
         c.line(x0 + col1 + col2 + col3, y0, x0 + col1 + col2 + col3, y_top)
 
-        # Patient block (NO barcode here now)
         px = x0 + 3.5 * mm
         py = y_top - 5.2 * mm
         c.setFillColor(INK)
         c.setFont("Helvetica-Bold", 12.5)
-        c.drawString(px, py, pname)
+        c.drawString(px, py, pname or "-")
 
         c.setFillColor(MUTED)
         c.setFont("Helvetica", 9.0)
@@ -1319,7 +1156,7 @@ def _build_lab_report_pdf_reportlab(
         py -= 4.6 * mm
         c.drawString(px, py, f"UHID : {pid}")
 
-        # QR block (✅ always try to generate from payload)
+        # QR (FIX: apply bounds translation + scale)
         qx0 = x0 + col1
         qx = qx0 + (col2 / 2)
         qy = y0 + strip_h / 2
@@ -1327,12 +1164,16 @@ def _build_lab_report_pdf_reportlab(
 
         if qr_payload:
             try:
-                size = 20 * mm
+                size = 22 * mm
                 qr = QrCodeWidget(qr_payload)
                 x1, y1, x2, y2 = qr.getBounds()
                 w = max(1.0, x2 - x1)
                 h = max(1.0, y2 - y1)
-                d = Drawing(size, size, transform=[size / w, 0, 0, size / h, 0, 0])
+                sx = size / w
+                sy = size / h
+                tx = -x1 * sx
+                ty = -y1 * sy
+                d = Drawing(size, size, transform=[sx, 0, 0, sy, tx, ty])
                 d.add(qr)
                 renderPDF.draw(d, c, qx - size / 2, qy - size / 2)
                 drawn = True
@@ -1342,21 +1183,22 @@ def _build_lab_report_pdf_reportlab(
         if not drawn:
             c.setStrokeColor(colors.HexColor("#94A3B8"))
             c.setDash(2, 2)
-            s = 20 * mm
+            s = 22 * mm
             c.roundRect(qx - s / 2, qy - s / 2, s, s, 6, stroke=1, fill=0)
             c.setDash()
             c.setFillColor(colors.HexColor("#64748B"))
             c.setFont("Helvetica-Bold", 8.8)
             c.drawCentredString(qx, qy - 3, "QR")
 
-        # Sample collected block (✅ barcode + lab no moved here)
-        sx = x0 + col1 + col2 + 3.5 * mm
-        sy = y_top - 6.0 * mm
+        # Sample block
+        sx0 = x0 + col1 + col2
+        sx = sx0 + 3.5 * mm
+        sy0 = y_top - 6.0 * mm
         c.setFillColor(INK)
         c.setFont("Helvetica-Bold", 9.6)
-        c.drawString(sx, sy, "Sample Collected At:")
+        c.drawString(sx, sy0, "Sample Collected At:")
 
-        sy -= 4.8 * mm
+        sy = sy0 - 4.8 * mm
         c.setFillColor(INK)
         c.setFont("Helvetica-Bold", 9.2)
         if sample_collected_at:
@@ -1365,11 +1207,11 @@ def _build_lab_report_pdf_reportlab(
         else:
             sy -= 1.2 * mm
 
-        # ✅ Barcode under Sample Collected At
-        if pid and pid != "-":
+        # Barcode order id
+        if order_id_str:
             try:
                 bar_h = 6.2 * mm
-                b = createBarcodeDrawing("Code128", value=pid, barHeight=bar_h, humanReadable=False)
+                b = createBarcodeDrawing("Code128", value=order_id_str, barHeight=bar_h, humanReadable=False)
                 target_w = col3 - 7.0 * mm
                 if b.width and b.width > 0:
                     b.scale(target_w / b.width, 1.0)
@@ -1379,13 +1221,12 @@ def _build_lab_report_pdf_reportlab(
             except Exception:
                 pass
 
-        # ✅ Lab No under Sample Collected At (after barcode)
         c.setFillColor(MUTED)
         c.setFont("Helvetica-Bold", 8.2)
         c.drawString(sx, sy, "Lab No:")
         c.setFillColor(INK)
         c.setFont("Helvetica", 8.6)
-        c.drawString(sx + 12 * mm, sy, str(lab_no)[:20])
+        c.drawString(sx + 12 * mm, sy, _clean_inline(lab_no)[:20])
         sy -= 4.0 * mm
 
         if sample_address:
@@ -1411,10 +1252,11 @@ def _build_lab_report_pdf_reportlab(
             c.drawString(sx, sy, "Collected By:")
             c.setFillColor(INK)
             c.setFont("Helvetica", 8.6)
-            c.drawString(sx + 23 * mm, sy, str(collected_by_name)[:24])
+            c.drawString(sx + 23 * mm, sy, _clean_inline(collected_by_name)[:24])
 
-        # Times block (✅ only times now)
-        tx = x0 + col1 + col2 + col3 + 3.5 * mm
+        # Times block
+        tx0 = x0 + col1 + col2 + col3
+        tx = tx0 + 3.5 * mm
         ty = y_top - 6.0 * mm
         c.setFillColor(MUTED)
         c.setFont("Helvetica-Bold", 8.2)
@@ -1491,7 +1333,6 @@ def _build_lab_report_pdf_reportlab(
         c.line(LEFT, y - 2.8 * mm, page_w - RIGHT, y - 2.8 * mm)
         y -= 9.0 * mm
 
-        draw_watermark(y - 45 * mm)
         current_y = draw_table_header(y)
 
     def ensure_space(need_h: float) -> None:
@@ -1507,19 +1348,15 @@ def _build_lab_report_pdf_reportlab(
     zebra = 0
     for sec in sections:
         for row in (getattr(sec, "rows", None) or []):
-            inv = (str(_pick(row, "service_name", "test_name", default="-") or "-")).strip()
-            result = (str(_pick(row, "result_value", "value", default="-") or "-")).strip()
-            unit = (str(_pick(row, "unit", default="-") or "-")).strip()
-            ref = (str(_pick(row, "normal_range", "reference_range", default="-") or "-")).strip()
-            flag = (str(_pick(row, "flag", "abnormal_flag", default="") or "")).strip()
-            comments = (str(_pick(row, "comments", "comment", default="") or "")).strip()
+            inv = _clean_inline(_pick(row, "service_name", "test_name", default="-") or "-")
+            result = _clean_inline(_pick(row, "result_value", "value", default="-") or "-")
+            unit = _clean_inline(_pick(row, "unit", default="-") or "-")
+            ref = _clean_inline(_pick(row, "normal_range", "reference_range", default="-") or "-")
+            flag = _clean_inline(_pick(row, "flag", "abnormal_flag", default="") or "")
+            comments = _clean_inline(_pick(row, "comments", "comment", default="") or "")
 
             inv_lines = _split_text_to_lines(inv, "Helvetica-Bold", 8.8, W_INV - 2 * PAD)
-            cmt_lines = (
-                _split_text_to_lines(comments, "Helvetica-Oblique", 8.0, W_INV - 2 * PAD)[:2]
-                if comments
-                else []
-            )
+            cmt_lines = _split_text_to_lines(comments, "Helvetica-Oblique", 8.0, W_INV - 2 * PAD)[:2] if comments else []
             ref_lines = _split_text_to_lines(ref, "Helvetica", 8.2, W_REF - 2 * PAD)[:5]
 
             base_lines = len(inv_lines) + (len(cmt_lines) if cmt_lines else 0)
@@ -1568,26 +1405,7 @@ def _build_lab_report_pdf_reportlab(
             current_y = bot_y
             zebra += 1
 
-    notes_text = str(_pick(report, "notes", "note", "remarks", "interpretation", default="") or "").strip()
-    if notes_text:
-        ensure_space(32 * mm)
-        current_y -= 3.0 * mm
-        c.setFillColor(INK)
-        c.setFont("Helvetica-Bold", 9.4)
-        c.drawString(LEFT, current_y, "Note :")
-        current_y -= 5.0 * mm
-
-        c.setFillColor(INK)
-        c.setFont("Helvetica", 8.8)
-        lines = [ln.strip() for ln in notes_text.replace("\r\n", "\n").split("\n") if ln.strip()]
-        for i, ln in enumerate(lines[:8], start=1):
-            wrapped = _split_text_to_lines(f"{i}. {ln}", "Helvetica", 8.8, TABLE_W - 4 * mm)
-            for wln in wrapped:
-                ensure_space(6 * mm)
-                c.drawString(LEFT + 2 * mm, current_y, wln)
-                current_y -= 4.2 * mm
-        current_y -= 2 * mm
-
+    # signatures
     ensure_space(34 * mm)
     current_y -= 4 * mm
     c.setStrokeColor(LINE)
@@ -1595,19 +1413,16 @@ def _build_lab_report_pdf_reportlab(
 
     sig_y = current_y - 10 * mm
     c.line(LEFT, sig_y, LEFT + 60 * mm, sig_y)
-    # c.line(LEFT + 65 * mm, sig_y, LEFT + 125 * mm, sig_y)
     c.line(page_w - RIGHT - 60 * mm, sig_y, page_w - RIGHT, sig_y)
 
     c.setFillColor(INK)
     c.setFont("Helvetica-Bold", 8.8)
     c.drawString(LEFT, sig_y - 5 * mm, "Medical Lab Technician")
-    # c.drawString(LEFT + 65 * mm, sig_y - 5 * mm, "Dr. / Pathologist")
     c.drawRightString(page_w - RIGHT, sig_y - 5 * mm, "Authorized Signatory")
 
     c.setFillColor(MUTED)
     c.setFont("Helvetica", 7.8)
     c.drawString(LEFT, sig_y - 9 * mm, "(DMLT, BMLT)")
-    # c.drawString(LEFT + 65 * mm, sig_y - 9 * mm, "(Verified)")
     c.drawRightString(page_w - RIGHT, sig_y - 9 * mm, "(MD)")
 
     draw_footer(page_no)
@@ -1618,8 +1433,6 @@ def _build_lab_report_pdf_reportlab(
 # ============================================================
 # Public API
 # ============================================================
-
-
 def build_lab_report_pdf_bytes(
     *,
     branding: Any,
@@ -1628,16 +1441,22 @@ def build_lab_report_pdf_bytes(
     lab_no: str,
     order_date: Any,
     collected_by_name: Optional[str] = None,
+    pdf_url: Optional[str] = None,
+    request: Optional[Request] = None,
 ) -> bytes:
     """
-    ✅ WeasyPrint first (if available)
+    ✅ WeasyPrint first (if installed + deps)
     ✅ ReportLab fallback always
-
-    Fixes requested:
-    - Barcode moved under Sample Collected At
-    - QR now always generates (fallback payload)
-    - Lab No moved under Sample Collected At
+    ✅ QR uses a real http(s) pdf_url (NOT blob:)
+    - If pdf_url not provided, and request/base_url is available, it auto-builds:
+        {PUBLIC_BASE_URL}/api/lab/orders/{id}/report-pdf?download=1
     """
+    base_url = _public_base_url(request)
+    order_id_int, _ = _extract_order_id(report)
+
+    if not pdf_url and order_id_int is not None and base_url:
+        pdf_url = _lab_report_pdf_url(request, order_id_int, download=True) or None
+
     try:
         from weasyprint import HTML, CSS  # type: ignore
 
@@ -1648,11 +1467,14 @@ def build_lab_report_pdf_bytes(
             lab_no=lab_no,
             order_date=order_date,
             collected_by_name=collected_by_name,
+            pdf_url=pdf_url,
+            base_url=base_url,
         )
         return HTML(string=html, base_url=str(settings.STORAGE_DIR)).write_pdf(
             stylesheets=[CSS(string=_css())]
         )
-    except Exception:
+    except Exception as e:
+        logger.warning("WeasyPrint unavailable, using ReportLab fallback. Reason: %s", e)
         return _build_lab_report_pdf_reportlab(
             branding=branding,
             report=report,
@@ -1660,4 +1482,6 @@ def build_lab_report_pdf_bytes(
             lab_no=lab_no,
             order_date=order_date,
             collected_by_name=collected_by_name,
+            pdf_url=pdf_url,
+            request=request,
         )

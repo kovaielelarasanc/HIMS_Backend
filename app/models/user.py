@@ -3,8 +3,6 @@ from __future__ import annotations
 
 from sqlalchemy import Column, Integer, String, Boolean, ForeignKey
 from sqlalchemy.orm import relationship
-from typing import List, Optional
-from pydantic import BaseModel
 from app.db.base import Base
 
 
@@ -43,6 +41,10 @@ class User(Base):
     is_doctor = Column(Boolean, default=False, nullable=False)
     department_id = Column(Integer, ForeignKey("departments.id"), nullable=True)
     department = relationship("Department", back_populates="users")
+
+    # ✅ NEW: Doctor optional fields (only meaningful when is_doctor=true)
+    doctor_qualification = Column(String(255), nullable=True)
+    doctor_registration_no = Column(String(64), nullable=True, index=True)
 
     roles = relationship("Role", secondary="user_roles", back_populates="users")
 
@@ -108,4 +110,3 @@ class UserSession(Base):
     revoke_reason = Column(String(50), nullable=True)
 
     user = relationship("User", back_populates="sessions")
-

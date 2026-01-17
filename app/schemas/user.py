@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from typing import List, Optional
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, Field
 
 
 class UserOut(BaseModel):
@@ -18,6 +18,10 @@ class UserOut(BaseModel):
     is_admin: bool
     is_doctor: bool
     department_id: Optional[int] = None
+
+    # ✅ NEW
+    doctor_qualification: Optional[str] = None
+    doctor_registration_no: Optional[str] = None
 
     role_ids: List[int] = []
 
@@ -38,6 +42,11 @@ class UserCreate(BaseModel):
     two_fa_enabled: bool = False
     multi_login_enabled: bool = True
     department_id: Optional[int] = None
+
+    # ✅ NEW (optional)
+    doctor_qualification: Optional[str] = Field(default=None, max_length=255)
+    doctor_registration_no: Optional[str] = Field(default=None, max_length=64)
+
     role_ids: Optional[List[int]] = None
 
 
@@ -48,6 +57,10 @@ class UserUpdate(BaseModel):
     is_active: bool = True
     is_doctor: bool = False
     department_id: Optional[int] = None
+
+    # ✅ NEW (optional)
+    doctor_qualification: Optional[str] = Field(default=None, max_length=255)
+    doctor_registration_no: Optional[str] = Field(default=None, max_length=64)
 
     # toggles
     two_fa_enabled: bool = False
@@ -62,6 +75,7 @@ class UserUpdate(BaseModel):
     # [..] => set roles
     role_ids: Optional[List[int]] = None
 
+
 class UserSaveResponse(BaseModel):
     user: UserOut
     needs_email_verify: bool = False
@@ -72,6 +86,7 @@ class UserSaveResponse(BaseModel):
 class VerifyEmailOtpIn(BaseModel):
     otp: str = Field(..., min_length=6, max_length=6)
 
+
 class UserMiniOut(BaseModel):
     id: int
     name: Optional[str] = None
@@ -79,6 +94,7 @@ class UserMiniOut(BaseModel):
 
     class Config:
         from_attributes = True
+
 
 class UserLite(BaseModel):
     id: int
@@ -99,9 +115,12 @@ class DoctorOut(BaseModel):
     is_active: bool
     department_id: Optional[int] = None
 
+    # ✅ NEW
+    doctor_qualification: Optional[str] = None
+    doctor_registration_no: Optional[str] = None
+
     class Config:
         from_attributes = True
-
 
 
 class DoctorListResponse(BaseModel):
