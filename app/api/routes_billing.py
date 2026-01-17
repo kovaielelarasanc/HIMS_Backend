@@ -1,16 +1,22 @@
 # FILE: app/api/routes_billing.py
 from __future__ import annotations
-
+from collections import defaultdict
 from decimal import Decimal
 from datetime import datetime
 from typing import Optional, Any, Dict, List
 from fastapi.encoders import jsonable_encoder
 from fastapi import APIRouter, Depends, HTTPException, Query, Body
 from sqlalchemy.orm import Session
-from sqlalchemy import func, or_, desc
+from sqlalchemy import func, or_, desc, exists, and_
 from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel, Field
 from app.models.charge_item_master import ChargeItemMaster
+from enum import Enum
+from fastapi.responses import StreamingResponse
+from io import BytesIO
+
+from app.models.ui_branding import UiBranding
+from app.services.pdfs.billing_case_export import build_full_case_pdf
 
 from app.api.deps import get_db, current_user
 from app.models.user import User
@@ -112,6 +118,177 @@ import logging
 logger = logging.getLogger(__name__)
 
 from typing import Any, Dict, Optional, Tuple, List, Union
+
+
+def _now_utc():
+    return datetime.utcnow()
+
+
+def _norm_payer_bucket(
+        payer_type: PayerType,
+        payer_id: Optional[int]) -> tuple[PayerType, Optional[int]]:
+    """
+    PATIENT bucket must always have payer_id=None
+    """
+    pt = payer_type
+    pid = int(payer_id) if payer_id is not None else None
+    if str(_enum_value(pt)).upper() == "PATIENT":
+        pid = None
+    return pt, pid
+
+
+def _sum_allocated_for_invoice(db: Session, invoice_id: int) -> Decimal:
+    """
+    Source of truth:
+    - If BillingPaymentAllocation exists -> sum ACTIVE allocations for this invoice.
+    - Else -> sum direct payments.payment.invoice_id
+    Avoid double-counting when both exist.
+    """
+    if BillingPaymentAllocation is not None:
+        q = db.query(
+            func.coalesce(func.sum(
+                BillingPaymentAllocation.amount), 0)).filter(
+                    BillingPaymentAllocation.invoice_id == int(invoice_id))
+
+        # allocation status
+        if ReceiptStatus is not None and hasattr(BillingPaymentAllocation,
+                                                 "status"):
+            try:
+                q = q.filter(
+                    BillingPaymentAllocation.status == ReceiptStatus.ACTIVE)
+            except Exception:
+                pass
+
+        # also ensure payment is ACTIVE if payment has status column
+        if hasattr(BillingPayment, "status"):
+            try:
+                q = q.join(
+                    BillingPayment, BillingPayment.id ==
+                    BillingPaymentAllocation.payment_id).filter(
+                        BillingPayment.status == ReceiptStatus.ACTIVE)
+            except Exception:
+                pass
+
+        return Decimal(str(q.scalar() or 0))
+
+    # fallback (legacy)
+    q2 = db.query(
+        func.coalesce(func.sum(BillingPayment.amount),
+                      0)).filter(BillingPayment.invoice_id == int(invoice_id))
+    if hasattr(BillingPayment, "status") and ReceiptStatus is not None:
+        try:
+            q2 = q2.filter(BillingPayment.status == ReceiptStatus.ACTIVE)
+        except Exception:
+            pass
+    return Decimal(str(q2.scalar() or 0))
+
+
+def _invoice_outstanding(db: Session, inv: BillingInvoice) -> Decimal:
+    gt = Decimal(str(getattr(inv, "grand_total", 0) or 0))
+    paid = _sum_allocated_for_invoice(db, int(inv.id))
+    out = gt - paid
+    if out < 0:
+        out = Decimal("0")
+    return out
+
+
+def _create_payment_row(
+    db: Session,
+    *,
+    billing_case_id: int,
+    invoice_id: int,
+    user: User,
+    amount: Decimal,
+    mode: PayMode,
+    txn_ref: Optional[str],
+    notes: Optional[str],
+    payer_type: PayerType,
+    payer_id: Optional[int],
+) -> BillingPayment:
+    p = BillingPayment()
+
+    # required core fields
+    if hasattr(p, "billing_case_id"):
+        p.billing_case_id = int(billing_case_id)
+    if hasattr(p, "invoice_id"):
+        p.invoice_id = int(invoice_id)
+
+    p.amount = Decimal(str(amount))
+    if hasattr(p, "mode"):
+        p.mode = mode
+    if hasattr(p, "txn_ref"):
+        p.txn_ref = (txn_ref or "").strip() or None
+    if hasattr(p, "notes"):
+        p.notes = (notes or "").strip() or None
+
+    if hasattr(p, "payer_type"):
+        p.payer_type = payer_type
+    if hasattr(p, "payer_id"):
+        p.payer_id = int(payer_id) if payer_id is not None else None
+
+    # status/kind (optional, handle safely)
+    if hasattr(p, "status") and ReceiptStatus is not None:
+        try:
+            p.status = ReceiptStatus.ACTIVE
+        except Exception:
+            pass
+
+    if hasattr(p, "kind") and PaymentKind is not None:
+        # choose a "normal payment" kind if you have it, else keep None
+        try:
+            if "PAYMENT" in getattr(PaymentKind, "__members__", {}):
+                p.kind = PaymentKind["PAYMENT"]
+        except Exception:
+            pass
+
+    # timestamps / user refs
+    if hasattr(p, "received_at") and getattr(p, "received_at", None) is None:
+        p.received_at = _now_utc()
+    if hasattr(p, "received_by") and getattr(p, "received_by", None) is None:
+        p.received_by = getattr(user, "id", None)
+
+    db.add(p)
+    db.flush()
+    return p
+
+
+def _allocate_payment_to_invoice(
+    db: Session,
+    *,
+    payment: BillingPayment,
+    invoice_id: int,
+    amount: Decimal,
+):
+    """
+    If allocation table exists -> insert allocation row.
+    Otherwise invoice_id on payment already links it (legacy).
+    """
+    if BillingPaymentAllocation is None:
+        return None
+
+    a = BillingPaymentAllocation()
+    if hasattr(a, "tenant_id"):
+        setattr(a, "tenant_id", getattr(payment, "tenant_id", None))
+
+    if hasattr(a, "billing_case_id") and hasattr(payment, "billing_case_id"):
+        setattr(a, "billing_case_id", int(getattr(payment, "billing_case_id")))
+
+    setattr(a, "payment_id", int(getattr(payment, "id")))
+    setattr(a, "invoice_id", int(invoice_id))
+    setattr(a, "amount", Decimal(str(amount)))
+
+    if hasattr(a, "status") and ReceiptStatus is not None:
+        try:
+            a.status = ReceiptStatus.ACTIVE
+        except Exception:
+            pass
+
+    if hasattr(a, "allocated_at") and getattr(a, "allocated_at", None) is None:
+        setattr(a, "allocated_at", _now_utc())
+
+    db.add(a)
+    db.flush()
+    return a
 
 
 def _find_payment_row_in_obj(db: Session,
@@ -1297,33 +1474,33 @@ def _line_to_dict(
     }
 
 
-def _payment_to_dict(p: BillingPayment) -> Dict[str, Any]:
-    return {
-        "id":
-        int(p.id),
-        "billing_case_id":
-        int(p.billing_case_id),
-        "invoice_id":
-        int(p.invoice_id) if p.invoice_id else None,
-        "payer_type":
-        _enum_value(getattr(p, "payer_type", None)),
-        "payer_id":
-        getattr(p, "payer_id", None),
-        "mode":
-        _enum_value(getattr(p, "mode", None)),
-        "amount":
-        str(getattr(p, "amount", 0) or 0),
-        "txn_ref":
-        getattr(p, "txn_ref", None),
-        "notes":
-        getattr(p, "notes", None),
-        "received_at":
-        p.received_at.isoformat() if getattr(p, "received_at", None) else None,
-        "created_at":
-        p.created_at.isoformat() if getattr(p, "created_at", None) else None,
-        "received_by":
-        getattr(p, "received_by", None),
-    }
+# def _payment_to_dict(p: BillingPayment) -> Dict[str, Any]:
+#     return {
+#         "id":
+#         int(p.id),
+#         "billing_case_id":
+#         int(p.billing_case_id),
+#         "invoice_id":
+#         int(p.invoice_id) if p.invoice_id else None,
+#         "payer_type":
+#         _enum_value(getattr(p, "payer_type", None)),
+#         "payer_id":
+#         getattr(p, "payer_id", None),
+#         "mode":
+#         _enum_value(getattr(p, "mode", None)),
+#         "amount":
+#         str(getattr(p, "amount", 0) or 0),
+#         "txn_ref":
+#         getattr(p, "txn_ref", None),
+#         "notes":
+#         getattr(p, "notes", None),
+#         "received_at":
+#         p.received_at.isoformat() if getattr(p, "received_at", None) else None,
+#         "created_at":
+#         p.created_at.isoformat() if getattr(p, "created_at", None) else None,
+#         "received_by":
+#         getattr(p, "received_by", None),
+#     }
 
 
 def _advance_to_dict(a: BillingAdvance) -> Dict[str, Any]:
@@ -2221,20 +2398,123 @@ def delete_line(
         _err(e)
 
 
+def _dec(v) -> Decimal:
+    try:
+        return Decimal(str(v or 0))
+    except Exception:
+        return Decimal("0")
+
+
+def _pick_dt(obj, *keys):
+    for k in keys:
+        if hasattr(obj, k):
+            v = getattr(obj, k, None)
+            if v is not None:
+                return v
+    return None
+
+
+def _payment_to_dict(p):
+    return {
+        "id": p.id,
+        "billing_case_id": getattr(p, "billing_case_id", None),
+        "invoice_id": getattr(p, "invoice_id", None),
+        "amount": float(getattr(p, "amount", 0) or 0),
+        "mode": getattr(p, "mode", None),
+        "txn_ref": getattr(p, "txn_ref", None),
+        "notes": getattr(p, "notes", None),
+        "status": getattr(p, "status", None),
+        "kind": getattr(p, "kind", None),  # optional
+        "direction": getattr(p, "direction", None),  # optional
+        "created_at": _pick_dt(p, "created_at", "paid_at", "received_at"),
+        "paid_at": _pick_dt(p, "paid_at", "received_at"),
+    }
+
+
+def _alloc_to_dict(a):
+    return {
+        "id": a.id,
+        "payment_id": getattr(a, "payment_id", None),
+        "invoice_id": getattr(a, "invoice_id", None),
+        "amount": float(getattr(a, "amount", 0) or 0),
+        "status": getattr(a, "status", None),
+        "allocated_at": _pick_dt(a, "allocated_at", "created_at"),
+    }
+
+
 @router.get("/invoices/{invoice_id}/payments")
 def list_invoice_payments(
         invoice_id: int,
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
 ):
-    try:
-        inv = _get_invoice_or_404(db, user, invoice_id)
-        rows = (db.query(BillingPayment).filter(
-            BillingPayment.invoice_id == int(inv.id)).order_by(
-                desc(BillingPayment.received_at)).all())
-        return {"items": [_payment_to_dict(x) for x in rows]}
-    except Exception as e:
-        _err(e)
+    """
+    ✅ Returns BOTH:
+    - Direct payments where payment.invoice_id == invoice_id
+    - Advance/manual allocations where allocation.invoice_id == invoice_id
+    So InvoiceEditor can compute paid/due correctly from allocations.
+    """
+    # Ensure invoice exists
+    inv = db.query(BillingInvoice).filter(
+        BillingInvoice.id == int(invoice_id)).first()
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+
+    # 1) Load allocations for this invoice (ACTIVE only if enum exists)
+    aq = db.query(BillingPaymentAllocation).filter(
+        BillingPaymentAllocation.invoice_id == int(invoice_id))
+    if ReceiptStatus is not None and hasattr(BillingPaymentAllocation,
+                                             "status"):
+        try:
+            aq = aq.filter(
+                BillingPaymentAllocation.status == ReceiptStatus.ACTIVE)
+        except Exception:
+            pass
+    allocs = aq.all()
+
+    allocs_by_payment = defaultdict(list)
+    alloc_sum_by_payment = defaultdict(Decimal)
+    pay_ids_from_alloc = set()
+
+    for a in allocs:
+        pid = getattr(a, "payment_id", None)
+        if not pid:
+            continue
+        pay_ids_from_alloc.add(int(pid))
+        allocs_by_payment[int(pid)].append(_alloc_to_dict(a))
+        alloc_sum_by_payment[int(pid)] += _dec(getattr(a, "amount", 0))
+
+    # 2) Load direct payments for this invoice
+    pq_direct = db.query(
+        BillingPayment.id).filter(BillingPayment.invoice_id == int(invoice_id))
+    direct_ids = {int(x[0]) for x in pq_direct.all()}
+
+    # 3) Union ids
+    all_ids = sorted(list(pay_ids_from_alloc.union(direct_ids)))
+    if not all_ids:
+        return {"items": []}
+
+    # 4) Fetch payments
+    pq = db.query(BillingPayment).filter(
+        BillingPayment.id.in_(all_ids)).order_by(
+            desc(getattr(BillingPayment, "created_at", BillingPayment.id)))
+    pays = pq.all()
+
+    out = []
+    for p in pays:
+        d = _payment_to_dict(p)
+
+        # attach allocations (for invoice editor)
+        pid = int(p.id)
+        d["allocations"] = allocs_by_payment.get(pid, [])
+
+        # attach allocated amount (handy for UI)
+        d["allocated_amount"] = float(
+            alloc_sum_by_payment.get(pid, Decimal("0")))
+
+        out.append(d)
+
+    return {"items": out}
 
 
 # ============================================================
@@ -2647,10 +2927,10 @@ def _record_advance_only(
 def pay(
         case_id: int,
 
-        # ✅ allow JSON body (recommended)
+        # JSON body (recommended)
         inp: Optional[PaymentIn] = Body(default=None),
 
-        # ✅ backward-compatible query params
+        # backward-compatible query params
         amount: Optional[Decimal] = Query(default=None),
         mode: PayMode = Query(default=PayMode.CASH),
         invoice_id: Optional[int] = Query(default=None),
@@ -2661,10 +2941,16 @@ def pay(
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
 ):
+    """
+    ✅ Fixes:
+    - Enforces correct payer bucket (must match invoice payer bucket)
+    - Computes outstanding from allocations/direct payments
+    - Prevents false 'No outstanding amount for this payer bucket'
+    """
     try:
         _get_case_or_404(db, user, int(case_id))
 
-        # ✅ merge body over query params (only if body values are not None)
+        # merge body over query params
         if inp is not None:
             if inp.amount is not None: amount = inp.amount
             if inp.mode is not None: mode = inp.mode
@@ -2677,7 +2963,11 @@ def pay(
         if amount is None:
             raise HTTPException(status_code=422, detail="amount is required")
 
-        # ✅ choose invoice (POSTED preferred, else APPROVED)
+        amount = Decimal(str(amount))
+        if amount <= 0:
+            raise HTTPException(status_code=422, detail="amount must be > 0")
+
+        # choose invoice (POSTED preferred, else APPROVED)
         inv_id = invoice_id
         if inv_id is None:
             inv_id = (db.query(BillingInvoice.id).filter(
@@ -2708,18 +2998,62 @@ def pay(
                 f"Invoice must be APPROVED/POSTED to accept payments (current: {inv.status})",
             )
 
-        # ✅ record payment (this is fine; unrelated to advance auto-apply)
-        pay_row, allocations = record_payment_full(
+        # ✅ Enforce payer bucket = invoice payer bucket
+        inv_pt, inv_pid = _norm_payer_bucket(inv.payer_type,
+                                             getattr(inv, "payer_id", None))
+        req_pt, req_pid = _norm_payer_bucket(payer_type, payer_id)
+
+        # if caller didn't intend payer bucket, we force invoice bucket
+        # (prevents front-end mistakes like payer_id sent with PATIENT)
+        req_pt = inv_pt if req_pt is None else req_pt
+        req_pid = inv_pid if (str(_enum_value(req_pt)).upper() != "PATIENT"
+                              and req_pid is None) else req_pid
+        req_pt, req_pid = _norm_payer_bucket(req_pt, req_pid)
+
+        if str(_enum_value(req_pt)).upper() != str(
+                _enum_value(inv_pt)).upper():
+            raise HTTPException(
+                status_code=409,
+                detail="Payment payer_type must match invoice payer_type")
+        if str(_enum_value(inv_pt)).upper() != "PATIENT":
+            if (req_pid or None) != (inv_pid or None):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Payment payer_id must match invoice payer_id")
+
+        # ✅ Use invoice outstanding (not 'bucket outstanding' that breaks)
+        outstanding = _invoice_outstanding(db, inv)
+        if outstanding <= 0:
+            raise HTTPException(
+                status_code=409,
+                detail="Invoice already fully paid (no outstanding).")
+
+        if amount > outstanding:
+            raise HTTPException(
+                status_code=409,
+                detail=
+                f"Payment exceeds outstanding. Outstanding={outstanding}, Payment={amount}",
+            )
+
+        # ✅ Create payment + allocation
+        pay_row = _create_payment_row(
             db,
             billing_case_id=int(case_id),
+            invoice_id=int(inv.id),
             user=user,
-            amount=Decimal(str(amount)),
+            amount=amount,
             mode=mode,
-            invoice_id=int(inv_id),
             txn_ref=txn_ref,
             notes=notes,
-            payer_type=payer_type,
-            payer_id=payer_id,
+            payer_type=inv_pt,
+            payer_id=inv_pid,
+        )
+
+        alloc_row = _allocate_payment_to_invoice(
+            db,
+            payment=pay_row,
+            invoice_id=int(inv.id),
+            amount=amount,
         )
 
         db.commit()
@@ -2729,8 +3063,9 @@ def pay(
             pass
 
         out: Dict[str, Any] = {"payment": _payment_to_dict(pay_row)}
-        if allocations is not None:
-            out["allocations"] = allocations
+        if alloc_row is not None:
+            out["allocations"] = [_alloc_to_dict(alloc_row)]
+        out["invoice_outstanding_after"] = str(_invoice_outstanding(db, inv))
         return out
 
     except HTTPException:
@@ -4281,6 +4616,66 @@ def cancel_case(
         _err(e)
 
 
+def _safe_set(obj: Any, field_names: List[str], value: Any) -> bool:
+    for f in field_names:
+        if hasattr(obj, f):
+            setattr(obj, f, value)
+            return True
+    return False
+
+
+def _sum_case_invoices(db: Session, case_id: int) -> Decimal:
+    # Sum non-VOID invoices (all statuses except VOID)
+    q = db.query(func.coalesce(
+        func.sum(BillingInvoice.grand_total),
+        0)).filter(BillingInvoice.billing_case_id == int(case_id))
+    # DocStatus may vary; handle safely
+    try:
+        q = q.filter(BillingInvoice.status != DocStatus.VOID)
+    except Exception:
+        pass
+    v = q.scalar() or 0
+    return Decimal(str(v or 0))
+
+
+def _sum_case_payments(db: Session, case_id: int) -> Decimal:
+    q = db.query(func.coalesce(
+        func.sum(BillingPayment.amount),
+        0)).filter(BillingPayment.billing_case_id == int(case_id))
+    # exclude VOID/CANCELLED receipts if model has status
+    if hasattr(BillingPayment, "status") and "ReceiptStatus" in globals():
+        try:
+            q = q.filter(BillingPayment.status == ReceiptStatus.ACTIVE)
+        except Exception:
+            pass
+    v = q.scalar() or 0
+    return Decimal(str(v or 0))
+
+
+def _sum_case_net_deposit(db: Session, case_id: int) -> Decimal:
+    adv = db.query(func.coalesce(func.sum(BillingAdvance.amount), 0)).filter(
+        BillingAdvance.billing_case_id == int(case_id)).filter(
+            BillingAdvance.entry_type == AdvanceType.ADVANCE).scalar() or 0
+
+    ref = db.query(func.coalesce(func.sum(BillingAdvance.amount), 0)).filter(
+        BillingAdvance.billing_case_id == int(case_id)).filter(
+            BillingAdvance.entry_type == AdvanceType.REFUND).scalar() or 0
+
+    return Decimal(str(adv or 0)) - Decimal(str(ref or 0))
+
+
+def _case_has_open_invoices(db: Session, case_id: int) -> bool:
+    # If any DRAFT/APPROVED invoices exist -> case is not “finalized”
+    try:
+        cnt = db.query(func.count(BillingInvoice.id)).filter(
+            BillingInvoice.billing_case_id == int(case_id)).filter(
+                BillingInvoice.status.in_(
+                    [DocStatus.DRAFT, DocStatus.APPROVED])).scalar() or 0
+        return int(cnt) > 0
+    except Exception:
+        return False
+
+
 @router.post("/cases/{case_id}/close")
 def close_case(
         case_id: int,
@@ -4288,47 +4683,74 @@ def close_case(
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
 ):
+    """
+    Close case:
+    - default: blocks closing if balance != 0 OR any DRAFT/APPROVED invoices exist
+    - allow_close_with_balance=True bypasses balance block (still recommended to avoid)
+    """
     try:
-        c = _get_case_or_404(db, user, case_id)
+        c = _get_case_or_404(db, user, int(case_id))
         _require_perm_code(user, "billing.case.close")
 
         st = _case_status_name(c)
         if st == "CLOSED":
-            return {"ok": True, "status": "CLOSED"}
+            return {
+                "ok": True,
+                "status": "CLOSED",
+                "case": _case_to_dict(c, None)
+            }
+
         if st == "CANCELLED":
             raise HTTPException(
                 status_code=409,
                 detail="Cancelled case cannot be closed. Reopen first.")
 
-        posted_total = (db.query(
-            func.coalesce(func.sum(BillingInvoice.grand_total), 0)).filter(
-                BillingInvoice.billing_case_id == c.id).filter(
-                    BillingInvoice.status == DocStatus.POSTED).scalar()) or 0
-
-        paid_total = (db.query(
-            func.coalesce(func.sum(BillingPayment.amount), 0)
-        ).filter(BillingPayment.billing_case_id == c.id).filter(
-            BillingPayment.status == ReceiptStatus.ACTIVE).scalar()) or 0
-
-        balance = Decimal(str(posted_total)) - Decimal(str(paid_total))
-        if (not inp.allow_close_with_balance) and balance != 0:
+        if _case_has_open_invoices(db, int(case_id)):
             raise HTTPException(
                 status_code=409,
                 detail=
-                f"Case has pending balance={balance}. Set allow_close_with_balance=true to force close."
+                "Cannot close case while invoices are in DRAFT/APPROVED. Post/Void them first.",
             )
 
-        c.status = BillingCaseStatus.CLOSED
-        c.notes = ((c.notes or "") + f"\n[CLOSE] {inp.reason}").strip()
-        c.updated_by = getattr(user, "id", None)
+        total_bill = _sum_case_invoices(db, int(case_id))
+        total_paid = _sum_case_payments(db, int(case_id))
+        balance = total_bill - total_paid
+
+        if (not inp.allow_close_with_balance) and balance != Decimal("0"):
+            raise HTTPException(
+                status_code=409,
+                detail=
+                f"Cannot close case with non-zero balance. Balance={balance}. "
+                f"Set allow_close_with_balance=true only if you REALLY want to force close.",
+            )
+
+        # set CLOSED
+        if "CLOSED" in BillingCaseStatus.__members__:
+            c.status = BillingCaseStatus.CLOSED
+        else:
+            # fallback if enum differs
+            c.status = BillingCaseStatus.READY_FOR_POST if "READY_FOR_POST" in BillingCaseStatus.__members__ else c.status
+
+        note = f"\n[CLOSE] {inp.reason}".strip()
+        c.notes = ((c.notes or "") + note).strip()
+
+        _safe_set(c, ["updated_by", "updated_by_id"],
+                  getattr(user, "id", None))
+        _safe_set(c, ["updated_at"], datetime.utcnow())
 
         db.add(c)
         db.commit()
         db.refresh(c)
+
         return {
             "ok": True,
             "case": _case_to_dict(c, None),
-            "balance": str(balance)
+            "totals": {
+                "total_bill": str(total_bill),
+                "total_paid": str(total_paid),
+                "balance": str(balance),
+                "net_deposit": str(_sum_case_net_deposit(db, int(case_id))),
+            },
         }
     except Exception as e:
         db.rollback()
@@ -4342,20 +4764,32 @@ def reopen_case(
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
 ):
+    """
+    Reopen case:
+    - CLOSED -> READY_FOR_POST (or OPEN if READY_FOR_POST not present)
+    - CANCELLED -> OPEN
+    """
     try:
-        c = _get_case_or_404(db, user, case_id)
+        c = _get_case_or_404(db, user, int(case_id))
         _require_perm_code(user, "billing.case.reopen")
 
         st = _case_status_name(c)
         if st not in {"CLOSED", "CANCELLED"}:
-            raise HTTPException(
-                status_code=409,
-                detail=
-                f"Only CLOSED/CANCELLED cases can be reopened (current={st})")
+            return {"ok": True, "status": st, "case": _case_to_dict(c, None)}
 
-        c.status = BillingCaseStatus.OPEN
+        # choose reopen target
+        if "READY_FOR_POST" in BillingCaseStatus.__members__:
+            c.status = BillingCaseStatus.READY_FOR_POST
+        elif "OPEN" in BillingCaseStatus.__members__:
+            c.status = BillingCaseStatus.OPEN
+        else:
+            # fallback: keep existing
+            c.status = c.status
+
         c.notes = ((c.notes or "") + f"\n[REOPEN] {inp.reason}").strip()
-        c.updated_by = getattr(user, "id", None)
+        _safe_set(c, ["updated_by", "updated_by_id"],
+                  getattr(user, "id", None))
+        _safe_set(c, ["updated_at"], datetime.utcnow())
 
         db.add(c)
         db.commit()
@@ -4367,168 +4801,60 @@ def reopen_case(
 
 
 # ============================================================
-# ✅ Payments: receipt print + void receipt
+# ✅ Receipt void (Payment void)
 # ============================================================
 
 
-class PaymentVoidIn(BaseModel):
+class ReceiptVoidIn(BaseModel):
     reason: str = Field(..., min_length=3, max_length=255)
 
 
-def _render_receipt_pdf_bytes(db: Session, payment_id: int) -> bytes:
-    pay = db.query(BillingPayment).filter(
-        BillingPayment.id == int(payment_id)).first()
-    if not pay:
-        raise HTTPException(status_code=404, detail="Payment not found")
-
-    case = db.query(BillingCase).filter(
-        BillingCase.id == int(pay.billing_case_id)).first()
-    patient = db.query(Patient).filter(
-        Patient.id == int(case.patient_id)).first() if case else None
-    inv = db.query(BillingInvoice).filter(BillingInvoice.id == int(
-        pay.invoice_id)).first() if pay.invoice_id else None
-
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    w, h = A4
-    left = 15 * mm
-    top = h - 15 * mm
-    y = top
-
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(left, y, "PAYMENT RECEIPT")
-    y -= 7 * mm
-
-    c.setFont("Helvetica", 9)
-    rcpt = getattr(pay, "receipt_number", None) or f"RCPT-{pay.id}"
-    c.drawString(left, y, f"Receipt No: {rcpt}")
-    c.drawRightString(
-        w - left, y,
-        f"Date: {(getattr(pay, 'received_at', None) or getattr(pay, 'created_at', None) or datetime.utcnow()).strftime('%d-%m-%Y %H:%M')}"
-    )
-    y -= 6 * mm
-
-    pname = None
-    if patient:
-        first_col, last_col, full_col = _patient_name_cols()
-        if full_col is not None:
-            pname = (getattr(patient, full_col.key, None)
-                     or "").strip() or None
-        else:
-            fn = (getattr(patient, first_col.key, "")
-                  if first_col else "") or ""
-            ln = (getattr(patient, last_col.key, "") if last_col else "") or ""
-            pname = f"{fn} {ln}".strip() or None
-
-    c.drawString(
-        left, y,
-        f"Patient: {pname or (f'#{case.patient_id}' if case else '-')}")
-    if case:
-        c.drawRightString(w - left, y, f"Case: {case.case_number}")
-    y -= 6 * mm
-
-    if inv:
-        c.drawString(
-            left, y,
-            f"Invoice: {inv.invoice_number or f'#{inv.id}'}  ({_enum_value(inv.status)})"
-        )
-        y -= 6 * mm
-
-    c.line(left, y, w - left, y)
-    y -= 8 * mm
-
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(left, y, "Payment Details")
-    y -= 8 * mm
-
-    c.setFont("Helvetica", 10)
-    c.drawString(left, y, f"Amount: {_money(getattr(pay, 'amount', 0))} INR")
-    y -= 6 * mm
-    c.drawString(left, y, f"Mode: {_enum_value(pay.mode)}")
-    y -= 6 * mm
-    if getattr(pay, "txn_ref", None):
-        c.drawString(left, y, f"Txn Ref: {pay.txn_ref}")
-        y -= 6 * mm
-    if getattr(pay, "notes", None):
-        c.drawString(left, y, f"Notes: {pay.notes}")
-        y -= 6 * mm
-
-    y -= 10 * mm
-    c.setFont("Helvetica", 8)
-    c.drawString(left, y, "This is a computer generated receipt.")
-    y -= 18 * mm
-    c.setFont("Helvetica", 9)
-    c.drawRightString(w - left, y, "Authorised Signature")
-
-    c.showPage()
-    c.save()
-    return buf.getvalue()
-
-
-@router.get("/payments/{payment_id}/print")
-def print_payment_receipt_pdf(
-        payment_id: int,
-        db: Session = Depends(get_db),
-        user: User = Depends(current_user),
-):
-    try:
-        _require_perm_code(user, "billing.receipt.print")
-        pdf_bytes = _render_receipt_pdf_bytes(db, int(payment_id))
-        return StreamingResponse(
-            io.BytesIO(pdf_bytes),
-            media_type="application/pdf",
-            headers={
-                "Content-Disposition":
-                f'inline; filename="receipt_{payment_id}.pdf"'
-            },
-        )
-    except Exception as e:
-        _err(e)
+def _receipt_status_name(p: BillingPayment) -> str:
+    return str(_enum_value(getattr(p, "status", "") or "")).upper()
 
 
 @router.post("/payments/{payment_id}/void")
 def void_payment_receipt(
         payment_id: int,
-        inp: PaymentVoidIn,
+        inp: ReceiptVoidIn,
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
 ):
+    """
+    Voids a receipt/payment:
+    - marks payment status VOID (if supported)
+    - does NOT delete rows (audit-safe)
+    """
     try:
-        _require_perm_code(user, "billing.receipt.void")
-
-        pay = db.query(BillingPayment).filter(
+        _require_perm_code(user, "billing.receipts.void")
+        p = db.query(BillingPayment).filter(
             BillingPayment.id == int(payment_id)).first()
-        if not pay:
-            raise HTTPException(status_code=404, detail="Payment not found")
+        if not p:
+            return {"ok": True}
 
-        if str(_enum_value(getattr(pay, "status", ""))
-               or "").upper() == "VOID":
-            return {"ok": True, "status": "VOID"}
+        # already void?
+        if hasattr(p, "status") and _receipt_status_name(p) in {
+                "VOID", "CANCELLED"
+        }:
+            return {"ok": True, "payment": _payment_to_dict(p)}
 
-        # ✅ safety: don't void allocations without a proper reversal workflow
-        alloc_count = 0
-        try:
-            alloc_count = db.query(BillingPaymentAllocation).filter(
-                BillingPaymentAllocation.payment_id == int(pay.id)).count()
-        except Exception:
-            alloc_count = 0
-        if alloc_count > 0:
-            raise HTTPException(
-                status_code=409,
-                detail=
-                "Receipt has allocations. Please implement reversal workflow before allowing void."
-            )
+        if hasattr(p, "status"):
+            st_void = _pick_status(ReceiptStatus, "VOID") or _pick_status(
+                ReceiptStatus, "CANCELLED")
+            if st_void is not None:
+                p.status = st_void
 
-        pay.status = ReceiptStatus.VOID
-        pay.voided_by = getattr(user, "id", None)
-        pay.voided_at = datetime.utcnow()
-        pay.void_reason = inp.reason
+        _safe_set(p, ["voided_at"], datetime.utcnow())
+        _safe_set(p, ["voided_by", "voided_by_id"], getattr(user, "id", None))
+        if hasattr(p, "void_reason"):
+            p.void_reason = inp.reason
+        elif hasattr(p, "notes"):
+            p.notes = ((p.notes or "") + f"\n[VOID] {inp.reason}").strip()
 
-        db.add(pay)
+        db.add(p)
         db.commit()
-        db.refresh(pay)
-
-        return {"ok": True, "payment": _payment_to_dict(pay)}
+        db.refresh(p)
+        return {"ok": True, "payment": _payment_to_dict(p)}
     except Exception as e:
         db.rollback()
         _err(e)
@@ -4538,6 +4864,10 @@ def void_payment_receipt(
 # ✅ Insurance: PREAUTH endpoints (full workflow)
 # ============================================================
 
+# ============================================================
+# ✅ Preauth Workflow APIs (create/submit/approve/reject/cancel)
+# ============================================================
+
 
 class PreauthCreateIn(BaseModel):
     requested_amount: Decimal = Field(..., gt=0)
@@ -4545,13 +4875,9 @@ class PreauthCreateIn(BaseModel):
     attachments_json: Optional[Dict[str, Any]] = None
 
 
-class PreauthSubmitIn(BaseModel):
-    remarks: str = ""
-
-
 class PreauthApproveIn(BaseModel):
     approved_amount: Decimal = Field(..., gt=0)
-    partial: bool = False
+    is_partial: bool = False
     remarks: str = ""
 
 
@@ -4559,25 +4885,38 @@ class PreauthDecisionIn(BaseModel):
     remarks: str = ""
 
 
-@router.get("/cases/{case_id}/insurance/preauths")
-def list_case_preauths(
+def _preauth_status_name(p: BillingPreauthRequest) -> str:
+    return str(_enum_value(getattr(p, "status", "") or "")).upper()
+
+
+def _get_preauth_or_404(db: Session, preauth_id: int) -> BillingPreauthRequest:
+    row = db.query(BillingPreauthRequest).filter(
+        BillingPreauthRequest.id == int(preauth_id)).first()
+    if not row:
+        raise HTTPException(status_code=404,
+                            detail="Preauth request not found")
+    return row
+
+
+@router.get("/cases/{case_id}/insurance/preauth")
+def list_case_preauth(
         case_id: int,
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
 ):
-    try:
-        _get_case_or_404(db, user, case_id)
-        ins = _get_insurance_case_or_409(db, int(case_id))
-        rows = db.query(BillingPreauthRequest).filter(
-            BillingPreauthRequest.insurance_case_id == int(ins.id)).order_by(
-                desc(BillingPreauthRequest.created_at),
-                desc(BillingPreauthRequest.id)).all()
-        return {"items": [_preauth_to_dict(x) for x in rows]}
-    except Exception as e:
-        _err(e)
+    _get_case_or_404(db, user, int(case_id))
+    _require_perm_code(user, "billing.preauth.view")
+
+    ins = _get_insurance_case_or_409(db, int(case_id))
+    rows = db.query(BillingPreauthRequest).filter(
+        BillingPreauthRequest.insurance_case_id == int(ins.id)).order_by(
+            desc(BillingPreauthRequest.created_at),
+            desc(BillingPreauthRequest.id)).all()
+
+    return {"items": [_preauth_to_dict(x) for x in rows]}
 
 
-@router.post("/cases/{case_id}/insurance/preauths")
+@router.post("/cases/{case_id}/insurance/preauth")
 def create_preauth(
         case_id: int,
         inp: PreauthCreateIn,
@@ -4585,26 +4924,35 @@ def create_preauth(
         user: User = Depends(current_user),
 ):
     try:
-        _require_perm_code(user, "billing.insurance.preauth.create")
-        _get_case_or_404(db, user, case_id)
+        _get_case_or_404(db, user, int(case_id))
+        _require_perm_code(user, "billing.preauth.create")
+
         ins = _get_insurance_case_or_409(db, int(case_id))
 
         p = BillingPreauthRequest(
             insurance_case_id=int(ins.id),
             requested_amount=Decimal(str(inp.requested_amount)),
-            approved_amount=Decimal("0"),
-            status=PreauthStatus.DRAFT,
-            remarks=(inp.remarks or "").strip() or None,
-            attachments_json=inp.attachments_json if hasattr(
-                BillingPreauthRequest, "attachments_json") else None,
-            created_by=getattr(user, "id", None),
+            status=_pick_status(PreauthStatus, "DRAFT")
+            or list(PreauthStatus.__members__.values())[0],
         )
-        db.add(p)
 
-        # insurance baseline
-        if ins.status is None:
-            ins.status = InsuranceStatus.INITIATED
-        db.add(ins)
+        if hasattr(p, "remarks"):
+            p.remarks = (inp.remarks or "").strip() or None
+        if hasattr(p, "attachments_json"):
+            p.attachments_json = inp.attachments_json
+
+        _safe_set(p, ["created_by", "created_by_id"],
+                  getattr(user, "id", None))
+
+        db.add(p)
+        db.flush()
+
+        # optional: sync insurance status
+        try:
+            _sync_ins_status_from_preauth(ins, p)
+            db.add(ins)
+        except Exception:
+            pass
 
         db.commit()
         db.refresh(p)
@@ -4614,47 +4962,26 @@ def create_preauth(
         _err(e)
 
 
-@router.get("/preauths/{preauth_id}")
-def get_preauth(
-        preauth_id: int,
-        db: Session = Depends(get_db),
-        user: User = Depends(current_user),
-):
-    try:
-        p = db.query(BillingPreauthRequest).filter(
-            BillingPreauthRequest.id == int(preauth_id)).first()
-        if not p:
-            raise HTTPException(status_code=404, detail="Preauth not found")
-        return {"preauth": _preauth_to_dict(p)}
-    except Exception as e:
-        _err(e)
-
-
-@router.post("/preauths/{preauth_id}/submit")
+@router.post("/insurance/preauth/{preauth_id}/submit")
 def submit_preauth(
         preauth_id: int,
-        inp: PreauthSubmitIn = Body(default=PreauthSubmitIn()),
+        inp: PreauthDecisionIn = Body(default=PreauthDecisionIn()),
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
 ):
     try:
-        _require_perm_code(user, "billing.insurance.preauth.submit")
+        _require_perm_code(user, "billing.preauth.submit")
+        p = _get_preauth_or_404(db, int(preauth_id))
 
-        p = db.query(BillingPreauthRequest).filter(
-            BillingPreauthRequest.id == int(preauth_id)).first()
-        if not p:
-            raise HTTPException(status_code=404, detail="Preauth not found")
+        st_sub = _pick_status(PreauthStatus, "SUBMITTED")
+        if st_sub is None:
+            raise HTTPException(status_code=500,
+                                detail="PreauthStatus missing SUBMITTED")
 
-        cur = str(_enum_value(p.status) or "").upper()
-        if cur not in {"DRAFT"}:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Preauth cannot be submitted from status={cur}")
-
-        p.status = PreauthStatus.SUBMITTED
-        p.submitted_at = datetime.utcnow()
-        if hasattr(p, "remarks"):
-            p.remarks = (inp.remarks or "").strip() or p.remarks
+        p.status = st_sub
+        _safe_set(p, ["submitted_at"], datetime.utcnow())
+        if hasattr(p, "remarks") and inp.remarks:
+            p.remarks = (inp.remarks or "").strip() or None
 
         ins = db.query(BillingInsuranceCase).filter(
             BillingInsuranceCase.id == int(p.insurance_case_id)).first()
@@ -4665,16 +4992,13 @@ def submit_preauth(
         db.add(p)
         db.commit()
         db.refresh(p)
-        return {
-            "preauth": _preauth_to_dict(p),
-            "insurance": _insurance_to_dict(ins) if ins else None
-        }
+        return {"preauth": _preauth_to_dict(p)}
     except Exception as e:
         db.rollback()
         _err(e)
 
 
-@router.post("/preauths/{preauth_id}/approve")
+@router.post("/insurance/preauth/{preauth_id}/approve")
 def approve_preauth(
         preauth_id: int,
         inp: PreauthApproveIn,
@@ -4682,26 +5006,23 @@ def approve_preauth(
         user: User = Depends(current_user),
 ):
     try:
-        _require_perm_code(user, "billing.insurance.preauth.approve")
+        _require_perm_code(user, "billing.preauth.approve")
+        p = _get_preauth_or_404(db, int(preauth_id))
 
-        p = db.query(BillingPreauthRequest).filter(
-            BillingPreauthRequest.id == int(preauth_id)).first()
-        if not p:
-            raise HTTPException(status_code=404, detail="Preauth not found")
-
-        cur = str(_enum_value(p.status) or "").upper()
-        if cur not in {"SUBMITTED"}:
+        st_app = _pick_status(PreauthStatus,
+                              "PARTIAL") if inp.is_partial else _pick_status(
+                                  PreauthStatus, "APPROVED")
+        if st_app is None:
             raise HTTPException(
-                status_code=409,
-                detail=f"Preauth cannot be approved from status={cur}")
+                status_code=500,
+                detail="PreauthStatus missing APPROVED/PARTIAL")
 
-        p.approved_amount = Decimal(str(inp.approved_amount))
-        p.approved_at = datetime.utcnow()
+        p.status = st_app
+        _safe_set(p, ["approved_at"], datetime.utcnow())
+        if hasattr(p, "approved_amount"):
+            p.approved_amount = Decimal(str(inp.approved_amount))
         if hasattr(p, "remarks"):
-            p.remarks = (inp.remarks or "").strip() or p.remarks
-
-        p.status = PreauthStatus.PARTIAL if bool(
-            inp.partial) else PreauthStatus.APPROVED
+            p.remarks = (inp.remarks or "").strip() or None
 
         ins = db.query(BillingInsuranceCase).filter(
             BillingInsuranceCase.id == int(p.insurance_case_id)).first()
@@ -4712,16 +5033,13 @@ def approve_preauth(
         db.add(p)
         db.commit()
         db.refresh(p)
-        return {
-            "preauth": _preauth_to_dict(p),
-            "insurance": _insurance_to_dict(ins) if ins else None
-        }
+        return {"preauth": _preauth_to_dict(p)}
     except Exception as e:
         db.rollback()
         _err(e)
 
 
-@router.post("/preauths/{preauth_id}/reject")
+@router.post("/insurance/preauth/{preauth_id}/reject")
 def reject_preauth(
         preauth_id: int,
         inp: PreauthDecisionIn = Body(default=PreauthDecisionIn()),
@@ -4729,24 +5047,18 @@ def reject_preauth(
         user: User = Depends(current_user),
 ):
     try:
-        _require_perm_code(user, "billing.insurance.preauth.reject")
+        _require_perm_code(user, "billing.preauth.reject")
+        p = _get_preauth_or_404(db, int(preauth_id))
 
-        p = db.query(BillingPreauthRequest).filter(
-            BillingPreauthRequest.id == int(preauth_id)).first()
-        if not p:
-            raise HTTPException(status_code=404, detail="Preauth not found")
+        st_rej = _pick_status(PreauthStatus, "REJECTED") or _pick_status(
+            PreauthStatus, "DENIED")
+        if st_rej is None:
+            raise HTTPException(status_code=500,
+                                detail="PreauthStatus missing REJECTED/DENIED")
 
-        cur = str(_enum_value(p.status) or "").upper()
-        if cur not in {"SUBMITTED"}:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Preauth cannot be rejected from status={cur}")
-
-        p.status = PreauthStatus.REJECTED
-        p.approved_amount = Decimal("0")
-        p.approved_at = datetime.utcnow()
+        p.status = st_rej
         if hasattr(p, "remarks"):
-            p.remarks = (inp.remarks or "").strip() or p.remarks
+            p.remarks = (inp.remarks or "").strip() or None
 
         ins = db.query(BillingInsuranceCase).filter(
             BillingInsuranceCase.id == int(p.insurance_case_id)).first()
@@ -4757,16 +5069,13 @@ def reject_preauth(
         db.add(p)
         db.commit()
         db.refresh(p)
-        return {
-            "preauth": _preauth_to_dict(p),
-            "insurance": _insurance_to_dict(ins) if ins else None
-        }
+        return {"preauth": _preauth_to_dict(p)}
     except Exception as e:
         db.rollback()
         _err(e)
 
 
-@router.post("/preauths/{preauth_id}/cancel")
+@router.post("/insurance/preauth/{preauth_id}/cancel")
 def cancel_preauth(
         preauth_id: int,
         inp: PreauthDecisionIn = Body(default=PreauthDecisionIn()),
@@ -4774,22 +5083,18 @@ def cancel_preauth(
         user: User = Depends(current_user),
 ):
     try:
-        _require_perm_code(user, "billing.insurance.preauth.cancel")
+        _require_perm_code(user, "billing.preauth.cancel")
+        p = _get_preauth_or_404(db, int(preauth_id))
 
-        p = db.query(BillingPreauthRequest).filter(
-            BillingPreauthRequest.id == int(preauth_id)).first()
-        if not p:
-            raise HTTPException(status_code=404, detail="Preauth not found")
+        st_can = _pick_status(PreauthStatus, "CANCELLED") or _pick_status(
+            PreauthStatus, "VOID")
+        if st_can is None:
+            raise HTTPException(status_code=500,
+                                detail="PreauthStatus missing CANCELLED/VOID")
 
-        cur = str(_enum_value(p.status) or "").upper()
-        if cur not in {"DRAFT", "SUBMITTED"}:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Preauth cannot be cancelled from status={cur}")
-
-        p.status = PreauthStatus.CANCELLED
+        p.status = st_can
         if hasattr(p, "remarks"):
-            p.remarks = (inp.remarks or "").strip() or p.remarks
+            p.remarks = (inp.remarks or "").strip() or None
 
         ins = db.query(BillingInsuranceCase).filter(
             BillingInsuranceCase.id == int(p.insurance_case_id)).first()
@@ -4800,10 +5105,7 @@ def cancel_preauth(
         db.add(p)
         db.commit()
         db.refresh(p)
-        return {
-            "preauth": _preauth_to_dict(p),
-            "insurance": _insurance_to_dict(ins) if ins else None
-        }
+        return {"preauth": _preauth_to_dict(p)}
     except Exception as e:
         db.rollback()
         _err(e)
@@ -4953,3 +5255,781 @@ def create_or_refresh_claim_from_invoice_validated(
     except Exception as e:
         db.rollback()
         _err(e)
+
+
+# ============================================================
+# ✅ Payments: receipt print + void receipt
+# ============================================================
+
+
+class PaymentVoidIn(BaseModel):
+    reason: str = Field(..., min_length=3, max_length=255)
+
+
+def _render_receipt_pdf_bytes(db: Session, payment_id: int) -> bytes:
+    pay = db.query(BillingPayment).filter(
+        BillingPayment.id == int(payment_id)).first()
+    if not pay:
+        raise HTTPException(status_code=404, detail="Payment not found")
+
+    case = db.query(BillingCase).filter(
+        BillingCase.id == int(pay.billing_case_id)).first()
+    patient = db.query(Patient).filter(
+        Patient.id == int(case.patient_id)).first() if case else None
+    inv = db.query(BillingInvoice).filter(BillingInvoice.id == int(
+        pay.invoice_id)).first() if pay.invoice_id else None
+
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    w, h = A4
+    left = 15 * mm
+    top = h - 15 * mm
+    y = top
+
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(left, y, "PAYMENT RECEIPT")
+    y -= 7 * mm
+
+    c.setFont("Helvetica", 9)
+    rcpt = getattr(pay, "receipt_number", None) or f"RCPT-{pay.id}"
+    c.drawString(left, y, f"Receipt No: {rcpt}")
+    c.drawRightString(
+        w - left, y,
+        f"Date: {(getattr(pay, 'received_at', None) or getattr(pay, 'created_at', None) or datetime.utcnow()).strftime('%d-%m-%Y %H:%M')}"
+    )
+    y -= 6 * mm
+
+    pname = None
+    if patient:
+        first_col, last_col, full_col = _patient_name_cols()
+        if full_col is not None:
+            pname = (getattr(patient, full_col.key, None)
+                     or "").strip() or None
+        else:
+            fn = (getattr(patient, first_col.key, "")
+                  if first_col else "") or ""
+            ln = (getattr(patient, last_col.key, "") if last_col else "") or ""
+            pname = f"{fn} {ln}".strip() or None
+
+    c.drawString(
+        left, y,
+        f"Patient: {pname or (f'#{case.patient_id}' if case else '-')}")
+    if case:
+        c.drawRightString(w - left, y, f"Case: {case.case_number}")
+    y -= 6 * mm
+
+    if inv:
+        c.drawString(
+            left, y,
+            f"Invoice: {inv.invoice_number or f'#{inv.id}'}  ({_enum_value(inv.status)})"
+        )
+        y -= 6 * mm
+
+    c.line(left, y, w - left, y)
+    y -= 8 * mm
+
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(left, y, "Payment Details")
+    y -= 8 * mm
+
+    c.setFont("Helvetica", 10)
+    c.drawString(left, y, f"Amount: {_money(getattr(pay, 'amount', 0))} INR")
+    y -= 6 * mm
+    c.drawString(left, y, f"Mode: {_enum_value(pay.mode)}")
+    y -= 6 * mm
+    if getattr(pay, "txn_ref", None):
+        c.drawString(left, y, f"Txn Ref: {pay.txn_ref}")
+        y -= 6 * mm
+    if getattr(pay, "notes", None):
+        c.drawString(left, y, f"Notes: {pay.notes}")
+        y -= 6 * mm
+
+    y -= 10 * mm
+    c.setFont("Helvetica", 8)
+    c.drawString(left, y, "This is a computer generated receipt.")
+    y -= 18 * mm
+    c.setFont("Helvetica", 9)
+    c.drawRightString(w - left, y, "Authorised Signature")
+
+    c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+@router.get("/payments/{payment_id}/print")
+def print_payment_receipt_pdf(
+        payment_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    try:
+        _require_perm_code(user, "billing.receipt.print")
+        pdf_bytes = _render_receipt_pdf_bytes(db, int(payment_id))
+        return StreamingResponse(
+            io.BytesIO(pdf_bytes),
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition":
+                f'inline; filename="receipt_{payment_id}.pdf"'
+            },
+        )
+    except Exception as e:
+        _err(e)
+
+
+class BillingExportKind(str, Enum):
+    FULL_CASE = "FULL_CASE"
+
+
+def _need_any(user: User, perms: List[str]):
+    up = set(getattr(user, "permissions", []) or [])
+    if not any(p in up for p in perms):
+        raise HTTPException(status_code=403, detail="Not permitted")
+
+
+def _get_branding(db: Session) -> Optional[UiBranding]:
+    q = db.query(UiBranding)
+    if hasattr(UiBranding, "is_active"):
+        q = q.filter(UiBranding.is_active == True)  # noqa
+    return q.order_by(UiBranding.id.desc()).first()
+
+
+def _to_dec(v) -> Decimal:
+    try:
+        return Decimal(str(v or "0"))
+    except Exception:
+        return Decimal("0")
+
+
+def _pick_first_attr(obj: Any, fields: List[str]):
+    for f in fields:
+        if hasattr(obj, f):
+            v = getattr(obj, f, None)
+            if v not in (None, "", 0):
+                return v
+    return None
+
+
+def _load_encounter_meta(db: Session, case: BillingCase) -> Dict[str, Any]:
+    """
+    ✅ Rule:
+      - if OP => use OP Visit Number
+      - if IP => use IP Admission Number
+
+    We attempt:
+      1) direct case.encounter_id -> Visit/Admission primary key
+      2) BillingCaseLink (VISIT / ADMISSION)
+      3) fallback to encounter_id as string (handled in PDF builder)
+    """
+    meta: Dict[str, Any] = {}
+
+    et = str(getattr(case, "encounter_type", "") or "").upper()
+    encounter_id = getattr(case, "encounter_id", None)
+
+    # --------------------------
+    # helper to load link id
+    # --------------------------
+    def _link_entity_id(entity_type: str) -> Optional[int]:
+        try:
+            row = (db.query(BillingCaseLink).filter(
+                BillingCaseLink.billing_case_id == case.id,
+                BillingCaseLink.entity_type == entity_type,
+            ).order_by(BillingCaseLink.id.desc()).first())
+            return int(row.entity_id) if row else None
+        except Exception:
+            return None
+
+    # --------------------------
+    # OP: Visit
+    # --------------------------
+    if et == "OP":
+        visit_obj = None
+        try:
+            from app.models.opd import Visit  # noqa
+
+            # try encounter_id
+            if encounter_id:
+                visit_obj = db.query(Visit).filter(
+                    Visit.id == int(encounter_id)).first()
+
+            # try link
+            if not visit_obj:
+                vid = _link_entity_id("VISIT")
+                if vid:
+                    visit_obj = db.query(Visit).filter(
+                        Visit.id == int(vid)).first()
+
+            if visit_obj:
+                visit_no = _pick_first_attr(
+                    visit_obj,
+                    ["visit_number", "visit_no", "visit_code", "visit_id"])
+                if visit_no:
+                    meta["op_visit_no"] = str(visit_no)
+
+                # doctor (best-effort)
+                doc_name = None
+                if hasattr(visit_obj, "doctor"):
+                    doc = getattr(visit_obj, "doctor", None)
+                    doc_name = getattr(doc, "name", None) if doc else None
+                if not doc_name and hasattr(visit_obj, "doctor_name"):
+                    doc_name = getattr(visit_obj, "doctor_name", None)
+                if not doc_name and hasattr(visit_obj, "doctor_id"):
+                    # optional lookup if doctor_id exists
+                    try:
+                        did = getattr(visit_obj, "doctor_id", None)
+                        if did:
+                            u = db.query(User).filter(
+                                User.id == int(did)).first()
+                            doc_name = getattr(u, "name", None) if u else None
+                    except Exception:
+                        pass
+                if doc_name:
+                    meta["doctor"] = doc_name
+
+                # visit date
+                vdt = _pick_first_attr(
+                    visit_obj,
+                    ["visit_date", "visited_at", "created_at", "updated_at"])
+                if vdt:
+                    meta[
+                        "admitted_on"] = vdt  # for OP we still show as admitted_on slot
+        except Exception:
+            pass
+
+        return meta
+
+    # --------------------------
+    # IP: Admission
+    # --------------------------
+    if et == "IP":
+        adm_obj = None
+        try:
+            from app.models.ipd import IpdAdmission  # noqa
+
+            # try encounter_id
+            if encounter_id:
+                adm_obj = db.query(IpdAdmission).filter(
+                    IpdAdmission.id == int(encounter_id)).first()
+
+            # try link
+            if not adm_obj:
+                aid = _link_entity_id("ADMISSION")
+                if aid:
+                    adm_obj = db.query(IpdAdmission).filter(
+                        IpdAdmission.id == int(aid)).first()
+
+            if adm_obj:
+                adm_no = _pick_first_attr(
+                    adm_obj,
+                    ["admission_number", "admission_no", "ip_no", "ip_number"])
+                if adm_no:
+                    meta["ip_admission_no"] = str(adm_no)
+
+                # ward/room (best-effort)
+                ward = _pick_first_attr(adm_obj,
+                                        ["ward_name", "ward", "ward_no"])
+                room = _pick_first_attr(
+                    adm_obj,
+                    ["room_no", "room_number", "room", "bed_no", "bed_number"])
+                if ward:
+                    meta["ward"] = str(ward)
+                if room:
+                    meta["room"] = str(room)
+
+                # doctor
+                doc_name = None
+                if hasattr(adm_obj, "doctor"):
+                    doc = getattr(adm_obj, "doctor", None)
+                    doc_name = getattr(doc, "name", None) if doc else None
+                if not doc_name and hasattr(adm_obj, "doctor_name"):
+                    doc_name = getattr(adm_obj, "doctor_name", None)
+                if not doc_name and hasattr(adm_obj, "doctor_id"):
+                    try:
+                        did = getattr(adm_obj, "doctor_id", None)
+                        if did:
+                            u = db.query(User).filter(
+                                User.id == int(did)).first()
+                            doc_name = getattr(u, "name", None) if u else None
+                    except Exception:
+                        pass
+                if doc_name:
+                    meta["doctor"] = doc_name
+
+                # dates
+                adt = _pick_first_attr(adm_obj, [
+                    "admitted_at", "admission_date", "admitted_on",
+                    "created_at"
+                ])
+                ddt = _pick_first_attr(adm_obj, [
+                    "discharged_at", "discharge_date", "discharged_on",
+                    "updated_at"
+                ])
+                if adt:
+                    meta["admitted_on"] = adt
+                if ddt:
+                    meta["discharged_on"] = ddt
+        except Exception:
+            pass
+
+        return meta
+
+    # OT/ER etc => leave empty (PDF falls back to encounter_id)
+    return meta
+
+
+def _load_payer_context(db: Session, case: BillingCase,
+                        ins: Optional[BillingInsuranceCase]) -> Dict[str, Any]:
+    """
+    Attach payer/insurer/tpa display names for PDF.
+    Best effort using your existing payer models.
+    """
+    ctx: Dict[str, Any] = {
+        "payer": None,
+        "insurer": None,
+        "insurance_company": None
+    }
+
+    try:
+        from app.models.payer import Payer, Tpa, CreditPlan  # noqa
+    except Exception:
+        Payer = None
+        Tpa = None
+        CreditPlan = None
+
+    # If insurance case exists, derive insurer/TPA/corporate
+    if ins:
+        kind = str(getattr(ins, "payer_kind", "") or "").upper()
+        if kind == "INSURANCE" and getattr(ins, "insurance_company_id",
+                                           None) and Payer:
+            p = db.query(Payer).filter(
+                Payer.id == int(ins.insurance_company_id)).first()
+            if p:
+                ctx["insurer"] = {"name": getattr(p, "name", None)}
+                ctx["insurance_company"] = {"name": getattr(p, "name", None)}
+
+        if kind == "TPA" and getattr(ins, "tpa_id", None) and Tpa:
+            t = db.query(Tpa).filter(Tpa.id == int(ins.tpa_id)).first()
+            if t:
+                ctx["payer"] = {"name": getattr(t, "name", None)}
+
+        if kind == "CORPORATE" and getattr(ins, "corporate_id", None):
+            # corporate might be stored in CreditPlan or Payer depending on your DB
+            corp_name = None
+            if CreditPlan:
+                cp = db.query(CreditPlan).filter(
+                    CreditPlan.id == int(ins.corporate_id)).first()
+                if cp:
+                    corp_name = getattr(cp, "name", None)
+            if (not corp_name) and Payer:
+                p = db.query(Payer).filter(
+                    Payer.id == int(ins.corporate_id)).first()
+                if p:
+                    corp_name = getattr(p, "name", None)
+            if corp_name:
+                ctx["payer"] = {"name": corp_name}
+
+    return ctx
+
+
+def _load_case_export_payload(db: Session, user: User,
+                              case_id: int) -> Dict[str, Any]:
+    # ✅ Permission if needed
+    # _need_any(user, ["billing.cases.view", "billing.view", "billing.case.view"])
+
+    case = db.query(BillingCase).filter(BillingCase.id == case_id).first()
+    if not case:
+        raise HTTPException(status_code=404, detail="Billing case not found")
+
+    patient_obj = None
+    try:
+        patient_obj = db.query(Patient).filter(
+            Patient.id == case.patient_id).first()
+    except Exception:
+        patient_obj = None
+
+    # invoices
+    invs = (db.query(BillingInvoice).filter(
+        BillingInvoice.billing_case_id == case_id).order_by(
+            BillingInvoice.id.asc()).all())
+    inv_ids = [int(i.id) for i in invs]
+
+    # lines (all invoices)
+    lines: List[BillingInvoiceLine] = []
+    if inv_ids:
+        lines = (db.query(BillingInvoiceLine).filter(
+            BillingInvoiceLine.invoice_id.in_(inv_ids)).order_by(
+                BillingInvoiceLine.invoice_id.asc(),
+                BillingInvoiceLine.id.asc()).all())
+
+    by_inv: Dict[int, List[BillingInvoiceLine]] = {}
+    for ln in lines:
+        by_inv.setdefault(int(ln.invoice_id), []).append(ln)
+
+    # payments
+    pays = (db.query(BillingPayment).filter(
+        BillingPayment.billing_case_id == case_id).order_by(
+            BillingPayment.id.asc()).all())
+
+    # advances
+    advs = (db.query(BillingAdvance).filter(
+        BillingAdvance.billing_case_id == case_id).order_by(
+            BillingAdvance.id.asc()).all())
+
+    # insurance + preauth + claims (FIXED)
+    ins: Optional[BillingInsuranceCase] = None
+    preauths: List[BillingPreauthRequest] = []
+    claims: List[BillingClaim] = []
+
+    try:
+        ins = (db.query(BillingInsuranceCase).filter(
+            BillingInsuranceCase.billing_case_id == case_id).first())
+        if ins:
+            preauths = (
+                db.query(BillingPreauthRequest).filter(
+                    BillingPreauthRequest.insurance_case_id == ins.id)  # ✅ FIX
+                .order_by(BillingPreauthRequest.id.asc()).all())
+            claims = (
+                db.query(BillingClaim).filter(
+                    BillingClaim.insurance_case_id == ins.id)  # ✅ FIX
+                .order_by(BillingClaim.id.asc()).all())
+    except Exception:
+        ins = None
+
+    # branding
+    branding = _get_branding(db)
+
+    # encounter meta OP/IP numbers
+    encounter_meta = _load_encounter_meta(db, case)
+
+    # payer context
+    payer_ctx = _load_payer_context(db, case, ins)
+
+    # finance summary (minimal)
+    safe_invs = [
+        i for i in invs if str(getattr(i, "status", "")).upper() != "VOID"
+    ]
+    total_billed = sum((_to_dec(getattr(i, "grand_total", 0))
+                        for i in safe_invs), Decimal("0"))
+
+    total_paid = Decimal("0")
+    for p in pays:
+        if str(getattr(p, "status", "")).upper() == "VOID":
+            continue
+        # receipts will be filtered in PDF by kind/direction; but finance wants total received
+        total_paid += _to_dec(getattr(p, "amount", 0))
+
+    # advances totals
+    adv_total = Decimal("0")
+    adv_balance = Decimal("0")
+    for a in advs:
+        t = str(getattr(a, "entry_type", "ADVANCE")).upper()
+        amt = _to_dec(getattr(a, "amount", 0))
+        if t == "ADVANCE":
+            adv_total += amt
+            adv_balance += amt
+        elif t in {"REFUND", "ADJUSTMENT"}:
+            adv_balance -= amt
+
+    due = total_billed - total_paid
+    if due < 0:
+        due = Decimal("0")
+
+    payload: Dict[str, Any] = {
+        "branding": branding,
+
+        # used by pdf builder for header fallback
+        "printed_dt": datetime.now(),
+
+        # ✅ these are used in footer/signatures
+        "printed_by": getattr(user, "name", None),
+        "billed_by": getattr(user, "name", None),
+        "checked_by":
+        None,  # we will fill below based on invoice approver if available
+        "case": {
+            "case_number": getattr(case, "case_number", None),
+            "status": getattr(case, "status", None),
+            "payer_mode": getattr(case, "payer_mode", None),
+            "encounter_type": getattr(case, "encounter_type", None),
+            "encounter_id": getattr(case, "encounter_id", None),
+        },
+        "patient": {
+            "name":
+            getattr(patient_obj, "name", None) if patient_obj else None,
+            "uhid":
+            getattr(patient_obj, "uhid", None) if patient_obj else None,
+            "phone":
+            getattr(patient_obj, "phone", None) if patient_obj else None,
+            "gender":
+            getattr(patient_obj, "gender", None) if patient_obj else None,
+            "age":
+            getattr(patient_obj, "age", None) if patient_obj else None,
+            "address":
+            getattr(patient_obj, "address", None) if patient_obj else None,
+        },
+
+        # ✅ critical for OP/IP number printing
+        "encounter_meta": encounter_meta,
+
+        # ✅ payer/insurer names for PDF
+        "payer": payer_ctx.get("payer"),
+        "insurer": payer_ctx.get("insurer"),
+        "insurance_company": payer_ctx.get("insurance_company"),
+        "invoices": [],
+        "payments": [],
+        "advances": [],
+        "insurance": None,
+        "preauths": [],
+        "claims": [],
+        "finance": {
+            "total_billed": str(total_billed),
+            "total_paid": str(total_paid),
+            "due": str(due),
+            "advance_total": str(adv_total),
+            "advance_balance": str(adv_balance),
+            # optional: if you compute later
+            "advance_consumed": "0",
+            "advance_refund": "0",
+        },
+    }
+
+    # map invoice_id -> invoice_number for payment/claim prints
+    inv_no_by_id: Dict[int, str] = {}
+    for inv in invs:
+        inv_no_by_id[int(inv.id)] = getattr(inv, "invoice_number",
+                                            None) or f"INV-{int(inv.id):06d}"
+
+    # find main bill invoice to set checked_by (approved/poster)
+    main_bill = None
+    for inv in invs:
+        if str(getattr(inv, "status", "")).upper() in {"APPROVED", "POSTED"}:
+            it = str(getattr(inv, "invoice_type", "")).upper()
+            if it == "PATIENT":
+                main_bill = inv
+    if not main_bill and invs:
+        main_bill = invs[-1]
+
+    if main_bill:
+        # checked_by = approved_by user name if available
+        try:
+            ab = getattr(main_bill, "approved_by_user", None)
+            pb = getattr(main_bill, "posted_by_user", None)
+            payload["checked_by"] = getattr(ab, "name", None) or getattr(
+                pb, "name", None)
+        except Exception:
+            payload["checked_by"] = None
+
+        # billed_by prefer invoice created_by_user
+        try:
+            cb = getattr(main_bill, "created_by_user", None)
+            payload["billed_by"] = getattr(cb, "name",
+                                           None) or payload["billed_by"]
+        except Exception:
+            pass
+
+    # invoices + lines (dict structure is fine for pdf builder)
+    for inv in invs:
+        inv_no = getattr(inv, "invoice_number",
+                         None) or f"INV-{int(inv.id):06d}"
+
+        inv_dict = {
+            "invoice_number": inv_no,
+            "module": getattr(inv, "module", None),
+            "invoice_type": getattr(inv, "invoice_type", None),
+            "status": getattr(inv, "status", None),
+            "created_at": getattr(inv, "created_at", None),
+            "service_date": getattr(inv, "service_date", None),
+            "sub_total": str(getattr(inv, "sub_total", 0) or 0),
+            "discount_total": str(getattr(inv, "discount_total", 0) or 0),
+            "tax_total": str(getattr(inv, "tax_total", 0) or 0),
+            "grand_total": str(getattr(inv, "grand_total", 0) or 0),
+            "lines": [],
+        }
+
+        for ln in by_inv.get(int(inv.id), []):
+            # skip deleted style flags if present in your DB (optional)
+            if getattr(ln, "is_deleted", False) or getattr(
+                    ln, "deleted_at", None):
+                continue
+
+            meta_json = getattr(ln, "meta_json", None) or {}
+            if not isinstance(meta_json, dict):
+                meta_json = {}
+
+            # normalize pharmacy keys for pdf split-up (batch/expiry/hsn)
+            batch = meta_json.get("batch_id") or meta_json.get(
+                "batch_no") or meta_json.get("batch")
+            expiry = meta_json.get("expiry") or meta_json.get(
+                "expiry_date") or meta_json.get("exp_date")
+            hsn = meta_json.get("hsn") or meta_json.get(
+                "hsn_code") or meta_json.get("hsn_sac")
+
+            # keep normalized keys also inside meta_json (so pdf builder reads consistently)
+            if batch and "batch_id" not in meta_json:
+                meta_json["batch_id"] = batch
+            if expiry and "expiry" not in meta_json:
+                meta_json["expiry"] = expiry
+            if hsn and "hsn" not in meta_json:
+                meta_json["hsn"] = hsn
+
+            inv_dict["lines"].append({
+                "service_group":
+                getattr(ln, "service_group",
+                        None),  # ✅ needed for section grouping
+                "description":
+                getattr(ln, "description", None),
+                "item_code":
+                getattr(ln, "item_code", None),
+                "service_date":
+                getattr(ln, "service_date", None)
+                or getattr(inv, "service_date", None)
+                or getattr(inv, "created_at", None),
+                "qty":
+                getattr(ln, "qty", None),
+                "unit_price":
+                str(getattr(ln, "unit_price", 0) or 0),
+                "discount_amount":
+                str(getattr(ln, "discount_amount", 0) or 0),
+                "gst_rate":
+                getattr(ln, "gst_rate", None),
+                "tax_amount":
+                str(getattr(ln, "tax_amount", 0) or 0),
+                "net_amount":
+                str(getattr(ln, "net_amount", 0) or 0),
+
+                # doc_status fallback used by pdf builder filters
+                "doc_status":
+                getattr(inv, "status", None),
+
+                # ✅ pharmacy/hsn extras in meta_json
+                "meta_json":
+                meta_json,
+            })
+
+        payload["invoices"].append(inv_dict)
+
+    # payments (IMPORTANT: include kind + direction)
+    for p in pays:
+        if str(getattr(p, "status", "")).upper() == "VOID":
+            continue
+
+        invoice_id = getattr(p, "invoice_id", None)
+        payload["payments"].append({
+            "receipt_number":
+            getattr(p, "receipt_number", None)
+            or f"RCPT-{int(getattr(p, 'id', 0) or 0):06d}",
+            "received_at":
+            getattr(p, "received_at", None) or getattr(p, "created_at", None),
+            "mode":
+            getattr(p, "mode", None),
+            "txn_ref":
+            getattr(p, "txn_ref", None),
+            "amount":
+            str(getattr(p, "amount", 0) or 0),
+            "invoice_number":
+            inv_no_by_id.get(int(invoice_id), None) if invoice_id else None,
+            "status":
+            getattr(p, "status", None),
+
+            # ✅ required for PDF filters
+            "kind":
+            getattr(p, "kind", None),
+            "direction":
+            getattr(p, "direction", None),
+        })
+
+    # advances
+    for a in advs:
+        # advances table doesn't have status in your model; safe anyway
+        payload["advances"].append({
+            "receipt_number":
+            getattr(a, "receipt_number", None)
+            or f"ADV-{int(getattr(a, 'id', 0) or 0):06d}",
+            "entry_at":
+            getattr(a, "entry_at", None) or getattr(a, "created_at", None),
+            "entry_type":
+            getattr(a, "entry_type", None),
+            "mode":
+            getattr(a, "mode", None),
+            "txn_ref":
+            getattr(a, "txn_ref", None),
+            "remarks":
+            getattr(a, "remarks", None),
+            "amount":
+            str(getattr(a, "amount", 0) or 0),
+        })
+
+    # insurance block
+    if ins:
+        payload["insurance"] = {
+            "status": getattr(ins, "status", None),
+            "payer_kind": getattr(ins, "payer_kind", None),
+            "policy_no": getattr(ins, "policy_no", None),
+            "member_id": getattr(ins, "member_id", None),
+            "plan_name": getattr(ins, "plan_name", None),
+            "approved_limit": str(getattr(ins, "approved_limit", 0) or 0),
+        }
+
+    for pa in preauths or []:
+        payload["preauths"].append({
+            "status":
+            getattr(pa, "status", None),
+            "requested_amount":
+            str(getattr(pa, "requested_amount", 0) or 0),
+            "approved_amount":
+            str(getattr(pa, "approved_amount", 0) or 0),
+            "remarks":
+            getattr(pa, "remarks", None),
+            "submitted_at":
+            getattr(pa, "submitted_at", None),
+            "approved_at":
+            getattr(pa, "approved_at", None),
+            "created_at":
+            getattr(pa, "created_at", None),
+        })
+
+    for cl in claims or []:
+        payload["claims"].append({
+            "status":
+            getattr(cl, "status", None),
+            "claim_amount":
+            str(getattr(cl, "claim_amount", 0) or 0),
+            "approved_amount":
+            str(getattr(cl, "approved_amount", 0) or 0),
+            "settled_amount":
+            str(getattr(cl, "settled_amount", 0) or 0),
+            "remarks":
+            getattr(cl, "remarks", None),
+            "submitted_at":
+            getattr(cl, "submitted_at", None),
+            "settled_at":
+            getattr(cl, "settled_at", None),
+            "created_at":
+            getattr(cl, "created_at", None),
+        })
+
+    return payload
+
+
+@router.get("/cases/{case_id}/exports/pdf")
+def billing_case_export_pdf(
+        case_id: int,
+        kind: BillingExportKind = BillingExportKind.FULL_CASE,
+        download: bool = False,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    payload = _load_case_export_payload(db, user, case_id)
+
+    if kind == BillingExportKind.FULL_CASE:
+        pdf_bytes = build_full_case_pdf(payload)
+        case_no = (payload.get("case")
+                   or {}).get("case_number") or f"CASE-{case_id:06d}"
+        filename = f"BillingCase_{case_no}_FullCase.pdf"
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported export kind")
+
+    disp = "attachment" if download else "inline"
+    headers = {"Content-Disposition": f'{disp}; filename="{filename}"'}
+    return StreamingResponse(BytesIO(pdf_bytes),
+                             media_type="application/pdf",
+                             headers=headers)

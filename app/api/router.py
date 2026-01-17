@@ -33,6 +33,7 @@ from app.api import (
     charge_item_master,
     
     routes_billing,
+    routes_billing_print,
     routes_billing_edits,
     routes_inventory_indent,
     routes_inventory_consumption,
@@ -157,6 +158,7 @@ api_router.include_router(routes_ris.router)
 api_router.include_router(routes_billing.router)
 api_router.include_router(charge_item_master.router)
 api_router.include_router(routes_billing_edits .router)
+api_router.include_router(routes_billing_print.router)
 # api_router.include_router(routes_billing_advances.router)
 # api_router.include_router(routes_billing_wallet.router )
 # api_router.include_router(routes_billing_invoice_wallet.router)
