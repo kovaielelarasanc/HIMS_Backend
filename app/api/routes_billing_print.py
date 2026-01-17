@@ -36,6 +36,13 @@ from app.models.billing import (
     PaymentDirection,
     AdvanceType,
 )
+
+# ✅ try load BillingAdvanceApplication safely (some installations may not have it)
+try:
+    from app.models.billing import BillingAdvanceApplication  # type: ignore
+except Exception:
+    BillingAdvanceApplication = None  # type: ignore
+
 from app.models.ui_branding import UiBranding
 
 # ✅ payer masters
@@ -127,8 +134,8 @@ def _dec(v: Any) -> Decimal:
 
 
 def _money(v: Any) -> str:
-    d = _dec(v)
-    return f"{d.quantize(Decimal('0.01'))}"
+    d = _dec(v).quantize(Decimal("0.01"))
+    return f"{d}"
 
 
 def _fmt_date(d: Any) -> str:
@@ -189,7 +196,8 @@ def _pick_best_address(addresses: list[PatientAddress]) -> str:
     pref = {"current": 0, "permanent": 1, "office": 2, "other": 3}
     addresses_sorted = sorted(
         addresses,
-        key=lambda a: pref.get((getattr(a, "type", None) or "").lower(), 99))
+        key=lambda a: pref.get((getattr(a, "type", None) or "").lower(), 99),
+    )
     a = addresses_sorted[0]
     parts = [
         (getattr(a, "line1", None) or "").strip(),
@@ -268,7 +276,6 @@ def _int_to_words_indian(n: int) -> str:
         return f"Minus {_int_to_words_indian(abs(n))}"
 
     parts: list[str] = []
-
     crore = n // 10000000
     n = n % 10000000
     if crore:
@@ -292,10 +299,6 @@ def _int_to_words_indian(n: int) -> str:
 
 
 def _amount_in_words_inr(amount: Any) -> str:
-    """
-    ✅ Rupees / Paise words
-    Example: 2390.00 => "Rupees Two Thousand Three Hundred and Ninety Only"
-    """
     d = _dec(amount).quantize(Decimal("0.01"))
     sign = "-" if d < 0 else ""
     d = abs(d)
@@ -314,7 +317,8 @@ def _amount_in_words_inr(amount: Any) -> str:
 # Loaders
 # ---------------------------
 def _load_branding(db: Session) -> Optional[UiBranding]:
-    return db.query(UiBranding).order_by(UiBranding.id.asc()).first()
+    # ✅ latest branding
+    return db.query(UiBranding).order_by(UiBranding.id.desc()).first()
 
 
 def _load_case(db: Session, case_id: int) -> BillingCase:
@@ -467,10 +471,22 @@ def _payer_block(db: Session, case: BillingCase) -> Dict[str, str]:
 
 
 # ---------------------------
-# Branding header (ReportLab) – MEDIUM size
+# Branding header (ReportLab) – MEDIUM size + perfect alignment
 # ---------------------------
+def _bget(b: Any, *names: str) -> str:
+    for n in names:
+        try:
+            v = getattr(b, n, None)
+            if v not in (None, "", []):
+                return str(v).strip()
+        except Exception:
+            pass
+    return ""
+
+
 def _read_logo_reader(branding: Any) -> Optional[ImageReader]:
-    rel = (getattr(branding, "logo_path", None) or "").strip()
+    rel = (_bget(branding, "logo_path", "logo_file", "logo", "logo_rel_path")
+           or "").strip()
     if not rel:
         return None
     abs_path = Path(getattr(settings, "STORAGE_DIR", ".")).joinpath(rel)
@@ -496,13 +512,8 @@ def _cap_lines(lines: list[str], max_lines: int) -> list[str]:
     return trimmed
 
 
-def _draw_branding_header(
-    c: canvas.Canvas,
-    branding: Optional[UiBranding],
-    x: float,
-    top_y: float,
-    w: float,
-) -> float:
+def _draw_branding_header(c: canvas.Canvas, branding: Optional[UiBranding],
+                          x: float, top_y: float, w: float) -> float:
     b = branding or SimpleNamespace(
         org_name="",
         org_tagline="",
@@ -517,63 +528,67 @@ def _draw_branding_header(
     INK = colors.black
     MUTED = colors.HexColor("#334155")
 
-    # medium header
-    logo_h = 22 * mm
-    logo_col = max(70 * mm, min(92 * mm, w * 0.45))
-    right_w = max(40 * mm, w - logo_col)
+    # ✅ medium header size
+    logo_h = 18 * mm
+    gutter = 5 * mm
 
-    org = _safe(getattr(b, "org_name", None))
-    tag = _safe(getattr(b, "org_tagline", None))
-    addr = _safe(getattr(b, "org_address", None))
-    phone = _safe(getattr(b, "org_phone", None))
-    email = _safe(getattr(b, "org_email", None))
-    website = _safe(getattr(b, "org_website", None))
-    gstin = _safe(getattr(b, "org_gstin", None))
+    # ✅ left column smaller to avoid right text getting squeezed into 1-word lines
+    logo_col = min(max(62 * mm, w * 0.36), 78 * mm)
+    right_w = max(58 * mm, w - logo_col - gutter)
 
-    # contact (single line)
+    org = _safe(_bget(b, "org_name", "name", "hospital_name"))
+    tag = _safe(_bget(b, "org_tagline", "tagline"))
+    addr = _safe(_bget(b, "org_address", "address"))
+    phone = _safe(_bget(b, "org_phone", "phone", "mobile"))
+    email = _safe(_bget(b, "org_email", "email"))
+    website = _safe(_bget(b, "org_website", "website"))
+    gstin = _safe(_bget(b, "org_gstin", "gstin"))
+
+    # ✅ combined contact line (short)
     contact_bits = []
     if phone != "—":
         contact_bits.append(f"Ph: {phone}")
     if email != "—":
         contact_bits.append(f"Email: {email}")
-    contact_line = " | ".join(contact_bits) if contact_bits else ""
+    contact_line = " | ".join(contact_bits)
 
     meta_lines: list[str] = []
     if addr != "—":
         meta_lines.extend(
-            _cap_lines(
-                simpleSplit(f"Address: {addr}", "Helvetica", 8.6, right_w), 2))
+            _cap_lines(simpleSplit(addr, "Helvetica", 8.4, right_w), 2))
     if contact_line:
         meta_lines.extend(
-            _cap_lines(
-                simpleSplit(f"Contact: {contact_line}", "Helvetica", 8.6,
-                            right_w), 1))
+            _cap_lines(simpleSplit(contact_line, "Helvetica", 8.4, right_w),
+                       1))
 
-    extras = []
+    # optional last line (only if space)
+    extra_bits = []
     if website != "—":
-        extras.append(f"Website: {website}")
+        extra_bits.append(f"{website}")
     if gstin != "—":
-        extras.append(f"GSTIN: {gstin}")
-    if extras and len(meta_lines) < 3:
+        extra_bits.append(f"GSTIN: {gstin}")
+    if extra_bits and len(meta_lines) < 3:
         meta_lines.extend(
             _cap_lines(
-                simpleSplit(" | ".join(extras), "Helvetica", 8.6, right_w), 1))
+                simpleSplit(" | ".join(extra_bits), "Helvetica", 8.4, right_w),
+                1))
 
     meta_lines = _cap_lines(meta_lines, 3)
 
+    # build text lines for right column
     lines: list[tuple[str, str, float, Any]] = []
     if org != "—":
-        lines.append((org, "Helvetica-Bold", 12.5, INK))
+        lines.append((org, "Helvetica-Bold", 12.0, INK))
     if tag != "—":
-        lines.append((tag, "Helvetica", 8.9, MUTED))
+        lines.append((tag, "Helvetica", 8.6, MUTED))
     for ln in meta_lines:
-        lines.append((ln, "Helvetica", 8.6, MUTED))
+        lines.append((ln, "Helvetica", 8.4, MUTED))
 
     def lh(sz: float) -> float:
-        return sz * 1.20
+        return sz * 1.18
 
-    text_h = sum(lh(sz) for _, _, sz, _ in lines) if lines else 10
-    header_h = max(logo_h, text_h) + (1.5 * mm)
+    text_h = sum(lh(sz) for _, _, sz, _ in lines) if lines else (10 * mm)
+    header_h = max(logo_h, text_h) + (2 * mm)
 
     # logo (left, vertically centered)
     logo_reader = _read_logo_reader(b)
@@ -581,18 +596,20 @@ def _draw_branding_header(
         try:
             iw, ih = logo_reader.getSize()
             if iw and ih:
+                # scale to fit in both height and width
                 scale_h = logo_h / float(ih)
                 draw_w = float(iw) * scale_h
                 draw_h = logo_h
 
-                max_w = logo_col - (2 * mm)
+                max_w = logo_col
                 if draw_w > max_w:
                     scale_w = max_w / float(iw)
                     draw_w = max_w
                     draw_h = float(ih) * scale_w
 
+                center_y = top_y - header_h / 2
                 logo_x = x
-                logo_y = top_y - (header_h / 2) - (draw_h / 2)
+                logo_y = center_y - (draw_h / 2)
                 c.drawImage(
                     logo_reader,
                     logo_x,
@@ -605,9 +622,11 @@ def _draw_branding_header(
         except Exception:
             pass
 
-    # org details (right aligned, vertically centered)
+    # right column text (right aligned) — aligned to center with logo
     text_right_x = x + w
-    cur_y = top_y - (header_h / 2) + (text_h / 2)
+    center_y = top_y - header_h / 2
+    cur_y = center_y + (text_h / 2)
+
     for txt, font, sz, col in lines:
         cur_y -= lh(sz)
         c.setFont(font, sz)
@@ -709,19 +728,8 @@ MODULE_LABELS: Dict[str, str] = {
 }
 
 MODULE_ORDER: list[str] = [
-    "ADM",
-    "ROOM",
-    "DOC",
-    "LAB",
-    "BLOOD",
-    "DIET",
-    "PHM",
-    "PHC",
-    "PROC",
-    "SCAN",
-    "XRAY",
-    "SURG",
-    "MISC",
+    "ADM", "ROOM", "DOC", "LAB", "BLOOD", "DIET", "PHM", "PHC", "PROC", "SCAN",
+    "XRAY", "SURG", "MISC"
 ]
 
 
@@ -739,8 +747,33 @@ def _module_order_key(code: str) -> int:
 
 
 # ---------------------------
-# Payload: Overview (Module-wise compact)
+# Payload: Overview (Module-wise compact) + FIX payments
 # ---------------------------
+def _advance_consumed_from_applications(
+        db: Session, case_id: int) -> tuple[Decimal, Optional[datetime]]:
+    """
+    ✅ fallback for advance consumed amount even if not stored as BillingPayment(kind=ADVANCE_ADJUSTMENT)
+    """
+    if BillingAdvanceApplication is None:
+        return Decimal("0"), None
+    try:
+        q = db.query(BillingAdvanceApplication).filter(
+            BillingAdvanceApplication.billing_case_id == case_id)
+        rows = q.all()
+        total = Decimal("0")
+        last_dt: Optional[datetime] = None
+        for r in rows:
+            amt = _dec(getattr(r, "amount", 0))
+            total += amt
+            dt = getattr(r, "applied_at", None) or getattr(
+                r, "created_at", None) or getattr(r, "entry_at", None)
+            if isinstance(dt, datetime):
+                last_dt = dt if (last_dt is None or dt > last_dt) else last_dt
+        return total, last_dt
+    except Exception:
+        return Decimal("0"), None
+
+
 def _build_overview_payload(
     db: Session,
     case: BillingCase,
@@ -797,7 +830,7 @@ def _build_overview_payload(
     } for k, v in modules_map.items()]
     modules.sort(key=lambda m: _module_order_key(m["code"]))
 
-    # ---- payments (include advance adjustment into "Payment Received")
+    # ---- payments (include advance adjustment)
     pays = (db.query(BillingPayment).filter(
         BillingPayment.billing_case_id == case.id).order_by(
             BillingPayment.received_at.asc()).all())
@@ -807,6 +840,7 @@ def _build_overview_payload(
     refunds_total = Decimal("0")
 
     payment_rows: list[Dict[str, Any]] = []
+    has_adv_row = False
 
     for p in pays:
         status = getattr(p, "status", None)
@@ -826,25 +860,13 @@ def _build_overview_payload(
             continue
 
         if is_in:
-            if _eq_enum(kind, PaymentKind.RECEIPT) or kind is None:
-                receipts_total += amt
-                receipt_no = _safe(getattr(p, "receipt_number", None))
-                if receipt_no == "—":
-                    receipt_no = _safe(getattr(p, "txn_ref", None))
-                payment_rows.append({
-                    "receipt_number":
-                    receipt_no,
-                    "mode":
-                    _safe(_val(getattr(p, "mode", None))),
-                    "date":
-                    _fmt_date(getattr(p, "received_at", None)),
-                    "amount":
-                    float(amt),
-                })
-            elif _eq_enum(kind, PaymentKind.ADVANCE_ADJUSTMENT):
+            if _eq_enum(kind, PaymentKind.ADVANCE_ADJUSTMENT):
                 adv_adjusted_total += amt
+                has_adv_row = True
                 payment_rows.append({
                     "receipt_number":
+                    _safe(getattr(p, "receipt_number", None)) if _safe(
+                        getattr(p, "receipt_number", None)) != "—" else
                     "ADV-ADJ",
                     "mode":
                     "ADVANCE",
@@ -853,31 +875,56 @@ def _build_overview_payload(
                     "amount":
                     float(amt),
                 })
-            else:
-                receipts_total += amt
-                payment_rows.append({
-                    "receipt_number":
-                    _safe(getattr(p, "receipt_number", None)) if _safe(
-                        getattr(p, "receipt_number", None)) != "—" else "RCPT",
-                    "mode":
-                    _safe(_val(getattr(p, "mode", None))),
-                    "date":
-                    _fmt_date(getattr(p, "received_at", None)),
-                    "amount":
-                    float(amt),
-                })
+                continue
 
-    payment_received_total = receipts_total + adv_adjusted_total
+            # receipt or unknown kind => normal receipt
+            receipts_total += amt
+            receipt_no = _safe(getattr(p, "receipt_number", None))
+            if receipt_no == "—":
+                receipt_no = _safe(getattr(p, "txn_ref", None))
+            payment_rows.append({
+                "receipt_number":
+                receipt_no if receipt_no != "—" else "RCPT",
+                "mode":
+                _safe(_val(getattr(p, "mode", None))),
+                "date":
+                _fmt_date(getattr(p, "received_at", None)),
+                "amount":
+                float(amt),
+            })
+
+    # ✅ fallback: advance applied from applications table (if payments didn’t store it)
+    adv_app_total, adv_app_last_dt = _advance_consumed_from_applications(
+        db, case.id)
+
+    # ✅ avoid double count: take MAX (if both represent same consumption)
+    consumed_advance = max(adv_adjusted_total, adv_app_total)
+
+    # if we derived from applications and we didn't have a row, add one for clarity
+    if consumed_advance > 0 and not has_adv_row and adv_adjusted_total == 0:
+        payment_rows.append({
+            "receipt_number":
+            "ADV-ADJ",
+            "mode":
+            "ADVANCE",
+            "date":
+            _fmt_date(adv_app_last_dt) if adv_app_last_dt else "—",
+            "amount":
+            float(consumed_advance),
+        })
+
+    # ✅ payment received = cash receipts + advance consumed
+    payment_received_total = receipts_total + consumed_advance
     effective_paid = payment_received_total - refunds_total
     balance = total_bill - effective_paid
 
-    # ---- advances summary
+    # ---- advances summary (show gross advance paid)
     adv_rows = (db.query(BillingAdvance).filter(
         BillingAdvance.billing_case_id == case.id).order_by(
             BillingAdvance.entry_at.asc()).all())
 
-    total_adv_in = Decimal("0")  # ✅ gross advance paid (example: 10000)
-    total_adv_refund = Decimal("0")  # ✅ refund (example: 5000)
+    total_adv_in = Decimal("0")
+    total_adv_refund = Decimal("0")
     total_adv_adjust = Decimal("0")
     last_adv_dt: Optional[datetime] = None
 
@@ -893,8 +940,7 @@ def _build_overview_payload(
             total_adv_adjust += amt
 
     net_advance = total_adv_in - total_adv_refund + total_adv_adjust
-    consumed = adv_adjusted_total
-    available = net_advance - consumed
+    available = net_advance - consumed_advance
     if available < 0:
         available = Decimal("0")
 
@@ -915,8 +961,9 @@ def _build_overview_payload(
             "refunds": float(refunds_total),
             "effective_paid": float(effective_paid),
             "balance": float(balance),
+            "advance_consumed": float(consumed_advance),  # ✅ helpful debug
 
-            # ✅ NEW: words for all requested
+            # ✅ words
             "total_bill_words": _amount_in_words_inr(total_bill),
             "payment_received_words":
             _amount_in_words_inr(payment_received_total),
@@ -926,10 +973,9 @@ def _build_overview_payload(
         "advance_summary_row": {
             "as_on": _fmt_date(last_adv_dt) if last_adv_dt else "—",
             "type": "Advance Wallet",
-            # ✅ show gross paid, not net after refund
             "total_advance": float(total_adv_in),
             "net_advance": float(net_advance),
-            "consumed": float(consumed),
+            "consumed": float(consumed_advance),
             "available": float(available),
             "advance_refunded": float(total_adv_refund),
         },
@@ -938,7 +984,7 @@ def _build_overview_payload(
 
 
 # ---------------------------
-# ReportLab: Patient header (FIXED alignment)
+# ReportLab: Patient header (clean alignment)
 # ---------------------------
 def _draw_lv_column(
     c: canvas.Canvas,
@@ -948,8 +994,8 @@ def _draw_lv_column(
     col_w: float,
     rows: list[tuple[str, str]],
     label_w: float,
-    size: float = 8.9,
-    leading: float = 10.8,
+    size: float = 8.8,
+    leading: float = 10.2,
 ) -> float:
     colon_w = 2.0 * mm
     gap = 2.0 * mm
@@ -962,17 +1008,16 @@ def _draw_lv_column(
 
         c.setFont("Helvetica-Bold", size)
         c.setFillColor(colors.black)
-
         c.drawString(x, y, (k[:28] + "…") if len(k) > 29 else k)
         c.drawString(x + label_w + 0.2 * mm, y, ":")
 
         c.setFont("Helvetica", size)
         lines = simpleSplit(v, "Helvetica", size, value_w) or ["—"]
-        c.drawString(value_x, y, lines[0][:160])
+        c.drawString(value_x, y, lines[0][:200])
 
         for ln in lines[1:]:
             y -= leading
-            c.drawString(value_x, y, ln[:160])
+            c.drawString(value_x, y, ln[:200])
 
         y -= leading
 
@@ -1042,26 +1087,24 @@ def _draw_patient_header_block(c: canvas.Canvas, payload: Dict[str, Any],
             ("Discharged On", _safe(enc.get("Discharged On"))),
         ]
 
-    y1 = _draw_lv_column(
-        c,
-        x=x,
-        y=y_top,
-        col_w=left_w - 2 * mm,
-        rows=left_rows,
-        label_w=28 * mm,
-    )
-    y2 = _draw_lv_column(
-        c,
-        x=x + left_w + 6 * mm,
-        y=y_top,
-        col_w=right_w - 6 * mm,
-        rows=right_rows,
-        label_w=28 * mm,
-    )
+    # ✅ consistent label width for both cols
+    label_w = 30 * mm
+    y1 = _draw_lv_column(c,
+                         x=x,
+                         y=y_top,
+                         col_w=left_w - 2 * mm,
+                         rows=left_rows,
+                         label_w=label_w)
+    y2 = _draw_lv_column(c,
+                         x=x + left_w + 6 * mm,
+                         y=y_top,
+                         col_w=right_w - 6 * mm,
+                         rows=right_rows,
+                         label_w=label_w)
 
     y_end = min(y1, y2)
 
-    # ✅ PATCH: line padding (avoid overlap with address)
+    # separator rule
     line_y = y_end + 1.2 * mm
     c.setStrokeColor(colors.black)
     c.setLineWidth(0.9)
@@ -1136,7 +1179,7 @@ def _draw_simple_table(
         xx = x
         for j, cw in enumerate(col_widths):
             txt = "" if j >= len(r) else ("" if r[j] is None else str(r[j]))
-            c.drawString(xx + 2.0 * mm, cur_y - row_h + 2.0 * mm, txt[:160])
+            c.drawString(xx + 2.0 * mm, cur_y - row_h + 2.0 * mm, txt[:200])
             xx += cw
 
         cur_y -= row_h
@@ -1190,15 +1233,10 @@ def _render_overview_pdf_reportlab(payload: Dict[str, Any],
         return y0
 
     y = new_page()
-
     y = _draw_patient_header_block(c, payload, x0, y, w0)
-    y -= 3 * mm
-
-    c.setFont("Helvetica-Bold", 9.8)
-    c.drawString(x0, y, "Particulars")
-    c.drawRightString(x0 + w0, y, "Total Amount")
     y -= 4 * mm
 
+    # ✅ module table (no duplicate "Particulars" heading)
     modules = payload.get("modules") or []
     part_rows = [[_safe(m.get("label")),
                   _money(m.get("total"))] for m in modules] or [["—", "0.00"]]
@@ -1217,12 +1255,10 @@ def _render_overview_pdf_reportlab(payload: Dict[str, Any],
     y -= 3 * mm
 
     totals = payload.get("totals") or {}
-
     total_bill = _money(totals.get("total_bill"))
     taxable_val = _money(totals.get("taxable_value"))
     gst_val = _money(totals.get("gst"))
     round_off = _money(totals.get("round_off"))
-
     payment_received = _money(totals.get("payment_received"))
     balance = _money(totals.get("balance"))
 
@@ -1256,15 +1292,15 @@ def _render_overview_pdf_reportlab(payload: Dict[str, Any],
     y = total_line("Round Off :", round_off, y)
     y = total_line("Total Bill Amount :", total_bill, y, bold=True)
 
-    # ✅ NEW: Total Bill Amount in words
+    # ✅ Total Bill amount in words
     y -= 3.5 * mm
     c.setFont("Helvetica-Bold", 9.2)
     c.drawString(x0, y, "In Words :")
     c.setFont("Helvetica", 9.2)
     bill_word_lines = simpleSplit(total_bill_words, "Helvetica", 9.2,
                                   w0 - 22 * mm)
-    yy = y
     x_words = x0 + 18 * mm
+    yy = y
     for ln in bill_word_lines[:3]:
         c.drawString(x_words, yy, ln)
         yy -= 4.6 * mm
@@ -1277,7 +1313,7 @@ def _render_overview_pdf_reportlab(payload: Dict[str, Any],
             c.showPage()
             y = new_page()
             y = _draw_patient_header_block(c, payload, x0, y, w0)
-            y -= 3 * mm
+            y -= 4 * mm
 
         c.setFont("Helvetica-Bold", 9.8)
         c.drawString(x0, y, "PAYMENT DETAILS")
@@ -1305,13 +1341,13 @@ def _render_overview_pdf_reportlab(payload: Dict[str, Any],
             new_page_fn=new_page,
         )
 
-        # ✅ padding + totals + words
+        # Payment received value
         y -= 4.0 * mm
         c.setFont("Helvetica-Bold", 9.4)
-        c.drawRightString(x0 + w0 - 42 * mm, y, "Payment Received :")
+        c.drawRightString(x0 + w0 - 42 * mm, y, "Total Payment Received :")
         c.drawRightString(x0 + w0, y, payment_received)
 
-        # ✅ NEW: Payment received words
+        # Payment words
         y -= 5.5 * mm
         c.setFont("Helvetica-Bold", 9.2)
         c.drawString(x0, y, "In Words :")
@@ -1331,7 +1367,7 @@ def _render_overview_pdf_reportlab(payload: Dict[str, Any],
             c.showPage()
             y = new_page()
             y = _draw_patient_header_block(c, payload, x0, y, w0)
-            y -= 3 * mm
+            y -= 4 * mm
 
         c.setFont("Helvetica-Bold", 9.8)
         c.drawString(x0, y, "ADVANCE SUMMARY")
@@ -1340,7 +1376,7 @@ def _render_overview_pdf_reportlab(payload: Dict[str, Any],
         rows = [[
             _safe(adv.get("as_on")),
             _safe(adv.get("type") or "Advance Wallet"),
-            _money(adv.get("total_advance")),  # ✅ gross
+            _money(adv.get("total_advance")),
             _money(adv.get("consumed")),
             _money(adv.get("available")),
             _money(adv.get("advance_refunded")),
@@ -1371,10 +1407,9 @@ def _render_overview_pdf_reportlab(payload: Dict[str, Any],
     y -= 5.0 * mm
 
     c.setFont("Helvetica-Bold", 9.8)
-    c.drawRightString(x0 + w0 - 42 * mm, y, "Balance Amount :")
+    c.drawRightString(x0 + w0 - 42 * mm, y, "Total Balance Amount :")
     c.drawRightString(x0 + w0, y, balance)
 
-    # ✅ Balance words
     y -= 5.5 * mm
     c.setFont("Helvetica-Bold", 9.2)
     c.drawString(x0, y, "In Words :")
@@ -1384,119 +1419,14 @@ def _render_overview_pdf_reportlab(payload: Dict[str, Any],
     for ln in bal_lines[:3]:
         c.drawString(x_words, yy, ln)
         yy -= 4.6 * mm
-    y = yy - 1.0 * mm
 
     c.showPage()
     c.save()
     return buf.getvalue()
 
 
-# ---------------------------
-# Optional WeasyPrint: Common Header only
-# ---------------------------
-def _render_common_header_pdf_weasy(payload: Dict[str, Any],
-                                    branding: UiBranding) -> bytes:
-    if not (brand_header_css and render_brand_header_html):
-        raise RuntimeError("pdf_branding html helpers not available")
-
-    try:
-        from weasyprint import HTML  # type: ignore
-    except Exception as e:
-        raise RuntimeError(f"WeasyPrint not available: {e}")
-
-    def esc(x: Any) -> str:
-        import html as _html
-        return _html.escape(_safe(x))
-
-    bill = payload.get("bill", {})
-    pat = payload.get("patient", {})
-    enc_type = payload.get("encounter_type")
-    enc = payload.get("encounter") or {}
-
-    css = f"""
-    @page{{ size:A4; margin:10mm 10mm 14mm 10mm; }}
-    html,body{{ font-family: Arial, sans-serif; font-size: 11px; color:#111827; }}
-    {brand_header_css()}
-    .grid{{ display:flex; gap:12px; margin-top:4px; }}
-    .col{{ flex:1; }}
-    .row{{ margin:2px 0; }}
-    .k{{ font-weight:700; display:inline-block; width:120px; }}
-    .sep{{ border-top:1px solid #111827; margin:8px 0; }}
-    """
-
-    left = []
-    left.append(
-        f"<div class='row'><span class='k'>Patient Name</span>: {esc(pat.get('Patient Name'))}</div>"
-    )
-    left.append(
-        f"<div class='row'><span class='k'>Patient ID</span>: {esc(pat.get('UHID'))}</div>"
-    )
-    left.append(
-        f"<div class='row'><span class='k'>Age / Gender</span>: {esc(pat.get('Age'))} / {esc(pat.get('Gender'))}</div>"
-    )
-    left.append(
-        f"<div class='row'><span class='k'>Phone</span>: {esc(pat.get('Phone'))}</div>"
-    )
-    left.append(
-        f"<div class='row'><span class='k'>Address</span>: {esc(pat.get('Address'))}</div>"
-    )
-
-    right = []
-    right.append(
-        f"<div class='row'><span class='k'>Bill Number</span>: {esc(bill.get('Bill Number'))}</div>"
-    )
-    right.append(
-        f"<div class='row'><span class='k'>Bill Date</span>: {esc(bill.get('Bill Date'))}</div>"
-    )
-    right.append(
-        f"<div class='row'><span class='k'>Encounter Type</span>: {esc(enc_type)}</div>"
-    )
-    if enc_type == "OP":
-        right.append(
-            f"<div class='row'><span class='k'>Visit ID</span>: {esc(enc.get('Visit Id'))}</div>"
-        )
-        right.append(
-            f"<div class='row'><span class='k'>Appointment On</span>: {esc(enc.get('Appointment On'))}</div>"
-        )
-        right.append(
-            f"<div class='row'><span class='k'>Doctor</span>: {esc(enc.get('Doctor'))}</div>"
-        )
-
-    html_doc = f"""
-    <html>
-      <head><meta charset="utf-8"><style>{css}</style></head>
-      <body>
-        {render_brand_header_html(branding)}
-        <div class="grid">
-          <div class="col">{''.join(left)}</div>
-          <div class="col">{''.join(right)}</div>
-        </div>
-        <div class="sep"></div>
-      </body>
-    </html>
-    """
-
-    return HTML(string=html_doc,
-                base_url=str(getattr(settings, "STORAGE_DIR",
-                                     "."))).write_pdf()
-
-
 def _render_common_header_pdf(payload: Dict[str, Any],
-                              branding: Optional[UiBranding], *,
-                              engine: str) -> bytes:
-    engine = (engine or "reportlab").strip().lower()
-    if engine == "reportlab":
-        return _render_common_header_pdf_reportlab(payload, branding)
-    if engine in ("weasy", "auto"):
-        if not branding:
-            raise HTTPException(status_code=500,
-                                detail="UiBranding not configured")
-        try:
-            return _render_common_header_pdf_weasy(payload, branding)
-        except Exception:
-            if engine == "weasy":
-                raise
-            return _render_common_header_pdf_reportlab(payload, branding)
+                              branding: Optional[UiBranding]) -> bytes:
     return _render_common_header_pdf_reportlab(payload, branding)
 
 
@@ -1522,7 +1452,6 @@ def billing_common_header_pdf(
         doc_no: Optional[str] = Query(None),
         doc_date: Optional[date] = Query(None),
         disposition: str = Query("inline", pattern="^(inline|attachment)$"),
-        engine: str = Query("reportlab", pattern="^(reportlab|weasy|auto)$"),
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
 ):
@@ -1531,7 +1460,7 @@ def billing_common_header_pdf(
     branding = _load_branding(db)
 
     payload = _build_header_payload(db, case, doc_no=doc_no, doc_date=doc_date)
-    pdf_bytes = _render_common_header_pdf(payload, branding, engine=engine)
+    pdf_bytes = _render_common_header_pdf(payload, branding)
 
     filename = f"Billing_Header_{_safe(getattr(case, 'case_number', None))}.pdf"
     headers = {"Content-Disposition": f'{disposition}; filename="{filename}"'}
@@ -1556,7 +1485,8 @@ def billing_overview_data(
         case,
         doc_no=doc_no,
         doc_date=doc_date,
-        include_draft_invoices=include_draft_invoices)
+        include_draft_invoices=include_draft_invoices,
+    )
 
 
 @router.get("/overview")
@@ -1578,7 +1508,8 @@ def billing_overview_pdf(
         case,
         doc_no=doc_no,
         doc_date=doc_date,
-        include_draft_invoices=include_draft_invoices)
+        include_draft_invoices=include_draft_invoices,
+    )
     pdf_bytes = _render_overview_pdf_reportlab(payload, branding)
 
     filename = f"Billing_Overview_{_safe(getattr(case, 'case_number', None))}.pdf"

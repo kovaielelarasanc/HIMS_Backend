@@ -192,7 +192,7 @@ def seed_permissions(db: Session) -> None:
         ("lab.device_results", ["review",
                                 "import"]),  # review staging, import to LIS
         ("lab.device_logs", ["view"]),  # view raw message logs
-        ("lab.integration",["view","manage"])
+        ("lab.integration",["view","manage"]),
         # LIS masters (new LIS service master screens)
         ("lis.masters.departments", ["view", "create", "update", "delete"]),
         ("lis.masters.services", ["view", "create", "update", "delete"]),
@@ -265,7 +265,7 @@ def seed_permissions(db: Session) -> None:
         ("pharmacy.reports.schedule_medicine", ["view"]),
 
         ("pharmacy.reports", ["view"]),
-        ("quickorder",["radiology","pharmacy","laboratory","ot","consumables"])
+        ("quickorder",["radiology","pharmacy","laboratory","ot","consumables"]),
 
         # -------- Settings / Customization ----------
         ("settings.customization", ["view", "manage"]),
