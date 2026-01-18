@@ -4906,7 +4906,7 @@ def _get_preauth_or_404(db: Session, preauth_id: int) -> BillingPreauthRequest:
     return row
 
 
-@router.get("/cases/{case_id}/insurance/preauth")
+@router.get("/cases/{case_id}/insurance/preauths")
 def list_case_preauth(
         case_id: int,
         db: Session = Depends(get_db),
@@ -4924,7 +4924,7 @@ def list_case_preauth(
     return {"items": [_preauth_to_dict(x) for x in rows]}
 
 
-@router.post("/cases/{case_id}/insurance/preauth")
+@router.post("/cases/{case_id}/insurance/preauths")
 def create_preauth(
         case_id: int,
         inp: PreauthCreateIn,

@@ -79,6 +79,7 @@ class PayerType(str, enum.Enum):
     PATIENT = "PATIENT"
     INSURER = "INSURER"
     CORPORATE = "CORPORATE"
+    TPA = "TPA"
 
 
 class ServiceGroup(str, enum.Enum):
@@ -941,69 +942,6 @@ class BillingPaymentAllocation(Base):
     invoice = relationship("BillingInvoice",
                            back_populates="payment_allocations",
                            lazy="selectin")
-
-
-# class BillingPaymentAllocation(Base):
-#     __tablename__ = "billing_payment_allocations"
-#     __table_args__ = (
-#         Index("ix_pay_alloc_case", "billing_case_id"),
-#         Index("ix_pay_alloc_invoice", "invoice_id"),
-#         Index("ix_pay_alloc_payment", "payment_id"),
-#         MYSQL_ARGS,
-#     )
-
-#     id = Column(BigInteger, primary_key=True,
-#                 autoincrement=True)  # ✅ add autoincrement
-#     tenant_id = Column(Integer, nullable=True, index=True)  # optional
-
-#     billing_case_id = Column(
-#         BigInteger,
-#         ForeignKey("billing_cases.id", ondelete="RESTRICT"),
-#         nullable=False,
-#         index=True,
-#     )
-
-#     payment_id = Column(
-#         BigInteger,  # ✅ FIX
-#         ForeignKey("billing_payments.id", ondelete="CASCADE"),
-#         nullable=False,
-#         index=True,
-#     )
-
-#     invoice_id = Column(
-#         BigInteger,  # ✅ FIX
-#         ForeignKey("billing_invoices.id", ondelete="SET NULL"),
-#         nullable=True,
-#         index=True,
-#     )
-
-#     amount = Column(Money, nullable=False, default=0)
-
-#     status = Column(Enum(ReceiptStatus),
-#                     nullable=False,
-#                     default=ReceiptStatus.ACTIVE)
-
-#     allocated_at = Column(DateTime, nullable=False, server_default=func.now())
-#     allocated_by = Column(Integer, nullable=True)
-
-#     voided_at = Column(DateTime, nullable=True)
-#     voided_by = Column(Integer, nullable=True)
-#     void_reason = Column(String(255), nullable=True)
-
-#     created_at = Column(DateTime, nullable=False, server_default=func.now())
-#     updated_at = Column(DateTime,
-#                         nullable=False,
-#                         server_default=func.now(),
-#                         onupdate=func.now())
-
-#     payment = relationship("BillingPayment",
-#                            back_populates="allocations",
-#                            lazy="selectin")
-#     invoice = relationship("BillingInvoice",
-#                            back_populates="payment_allocations",
-#                            lazy="selectin")
-
-
 class BillingAdvanceApplication(Base):
     """
     Tracks how advances are consumed when applying to invoices.

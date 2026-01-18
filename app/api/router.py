@@ -37,6 +37,7 @@ from app.api import (
     routes_billing_edits,
     routes_inventory_indent,
     routes_inventory_consumption,
+    routes_billing_insurance,
     
     routes_pharmacy_accounts,
     routes_ot_masters,
@@ -156,6 +157,7 @@ api_router.include_router(routes_lab_integration.router)
 api_router.include_router(routes_ris.router)
 
 api_router.include_router(routes_billing.router)
+api_router.include_router(routes_billing_insurance.router)
 api_router.include_router(charge_item_master.router)
 api_router.include_router(routes_billing_edits .router)
 api_router.include_router(routes_billing_print.router)

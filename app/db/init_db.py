@@ -32,14 +32,22 @@ def seed_permissions(db: Session) -> None:
         ("doctors", ["view"]),
 
         # -------- PATIENTS ----------
-        ("patients", ["view", "create", "update", "deactivate",]),
-        ("patients.addresses", ["view", "create", "update", "delete",]),
+        ("patients", [
+            "view",
+            "create",
+            "update",
+            "deactivate",
+        ]),
+        ("patients.addresses", [
+            "view",
+            "create",
+            "update",
+            "delete",
+        ]),
         ("patients.consents", ["view", "create"]),
         ("patients.attachments", ["manage"]),
         ("patients.masters", ["view", "manage"]),
-            
-            
-      
+
         # -------- OPD ----------
         ("schedules", ["manage"]),
         ("appointments", ["view", "create", "update", "cancel"]),
@@ -71,12 +79,16 @@ def seed_permissions(db: Session) -> None:
         # ✅ NEW: IPD Newborn (Resuscitation / Examination / Vaccination / PDF)
         # Matches your router checks: ipd.newborn.view/create/update/verify/finalize/void/print/manage
         # -------------------------------------------------------------------
-        ("ipd.newborn",["view", "create", "update", "verify", "finalize", "void", "print", "manage"]),
+        ("ipd.newborn", [
+            "view", "create", "update", "verify", "finalize", "void", "print",
+            "manage"
+        ]),
 
         # -------------------------------------------------------------------
         # IPD Admissions / Tracking
         # -------------------------------------------------------------------
-        ("ipd.admissions", ["view", "create", "update", "cancel", "transfer", "discharge"]),
+        ("ipd.admissions",
+         ["view", "create", "update", "cancel", "transfer", "discharge"]),
         ("ipd.tracking", ["view"]),
         ("ipd.my", ["view"]),
         ("ipd.discharged", ["view"]),
@@ -95,7 +107,10 @@ def seed_permissions(db: Session) -> None:
         # -------------------------------------------------------------------
         (
             "ipd.meds",
-            ["view", "order", "update", "regenerate", "mark", "meta", "iv", "nurse_rows", "doctor_auth", "pdf"],
+            [
+                "view", "order", "update", "regenerate", "mark", "meta", "iv",
+                "nurse_rows", "doctor_auth", "pdf"
+            ],
         ),
 
         # -------------------------------------------------------------------
@@ -103,7 +118,10 @@ def seed_permissions(db: Session) -> None:
         # -------------------------------------------------------------------
         (
             "ipd.discharges",
-            ["view", "summary", "checklist", "medications", "queue", "mark_status", "push_abha", "pdf"],
+            [
+                "view", "summary", "checklist", "medications", "queue",
+                "mark_status", "push_abha", "pdf"
+            ],
         ),
         # -------------------------------------------------------------------
         # IPD Referrals (Doctor-to-Doctor / Dept referrals)
@@ -111,15 +129,15 @@ def seed_permissions(db: Session) -> None:
         (
             "ipd.referrals",
             [
-                "view",     # ipd.referrals.view
-                "create",   # ipd.referrals.create
-                "accept",   # ipd.referrals.accept
+                "view",  # ipd.referrals.view
+                "create",  # ipd.referrals.create
+                "accept",  # ipd.referrals.accept
                 "decline",  # ipd.referrals.decline
                 "respond",  # ipd.referrals.respond
-                "close",    # ipd.referrals.close
-                "cancel",   # ipd.referrals.cancel
-                "edit",     # ipd.referrals.edit (optional)
-                "manage",   # admin wildcard for this module
+                "close",  # ipd.referrals.close
+                "cancel",  # ipd.referrals.cancel
+                "edit",  # ipd.referrals.edit (optional)
+                "manage",  # admin wildcard for this module
             ],
         ),
 
@@ -132,52 +150,51 @@ def seed_permissions(db: Session) -> None:
         (
             "ipd.transfers",
             [
-                "view",      # ipd.transfers.view
-                "create",    # ipd.transfers.create
-                "approve",   # ipd.transfers.approve
+                "view",  # ipd.transfers.view
+                "create",  # ipd.transfers.create
+                "approve",  # ipd.transfers.approve
                 "complete",  # ipd.transfers.complete
-                "cancel",    # ipd.transfers.cancel
-                "manage",    # optional admin wildcard for this module
+                "cancel",  # ipd.transfers.cancel
+                "manage",  # optional admin wildcard for this module
             ],
         ),
 
         # -------------------------------------------------------------------
         # IPD Clinical Permissions (module -> actions)
         # -------------------------------------------------------------------
-
-        ("ipd.dressing",   ["create", "view", "update"]),
-        ("ipd.icu",        ["create", "view", "update"]),
-        ("ipd.isolation",  ["create", "view", "update", "stop"]),
+        ("ipd.dressing", ["create", "view", "update"]),
+        ("ipd.icu", ["create", "view", "update"]),
+        ("ipd.isolation", ["create", "view", "update", "stop"]),
         ("ipd.restraints", ["create", "view", "update", "monitor", "stop"]),
-        ("ipd.transfusion",["create", "view", "update"]),
-        
-        # -------- Pharmacy Inventory ----------
+        ("ipd.transfusion", ["create", "view", "update"]),
 
+        # -------- Pharmacy Inventory ----------
         ("pharmacy.inventory.locations", ["view", "manage"]),
         ("pharmacy.inventory.suppliers", ["view", "manage"]),
         ("pharmacy.inventory.items", ["view", "manage"]),
         ("pharmacy.inventory.stock", ["view"]),
         ("pharmacy.inventory.alerts", ["view"]),
-        ("pharmacy.inventory.po", ["view", "manage","approve","cancel"]),
+        ("pharmacy.inventory.po", ["view", "manage", "approve", "cancel"]),
         ("pharmacy.inventory.grn", ["view", "manage"]),
         ("pharmacy.inventory.returns", ["view", "manage"]),
-        ("pharmacy.inventory", ["dispense","view"]),
+        ("pharmacy.inventory", ["dispense", "view"]),
         ("pharmacy.inventory.txns", ["view"]),
         ("pharmacy.batch_picks", ["view"]),
         ("pharmacy.accounts.supplier_ledger", ["view", "manage", "export"]),
         ("pharmacy.accounts.supplier_payments", ["view", "manage", "export"]),
         ("pharmacy.accounts.supplier_invoices", ["view", "manage", "export"]),
-        ("inventory.indents", ["view", "create", "update", "submit", "approve", "cancel"]),
+        ("inventory.indents",
+         ["view", "create", "update", "submit", "approve", "cancel"]),
         ("inventory.issues", ["view", "create", "update", "post", "cancel"]),
         ("inventory.catalog", ["view"]),
         ("inventory.locations", ["view"]),
         ("inventory.items", ["view"]),
         ("inventory.stock", ["view"]),
         ("inventory.batches", ["view"]),
-        ("inventory.consume", ["create","view"]),
-        ("inventory", ["manage","view"]),
+        ("inventory.consume", ["create", "view"]),
+        ("inventory", ["manage", "view"]),
         ("inventory.reconcile", ["create"]),
-        
+
         # -------- LIS ----------
         ("lab.masters", ["view", "manage"]),
         ("lab.orders", ["create", "view"]),  # OP/IP lab orders
@@ -192,7 +209,7 @@ def seed_permissions(db: Session) -> None:
         ("lab.device_results", ["review",
                                 "import"]),  # review staging, import to LIS
         ("lab.device_logs", ["view"]),  # view raw message logs
-        ("lab.integration",["view","manage"]),
+        ("lab.integration", ["view", "manage"]),
         # LIS masters (new LIS service master screens)
         ("lis.masters.departments", ["view", "create", "update", "delete"]),
         ("lis.masters.services", ["view", "create", "update", "delete"]),
@@ -206,9 +223,10 @@ def seed_permissions(db: Session) -> None:
         ("radiology.attachments", ["add"]),
 
         # -------- OT ----------
-        ("ot.masters", ["view", "create", "update", "delete","manage"]),
+        ("ot.masters", ["view", "create", "update", "delete", "manage"]),
         ("ot.specialities", ["view", "create", "update", "delete"]),
-        ("ot.schedule", ["view", "create", "update", "delete", "cancel", "manage"]),
+        ("ot.schedule",
+         ["view", "create", "update", "delete", "cancel", "manage"]),
         ("ot.cases", ["view", "create", "update", "delete", "close"]),
         ("ot.pre_anaesthesia", ["view", "create", "update"]),
         ("ot.preop_checklist", ["view", "create", "update"]),
@@ -248,30 +266,44 @@ def seed_permissions(db: Session) -> None:
         ("mis.stock", ["view"]),
         ("mis.lab", ["view"]),
         ("mis.radiology", ["view"]),
- 
+
         # -------- Pharmacy Rx & Billing ----------
-        ("pharmacy.rx", ["view", "dispense", "override", "cancel","manage","sign","print"]),
+        ("pharmacy.rx",
+         ["view", "dispense", "override", "cancel", "manage", "sign",
+          "print"]),
         ("pharmacy.rx_queue", ["view"]),
-        ("pharmacy.sales", ["view", "create", "return","finalize","cancel"]),
+        ("pharmacy.sales", ["view", "create", "return", "finalize", "cancel"]),
         ("pharmacy.billing", ["view", "create", "refund"]),
         ("pharmacy.returns", ["view", "manage"]),
-        ("pharmacy.prescriptions", ["view", "create", "update", "sign","cancel"]),
+        ("pharmacy.prescriptions",
+         ["view", "create", "update", "sign", "cancel"]),
         ("pharmacy.dispense", ["view", "create"]),
-        ("pharmacy.sales", ["view", "create","update"]),
+        ("pharmacy.sales", ["view", "create", "update"]),
         ("pharmacy.payments", ["view", "create"]),
         ("pharmacy.stock", ["view"]),
-        ("pharmacy", ["view","dispense"]),
+        ("pharmacy", ["view", "dispense"]),
         ("pharmacy.batch_picks", ["view"]),
         ("pharmacy.reports.schedule_medicine", ["view"]),
-
         ("pharmacy.reports", ["view"]),
-        ("quickorder",["radiology","pharmacy","laboratory","ot","consumables"]),
+        ("quickorder",
+         ["radiology", "pharmacy", "laboratory", "ot", "consumables"]),
 
         # -------- Settings / Customization ----------
         ("settings.customization", ["view", "manage"]),
         ("master.tenants", ["view", "manage"]),
         ("master.storage", ["view", "manage"]),
         ("master.migrations", ["view", "manage"]),
+
+        # view
+        ("billing.insurance.view"),
+        ("billing.preauth.view"),
+        ("billing.claims.view"),
+
+        # manage
+        ("billing.insurance.manage"),
+        ("billing.preauth.manage"),
+        ("billing.claims.manage"),
+        ("billing.invoices.split"),
     ]
 
     from app.models.permission import Permission  # tenant-level
