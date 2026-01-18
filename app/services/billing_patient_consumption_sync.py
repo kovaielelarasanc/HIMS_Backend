@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, date as dt_date
 from decimal import Decimal
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
@@ -146,6 +146,70 @@ def _recalc_invoice(db: Session, invoice_id: int) -> None:
     db.flush()
 
 
+# -------------------------------
+# ✅ META JSON HELPERS (NEW)
+# -------------------------------
+
+def _pick_first_attr(obj: Any, fields: List[str]) -> Any:
+    if obj is None:
+        return None
+    for f in fields:
+        if hasattr(obj, f):
+            v = getattr(obj, f, None)
+            if v is not None and v != "":
+                return v
+    return None
+
+
+def _iso_date(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v.date().isoformat()
+    if isinstance(v, dt_date):
+        return v.isoformat()
+    s = str(v).strip()
+    return s[:10] if s else None
+
+
+def _pick_hsn_sac(item: Optional[InventoryItem], batch: Optional[ItemBatch]) -> Optional[str]:
+    candidates = ["hsn_sac", "hsn", "hsn_code", "hsn_sac_code", "sac_code"]
+    v = _pick_first_attr(item, candidates)
+    if not v:
+        v = _pick_first_attr(batch, candidates)
+    s = str(v).strip() if v is not None else ""
+    return s or None
+
+
+def _clean_meta(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    out: Dict[str, Any] = {}
+    for k, v in (meta or {}).items():
+        if v is None:
+            continue
+        if isinstance(v, str) and not v.strip():
+            continue
+        out[k] = v
+    return out or None
+
+
+def _merge_meta(old_meta: Any, new_meta: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Merge new keys into old meta safely.
+    old_meta can be dict/None/str (rare).
+    """
+    base: Dict[str, Any] = {}
+    if isinstance(old_meta, dict):
+        base.update(old_meta)
+    # If old_meta is string or something else, ignore it (keep safe)
+    for k, v in new_meta.items():
+        if v is None:
+            continue
+        if isinstance(v, str) and not v.strip():
+            continue
+        base[k] = v
+    return base
+
+
 def ensure_billing_case(
     db: Session,
     *,
@@ -251,6 +315,11 @@ def sync_consumption_to_billing(
 ) -> Tuple[int, List[int]]:
     """
     lines: [{line_id, item_id, qty, batch_id(optional), item_code, item_name, item_type}]
+    ✅ Adds meta_json per invoice line:
+        - batch_id
+        - expiry_date (ISO)
+        - hsn_sac
+      (also stores batch_no if available; useful for UI/print)
     """
     case = ensure_billing_case(
         db,
@@ -289,13 +358,14 @@ def sync_consumption_to_billing(
         fallback_price = Decimal("0")
         fallback_gst = Decimal("0")
 
+        batch: Optional[ItemBatch] = None
         batch_id = ln.get("batch_id")
+
         if batch_id:
-            b = db.get(ItemBatch, int(batch_id))
-            if b:
-                fallback_price = _d(b.mrp)
-                # your batch model uses tax_percent
-                fallback_gst = _d(getattr(b, "tax_percent", 0))
+            batch = db.get(ItemBatch, int(batch_id))
+            if batch:
+                fallback_price = _d(getattr(batch, "mrp", 0))
+                fallback_gst = _d(getattr(batch, "tax_percent", 0))
 
         unit_price, gst_rate = _get_tariff_rate(
             db,
@@ -328,6 +398,21 @@ def sync_consumption_to_billing(
         desc = f"{item.name}"
         item_code = getattr(item, "code", None)
 
+        # ✅ Build meta_json (batch_id, expiry_date, hsn_sac) + optional batch_no
+        expiry_raw = _pick_first_attr(batch, ["expiry_date", "exp_date", "expiry", "expires_on"])
+        batch_no = _pick_first_attr(batch, ["batch_no", "batch_number", "batch"])
+        hsn_sac = _pick_hsn_sac(item, batch)
+
+        meta_new = _clean_meta(
+            {
+                "batch_id": int(batch_id) if batch_id else None,
+                "expiry_date": _iso_date(expiry_raw),
+                "hsn_sac": hsn_sac,
+                # optional but recommended for UI print
+                "batch_no": str(batch_no).strip() if batch_no is not None else None,
+            }
+        ) or {}
+
         if existing:
             existing.invoice_id = inv.id
             existing.service_group = ServiceGroup.PHARM
@@ -342,6 +427,10 @@ def sync_consumption_to_billing(
             existing.line_total = line_total
             existing.net_amount = net_amount
             existing.doctor_id = doctor_id
+
+            # ✅ merge meta (do not wipe other keys)
+            existing.meta_json = _merge_meta(getattr(existing, "meta_json", None), meta_new)
+
         else:
             db.add(
                 BillingInvoiceLine(
@@ -366,6 +455,8 @@ def sync_consumption_to_billing(
                     source_line_key=source_line_key,
                     is_manual=False,
                     created_by=created_by,
+                    # ✅ NEW
+                    meta_json=meta_new,
                 )
             )
 
