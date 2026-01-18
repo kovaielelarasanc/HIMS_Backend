@@ -1,6 +1,7 @@
 # FILE: app/api/routes_billing_insurance.py
 from __future__ import annotations
 
+import logging
 from typing import List, Any, Dict
 from decimal import Decimal
 
@@ -47,6 +48,7 @@ from app.services.billing_insurance import (
     _ref,
 )
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/billing", tags=["Billing Insurance"])
 
 ZERO = Decimal("0.00")
@@ -130,32 +132,36 @@ def _http_400_from_db_error(e: Exception) -> HTTPException:
     return HTTPException(status_code=400, detail=f"DB validation error: {msg}")
 
 
+def _db500(detail: str = "Database error") -> HTTPException:
+    return HTTPException(status_code=500, detail=detail)
+
+
 # ---------------------------------------------------------
 # Insurance Case
 # ---------------------------------------------------------
-@router.get("/cases/{billing_case_id}/insurance", response_model=InsuranceCaseOut)
+@router.get("/cases/{billing_case_id}/insurance",
+            response_model=InsuranceCaseOut)
 def get_insurance(
-    billing_case_id: int,
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+        billing_case_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["billing.insurance.view", "billing.insurance.manage"])
-    ins = (
-        db.query(BillingInsuranceCase)
-        .filter(BillingInsuranceCase.billing_case_id == int(billing_case_id))
-        .one_or_none()
-    )
+    ins = (db.query(BillingInsuranceCase).filter(
+        BillingInsuranceCase.billing_case_id == int(
+            billing_case_id)).one_or_none())
     if not ins:
         raise HTTPException(status_code=404, detail="Insurance case not found")
     return ins
 
 
-@router.put("/cases/{billing_case_id}/insurance", response_model=InsuranceCaseOut)
+@router.put("/cases/{billing_case_id}/insurance",
+            response_model=InsuranceCaseOut)
 def put_insurance(
-    billing_case_id: int,
-    payload: InsuranceCaseUpsert,
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+        billing_case_id: int,
+        payload: InsuranceCaseUpsert,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["billing.insurance.manage"])
     try:
@@ -176,20 +182,23 @@ def put_insurance(
         raise
     except SQLAlchemyError:
         db.rollback()
-        raise HTTPException(status_code=500, detail="Database error")
+        raise _db500()
     except Exception:
         db.rollback()
+        logger.exception("put_insurance unexpected error case=%s",
+                         billing_case_id)
         raise
 
 
 # ---------------------------------------------------------
 # Insurance Lines
 # ---------------------------------------------------------
-@router.get("/cases/{billing_case_id}/insurance/lines", response_model=List[InsuranceLineRow])
+@router.get("/cases/{billing_case_id}/insurance/lines",
+            response_model=List[InsuranceLineRow])
 def get_ins_lines(
-    billing_case_id: int,
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+        billing_case_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["billing.insurance.view", "billing.insurance.manage"])
     return list_insurance_lines(db, int(billing_case_id))
@@ -197,10 +206,10 @@ def get_ins_lines(
 
 @router.patch("/cases/{billing_case_id}/insurance/lines")
 def patch_ins_lines(
-    billing_case_id: int,
-    payload: List[InsuranceLinePatch] = Body(...),
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+        billing_case_id: int,
+        payload: List[InsuranceLinePatch] = Body(...),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["billing.insurance.manage"])
     try:
@@ -220,9 +229,11 @@ def patch_ins_lines(
         raise
     except SQLAlchemyError:
         db.rollback()
-        raise HTTPException(status_code=500, detail="Database error")
+        raise _db500()
     except Exception:
         db.rollback()
+        logger.exception("patch_ins_lines unexpected error case=%s",
+                         billing_case_id)
         raise
 
 
@@ -231,11 +242,11 @@ def patch_ins_lines(
 # ---------------------------------------------------------
 @router.post("/cases/{billing_case_id}/insurance/split")
 def split_insurance_invoices(
-    billing_case_id: int,
-    body: SplitRequest,
-    allow_paid_split: bool = Query(False),
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+        billing_case_id: int,
+        body: SplitRequest,
+        allow_paid_split: bool = Query(False),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["billing.insurance.manage"])
     try:
@@ -256,44 +267,42 @@ def split_insurance_invoices(
         raise
     except SQLAlchemyError:
         db.rollback()
-        raise HTTPException(status_code=500, detail="Database error")
+        raise _db500()
     except Exception:
         db.rollback()
+        logger.exception("split_insurance_invoices unexpected error case=%s",
+                         billing_case_id)
         raise
 
 
 # ---------------------------------------------------------
 # Preauth
 # ---------------------------------------------------------
-@router.get("/cases/{billing_case_id}/preauths", response_model=List[PreauthOut])
+@router.get("/cases/{billing_case_id}/preauths",
+            response_model=List[PreauthOut])
 def list_preauths(
-    billing_case_id: int,
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+        billing_case_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["billing.preauth.view", "billing.preauth.manage"])
-    ins = (
-        db.query(BillingInsuranceCase)
-        .filter(BillingInsuranceCase.billing_case_id == int(billing_case_id))
-        .one_or_none()
-    )
+    ins = (db.query(BillingInsuranceCase).filter(
+        BillingInsuranceCase.billing_case_id == int(
+            billing_case_id)).one_or_none())
     if not ins:
         return []
-    rows = (
-        db.query(BillingPreauthRequest)
-        .filter(BillingPreauthRequest.insurance_case_id == int(ins.id))
-        .order_by(BillingPreauthRequest.created_at.desc())
-        .all()
-    )
+    rows = (db.query(BillingPreauthRequest).filter(
+        BillingPreauthRequest.insurance_case_id == int(ins.id)).order_by(
+            BillingPreauthRequest.created_at.desc()).all())
     return [_preauth_out(r) for r in rows]
 
 
 @router.post("/cases/{billing_case_id}/preauths", response_model=PreauthOut)
 def post_preauth(
-    billing_case_id: int,
-    payload: PreauthCreate,
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+        billing_case_id: int,
+        payload: PreauthCreate,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["billing.preauth.manage"])
     try:
@@ -312,18 +321,21 @@ def post_preauth(
         raise
     except SQLAlchemyError:
         db.rollback()
-        raise HTTPException(status_code=500, detail="Database error")
+        raise _db500()
     except Exception:
         db.rollback()
+        logger.exception("post_preauth unexpected error case=%s",
+                         billing_case_id)
         raise
 
 
-@router.post("/cases/{billing_case_id}/preauths/{preauth_id}/submit", response_model=PreauthOut)
+@router.post("/cases/{billing_case_id}/preauths/{preauth_id}/submit",
+             response_model=PreauthOut)
 def submit_preauth(
-    billing_case_id: int,  # kept for route consistency
-    preauth_id: int,
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+        billing_case_id: int,
+        preauth_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["billing.preauth.manage"])
     try:
@@ -337,18 +349,20 @@ def submit_preauth(
         raise
     except SQLAlchemyError:
         db.rollback()
-        raise HTTPException(status_code=500, detail="Database error")
+        raise _db500()
     except Exception:
         db.rollback()
+        logger.exception("submit_preauth unexpected error preauth_id=%s",
+                         preauth_id)
         raise
 
 
 @router.post("/preauths/{preauth_id}/approve", response_model=PreauthOut)
 def approve_preauth(
-    preauth_id: int,
-    payload: PreauthDecision,
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+        preauth_id: int,
+        payload: PreauthDecision,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["billing.preauth.manage"])
     try:
@@ -369,18 +383,20 @@ def approve_preauth(
         raise
     except SQLAlchemyError:
         db.rollback()
-        raise HTTPException(status_code=500, detail="Database error")
+        raise _db500()
     except Exception:
         db.rollback()
+        logger.exception("approve_preauth unexpected error preauth_id=%s",
+                         preauth_id)
         raise
 
 
 @router.post("/preauths/{preauth_id}/partial", response_model=PreauthOut)
 def partial_preauth(
-    preauth_id: int,
-    payload: PreauthDecision,
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+        preauth_id: int,
+        payload: PreauthDecision,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["billing.preauth.manage"])
     try:
@@ -401,18 +417,20 @@ def partial_preauth(
         raise
     except SQLAlchemyError:
         db.rollback()
-        raise HTTPException(status_code=500, detail="Database error")
+        raise _db500()
     except Exception:
         db.rollback()
+        logger.exception("partial_preauth unexpected error preauth_id=%s",
+                         preauth_id)
         raise
 
 
 @router.post("/preauths/{preauth_id}/reject", response_model=PreauthOut)
 def reject_preauth(
-    preauth_id: int,
-    payload: PreauthDecision,
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+        preauth_id: int,
+        payload: PreauthDecision,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["billing.preauth.manage"])
     try:
@@ -433,9 +451,11 @@ def reject_preauth(
         raise
     except SQLAlchemyError:
         db.rollback()
-        raise HTTPException(status_code=500, detail="Database error")
+        raise _db500()
     except Exception:
         db.rollback()
+        logger.exception("reject_preauth unexpected error preauth_id=%s",
+                         preauth_id)
         raise
 
 
@@ -444,33 +464,28 @@ def reject_preauth(
 # ---------------------------------------------------------
 @router.get("/cases/{billing_case_id}/claims", response_model=List[ClaimOut])
 def list_claims(
-    billing_case_id: int,
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+        billing_case_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["billing.claims.view", "billing.claims.manage"])
-    ins = (
-        db.query(BillingInsuranceCase)
-        .filter(BillingInsuranceCase.billing_case_id == int(billing_case_id))
-        .one_or_none()
-    )
+    ins = (db.query(BillingInsuranceCase).filter(
+        BillingInsuranceCase.billing_case_id == int(
+            billing_case_id)).one_or_none())
     if not ins:
         return []
-    rows = (
-        db.query(BillingClaim)
-        .filter(BillingClaim.insurance_case_id == int(ins.id))
-        .order_by(BillingClaim.created_at.desc())
-        .all()
-    )
+    rows = (db.query(BillingClaim).filter(
+        BillingClaim.insurance_case_id == int(ins.id)).order_by(
+            BillingClaim.created_at.desc()).all())
     return [_claim_out(r) for r in rows]
 
 
 @router.post("/cases/{billing_case_id}/claims", response_model=ClaimOut)
 def post_claim(
-    billing_case_id: int,
-    payload: ClaimCreate,
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+        billing_case_id: int,
+        payload: ClaimCreate,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["billing.claims.manage"])
     try:
@@ -489,17 +504,19 @@ def post_claim(
         raise
     except SQLAlchemyError:
         db.rollback()
-        raise HTTPException(status_code=500, detail="Database error")
+        raise _db500()
     except Exception:
         db.rollback()
+        logger.exception("post_claim unexpected error case=%s",
+                         billing_case_id)
         raise
 
 
 @router.post("/claims/{claim_id}/submit", response_model=ClaimOut)
 def submit_claim(
-    claim_id: int,
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+        claim_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["billing.claims.manage"])
     try:
@@ -513,21 +530,59 @@ def submit_claim(
         raise
     except SQLAlchemyError:
         db.rollback()
-        raise HTTPException(status_code=500, detail="Database error")
-    except (KeyError, ValueError, TypeError) as e:
-        db.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.exception("submit_claim DB error claim_id=%s", claim_id)
+        raise _db500("Database error during claim submit")
     except Exception:
         db.rollback()
+        logger.exception("submit_claim unexpected error claim_id=%s", claim_id)
+        raise HTTPException(status_code=500,
+                            detail="Submit failed. Check server logs.")
+
+
+# ✅ NEW: Approve Claim (separate from Settle)
+@router.post("/claims/{claim_id}/approve", response_model=ClaimOut)
+def approve_claim(
+        claim_id: int,
+        payload: ClaimDecision,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    _need_any(user, ["billing.claims.manage"])
+    try:
+        cl = claim_settle(
+            db,
+            int(claim_id),
+            payload.approved_amount,
+            getattr(payload, "settled_amount", ZERO) or ZERO,
+            ClaimStatus.APPROVED,
+            payload.remarks or "",
+            getattr(user, "id", None),
+        )
+        return _commit_refresh_out(db, cl, _claim_out)
+    except (IntegrityError, DataError) as e:
+        db.rollback()
+        raise _http_400_from_db_error(e)
+    except HTTPException:
+        db.rollback()
         raise
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("approve_claim DB error claim_id=%s", claim_id)
+        raise _db500("Database error during claim approval")
+    except Exception:
+        db.rollback()
+        logger.exception("approve_claim unexpected error claim_id=%s",
+                         claim_id)
+        raise HTTPException(status_code=500,
+                            detail="Approve failed. Check server logs.")
 
 
 @router.post("/claims/{claim_id}/settle", response_model=ClaimOut)
 def settle_claim(
-    claim_id: int,
-    payload: ClaimDecision,
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+        claim_id: int,
+        payload: ClaimDecision,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["billing.claims.manage"])
     try:
@@ -549,18 +604,21 @@ def settle_claim(
         raise
     except SQLAlchemyError:
         db.rollback()
-        raise HTTPException(status_code=500, detail="Database error")
+        logger.exception("settle_claim DB error claim_id=%s", claim_id)
+        raise _db500("Database error during claim settlement")
     except Exception:
         db.rollback()
-        raise
+        logger.exception("settle_claim unexpected error claim_id=%s", claim_id)
+        raise HTTPException(status_code=500,
+                            detail="Settle failed. Check server logs.")
 
 
 @router.post("/claims/{claim_id}/deny", response_model=ClaimOut)
 def deny_claim(
-    claim_id: int,
-    payload: ClaimDecision,
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+        claim_id: int,
+        payload: ClaimDecision,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["billing.claims.manage"])
     try:
@@ -582,18 +640,19 @@ def deny_claim(
         raise
     except SQLAlchemyError:
         db.rollback()
-        raise HTTPException(status_code=500, detail="Database error")
+        raise _db500()
     except Exception:
         db.rollback()
+        logger.exception("deny_claim unexpected error claim_id=%s", claim_id)
         raise
 
 
 @router.post("/claims/{claim_id}/query", response_model=ClaimOut)
 def query_claim(
-    claim_id: int,
-    payload: ClaimDecision,
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+        claim_id: int,
+        payload: ClaimDecision,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
 ):
     _need_any(user, ["billing.claims.manage"])
     try:
@@ -615,7 +674,8 @@ def query_claim(
         raise
     except SQLAlchemyError:
         db.rollback()
-        raise HTTPException(status_code=500, detail="Database error")
+        raise _db500()
     except Exception:
         db.rollback()
+        logger.exception("query_claim unexpected error claim_id=%s", claim_id)
         raise

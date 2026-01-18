@@ -303,7 +303,36 @@ def seed_permissions(db: Session) -> None:
         ("billing.insurance.manage"),
         ("billing.preauth.manage"),
         ("billing.claims.manage"),
+        
         ("billing.invoices.split"),
+        ("billing.refunds.create"),
+        ("billing.claims.reject"),
+        ("billing.claims.cancel"),
+        ("billing.claims.reopen"),
+        ("billing.invoice.print"),
+        ("billing.invoice.export"),
+        ("billing.case.statement.print"),
+        ("billing.invoice.edit"),
+        ("billing.invoice.recalculate"),
+        ("billing.case.cancel"),
+        ("billing.case.close"),
+        ("billing.case.reopen"),
+        ("billing.receipts.void"),
+        ("billing.preauth.view"),
+        ("billing.preauth.create"),
+        ("billing.preauth.submit"),
+        ("billing.preauth.approve"),
+        ("billing.preauth.reject"),
+        ("billing.preauth.cancel"),
+        ("billing.claims.set_query"),
+        ("billing.claims.close"),
+        ("billing.receipt.print"),
+        ("billing.manage"),
+        ("billing.invoices.create"),
+        
+        ("masters.charge_items.view"),
+        ("masters.charge_items.manage"),
+        
     ]
 
     from app.models.permission import Permission  # tenant-level

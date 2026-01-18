@@ -285,7 +285,7 @@ def list_charge_items(
         sort: str = Query("updated_at"),
         order: str = Query("desc"),
         db: Session = Depends(get_db),
-        user: User = Depends(require_permissions("masters.charge_items.view")),
+        user: User = Depends(require_permissions("masters.charge_items.manage")),
 ):
     if (not search) and q:
         search = q
@@ -346,7 +346,7 @@ def list_charge_items(
 def get_charge_item(
         item_id: int,
         db: Session = Depends(get_db),
-        user: User = Depends(require_permissions("masters.charge_items.view")),
+        user: User = Depends(require_permissions("masters.charge_items.manage")),
 ):
     row = db.get(ChargeItemMaster, item_id)
     if not row:
@@ -489,7 +489,7 @@ def list_module_headers(
         q: str = Query(""),
         is_active: Optional[bool] = Query(True),
         db: Session = Depends(get_db),
-        user: User = Depends(require_permissions("masters.charge_items.view")),
+        user: User = Depends(require_permissions("masters.charge_items.manage")),
 ):
     qy = db.query(ChargeItemModuleHeader)
     if is_active is not None:
@@ -559,7 +559,7 @@ def list_service_headers(
         q: str = Query(""),
         is_active: Optional[bool] = Query(True),
         db: Session = Depends(get_db),
-        user: User = Depends(require_permissions("masters.charge_items.view")),
+        user: User = Depends(require_permissions("masters.charge_items.manage")),
 ):
     qy = db.query(ChargeItemServiceHeader)
     if is_active is not None:
@@ -658,7 +658,7 @@ def add_charge_item_line(
     inp: AddChargeItemLineIn,
     db: Session = Depends(get_db),
     user: User = Depends(
-        require_permissions("billing.invoices.update",
+        require_permissions("billing.manage",
                             "billing.invoices.create")),
 ):
     inv = db.get(BillingInvoice, int(invoice_id))
