@@ -71,6 +71,7 @@ from app.api import (
     routes_pharmacy_stock_alerts,
     routes_lab_integration,
     # routes_settings_branding
+    routes_opd_reports
 )
 
 
@@ -169,7 +170,7 @@ api_router.include_router(routes_ot_masters.router)
 api_router.include_router(routes_ot_schedule_cases.router)
 api_router.include_router(routes_ot_clinical.router)
 api_router.include_router(routes_ot_admin_logs.router)
-
+api_router.include_router(routes_opd_reports.router)
 # ---- Files & History
 api_router.include_router(routes_files.router, prefix="/files", tags=["Files"])
 api_router.include_router(routes_lis_history.router)
