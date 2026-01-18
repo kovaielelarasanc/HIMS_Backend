@@ -22,7 +22,11 @@ def print_tables(conn):
 def seed_permissions(db: Session) -> None:
     """
     Seed ONLY missing permission codes into a TENANT DB; safe to run multiple times.
+    Supports two formats inside MODULES:
+      1) ("module.name", ["view","create"])
+      2) "module.name.action"   (full permission code)
     """
+
     MODULES = [
         # -------- CORE / ADMIN ----------
         ("departments", ["view", "create", "update", "delete"]),
@@ -32,18 +36,8 @@ def seed_permissions(db: Session) -> None:
         ("doctors", ["view"]),
 
         # -------- PATIENTS ----------
-        ("patients", [
-            "view",
-            "create",
-            "update",
-            "deactivate",
-        ]),
-        ("patients.addresses", [
-            "view",
-            "create",
-            "update",
-            "delete",
-        ]),
+        ("patients", ["view", "create", "update", "deactivate"]),
+        ("patients.addresses", ["view", "create", "update", "delete"]),
         ("patients.consents", ["view", "create"]),
         ("patients.attachments", ["manage"]),
         ("patients.masters", ["view", "manage"]),
@@ -59,116 +53,49 @@ def seed_permissions(db: Session) -> None:
         ("opd.queue", ["view", "manage"]),
         ("opd.followups", ["view", "manage"]),
 
-        # -------------------------------------------------------------------
-        # IPD – Core
-        # -------------------------------------------------------------------
+        # -------- IPD ----------
         ("ipd", ["view", "manage", "doctor", "nursing"]),
-
-        # -------------------------------------------------------------------
-        # IPD Masters
-        # -------------------------------------------------------------------
         ("ipd.masters", ["manage"]),
         ("ipd.beds", ["view", "manage", "reserve", "release"]),
         ("ipd.bedrates", ["view", "manage"]),
         ("ipd.packages", ["view", "manage"]),
-
-        # ✅ FIX: Your routes use ipd.nursing.manage, so add "manage" here
         ("ipd.nursing", ["view", "create", "update", "manage"]),
-
-        # -------------------------------------------------------------------
-        # ✅ NEW: IPD Newborn (Resuscitation / Examination / Vaccination / PDF)
-        # Matches your router checks: ipd.newborn.view/create/update/verify/finalize/void/print/manage
-        # -------------------------------------------------------------------
         ("ipd.newborn", [
             "view", "create", "update", "verify", "finalize", "void", "print",
             "manage"
         ]),
-
-        # -------------------------------------------------------------------
-        # IPD Admissions / Tracking
-        # -------------------------------------------------------------------
         ("ipd.admissions",
          ["view", "create", "update", "cancel", "transfer", "discharge"]),
         ("ipd.tracking", ["view"]),
         ("ipd.my", ["view"]),
         ("ipd.discharged", ["view"]),
         ("ipd.bedboard", ["view"]),
-
-        # -------------------------------------------------------------------
-        # IPD Clinical – Vitals / Nursing Notes / IO / Assessments
-        # -------------------------------------------------------------------
         ("ipd.vitals", ["view", "create", "update"]),
         ("ipd.nursing_notes", ["view", "create", "update"]),
         ("ipd.io", ["view", "create", "update"]),
         ("ipd.assessments", ["view", "create", "update"]),
-
-        # -------------------------------------------------------------------
-        # IPD Medications / Drug Chart
-        # -------------------------------------------------------------------
-        (
-            "ipd.meds",
-            [
-                "view", "order", "update", "regenerate", "mark", "meta", "iv",
-                "nurse_rows", "doctor_auth", "pdf"
-            ],
-        ),
-
-        # -------------------------------------------------------------------
-        # IPD Discharge
-        # -------------------------------------------------------------------
-        (
-            "ipd.discharges",
-            [
-                "view", "summary", "checklist", "medications", "queue",
-                "mark_status", "push_abha", "pdf"
-            ],
-        ),
-        # -------------------------------------------------------------------
-        # IPD Referrals (Doctor-to-Doctor / Dept referrals)
-        # -------------------------------------------------------------------
-        (
-            "ipd.referrals",
-            [
-                "view",  # ipd.referrals.view
-                "create",  # ipd.referrals.create
-                "accept",  # ipd.referrals.accept
-                "decline",  # ipd.referrals.decline
-                "respond",  # ipd.referrals.respond
-                "close",  # ipd.referrals.close
-                "cancel",  # ipd.referrals.cancel
-                "edit",  # ipd.referrals.edit (optional)
-                "manage",  # admin wildcard for this module
-            ],
-        ),
-
-        # Optional: if you want audit as a separate restricted permission
-        ("ipd.referrals.audit", ["view"]),  # ipd.referrals.audit.view
-
-        # -------------------------------------------------------------------
-        # IPD Bed / Ward Transfers
-        # -------------------------------------------------------------------
-        (
-            "ipd.transfers",
-            [
-                "view",  # ipd.transfers.view
-                "create",  # ipd.transfers.create
-                "approve",  # ipd.transfers.approve
-                "complete",  # ipd.transfers.complete
-                "cancel",  # ipd.transfers.cancel
-                "manage",  # optional admin wildcard for this module
-            ],
-        ),
-
-        # -------------------------------------------------------------------
-        # IPD Clinical Permissions (module -> actions)
-        # -------------------------------------------------------------------
+        ("ipd.meds", [
+            "view", "order", "update", "regenerate", "mark", "meta", "iv",
+            "nurse_rows", "doctor_auth", "pdf"
+        ]),
+        ("ipd.discharges", [
+            "view", "summary", "checklist", "medications", "queue",
+            "mark_status", "push_abha", "pdf"
+        ]),
+        ("ipd.referrals", [
+            "view", "create", "accept", "decline", "respond", "close",
+            "cancel", "edit", "manage"
+        ]),
+        ("ipd.referrals.audit", ["view"]),
+        ("ipd.transfers",
+         ["view", "create", "approve", "complete", "cancel", "manage"]),
         ("ipd.dressing", ["create", "view", "update"]),
         ("ipd.icu", ["create", "view", "update"]),
         ("ipd.isolation", ["create", "view", "update", "stop"]),
         ("ipd.restraints", ["create", "view", "update", "monitor", "stop"]),
         ("ipd.transfusion", ["create", "view", "update"]),
 
-        # -------- Pharmacy Inventory ----------
+        # -------- Inventory / Pharmacy ----------
         ("pharmacy.inventory.locations", ["view", "manage"]),
         ("pharmacy.inventory.suppliers", ["view", "manage"]),
         ("pharmacy.inventory.items", ["view", "manage"]),
@@ -197,20 +124,14 @@ def seed_permissions(db: Session) -> None:
 
         # -------- LIS ----------
         ("lab.masters", ["view", "manage"]),
-        ("lab.orders", ["create", "view"]),  # OP/IP lab orders
-        ("lab.samples", ["collect"]),  # sample collection
+        ("lab.orders", ["create", "view"]),
+        ("lab.samples", ["collect"]),
         ("lab.results", ["enter", "validate", "report"]),
-        ("lab.attachments", ["add"]),  # add report attachments
-
-        # NEW: Analyzer / Device management
-        # Used in routes_lis_device.py & AnalyzerDeviceMapping.jsx
-        ("lab.devices", ["view", "manage"]
-         ),  # list/create/update/delete devices & channels
-        ("lab.device_results", ["review",
-                                "import"]),  # review staging, import to LIS
-        ("lab.device_logs", ["view"]),  # view raw message logs
+        ("lab.attachments", ["add"]),
+        ("lab.devices", ["view", "manage"]),
+        ("lab.device_results", ["review", "import"]),
+        ("lab.device_logs", ["view"]),
         ("lab.integration", ["view", "manage"]),
-        # LIS masters (new LIS service master screens)
         ("lis.masters.departments", ["view", "create", "update", "delete"]),
         ("lis.masters.services", ["view", "create", "update", "delete"]),
 
@@ -250,12 +171,10 @@ def seed_permissions(db: Session) -> None:
         ("billing.items", ["add"]),
         ("billing.payments", ["add"]),
 
-        # -------- EMR / Templates / Consents ----------
+        # -------- EMR / Settings / MIS ----------
         ("emr", ["view", "download"]),
         ("templates", ["view", "manage"]),
         ("consents", ["view", "manage"]),
-
-        # -------- MIS / Analytics ----------
         ("mis", ["view"]),
         ("mis.collection", ["view"]),
         ("mis.accounts", ["view"]),
@@ -267,88 +186,100 @@ def seed_permissions(db: Session) -> None:
         ("mis.lab", ["view"]),
         ("mis.radiology", ["view"]),
 
-        # -------- Pharmacy Rx & Billing ----------
+        # -------- Pharmacy Rx ----------
         ("pharmacy.rx",
          ["view", "dispense", "override", "cancel", "manage", "sign",
           "print"]),
         ("pharmacy.rx_queue", ["view"]),
-        ("pharmacy.sales", ["view", "create", "return", "finalize", "cancel"]),
+        ("pharmacy.sales",
+         ["view", "create", "return", "finalize", "cancel", "update"]),
         ("pharmacy.billing", ["view", "create", "refund"]),
         ("pharmacy.returns", ["view", "manage"]),
         ("pharmacy.prescriptions",
          ["view", "create", "update", "sign", "cancel"]),
         ("pharmacy.dispense", ["view", "create"]),
-        ("pharmacy.sales", ["view", "create", "update"]),
         ("pharmacy.payments", ["view", "create"]),
         ("pharmacy.stock", ["view"]),
         ("pharmacy", ["view", "dispense"]),
-        ("pharmacy.batch_picks", ["view"]),
         ("pharmacy.reports.schedule_medicine", ["view"]),
         ("pharmacy.reports", ["view"]),
-        ("quickorder",
-         ["radiology", "pharmacy", "laboratory", "ot", "consumables"]),
+        ("quickorder", ["radiology", "pharmacy", "laboratory", "ot", "consumables"]),
 
-        # -------- Settings / Customization ----------
+        # -------- Master / Settings ----------
         ("settings.customization", ["view", "manage"]),
         ("master.tenants", ["view", "manage"]),
         ("master.storage", ["view", "manage"]),
         ("master.migrations", ["view", "manage"]),
 
-        # view
-        ("billing.insurance.view"),
-        ("billing.preauth.view"),
-        ("billing.claims.view"),
-
-        # manage
-        ("billing.insurance.manage"),
-        ("billing.preauth.manage"),
-        ("billing.claims.manage"),
-        
-        ("billing.invoices.split"),
-        ("billing.refunds.create"),
-        ("billing.claims.reject"),
-        ("billing.claims.cancel"),
-        ("billing.claims.reopen"),
-        ("billing.invoice.print"),
-        ("billing.invoice.export"),
-        ("billing.case.statement.print"),
-        ("billing.invoice.edit"),
-        ("billing.invoice.recalculate"),
-        ("billing.case.cancel"),
-        ("billing.case.close"),
-        ("billing.case.reopen"),
-        ("billing.receipts.void"),
-        ("billing.preauth.view"),
-        ("billing.preauth.create"),
-        ("billing.preauth.submit"),
-        ("billing.preauth.approve"),
-        ("billing.preauth.reject"),
-        ("billing.preauth.cancel"),
-        ("billing.claims.set_query"),
-        ("billing.claims.close"),
-        ("billing.receipt.print"),
-        ("billing.manage"),
-        ("billing.invoices.create"),
-        
-        ("masters.charge_items.view"),
-        ("masters.charge_items.manage"),
-        
+        # ✅ Your “single code” entries can stay as strings now:
+        "billing.insurance.view",
+        "billing.preauth.view",
+        "billing.claims.view",
+        "billing.insurance.manage",
+        "billing.preauth.manage",
+        "billing.claims.manage",
+        "billing.invoices.split",
+        "billing.refunds.create",
+        "billing.claims.reject",
+        "billing.claims.cancel",
+        "billing.claims.reopen",
+        "billing.invoice.print",
+        "billing.invoice.export",
+        "billing.case.statement.print",
+        "billing.invoice.edit",
+        "billing.invoice.recalculate",
+        "billing.case.cancel",
+        "billing.case.close",
+        "billing.case.reopen",
+        "billing.receipts.void",
+        "billing.preauth.create",
+        "billing.preauth.submit",
+        "billing.preauth.approve",
+        "billing.preauth.reject",
+        "billing.preauth.cancel",
+        "billing.claims.set_query",
+        "billing.claims.close",
+        "billing.receipt.print",
+        "billing.manage",
+        "billing.invoices.create",
+        "masters.charge_items.view",
+        "masters.charge_items.manage",
     ]
 
-    from app.models.permission import Permission  # tenant-level
+    from app.models.permission import Permission
 
+    # load once (fast)
+    existing = {c for (c, ) in db.query(Permission.code).all()}
+
+    to_add = []
     seen = set()
-    for module, actions in MODULES:
+
+    def add_code(full_code: str):
+        full_code = (full_code or "").strip()
+        if not full_code or full_code in existing or full_code in seen:
+            return
+        seen.add(full_code)
+
+        if "." in full_code:
+            module, action = full_code.rsplit(".", 1)
+        else:
+            module, action = full_code, "view"
+
+        label = f"{module.replace('.', ' ').title()} — {action.replace('_', ' ').title()}"
+        to_add.append(Permission(code=full_code, label=label, module=module))
+
+    for item in MODULES:
+        if isinstance(item, str):
+            add_code(item)
+            continue
+
+        # tuple/list -> (module, actions)
+        module, actions = item
         for action in actions:
-            code = f"{module}.{action}"
-            if code in seen:
-                continue
-            seen.add(code)
-            exists = db.query(Permission).filter(
-                Permission.code == code).first()
-            if not exists:
-                label = f"{module.replace('.', ' ').title()} — {action.title()}"
-                db.add(Permission(code=code, label=label, module=module))
+            add_code(f"{module}.{action}")
+
+    if to_add:
+        db.add_all(to_add)
 
 
 # ---------- MASTER DB INIT ----------
