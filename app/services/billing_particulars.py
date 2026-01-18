@@ -24,7 +24,18 @@ from app.models.charge_item_master import ChargeItemMaster
 from app.models.ipd import IpdWard, IpdRoom, IpdBed, IpdBedRate
 from app.models.opd import LabTest, RadiologyTest, DoctorFee
 from app.models.ot import OtProcedure
-from app.models.ot_master import OtSurgeryMaster
+try:
+    from app.models.ot_master import (
+        OtSurgeryMaster,
+        OtTheaterMaster,
+        OtInstrumentMaster,
+        OtDeviceMaster,
+    )
+except Exception:
+    # fallback (if your file name differs)
+    from app.models.ot_masters import (  # type: ignore
+        OtSurgeryMaster, OtTheaterMaster, OtInstrumentMaster, OtDeviceMaster,
+    )
 
 from app.services.billing_service import (
     BillingError,
@@ -150,6 +161,13 @@ PARTICULARS: List[ParticularMeta] = [
                    InvoiceType.PATIENT, "CHARGE_ITEM"),
     ParticularMeta("BLOOD", "BLOOD BANK", "BLOOD", ServiceGroup.MISC,
                    InvoiceType.PATIENT, "CHARGE_ITEM"),
+    # --- NEW: OT Masters as separate Billing module headings ---
+    ParticularMeta("OTT", "OT THEATER CHARGES", "OTT", ServiceGroup.OT,
+                   InvoiceType.PATIENT, "OT_THEATER"),
+    ParticularMeta("OTI", "OT INSTRUMENT CHARGES", "OTI", ServiceGroup.OT,
+                   InvoiceType.PATIENT, "OT_INSTRUMENT"),
+    ParticularMeta("OTD", "OT DEVICE CHARGES", "OTD", ServiceGroup.OT,
+                   InvoiceType.PATIENT, "OT_DEVICE"),
 ]
 
 _PART_MAP = {p.code: p for p in PARTICULARS}
@@ -604,6 +622,113 @@ def doctor_fee_options(
     return {"doctors": out, "departments": dept_items}
 
 
+def ot_theater_options(db: Session, *, search: str = "", limit: int = 80):
+    limit = min(max(int(limit or 80), 1), 200)
+    s = (search or "").strip().lower()
+
+    q = db.query(OtTheaterMaster).filter(OtTheaterMaster.is_active.is_(True))
+    if s:
+        q = q.filter(
+            or_(
+                func.lower(OtTheaterMaster.code).like(f"%{s}%"),
+                func.lower(OtTheaterMaster.name).like(f"%{s}%"),
+            ))
+    rows = q.order_by(OtTheaterMaster.name.asc()).limit(limit).all()
+
+    return {
+        "theaters": [{
+            "id": int(x.id),
+            "code": x.code,
+            "name": x.name,
+            "cost_per_hour": str(_d(getattr(x, "cost_per_hour", 0))),
+            "description": getattr(x, "description", "") or "",
+        } for x in rows]
+    }
+
+
+def ot_instrument_options(db: Session, *, search: str = "", limit: int = 80):
+    limit = min(max(int(limit or 80), 1), 200)
+    s = (search or "").strip().lower()
+
+    q = db.query(OtInstrumentMaster).filter(
+        OtInstrumentMaster.is_active.is_(True))
+    if s:
+        q = q.filter(
+            or_(
+                func.lower(OtInstrumentMaster.code).like(f"%{s}%"),
+                func.lower(OtInstrumentMaster.name).like(f"%{s}%"),
+            ))
+    rows = q.order_by(OtInstrumentMaster.name.asc()).limit(limit).all()
+
+    return {
+        "instruments": [{
+            "id":
+            int(x.id),
+            "code":
+            x.code,
+            "name":
+            x.name,
+            "available_qty":
+            int(getattr(x, "available_qty", 0) or 0),
+            "cost_per_qty":
+            str(_d(getattr(x, "cost_per_qty", 0))),
+            "uom": (getattr(x, "uom", None) or "Nos"),
+            "description":
+            getattr(x, "description", "") or "",
+        } for x in rows]
+    }
+
+
+def ot_device_options(
+    db: Session,
+    *,
+    search: str = "",
+    category: str = "",
+    limit: int = 80,
+):
+    limit = min(max(int(limit or 80), 1), 200)
+    s = (search or "").strip().lower()
+    cat = (category or "").strip().upper()
+
+    q = db.query(OtDeviceMaster).filter(OtDeviceMaster.is_active.is_(True))
+    if cat:
+        q = q.filter(
+            func.upper(func.coalesce(OtDeviceMaster.category, "")) == cat)
+
+    if s:
+        q = q.filter(
+            or_(
+                func.lower(OtDeviceMaster.code).like(f"%{s}%"),
+                func.lower(OtDeviceMaster.name).like(f"%{s}%"),
+                func.lower(func.coalesce(OtDeviceMaster.category,
+                                         "")).like(f"%{s}%"),
+            ))
+
+    rows = q.order_by(OtDeviceMaster.category.asc(),
+                      OtDeviceMaster.name.asc()).limit(limit).all()
+
+    # helpful for UI filter dropdown
+    cats = (db.query(func.upper(func.coalesce(
+        OtDeviceMaster.category,
+        ""))).filter(OtDeviceMaster.is_active.is_(True)).distinct().order_by(
+            func.upper(func.coalesce(OtDeviceMaster.category,
+                                     "")).asc()).all())
+    category_items = [c[0] for c in cats if c and c[0]]
+
+    return {
+        "categories":
+        category_items,
+        "devices": [{
+            "id": int(x.id),
+            "category": (getattr(x, "category", "") or "").strip(),
+            "code": x.code,
+            "name": x.name,
+            "cost": str(_d(getattr(x, "cost", 0))),
+            "description": getattr(x, "description", "") or "",
+        } for x in rows],
+    }
+
+
 # -----------------------------
 # Options API
 # -----------------------------
@@ -688,6 +813,40 @@ def get_particular_options(
                 "kind": p.kind
             },
             "options": ot_surgery_options(db, search=search, limit=limit)
+        }
+    if p.kind == "OT_THEATER":
+        return {
+            "particular": {
+                "code": p.code,
+                "label": p.label,
+                "kind": p.kind
+            },
+            "options": ot_theater_options(db, search=search, limit=limit),
+        }
+
+    if p.kind == "OT_INSTRUMENT":
+        return {
+            "particular": {
+                "code": p.code,
+                "label": p.label,
+                "kind": p.kind
+            },
+            "options": ot_instrument_options(db, search=search, limit=limit),
+        }
+
+    if p.kind == "OT_DEVICE":
+        # NOTE: reusing `modality` param as "category" to avoid changing API signature
+        return {
+            "particular": {
+                "code": p.code,
+                "label": p.label,
+                "kind": p.kind
+            },
+            "options":
+            ot_device_options(db,
+                              search=search,
+                              category=modality,
+                              limit=limit),
         }
 
     if p.kind == "DOCTOR":
@@ -1283,6 +1442,240 @@ def add_particular_lines(
                 if not any_added:
                     raise BillingError(
                         "No split costs found to add (all costs are 0)")
+
+        return {"invoice_id": int(inv.id), "added_line_ids": added}
+        # ---------------- OT THEATER ----------------
+    if p.kind == "OT_THEATER":
+        for ln_in in work:
+            tid = _safe_int(_line_get(ln_in, "item_id"))
+            if tid <= 0:
+                raise BillingError("Each OT theater line must have item_id")
+
+            th = db.get(OtTheaterMaster, tid)
+            if not th or not getattr(th, "is_active", False):
+                raise BillingError("Invalid OT theater")
+
+            svc_dt = eff_dt(ln_in)
+            key_dt = (svc_dt.date().isoformat()
+                      if svc_dt else date.today().isoformat())
+
+            # qty here = hours (Decimal allowed)
+            q_hours = eff_qty(ln_in)
+            if q_hours <= 0:
+                raise BillingError("Hours (qty) must be > 0 for OT theater")
+
+            rate = eff_price_override(ln_in)
+            gst = eff_gst(ln_in)
+
+            if rate <= 0:
+                tr, tg = get_tariff_rate(
+                    db,
+                    tariff_plan_id=case.tariff_plan_id,
+                    item_type="OT_THEATER",
+                    item_id=tid,
+                )
+                if _d(tr) > 0:
+                    rate = _d(tr)
+                    if gst <= 0:
+                        gst = _d(tg)
+
+            if rate <= 0:
+                rate = _d(getattr(th, "cost_per_hour", 0))
+
+            if rate <= 0:
+                raise BillingError(
+                    "OT theater rate missing (tariff or cost_per_hour)")
+
+            suffix = line_key_suffix(ln_in)
+            source_ref_id, source_line_key = _mk_idem(case, "OTT", tid, key_dt,
+                                                      suffix)
+
+            ln = upsert_auto_line(
+                db,
+                invoice_id=int(inv.id),
+                billing_case_id=int(case.id),
+                user=user,
+                service_group=p.service_group,
+                item_type="OT_THEATER",
+                item_id=tid,
+                item_code=getattr(th, "code", None),
+                description=eff_desc(ln_in, f"{p.label} - {th.name}"),
+                qty=q_hours,
+                unit_price=rate,
+                gst_rate=gst,
+                discount_percent=eff_disc_pct(ln_in),
+                discount_amount=eff_disc_amt(ln_in),
+                source_module=p.module,
+                source_ref_id=source_ref_id,
+                source_line_key=source_line_key,
+                service_date=svc_dt,
+                meta_patch={
+                    "ot_theater": {
+                        "id": tid,
+                        "code": getattr(th, "code", None),
+                        "name": getattr(th, "name", None),
+                        "cost_per_hour":
+                        str(_d(getattr(th, "cost_per_hour", 0))),
+                    }
+                },
+            )
+            added.append(int(ln.id))
+
+        return {"invoice_id": int(inv.id), "added_line_ids": added}
+
+        # ---------------- OT INSTRUMENT ----------------
+    if p.kind == "OT_INSTRUMENT":
+        for ln_in in work:
+            iid = _safe_int(_line_get(ln_in, "item_id"))
+            if iid <= 0:
+                raise BillingError("Each OT instrument line must have item_id")
+
+            inst = db.get(OtInstrumentMaster, iid)
+            if not inst or not getattr(inst, "is_active", False):
+                raise BillingError("Invalid OT instrument")
+
+            svc_dt = eff_dt(ln_in)
+            key_dt = (svc_dt.date().isoformat()
+                      if svc_dt else date.today().isoformat())
+
+            q_qty = eff_qty(ln_in)
+            if q_qty <= 0:
+                raise BillingError("Qty must be > 0 for OT instrument")
+
+            rate = eff_price_override(ln_in)
+            gst = eff_gst(ln_in)
+
+            if rate <= 0:
+                tr, tg = get_tariff_rate(
+                    db,
+                    tariff_plan_id=case.tariff_plan_id,
+                    item_type="OT_INSTRUMENT",
+                    item_id=iid,
+                )
+                if _d(tr) > 0:
+                    rate = _d(tr)
+                    if gst <= 0:
+                        gst = _d(tg)
+
+            if rate <= 0:
+                rate = _d(getattr(inst, "cost_per_qty", 0))
+
+            if rate <= 0:
+                raise BillingError(
+                    "OT instrument rate missing (tariff or cost_per_qty)")
+
+            suffix = line_key_suffix(ln_in)
+            source_ref_id, source_line_key = _mk_idem(case, "OTI", iid, key_dt,
+                                                      suffix)
+
+            ln = upsert_auto_line(
+                db,
+                invoice_id=int(inv.id),
+                billing_case_id=int(case.id),
+                user=user,
+                service_group=p.service_group,
+                item_type="OT_INSTRUMENT",
+                item_id=iid,
+                item_code=getattr(inst, "code", None),
+                description=eff_desc(ln_in, f"{p.label} - {inst.name}"),
+                qty=q_qty,
+                unit_price=rate,
+                gst_rate=gst,
+                discount_percent=eff_disc_pct(ln_in),
+                discount_amount=eff_disc_amt(ln_in),
+                source_module=p.module,
+                source_ref_id=source_ref_id,
+                source_line_key=source_line_key,
+                service_date=svc_dt,
+                meta_patch={
+                    "ot_instrument": {
+                        "id": iid,
+                        "code": getattr(inst, "code", None),
+                        "name": getattr(inst, "name", None),
+                        "uom": getattr(inst, "uom", "Nos"),
+                        "cost_per_qty":
+                        str(_d(getattr(inst, "cost_per_qty", 0))),
+                    }
+                },
+            )
+            added.append(int(ln.id))
+
+        return {"invoice_id": int(inv.id), "added_line_ids": added}
+
+        # ---------------- OT DEVICE ----------------
+    if p.kind == "OT_DEVICE":
+        for ln_in in work:
+            did = _safe_int(_line_get(ln_in, "item_id"))
+            if did <= 0:
+                raise BillingError("Each OT device line must have item_id")
+
+            dev = db.get(OtDeviceMaster, did)
+            if not dev or not getattr(dev, "is_active", False):
+                raise BillingError("Invalid OT device")
+
+            svc_dt = eff_dt(ln_in)
+            key_dt = (svc_dt.date().isoformat()
+                      if svc_dt else date.today().isoformat())
+
+            q_qty = eff_qty(ln_in)
+            if q_qty <= 0:
+                raise BillingError("Qty must be > 0 for OT device")
+
+            rate = eff_price_override(ln_in)
+            gst = eff_gst(ln_in)
+
+            if rate <= 0:
+                tr, tg = get_tariff_rate(
+                    db,
+                    tariff_plan_id=case.tariff_plan_id,
+                    item_type="OT_DEVICE",
+                    item_id=did,
+                )
+                if _d(tr) > 0:
+                    rate = _d(tr)
+                    if gst <= 0:
+                        gst = _d(tg)
+
+            if rate <= 0:
+                rate = _d(getattr(dev, "cost", 0))
+
+            if rate <= 0:
+                raise BillingError("OT device rate missing (tariff or cost)")
+
+            suffix = line_key_suffix(ln_in)
+            source_ref_id, source_line_key = _mk_idem(case, "OTD", did, key_dt,
+                                                      suffix)
+
+            ln = upsert_auto_line(
+                db,
+                invoice_id=int(inv.id),
+                billing_case_id=int(case.id),
+                user=user,
+                service_group=p.service_group,
+                item_type="OT_DEVICE",
+                item_id=did,
+                item_code=getattr(dev, "code", None),
+                description=eff_desc(ln_in, f"{p.label} - {dev.name}"),
+                qty=q_qty,
+                unit_price=rate,
+                gst_rate=gst,
+                discount_percent=eff_disc_pct(ln_in),
+                discount_amount=eff_disc_amt(ln_in),
+                source_module=p.module,
+                source_ref_id=source_ref_id,
+                source_line_key=source_line_key,
+                service_date=svc_dt,
+                meta_patch={
+                    "ot_device": {
+                        "id": did,
+                        "category": getattr(dev, "category", None),
+                        "code": getattr(dev, "code", None),
+                        "name": getattr(dev, "name", None),
+                        "cost": str(_d(getattr(dev, "cost", 0))),
+                    }
+                },
+            )
+            added.append(int(ln.id))
 
         return {"invoice_id": int(inv.id), "added_line_ids": added}
 

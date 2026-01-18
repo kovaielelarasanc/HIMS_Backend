@@ -48,6 +48,7 @@ from app.models.billing import (
     ClaimStatus,
     PaymentKind,
     ReceiptStatus,
+    BillingCaseLink,
 )
 
 from app.services.billing_service import (
@@ -111,6 +112,11 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
 
+try:
+    from app.services.billing_ot import create_ot_invoice_items_for_case  # type: ignore
+except Exception:
+    create_ot_invoice_items_for_case = None  # type: ignore
+
 router = APIRouter(prefix="/billing", tags=["Billing"])
 
 import logging
@@ -118,6 +124,116 @@ import logging
 logger = logging.getLogger(__name__)
 
 from typing import Any, Dict, Optional, Tuple, List, Union
+
+MODULES = {
+    "ADM": "Admission Charges",
+    "ROOM": "Observation / Room Charges",
+    "BLOOD": "Blood Bank Charges",
+    "LAB": "Clinical Lab Charges",
+    "DIET": "Dietary Charges",
+    "DOC": "Doctor Fees",
+    "PHM": "Pharmacy Charges (Medicines)",
+    "PHC": "Pharmacy Charges (Consumables)",
+    "PROC": "Procedure Charges",
+    "SCAN": "Scan Charges",
+    "SURG": "Surgery Charges",
+    "XRAY": "X-Ray Charges",
+    "MISC": "Misc Charges",
+    "OTT": "OT Theater Charges",
+    "OTI": "OT Instrument Charges",
+    "OTD": "OT Device Charges",
+}
+
+MODULE_COLUMNS = {
+    "DEFAULT": [
+        {
+            "key": "service_date",
+            "label": "Date"
+        },
+        {
+            "key": "item_code",
+            "label": "Code"
+        },
+        {
+            "key": "description",
+            "label": "Item Name"
+        },
+        {
+            "key": "qty",
+            "label": "Qty"
+        },
+        {
+            "key": "unit_price",
+            "label": "Unit Price"
+        },
+        {
+            "key": "discount_amount",
+            "label": "Discount"
+        },
+        {
+            "key": "gst_rate",
+            "label": "GST %"
+        },
+        {
+            "key": "tax_amount",
+            "label": "Tax"
+        },
+        {
+            "key": "net_amount",
+            "label": "Total"
+        },
+    ],
+    "PHARMACY": [
+        {
+            "key": "service_date",
+            "label": "Bill Date"
+        },
+        {
+            "key": "item_code",
+            "label": "Code"
+        },
+        {
+            "key": "description",
+            "label": "Item Name"
+        },
+        {
+            "key": "meta.batch_id",
+            "label": "Batch"
+        },
+        {
+            "key": "meta.expiry_date",
+            "label": "Expiry"
+        },
+        {
+            "key": "qty",
+            "label": "Qty"
+        },
+        {
+            "key": "unit_price",
+            "label": "Item Amount"
+        },
+        {
+            "key": "meta.hsn_sac",
+            "label": "HSN/SAC"
+        },
+        {
+            "key": "meta.cgst_pct",
+            "label": "CGST %"
+        },
+        {
+            "key": "meta.sgst_pct",
+            "label": "SGST %"
+        },
+        {
+            "key": "tax_amount",
+            "label": "Tax"
+        },
+        {
+            "key": "net_amount",
+            "label": "Total"
+        },
+    ],
+}
 
 
 def _now_utc():
@@ -774,114 +890,6 @@ def billing_particular_add(
     except Exception as e:
         db.rollback()
         _err(e)
-
-
-MODULES = {
-    "ADM": "Admission Charges",
-    "ROOM": "Observation / Room Charges",
-    "BLOOD": "Blood Bank Charges",
-    "LAB": "Clinical Lab Charges",
-    "DIET": "Dietary Charges",
-    "DOC": "Doctor Fees",
-    "PHM": "Pharmacy Charges (Medicines)",
-    "PHC": "Pharmacy Charges (Consumables)",
-    "PROC": "Procedure Charges",
-    "SCAN": "Scan Charges",
-    "SURG": "Surgery Charges",
-    "XRAY": "X-Ray Charges",
-    "MISC": "Misc Charges",
-}
-
-MODULE_COLUMNS = {
-    "DEFAULT": [
-        {
-            "key": "service_date",
-            "label": "Date"
-        },
-        {
-            "key": "item_code",
-            "label": "Code"
-        },
-        {
-            "key": "description",
-            "label": "Item Name"
-        },
-        {
-            "key": "qty",
-            "label": "Qty"
-        },
-        {
-            "key": "unit_price",
-            "label": "Unit Price"
-        },
-        {
-            "key": "discount_amount",
-            "label": "Discount"
-        },
-        {
-            "key": "gst_rate",
-            "label": "GST %"
-        },
-        {
-            "key": "tax_amount",
-            "label": "Tax"
-        },
-        {
-            "key": "net_amount",
-            "label": "Total"
-        },
-    ],
-    "PHARMACY": [
-        {
-            "key": "service_date",
-            "label": "Bill Date"
-        },
-        {
-            "key": "item_code",
-            "label": "Code"
-        },
-        {
-            "key": "description",
-            "label": "Item Name"
-        },
-        {
-            "key": "meta.batch_id",
-            "label": "Batch"
-        },
-        {
-            "key": "meta.expiry_date",
-            "label": "Expiry"
-        },
-        {
-            "key": "qty",
-            "label": "Qty"
-        },
-        {
-            "key": "unit_price",
-            "label": "Item Amount"
-        },
-        {
-            "key": "meta.hsn_sac",
-            "label": "HSN/SAC"
-        },
-        {
-            "key": "meta.cgst_pct",
-            "label": "CGST %"
-        },
-        {
-            "key": "meta.sgst_pct",
-            "label": "SGST %"
-        },
-        {
-            "key": "tax_amount",
-            "label": "Tax"
-        },
-        {
-            "key": "net_amount",
-            "label": "Total"
-        },
-    ],
-}
 
 
 # ============================================================
@@ -6033,3 +6041,32 @@ def billing_case_export_pdf(
     return StreamingResponse(BytesIO(pdf_bytes),
                              media_type="application/pdf",
                              headers=headers)
+
+
+@router.post("/ot/cases/{case_id}/sync")
+def billing_sync_ot_case(
+        case_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    if create_ot_invoice_items_for_case is None:
+        raise HTTPException(status_code=500,
+                            detail="billing_ot service not available")
+
+    try:
+        inv = create_ot_invoice_items_for_case(db, case_id=case_id, user=user)
+        db.commit()
+        return {
+            "ok":
+            True,
+            "invoice_id":
+            int(getattr(inv, "id", 0) or 0),
+            "billing_case_id":
+            int(getattr(inv, "billing_case_id", 0) or 0),
+            "status":
+            getattr(getattr(inv, "status", None), "value",
+                    str(getattr(inv, "status", ""))),
+        }
+    except BillingError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))

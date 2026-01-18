@@ -7,11 +7,11 @@ from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Optional, Tuple
-
-from fastapi import APIRouter, Depends, HTTPException, Query
+import logging
+from fastapi import APIRouter, Depends, HTTPException, Query, Path as FPath
 from fastapi.responses import StreamingResponse
-from sqlalchemy.orm import Session, selectinload
-
+from sqlalchemy.orm import Session, selectinload, joinedload
+import json
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.lib import colors
@@ -73,6 +73,28 @@ except Exception:
     IpdBed = None
     IpdRoom = None
 
+from app.services.pdfs.billing_invoice_export import build_invoice_pdf
+
+# ✅ PDF merge (Overview + Invoices + Ledgers + Insurance => one PDF)
+PdfReader = PdfWriter = None  # type: ignore
+try:
+    from pypdf import PdfReader, PdfWriter  # type: ignore
+except Exception:
+    try:
+        from PyPDF2 import PdfReader, PdfWriter  # type: ignore
+    except Exception:
+        PdfReader = PdfWriter = None  # type: ignore
+
+logger = logging.getLogger(__name__)
+
+# ✅ Insurance models (safe import)
+try:
+    from app.models.billing import BillingInsuranceCase, BillingPreauthRequest, BillingClaim  # type: ignore
+except Exception:
+    BillingInsuranceCase = None  # type: ignore
+    BillingPreauthRequest = None  # type: ignore
+    BillingClaim = None  # type: ignore
+
 router = APIRouter(prefix="/billing/print", tags=["Billing Print"])
 
 
@@ -113,6 +135,38 @@ def _eq_enum(v: Any, enum_member: Any) -> bool:
         return v == enum_member or _val(v) == _val(enum_member)
     except Exception:
         return False
+
+
+def _up(v: Any) -> str:
+    return str(v or "").strip().upper()
+
+
+def _meta(v: Any) -> Dict[str, Any]:
+    if v is None:
+        return {}
+    if isinstance(v, dict):
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return {}
+        try:
+            obj = json.loads(s)
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _meta_pick(meta: Dict[str, Any],
+               keys: list[str],
+               default: str = "—") -> str:
+    for k in keys:
+        if k in meta:
+            val = meta.get(k)
+            if val not in (None, "", []):
+                return str(val).strip()
+    return default
 
 
 def _safe(v: Any) -> str:
@@ -209,6 +263,61 @@ def _pick_best_address(addresses: list[PatientAddress]) -> str:
     ]
     parts = [x for x in parts if x]
     return ", ".join(parts) if parts else "—"
+
+
+def _pick_attr(obj: Any, *names: str, default: str = "—") -> str:
+    for n in names:
+        try:
+            v = getattr(obj, n, None)
+            s = _safe(v)
+            if s != "—":
+                return s
+        except Exception:
+            pass
+    return default
+
+
+def _merge_pdf_bytes(parts: list[bytes]) -> bytes:
+    """
+    Merge multiple PDF byte blobs into one PDF (preserve page order).
+    Requires pypdf (preferred) or PyPDF2.
+    """
+    if not parts:
+        return b""
+
+    if PdfReader is None or PdfWriter is None:
+        raise HTTPException(
+            status_code=500,
+            detail="PDF merge dependency missing. Install: pip install pypdf",
+        )
+
+    writer = PdfWriter()
+    for b in parts:
+        if not b:
+            continue
+        reader = PdfReader(BytesIO(b))
+        for page in reader.pages:
+            writer.add_page(page)
+
+    out = BytesIO()
+    writer.write(out)
+    return out.getvalue()
+
+
+def _list_case_invoices(
+    db: Session,
+    case_id: int,
+    *,
+    include_draft_invoices: bool = True,
+) -> list[BillingInvoice]:
+    q = (db.query(BillingInvoice).options(selectinload(
+        BillingInvoice.lines)).filter(
+            BillingInvoice.billing_case_id == case_id,
+            BillingInvoice.status != DocStatus.VOID,
+        ).order_by(BillingInvoice.created_at.asc()))
+    if not include_draft_invoices:
+        q = q.filter(BillingInvoice.status != DocStatus.DRAFT)
+    return q.all()
 
 
 # ---------------------------
@@ -340,10 +449,11 @@ def _load_op_context(db: Session, encounter_id: int) -> Dict[str, str]:
     if Visit is None:
         return out
 
-    v = (db.query(Visit).options(selectinload(Visit.appointment),
-                                 selectinload(Visit.doctor),
-                                 selectinload(Visit.department)).filter(
-                                     Visit.id == encounter_id).first())
+    v = (db.query(Visit).options(
+        selectinload(Visit.appointment),
+        selectinload(Visit.doctor),
+        selectinload(Visit.department),
+    ).filter(Visit.id == encounter_id).first())
     if not v:
         return out
 
@@ -528,11 +638,9 @@ def _draw_branding_header(c: canvas.Canvas, branding: Optional[UiBranding],
     INK = colors.black
     MUTED = colors.HexColor("#334155")
 
-    # ✅ medium header size
     logo_h = 18 * mm
     gutter = 5 * mm
 
-    # ✅ left column smaller to avoid right text getting squeezed into 1-word lines
     logo_col = min(max(62 * mm, w * 0.36), 78 * mm)
     right_w = max(58 * mm, w - logo_col - gutter)
 
@@ -544,7 +652,6 @@ def _draw_branding_header(c: canvas.Canvas, branding: Optional[UiBranding],
     website = _safe(_bget(b, "org_website", "website"))
     gstin = _safe(_bget(b, "org_gstin", "gstin"))
 
-    # ✅ combined contact line (short)
     contact_bits = []
     if phone != "—":
         contact_bits.append(f"Ph: {phone}")
@@ -561,7 +668,6 @@ def _draw_branding_header(c: canvas.Canvas, branding: Optional[UiBranding],
             _cap_lines(simpleSplit(contact_line, "Helvetica", 8.4, right_w),
                        1))
 
-    # optional last line (only if space)
     extra_bits = []
     if website != "—":
         extra_bits.append(f"{website}")
@@ -575,7 +681,6 @@ def _draw_branding_header(c: canvas.Canvas, branding: Optional[UiBranding],
 
     meta_lines = _cap_lines(meta_lines, 3)
 
-    # build text lines for right column
     lines: list[tuple[str, str, float, Any]] = []
     if org != "—":
         lines.append((org, "Helvetica-Bold", 12.0, INK))
@@ -590,13 +695,11 @@ def _draw_branding_header(c: canvas.Canvas, branding: Optional[UiBranding],
     text_h = sum(lh(sz) for _, _, sz, _ in lines) if lines else (10 * mm)
     header_h = max(logo_h, text_h) + (2 * mm)
 
-    # logo (left, vertically centered)
     logo_reader = _read_logo_reader(b)
     if logo_reader:
         try:
             iw, ih = logo_reader.getSize()
             if iw and ih:
-                # scale to fit in both height and width
                 scale_h = logo_h / float(ih)
                 draw_w = float(iw) * scale_h
                 draw_h = logo_h
@@ -622,7 +725,6 @@ def _draw_branding_header(c: canvas.Canvas, branding: Optional[UiBranding],
         except Exception:
             pass
 
-    # right column text (right aligned) — aligned to center with logo
     text_right_x = x + w
     center_y = top_y - header_h / 2
     cur_y = center_y + (text_h / 2)
@@ -633,7 +735,6 @@ def _draw_branding_header(c: canvas.Canvas, branding: Optional[UiBranding],
         c.setFillColor(col)
         c.drawRightString(text_right_x, cur_y, txt)
 
-    # rule
     c.setStrokeColor(colors.HexColor("#cbd5e1"))
     c.setLineWidth(0.6)
     c.line(x, top_y - header_h, x + w, top_y - header_h)
@@ -684,76 +785,10 @@ def _build_header_payload(db: Session, case: BillingCase,
 
 
 # ---------------------------
-# Module label mapping
-# ---------------------------
-MODULE_LABELS: Dict[str, str] = {
-    "DOC": "Doctor Fees",
-    "DOCTOR": "Doctor Fees",
-    "CONSULT": "Doctor Fees",
-    "CONSULTATION": "Doctor Fees",
-    "LAB": "Clinical Lab Charges",
-    "LIS": "Clinical Lab Charges",
-    "LABORATORY": "Clinical Lab Charges",
-    "PHM": "Pharmacy Charges (Medicines)",
-    "PHARM": "Pharmacy Charges (Medicines)",
-    "PHARMACY": "Pharmacy Charges (Medicines)",
-    "RX": "Pharmacy Charges (Medicines)",
-    "MED": "Pharmacy Charges (Medicines)",
-    "ADM": "Admission Charges",
-    "ADMISSION": "Admission Charges",
-    "ROOM": "Observation / Room Charges",
-    "BED": "Observation / Room Charges",
-    "WARD": "Observation / Room Charges",
-    "BLOOD": "Blood Bank Charges",
-    "BLOODBANK": "Blood Bank Charges",
-    "BB": "Blood Bank Charges",
-    "DIET": "Dietary Charges",
-    "DIETARY": "Dietary Charges",
-    "PHC": "Pharmacy Charges (Consumables)",
-    "CONSUMABLES": "Pharmacy Charges (Consumables)",
-    "CONSUMABLE": "Pharmacy Charges (Consumables)",
-    "CONSUM": "Pharmacy Charges (Consumables)",
-    "PROC": "Procedure Charges",
-    "PROCEDURE": "Procedure Charges",
-    "SCAN": "Scan Charges",
-    "RAD": "Scan Charges",
-    "RIS": "Scan Charges",
-    "SURG": "Surgery Charges",
-    "SURGERY": "Surgery Charges",
-    "OT": "Surgery Charges",
-    "XRAY": "X-Ray Charges",
-    "X-RAY": "X-Ray Charges",
-    "MISC": "Miscellaneous Charges",
-    "OTHER": "Miscellaneous Charges",
-}
-
-MODULE_ORDER: list[str] = [
-    "ADM", "ROOM", "DOC", "LAB", "BLOOD", "DIET", "PHM", "PHC", "PROC", "SCAN",
-    "XRAY", "SURG", "MISC"
-]
-
-
-def _module_label(code: str) -> str:
-    c = (code or "").strip().upper()
-    return MODULE_LABELS.get(c, "Miscellaneous Charges")
-
-
-def _module_order_key(code: str) -> int:
-    c = (code or "").strip().upper()
-    try:
-        return MODULE_ORDER.index(c)
-    except Exception:
-        return 999
-
-
-# ---------------------------
 # Payload: Overview (Module-wise compact) + FIX payments
 # ---------------------------
 def _advance_consumed_from_applications(
         db: Session, case_id: int) -> tuple[Decimal, Optional[datetime]]:
-    """
-    ✅ fallback for advance consumed amount even if not stored as BillingPayment(kind=ADVANCE_ADJUSTMENT)
-    """
     if BillingAdvanceApplication is None:
         return Decimal("0"), None
     try:
@@ -799,6 +834,63 @@ def _build_overview_payload(
     gst_total = Decimal("0")
     round_off_total = Decimal("0")
 
+    # keep your existing mapping tables exactly as-is (unchanged)
+    MODULE_LABELS: Dict[str, str] = {
+        "DOC": "Doctor Fees",
+        "DOCTOR": "Doctor Fees",
+        "CONSULT": "Doctor Fees",
+        "CONSULTATION": "Doctor Fees",
+        "LAB": "Clinical Lab Charges",
+        "LIS": "Clinical Lab Charges",
+        "LABORATORY": "Clinical Lab Charges",
+        "PHM": "Pharmacy Charges (Medicines)",
+        "PHARM": "Pharmacy Charges (Medicines)",
+        "PHARMACY": "Pharmacy Charges (Medicines)",
+        "RX": "Pharmacy Charges (Medicines)",
+        "MED": "Pharmacy Charges (Medicines)",
+        "ADM": "Admission Charges",
+        "ADMISSION": "Admission Charges",
+        "ROOM": "Observation / Room Charges",
+        "BED": "Observation / Room Charges",
+        "WARD": "Observation / Room Charges",
+        "BLOOD": "Blood Bank Charges",
+        "BLOODBANK": "Blood Bank Charges",
+        "BB": "Blood Bank Charges",
+        "DIET": "Dietary Charges",
+        "DIETARY": "Dietary Charges",
+        "PHC": "Pharmacy Charges (Consumables)",
+        "CONSUMABLES": "Pharmacy Charges (Consumables)",
+        "CONSUMABLE": "Pharmacy Charges (Consumables)",
+        "CONSUM": "Pharmacy Charges (Consumables)",
+        "PROC": "Procedure Charges",
+        "PROCEDURE": "Procedure Charges",
+        "SCAN": "Scan Charges",
+        "RAD": "Scan Charges",
+        "RIS": "Scan Charges",
+        "SURG": "Surgery Charges",
+        "SURGERY": "Surgery Charges",
+        "OT": "Surgery Charges",
+        "XRAY": "X-Ray Charges",
+        "X-RAY": "X-Ray Charges",
+        "MISC": "Miscellaneous Charges",
+        "OTHER": "Miscellaneous Charges",
+    }
+    MODULE_ORDER: list[str] = [
+        "ADM", "ROOM", "DOC", "LAB", "BLOOD", "DIET", "PHM", "PHC", "PROC",
+        "SCAN", "XRAY", "SURG", "MISC"
+    ]
+
+    def _module_label(code: str) -> str:
+        c = (code or "").strip().upper()
+        return MODULE_LABELS.get(c, "Miscellaneous Charges")
+
+    def _module_order_key(code: str) -> int:
+        c = (code or "").strip().upper()
+        try:
+            return MODULE_ORDER.index(c)
+        except Exception:
+            return 999
+
     for inv in invoices:
         mod_code = (getattr(inv, "module", None) or "MISC").strip().upper()
         label = _module_label(mod_code)
@@ -830,7 +922,6 @@ def _build_overview_payload(
     } for k, v in modules_map.items()]
     modules.sort(key=lambda m: _module_order_key(m["code"]))
 
-    # ---- payments (include advance adjustment)
     pays = (db.query(BillingPayment).filter(
         BillingPayment.billing_case_id == case.id).order_by(
             BillingPayment.received_at.asc()).all())
@@ -877,7 +968,6 @@ def _build_overview_payload(
                 })
                 continue
 
-            # receipt or unknown kind => normal receipt
             receipts_total += amt
             receipt_no = _safe(getattr(p, "receipt_number", None))
             if receipt_no == "—":
@@ -893,14 +983,10 @@ def _build_overview_payload(
                 float(amt),
             })
 
-    # ✅ fallback: advance applied from applications table (if payments didn’t store it)
     adv_app_total, adv_app_last_dt = _advance_consumed_from_applications(
         db, case.id)
-
-    # ✅ avoid double count: take MAX (if both represent same consumption)
     consumed_advance = max(adv_adjusted_total, adv_app_total)
 
-    # if we derived from applications and we didn't have a row, add one for clarity
     if consumed_advance > 0 and not has_adv_row and adv_adjusted_total == 0:
         payment_rows.append({
             "receipt_number":
@@ -913,12 +999,10 @@ def _build_overview_payload(
             float(consumed_advance),
         })
 
-    # ✅ payment received = cash receipts + advance consumed
     payment_received_total = receipts_total + consumed_advance
     effective_paid = payment_received_total - refunds_total
     balance = total_bill - effective_paid
 
-    # ---- advances summary (show gross advance paid)
     adv_rows = (db.query(BillingAdvance).filter(
         BillingAdvance.billing_case_id == case.id).order_by(
             BillingAdvance.entry_at.asc()).all())
@@ -961,9 +1045,7 @@ def _build_overview_payload(
             "refunds": float(refunds_total),
             "effective_paid": float(effective_paid),
             "balance": float(balance),
-            "advance_consumed": float(consumed_advance),  # ✅ helpful debug
-
-            # ✅ words
+            "advance_consumed": float(consumed_advance),
             "total_bill_words": _amount_in_words_inr(total_bill),
             "payment_received_words":
             _amount_in_words_inr(payment_received_total),
@@ -981,6 +1063,209 @@ def _build_overview_payload(
         },
     }
     return payload
+
+
+def _build_payments_ledger_payload(db: Session,
+                                   case: BillingCase) -> Dict[str, Any]:
+    pays = (db.query(BillingPayment).filter(
+        BillingPayment.billing_case_id == case.id).order_by(
+            BillingPayment.received_at.asc()).all())
+
+    rows: list[dict[str, Any]] = []
+    total_in = Decimal("0")
+    total_out = Decimal("0")
+
+    for p in pays:
+        status = getattr(p, "status", None)
+        if status is not None and not _eq_enum(status, ReceiptStatus.ACTIVE):
+            # govt print: show only ACTIVE receipts
+            continue
+
+        direction = getattr(p, "direction", None)
+        kind = getattr(p, "kind", None)
+        amt = _dec(getattr(p, "amount", 0))
+
+        is_out = _eq_enum(direction, PaymentDirection.OUT) or _eq_enum(
+            kind, PaymentKind.REFUND)
+        if is_out:
+            total_out += amt
+        else:
+            total_in += amt
+
+        receipt_no = _safe(getattr(p, "receipt_number", None))
+        if receipt_no == "—":
+            receipt_no = _safe(getattr(p, "txn_ref", None))
+        if receipt_no == "—":
+            receipt_no = "RCPT"
+
+        rows.append({
+            "receipt_number": receipt_no,
+            "mode": _safe(_val(getattr(p, "mode", None))),
+            "kind": _safe(_val(kind)),
+            "direction": "OUT" if is_out else "IN",
+            "date": _fmt_dt(getattr(p, "received_at", None)),
+            "amount": float(amt),
+        })
+
+    return {
+        "rows": rows,
+        "totals": {
+            "received": float(total_in),
+            "refunds": float(total_out),
+            "net": float(total_in - total_out),
+            "received_words": _amount_in_words_inr(total_in),
+            "net_words": _amount_in_words_inr(total_in - total_out),
+        },
+    }
+
+
+def _build_advance_ledger_payload(db: Session,
+                                  case: BillingCase) -> Dict[str, Any]:
+    advs = (db.query(BillingAdvance).filter(
+        BillingAdvance.billing_case_id == case.id).order_by(
+            BillingAdvance.entry_at.asc()).all())
+
+    rows: list[dict[str, Any]] = []
+    net = Decimal("0")
+
+    for a in advs:
+        et = getattr(a, "entry_type", None)
+        amt = _dec(getattr(a, "amount", 0))
+
+        # Sign logic (govt ledger style)
+        # Advance = +, Refund = -, Adjustment = +/- (keep as stored)
+        sign_amt = amt
+        if _eq_enum(et, AdvanceType.REFUND):
+            sign_amt = -abs(amt)
+        elif _eq_enum(et, AdvanceType.ADVANCE):
+            sign_amt = abs(amt)
+
+        net += sign_amt
+
+        ref = _pick_attr(
+            a,
+            "advance_number",
+            "voucher_number",
+            "ref_number",
+            "reference_number",
+            "receipt_number",
+            "txn_ref",
+            default="—",
+        )
+
+        note = _pick_attr(a, "notes", "note", "remark", "remarks", default="—")
+
+        rows.append({
+            "date":
+            _fmt_dt(
+                getattr(a, "entry_at", None)
+                or getattr(a, "created_at", None)),
+            "type":
+            _safe(_val(et)),
+            "reference":
+            ref,
+            "note":
+            note,
+            "amount":
+            float(sign_amt),
+        })
+
+    return {
+        "rows": rows,
+        "totals": {
+            "net": float(net),
+            "net_words": _amount_in_words_inr(net),
+        },
+    }
+
+
+def _try_load_insurance_payload(db: Session,
+                                case: BillingCase) -> Dict[str, Any]:
+    """
+    Optional: Insurance tables may not exist in every installation.
+    We'll try safely and return empty if missing.
+    """
+    out: Dict[str, Any] = {
+        "insurance_case": None,
+        "preauths": [],
+        "claims": []
+    }
+
+    BillingInsuranceCase = BillingPreauthRequest = BillingClaim = None  # type: ignore
+    try:
+        from app.models.billing import BillingInsuranceCase, BillingPreauthRequest, BillingClaim  # type: ignore
+    except Exception:
+        return out
+
+    try:
+        ic = (db.query(BillingInsuranceCase).filter(
+            BillingInsuranceCase.billing_case_id == case.id).order_by(
+                BillingInsuranceCase.id.desc()).first())
+        if ic:
+            out["insurance_case"] = {
+                "payer":
+                _safe(
+                    getattr(ic, "payer_name", None)
+                    or getattr(ic, "payer", None)),
+                "tpa":
+                _safe(
+                    getattr(ic, "tpa_name", None) or getattr(ic, "tpa", None)),
+                "policy_no":
+                _safe(
+                    getattr(ic, "policy_no", None)
+                    or getattr(ic, "policy_number", None)),
+                "member_id":
+                _safe(getattr(ic, "member_id", None)),
+                "uhid":
+                _safe(getattr(case.patient, "uhid", None)) if getattr(
+                    case, "patient", None) else "—",
+                "status":
+                _safe(_val(getattr(ic, "status", None))),
+                "approved_limit":
+                _money(getattr(ic, "approved_limit", None)),
+            }
+
+            preauths = (db.query(BillingPreauthRequest).filter(
+                BillingPreauthRequest.billing_case_id == case.id).order_by(
+                    BillingPreauthRequest.created_at.asc()).all())
+            for p in preauths:
+                out["preauths"].append({
+                    "preauth_no":
+                    _safe(
+                        getattr(p, "preauth_number", None)
+                        or getattr(p, "request_no", None)),
+                    "status":
+                    _safe(_val(getattr(p, "status", None))),
+                    "requested":
+                    _money(getattr(p, "requested_amount", None)),
+                    "approved":
+                    _money(getattr(p, "approved_amount", None)),
+                    "date":
+                    _fmt_dt(getattr(p, "created_at", None)),
+                })
+
+            claims = (db.query(BillingClaim).filter(
+                BillingClaim.billing_case_id == case.id).order_by(
+                    BillingClaim.created_at.asc()).all())
+            for cl in claims:
+                out["claims"].append({
+                    "claim_no":
+                    _safe(
+                        getattr(cl, "claim_number", None)
+                        or getattr(cl, "claim_no", None)),
+                    "status":
+                    _safe(_val(getattr(cl, "status", None))),
+                    "claimed":
+                    _money(getattr(cl, "claimed_amount", None)),
+                    "approved":
+                    _money(getattr(cl, "approved_amount", None)),
+                    "date":
+                    _fmt_dt(getattr(cl, "created_at", None)),
+                })
+
+        return out
+    except Exception:
+        return out
 
 
 # ---------------------------
@@ -1087,7 +1372,6 @@ def _draw_patient_header_block(c: canvas.Canvas, payload: Dict[str, Any],
             ("Discharged On", _safe(enc.get("Discharged On"))),
         ]
 
-    # ✅ consistent label width for both cols
     label_w = 30 * mm
     y1 = _draw_lv_column(c,
                          x=x,
@@ -1104,7 +1388,6 @@ def _draw_patient_header_block(c: canvas.Canvas, payload: Dict[str, Any],
 
     y_end = min(y1, y2)
 
-    # separator rule
     line_y = y_end + 1.2 * mm
     c.setStrokeColor(colors.black)
     c.setLineWidth(0.9)
@@ -1187,6 +1470,715 @@ def _draw_simple_table(
     return cur_y
 
 
+from reportlab.pdfbase.pdfmetrics import stringWidth
+
+
+class _NumberedCanvas(canvas.Canvas):
+    """
+    Page X of Y + Printed Date/Time + Printed By (Govt form footer)
+    """
+
+    def __init__(self,
+                 *args,
+                 printed_at: str = "",
+                 printed_by: str = "",
+                 **kwargs):
+        super().__init__(*args, **kwargs)
+        self._saved_page_states = []
+        self._printed_at = printed_at
+        self._printed_by = printed_by
+
+    def showPage(self):
+        self._saved_page_states.append(dict(self.__dict__))
+        self._startPage()
+
+    def save(self):
+        self._saved_page_states.append(dict(self.__dict__))
+        total = len(self._saved_page_states)
+        for state in self._saved_page_states:
+            self.__dict__.update(state)
+            self._draw_footer(total)
+            canvas.Canvas.showPage(self)
+        canvas.Canvas.save(self)
+
+    def _draw_footer(self, total_pages: int):
+        W, H = self._pagesize
+        M = 10 * mm
+        y = 8.5 * mm
+
+        self.setFont("Helvetica", 8.2)
+        self.setFillColor(colors.black)
+
+        # left: printed date/time
+        if self._printed_at:
+            self.drawString(M, y, f"Printed Date / Time : {self._printed_at}")
+
+        # center: printed by
+        if self._printed_by:
+            mid = W / 2
+            txt = f"Printed By : {self._printed_by}"
+            self.drawCentredString(mid, y, txt)
+
+        # right: page x of y
+        self.drawRightString(W - M, y,
+                             f"Page {self.getPageNumber()} of {total_pages}")
+
+
+def _bill_kind_title(case: BillingCase) -> tuple[str, str]:
+    """
+    Titles like sample:
+    - INPATIENT SUMMARY BILL - CREDIT
+    - INPATIENT DETAIL BILL OF SUPPLY - CREDIT
+    """
+    et = _safe(
+        _val(case.encounter_type) if case.encounter_type else None).upper()
+    pm = case.payer_mode
+    is_credit = (pm is not None and pm != PayerMode.SELF)
+
+    if et == "IP":
+        base = "INPATIENT"
+    elif et == "OP":
+        base = "OUTPATIENT"
+    else:
+        base = "PATIENT"
+
+    kind = "CREDIT" if is_credit else "CASH"
+    return base, kind
+
+
+def _collect_detail_rows(
+        invoices: list[BillingInvoice]) -> dict[str, list[dict[str, Any]]]:
+    MODULE_LABELS: Dict[str, str] = {
+        "ADM": "ADMISSIONS",
+        "ADMISSION": "ADMISSIONS",
+        "ROOM": "BED CHARGES",
+        "BED": "BED CHARGES",
+        "WARD": "BED CHARGES",
+        "BLOOD": "BLOOD BANK",
+        "BB": "BLOOD BANK",
+        "LAB": "CLINICAL LAB CHARGES",
+        "LIS": "CLINICAL LAB CHARGES",
+        "DIET": "DIETARY CHARGES",
+        "DOC": "DOCTOR FEES",
+        "DOCTOR": "DOCTOR FEES",
+        "PHM": "PHARMACY CHARGES",
+        "PHARM": "PHARMACY CHARGES",
+        "PHARMACY": "PHARMACY CHARGES",
+        "PHC": "CONSUMABLES & DISPOSABLES",
+        "CONSUMABLES": "CONSUMABLES & DISPOSABLES",
+        "PROC": "PROCEDURES",
+        "PROCEDURE": "PROCEDURES",
+        "SCAN": "SCAN CHARGES",
+        "RIS": "SCAN CHARGES",
+        "RAD": "SCAN CHARGES",
+        "XRAY": "X RAY CHARGES",
+        "X-RAY": "X RAY CHARGES",
+        "SURG": "SURGERY",
+        "SURGERY": "SURGERY",
+        "OT": "SURGERY",
+        "MISC": "MISCELLANEOUS",
+        "OTHER": "MISCELLANEOUS",
+    }
+
+    def label_for_module(mod: str) -> str:
+        m = (mod or "MISC").strip().upper()
+        return MODULE_LABELS.get(m, "MISCELLANEOUS")
+
+    out: dict[str, list[dict[str, Any]]] = {}
+
+    for inv in invoices:
+        if getattr(inv, "status", None) == DocStatus.VOID:
+            continue
+
+        mod = (getattr(inv, "module", None) or "MISC").strip().upper()
+        grp = label_for_module(mod)
+
+        for ln in list(getattr(inv, "lines", []) or []):
+            meta = _meta(getattr(ln, "meta_json", None))
+
+            # skip deleted/void lines ONLY by meta flags (safe for your model)
+            if meta.get("is_void") is True or meta.get("is_deleted") is True:
+                continue
+
+            dt = (getattr(ln, "service_date", None)
+                  or getattr(inv, "service_date", None)
+                  or getattr(inv, "created_at", None))
+
+            out.setdefault(grp, []).append({
+                "desc":
+                _safe(getattr(ln, "description", None)),
+                "date":
+                _fmt_date(dt),
+                "qty":
+                _safe(getattr(ln, "qty", None)),
+                "amt":
+                _money(getattr(ln, "net_amount", 0)),
+            })
+
+    return out
+
+
+def _collect_pharmacy_split_rows(
+        invoices: list[BillingInvoice]) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for inv in invoices:
+        mod = (getattr(inv, "module", "") or "").upper()
+        is_ph = mod in ("PHM", "PHARM", "PHARMACY")
+        if not is_ph:
+            continue
+
+        bill_no = _safe(getattr(inv, "invoice_number", None))
+        bill_date = _fmt_date(getattr(inv, "created_at", None))
+
+        for ln in list(getattr(inv, "lines", []) or []):
+            meta = _meta(getattr(ln, "meta_json", None))
+            batch_no = _meta_pick(meta, [
+                "batch_no", "batchNo", "batch_number", "batchNumber", "batch"
+            ], "—")
+            exp = _meta_pick(
+                meta,
+                ["expiry_date", "expiryDate", "expiry", "exp_date", "expDate"],
+                "—")
+
+            rows.append([
+                bill_no,
+                bill_date,
+                _safe(getattr(ln, "description", None)),
+                batch_no,
+                exp,
+                _safe(getattr(ln, "qty", None)),
+                _money(getattr(ln, "net_amount", 0)),
+            ])
+    return rows
+
+
+def _load_insurance_block(db: Session, case: BillingCase,
+                          invoices: list[BillingInvoice]) -> dict[str, Any]:
+    """
+    Insurance block like sample:
+    Company | Approval Number | Amount | Total
+    """
+    payer_company = "—"
+    approval_no = "—"
+
+    payer = _payer_block(db, case) or {}
+    if _safe(payer.get("Payer")) != "—":
+        payer_company = _safe(payer.get("Payer"))
+
+    # try insurance tables
+    if BillingInsuranceCase is not None:
+        try:
+            ins = db.query(BillingInsuranceCase).filter(
+                BillingInsuranceCase.billing_case_id == case.id).order_by(
+                    BillingInsuranceCase.id.desc()).first()
+            if ins is not None:
+                # best-effort fields
+                approval_no = _safe(
+                    getattr(ins, "approval_number", None)
+                    or getattr(ins, "preauth_number", None)
+                    or getattr(ins, "policy_number", None))
+                payer_company = _safe(getattr(
+                    ins, "insurer_name", None)) if _safe(
+                        getattr(ins, "insurer_name",
+                                None)) != "—" else payer_company
+        except Exception:
+            pass
+
+    # compute insurer payable from lines
+    insurer_sum = Decimal("0")
+    for inv in invoices:
+        for ln in list(getattr(inv, "lines", []) or []):
+            insurer_sum += _dec(getattr(ln, "insurer_pay_amount", 0))
+            if insurer_sum == 0:
+                insurer_sum += _dec(getattr(ln, "approved_amount", 0))
+
+    return {
+        "company": payer_company,
+        "approval_no": approval_no,
+        "amount": _money(insurer_sum),
+    }
+
+
+def _advance_ledger_rows(db: Session, case_id: int,
+                         overview_payload: dict[str, Any]) -> dict[str, Any]:
+    """
+    Deposit Summary table like sample:
+    Deposit Date | Reference No | Actual Amt | Consumed Amt | Refund Amt | Balance Amt
+    """
+    adv_rows = (db.query(BillingAdvance).filter(
+        BillingAdvance.billing_case_id == case_id).order_by(
+            BillingAdvance.entry_at.asc()).all())
+
+    total_in = Decimal("0")
+    total_ref = Decimal("0")
+
+    # consumed from overview totals
+    consumed = _dec((overview_payload.get("totals")
+                     or {}).get("advance_consumed", 0))
+    available = _dec(((overview_payload.get("advance_summary_row")
+                       or {}).get("available", 0)))
+
+    rows: list[list[str]] = []
+    for a in adv_rows:
+        dt = _fmt_dt(getattr(a, "entry_at", None))
+        ref = _safe(
+            getattr(a, "reference_no", None) or getattr(a, "ref_no", None)
+            or getattr(a, "receipt_number", None)
+            or getattr(a, "txn_ref", None) or getattr(a, "id", None))
+        et = getattr(a, "entry_type", None)
+        amt = _dec(getattr(a, "amount", 0))
+
+        if _eq_enum(et, AdvanceType.ADVANCE):
+            total_in += amt
+            rows.append([dt, ref, _money(amt), "0.00", "0.00", "—"])
+        elif _eq_enum(et, AdvanceType.REFUND):
+            total_ref += amt
+            rows.append([dt, ref, "0.00", "0.00", _money(amt), "—"])
+        else:
+            # adjustment (rare)
+            rows.append([dt, ref, _money(amt), "0.00", "0.00", "—"])
+
+    return {
+        "rows": rows,
+        "total_in": _money(total_in),
+        "total_refund": _money(total_ref),
+        "consumed": _money(consumed),
+        "available": _money(available),
+    }
+
+
+def _render_full_history_pdf_reportlab(
+    *,
+    db: Session,
+    case: BillingCase,
+    invoices: list[BillingInvoice],
+    branding: Optional[UiBranding],
+    overview_payload: dict[str, Any],
+    printed_by: str = "",
+) -> bytes:
+    """
+    ✅ One single PDF (Govt form style) -> Summary + Detail lines + Payments + Insurance + Deposit summary + Pharmacy split up.
+    No PDF merge, no external dependency, no 500.
+    """
+    buf = BytesIO()
+
+    printed_at = datetime.now().strftime("%d/%m/%Y %I:%M %p")
+    c = _NumberedCanvas(buf,
+                        pagesize=A4,
+                        printed_at=printed_at,
+                        printed_by=printed_by)
+    W, H = A4
+
+    M = 10 * mm
+    x0 = M
+    w0 = W - 2 * M
+    bottom = 14 * mm
+
+    base, kind = _bill_kind_title(case)
+    bill_no = _safe(getattr(case, "case_number", None))
+    bill_date = _fmt_dt(getattr(case, "created_at", None))
+
+    header_payload = _build_header_payload(db,
+                                           case,
+                                           doc_no=bill_no,
+                                           doc_date=None)
+
+    # ---------- page header ----------
+    def new_page(title: str) -> float:
+        y = H - M
+        y = _draw_branding_header(c, branding, x0, y, w0)
+        y -= 2 * mm
+
+        # title (govt style)
+        c.setFont("Helvetica-Bold", 10.5)
+        c.setFillColor(colors.black)
+        c.drawCentredString(x0 + w0 / 2, y, title)
+        y -= 5.0 * mm
+
+        # patient block
+        y = _draw_patient_header_block(c, header_payload, x0, y, w0)
+        y -= 3.0 * mm
+        return y
+
+    # ---------- SUMMARY PAGE (like sample page 1) ----------
+    title1 = f"{base} SUMMARY BILL - {kind}"
+    y = new_page(title1)
+
+    # Particulars summary (module totals)
+    modules = (overview_payload.get("modules") or [])
+    sum_rows = [[_safe(m.get("label")),
+                 _money(m.get("total"))] for m in modules] or [["—", "0.00"]]
+
+    y = _draw_simple_table(
+        c,
+        x=x0,
+        y=y,
+        w=w0,
+        cols=[("Particulars", 0.76), ("Total Amount", 0.24)],
+        rows=sum_rows,
+        row_h=7 * mm,
+        bottom_margin=bottom,
+        new_page_fn=lambda: new_page(title1),
+    )
+    y -= 3.0 * mm
+
+    # Totals block (match sample: Exempted/Taxable/GST/RoundOff/Total)
+    totals = overview_payload.get("totals") or {}
+    total_bill = _dec(totals.get("total_bill", 0))
+    taxable = _dec(totals.get("taxable_value", 0))
+    gst = _dec(totals.get("gst", 0))
+    round_off = _dec(totals.get("round_off", 0))
+    total_amt = total_bill
+
+    pre_round = total_amt - round_off  # matches sample math
+    exempted = pre_round if (taxable == 0 and gst == 0) else Decimal("0")
+
+    # Right aligned totals (govt style)
+    def draw_right_total(label: str, val: str, yy: float, bold=False) -> float:
+        c.setFont("Helvetica-Bold" if bold else "Helvetica", 9.2)
+        c.drawRightString(x0 + w0 - 42 * mm, yy, f"{label} :")
+        c.setFont("Helvetica-Bold" if bold else "Helvetica", 9.2)
+        c.drawRightString(x0 + w0, yy, val)
+        return yy - 4.8 * mm
+
+    c.setStrokeColor(colors.black)
+    c.setLineWidth(0.9)
+    c.line(x0, y, x0 + w0, y)
+    y -= 4.0 * mm
+
+    y = draw_right_total("Exempted Value", _money(exempted), y)
+    y = draw_right_total("Taxable Value", _money(taxable), y)
+    y = draw_right_total("GST", _money(gst), y)
+    y = draw_right_total("Round Off", _money(round_off), y)
+    c.setLineWidth(1.1)
+    c.line(x0 + w0 - 70 * mm, y + 2.0 * mm, x0 + w0, y + 2.0 * mm)
+    y = draw_right_total("Total Bill Amount", _money(total_amt), y, bold=True)
+
+    # PAYMENT DETAILS (like sample)
+    pay_rows = overview_payload.get("payment_details") or []
+    if pay_rows:
+        if y - 28 * mm < bottom:
+            c.showPage()
+            y = new_page(title1)
+
+        y -= 3.5 * mm
+        c.setFont("Helvetica-Bold", 9.8)
+        c.drawString(x0, y, "PAYMENT DETAILS")
+        y -= 4.0 * mm
+
+        pr = []
+        total_pay = Decimal("0")
+        for p in pay_rows:
+            amt = _dec(p.get("amount", 0))
+            total_pay += amt
+            pr.append([
+                _safe(p.get("receipt_number")),
+                _safe(p.get("mode")),
+                _safe(p.get("date")),
+                _money(amt),
+            ])
+
+        y = _draw_simple_table(
+            c,
+            x=x0,
+            y=y,
+            w=w0,
+            cols=[("Receipt No", 0.30), ("Paymode", 0.18), ("Date", 0.22),
+                  ("Amount", 0.30)],
+            rows=pr,
+            row_h=7 * mm,
+            bottom_margin=bottom,
+            new_page_fn=lambda: new_page(title1),
+        )
+        y -= 4.0 * mm
+        c.setFont("Helvetica-Bold", 9.2)
+        c.drawRightString(x0 + w0 - 42 * mm, y, "Payment Received :")
+        c.drawRightString(x0 + w0, y, _money(total_pay))
+
+    # INSURANCE DETAILS (like sample)
+    ins = _load_insurance_block(db, case, invoices)
+    if _safe(ins.get("company")) != "—" and _safe(ins.get("amount")) != "0.00":
+        if y - 22 * mm < bottom:
+            c.showPage()
+            y = new_page(title1)
+
+        y -= 4.0 * mm
+        c.setFont("Helvetica-Bold", 9.8)
+        c.drawString(x0, y, "INSURANCE DETAILS")
+        y -= 4.0 * mm
+
+        ins_rows = [[
+            _safe(ins.get("company")),
+            _safe(ins.get("approval_no")),
+            _safe(ins.get("amount"))
+        ]]
+        y = _draw_simple_table(
+            c,
+            x=x0,
+            y=y,
+            w=w0,
+            cols=[("Company", 0.56), ("Approval Number", 0.26),
+                  ("Amount", 0.18)],
+            rows=ins_rows,
+            row_h=7 * mm,
+            bottom_margin=bottom,
+            new_page_fn=lambda: new_page(title1),
+        )
+
+        y -= 4.0 * mm
+        c.setFont("Helvetica-Bold", 9.2)
+        c.drawRightString(x0 + w0 - 42 * mm, y, "Total :")
+        c.drawRightString(x0 + w0, y, _safe(ins.get("amount")))
+
+    # ---------- DETAIL BILL (like sample pages 2..n) ----------
+    c.showPage()
+    title2 = f"{base} DETAIL BILL OF SUPPLY - {kind}"
+    y = new_page(title2)
+
+    # table header for details
+    col_part = 0.62
+    col_date = 0.14
+    col_qty = 0.10
+    col_amt = 0.14
+
+    def draw_detail_header(yy: float) -> float:
+        c.setStrokeColor(colors.black)
+        c.setLineWidth(0.9)
+        h = 7 * mm
+        c.rect(x0, yy - h, w0, h, stroke=1, fill=0)
+        c.setFont("Helvetica-Bold", 9.2)
+        c.drawString(x0 + 2 * mm, yy - h + 2.2 * mm, "Particulars")
+        c.drawString(x0 + w0 * col_part + 2 * mm, yy - h + 2.2 * mm, "Date")
+        c.drawRightString(x0 + w0 * (col_part + col_date + col_qty) - 2 * mm,
+                          yy - h + 2.2 * mm, "Quantity")
+        c.drawRightString(x0 + w0 - 2 * mm, yy - h + 2.2 * mm, "Total Amount")
+
+        # vertical lines
+        vx1 = x0 + w0 * col_part
+        vx2 = x0 + w0 * (col_part + col_date)
+        vx3 = x0 + w0 * (col_part + col_date + col_qty)
+        c.setLineWidth(0.7)
+        c.line(vx1, yy - h, vx1, yy)
+        c.line(vx2, yy - h, vx2, yy)
+        c.line(vx3, yy - h, vx3, yy)
+        return yy - h
+
+    def ensure_space(yy: float, need: float) -> float:
+        if yy - need < bottom:
+            c.showPage()
+            yy = new_page(title2)
+            yy = draw_detail_header(yy)
+        return yy
+
+    y = draw_detail_header(y)
+
+    grouped = _collect_detail_rows(invoices)
+
+    # order groups like sample (common hospital order)
+    GROUP_ORDER = [
+        "ADMISSIONS",
+        "BED CHARGES",
+        "BLOOD BANK",
+        "CLINICAL LAB CHARGES",
+        "CONSUMABLES & DISPOSABLES",
+        "DIETARY CHARGES",
+        "DOCTOR FEES",
+        "PHARMACY CHARGES",
+        "PROCEDURES",
+        "SCAN CHARGES",
+        "SURGERY",
+        "X RAY CHARGES",
+        "MISCELLANEOUS",
+    ]
+
+    def group_key(g: str) -> int:
+        try:
+            return GROUP_ORDER.index(g)
+        except Exception:
+            return 999
+
+    for grp in sorted(grouped.keys(), key=group_key):
+        items = grouped[grp]
+        if not items:
+            continue
+
+        # group header
+        y = ensure_space(y, 10 * mm)
+        y -= 2.8 * mm
+        c.setFont("Helvetica-Bold", 9.6)
+        c.drawString(x0 + 1.0 * mm, y, grp)
+        y -= 2.0 * mm
+        c.setLineWidth(0.6)
+        c.line(x0, y, x0 + 55 * mm, y)  # underline left (like sample)
+        y -= 2.5 * mm
+
+        # rows
+        row_h = 6.0 * mm
+        for r in items:
+            y = ensure_space(y, row_h + 2 * mm)
+
+            # row border (thin)
+            c.setStrokeColor(colors.black)
+            c.setLineWidth(0.5)
+            c.rect(x0, y - row_h, w0, row_h, stroke=1, fill=0)
+
+            # verticals
+            vx1 = x0 + w0 * col_part
+            vx2 = x0 + w0 * (col_part + col_date)
+            vx3 = x0 + w0 * (col_part + col_date + col_qty)
+            c.line(vx1, y - row_h, vx1, y)
+            c.line(vx2, y - row_h, vx2, y)
+            c.line(vx3, y - row_h, vx3, y)
+
+            c.setFont("Helvetica", 9.0)
+
+            # particulars (clip if too long)
+            desc = r["desc"] or "—"
+            max_w = w0 * col_part - 4 * mm
+            while stringWidth(desc, "Helvetica",
+                              9.0) > max_w and len(desc) > 4:
+                desc = desc[:-1]
+            c.drawString(x0 + 2 * mm, y - row_h + 2.0 * mm, desc)
+
+            # date
+            c.drawString(vx1 + 2 * mm, y - row_h + 2.0 * mm, r["date"])
+
+            # qty (right)
+            c.drawRightString(vx3 - 2 * mm, y - row_h + 2.0 * mm, r["qty"])
+
+            # amt (right)
+            c.drawRightString(x0 + w0 - 2 * mm, y - row_h + 2.0 * mm, r["amt"])
+
+            y -= row_h
+
+        y -= 2.0 * mm
+
+    # ---------- FINAL PAGE: Deposit + Bill Abstract (like sample last page) ----------
+    c.showPage()
+    title3 = f"{base} BILL ABSTRACT - {kind}"
+    y = new_page(title3)
+
+    # Deposit Summary
+    adv = _advance_ledger_rows(db, case.id, overview_payload)
+    rows = adv.get("rows") or []
+    if rows:
+        c.setFont("Helvetica-Bold", 9.8)
+        c.drawString(x0, y, "DEPOSIT SUMMARY")
+        y -= 4.0 * mm
+
+        y = _draw_simple_table(
+            c,
+            x=x0,
+            y=y,
+            w=w0,
+            cols=[
+                ("Deposit Date", 0.22),
+                ("Reference No", 0.22),
+                ("Actual Amt", 0.14),
+                ("Consumed Amt", 0.14),
+                ("Refund Amt", 0.14),
+                ("Balance Amt", 0.14),
+            ],
+            rows=rows,
+            row_h=7 * mm,
+            bottom_margin=bottom,
+            new_page_fn=lambda: new_page(title3),
+        )
+        y -= 4.0 * mm
+
+        # totals line
+        c.setFont("Helvetica-Bold", 9.0)
+        c.drawRightString(
+            x0 + w0, y,
+            f"Total Advance : {adv.get('total_in')}    Consumed : {adv.get('consumed')}    Available : {adv.get('available')}"
+        )
+        y -= 6.0 * mm
+
+    # Bill Abstract block (like sample bottom-right)
+    effective_paid = _dec((overview_payload.get("totals")
+                           or {}).get("effective_paid", 0))
+    balance = _dec((overview_payload.get("totals") or {}).get("balance", 0))
+    insurer_amt = _dec((_load_insurance_block(db, case, invoices)
+                        or {}).get("amount", 0))
+
+    if y - 40 * mm < bottom:
+        c.showPage()
+        y = new_page(title3)
+
+    # left signature box
+    box_w = w0 * 0.52
+    box_h = 26 * mm
+    c.setLineWidth(0.8)
+    c.rect(x0, y - box_h, box_w, box_h, stroke=1, fill=0)
+    c.setFont("Helvetica", 9.0)
+    c.drawString(x0 + 3 * mm, y - 6 * mm, "Patient / Attender signature")
+    c.drawString(x0 + 3 * mm, y - 12 * mm, "Name & Relationship")
+    c.drawString(x0 + 3 * mm, y - 18 * mm, "Contact Number")
+
+    # right abstract box
+    rx = x0 + box_w + 8 * mm
+    rw = w0 - (box_w + 8 * mm)
+    c.rect(rx, y - box_h, rw, box_h, stroke=1, fill=0)
+
+    c.setFont("Helvetica-Bold", 9.2)
+    c.drawString(rx + 3 * mm, y - 6 * mm, "Bill Abstract :")
+    c.setFont("Helvetica", 9.0)
+    c.drawRightString(rx + rw - 3 * mm, y - 6 * mm, f"{_money(total_amt)}")
+
+    c.setFont("Helvetica-Bold", 9.0)
+    c.drawString(rx + 3 * mm, y - 12 * mm, "Less Payment Received :")
+    c.drawRightString(rx + rw - 3 * mm, y - 12 * mm, _money(effective_paid))
+
+    c.drawString(rx + 3 * mm, y - 18 * mm, "Balance Amount :")
+    c.drawRightString(rx + rw - 3 * mm, y - 18 * mm, _money(balance))
+
+    # Insurance net payable line (if credit)
+    if insurer_amt > 0:
+        c.drawString(rx + 3 * mm, y - 24 * mm,
+                     "Net Payable by Insurance Company :")
+        c.drawRightString(rx + rw - 3 * mm, y - 24 * mm, _money(insurer_amt))
+
+    y -= (box_h + 10 * mm)
+
+    # Balance in words (like sample)
+    bal_words = _amount_in_words_inr(balance)
+    c.setFont("Helvetica-Bold", 9.0)
+    c.drawString(x0, y, "Balance Amount in Words :")
+    c.setFont("Helvetica", 9.0)
+    c.drawString(x0 + 46 * mm, y, bal_words[:170])
+    y -= 8 * mm
+
+    # ---------- Pharmacy Split Up (optional, like sample separate report) ----------
+    ph_rows = _collect_pharmacy_split_rows(invoices)
+    if ph_rows:
+        c.showPage()
+        title4 = "PHARMACY SPLIT UP REPORT"
+        y = new_page(title4)
+
+        y = _draw_simple_table(
+            c,
+            x=x0,
+            y=y,
+            w=w0,
+            cols=[
+                ("Bill No", 0.16),
+                ("Bill Date", 0.12),
+                ("Item Name", 0.36),
+                ("Batch No", 0.12),
+                ("Expiry Date", 0.10),
+                ("Qty", 0.06),
+                ("Item Amount", 0.08),
+            ],
+            rows=ph_rows,
+            row_h=7 * mm,
+            bottom_margin=bottom,
+            new_page_fn=lambda: new_page(title4),
+        )
+
+    c.save()
+    return buf.getvalue()
+
+
 # ---------------------------
 # PDFs
 # ---------------------------
@@ -1236,7 +2228,6 @@ def _render_overview_pdf_reportlab(payload: Dict[str, Any],
     y = _draw_patient_header_block(c, payload, x0, y, w0)
     y -= 4 * mm
 
-    # ✅ module table (no duplicate "Particulars" heading)
     modules = payload.get("modules") or []
     part_rows = [[_safe(m.get("label")),
                   _money(m.get("total"))] for m in modules] or [["—", "0.00"]]
@@ -1292,7 +2283,6 @@ def _render_overview_pdf_reportlab(payload: Dict[str, Any],
     y = total_line("Round Off :", round_off, y)
     y = total_line("Total Bill Amount :", total_bill, y, bold=True)
 
-    # ✅ Total Bill amount in words
     y -= 3.5 * mm
     c.setFont("Helvetica-Bold", 9.2)
     c.drawString(x0, y, "In Words :")
@@ -1306,7 +2296,6 @@ def _render_overview_pdf_reportlab(payload: Dict[str, Any],
         yy -= 4.6 * mm
     y = yy - 2.0 * mm
 
-    # PAYMENT DETAILS
     pay_rows = payload.get("payment_details") or []
     if pay_rows:
         if y - 22 * mm < bottom:
@@ -1341,13 +2330,11 @@ def _render_overview_pdf_reportlab(payload: Dict[str, Any],
             new_page_fn=new_page,
         )
 
-        # Payment received value
         y -= 4.0 * mm
         c.setFont("Helvetica-Bold", 9.4)
         c.drawRightString(x0 + w0 - 42 * mm, y, "Total Payment Received :")
         c.drawRightString(x0 + w0, y, payment_received)
 
-        # Payment words
         y -= 5.5 * mm
         c.setFont("Helvetica-Bold", 9.2)
         c.drawString(x0, y, "In Words :")
@@ -1359,7 +2346,6 @@ def _render_overview_pdf_reportlab(payload: Dict[str, Any],
             yy -= 4.6 * mm
         y = yy - 2.0 * mm
 
-    # ADVANCE SUMMARY
     adv = payload.get("advance_summary_row") or {}
     if adv and (_dec(adv.get("total_advance")) != Decimal("0")
                 or _dec(adv.get("consumed")) != Decimal("0")):
@@ -1396,7 +2382,6 @@ def _render_overview_pdf_reportlab(payload: Dict[str, Any],
         )
         y -= 3.0 * mm
 
-    # Balance amount + words
     if y - 18 * mm < bottom:
         c.showPage()
         y = new_page()
@@ -1419,6 +2404,317 @@ def _render_overview_pdf_reportlab(payload: Dict[str, Any],
     for ln in bal_lines[:3]:
         c.drawString(x_words, yy, ln)
         yy -= 4.6 * mm
+
+    c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+def _render_payments_ledger_pdf_reportlab(
+    payload: Dict[str, Any],
+    branding: Optional[UiBranding],
+    payments_payload: Dict[str, Any],
+) -> bytes:
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    W, H = A4
+    M = 10 * mm
+    x0 = M
+    w0 = W - 2 * M
+    bottom = 14 * mm
+
+    def new_page(title: str) -> float:
+        y0 = H - M
+        y0 = _draw_branding_header(c, branding, x0, y0, w0)
+        y0 -= 2 * mm
+        y0 = _draw_patient_header_block(c, payload, x0, y0, w0)
+        y0 -= 3 * mm
+        c.setFont("Helvetica-Bold", 10.0)
+        c.drawCentredString(x0 + w0 / 2, y0, title)
+        y0 -= 5 * mm
+        return y0
+
+    y = new_page("PAYMENT RECEIPTS LEDGER")
+
+    rows = []
+    for r in payments_payload.get("rows") or []:
+        rows.append([
+            _safe(r.get("receipt_number")),
+            _safe(r.get("mode")),
+            _safe(r.get("kind")),
+            _safe(r.get("direction")),
+            _safe(r.get("date")),
+            _money(r.get("amount")),
+        ])
+
+    if not rows:
+        rows = [["—", "—", "—", "—", "—", "0.00"]]
+
+    y = _draw_simple_table(
+        c,
+        x=x0,
+        y=y,
+        w=w0,
+        cols=[
+            ("Receipt No", 0.18),
+            ("Mode", 0.12),
+            ("Kind", 0.18),
+            ("Dir", 0.08),
+            ("Date/Time", 0.26),
+            ("Amount", 0.18),
+        ],
+        rows=rows,
+        row_h=7 * mm,
+        bottom_margin=bottom,
+        new_page_fn=lambda: new_page("PAYMENT RECEIPTS LEDGER (Cont.)"),
+    )
+
+    y -= 4 * mm
+    if y - 18 * mm < bottom:
+        c.showPage()
+        y = new_page("PAYMENT RECEIPTS LEDGER (Summary)")
+
+    t = payments_payload.get("totals") or {}
+    c.setStrokeColor(colors.black)
+    c.setLineWidth(0.8)
+    c.line(x0, y, x0 + w0, y)
+    y -= 5 * mm
+
+    def line(label: str, val: str, bold: bool = False):
+        nonlocal y
+        c.setFont("Helvetica-Bold" if bold else "Helvetica", 9.4)
+        c.drawRightString(x0 + w0 - 42 * mm, y, label)
+        c.setFont("Helvetica-Bold" if bold else "Helvetica", 9.4)
+        c.drawRightString(x0 + w0, y, val)
+        y -= 5 * mm
+
+    line("Total Received :", _money(t.get("received")), bold=True)
+    line("Total Refunds :", _money(t.get("refunds")))
+    line("Net Received :", _money(t.get("net")), bold=True)
+
+    y -= 2 * mm
+    c.setFont("Helvetica-Bold", 9.2)
+    c.drawString(x0, y, "In Words :")
+    c.setFont("Helvetica", 9.2)
+    words = _safe(t.get("net_words") or "")
+    for ln in simpleSplit(words, "Helvetica", 9.2, w0 - 22 * mm)[:3]:
+        c.drawString(x0 + 18 * mm, y, ln)
+        y -= 4.6 * mm
+
+    c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+def _render_advance_ledger_pdf_reportlab(
+    payload: Dict[str, Any],
+    branding: Optional[UiBranding],
+    adv_payload: Dict[str, Any],
+) -> bytes:
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    W, H = A4
+    M = 10 * mm
+    x0 = M
+    w0 = W - 2 * M
+    bottom = 14 * mm
+
+    def new_page(title: str) -> float:
+        y0 = H - M
+        y0 = _draw_branding_header(c, branding, x0, y0, w0)
+        y0 -= 2 * mm
+        y0 = _draw_patient_header_block(c, payload, x0, y0, w0)
+        y0 -= 3 * mm
+        c.setFont("Helvetica-Bold", 10.0)
+        c.drawCentredString(x0 + w0 / 2, y0, title)
+        y0 -= 5 * mm
+        return y0
+
+    y = new_page("ADVANCE LEDGER")
+
+    rows = []
+    for r in adv_payload.get("rows") or []:
+        rows.append([
+            _safe(r.get("date")),
+            _safe(r.get("type")),
+            _safe(r.get("reference")),
+            _safe(r.get("note")),
+            _money(r.get("amount")),
+        ])
+    if not rows:
+        rows = [["—", "—", "—", "—", "0.00"]]
+
+    y = _draw_simple_table(
+        c,
+        x=x0,
+        y=y,
+        w=w0,
+        cols=[
+            ("Date/Time", 0.22),
+            ("Type", 0.14),
+            ("Reference", 0.20),
+            ("Note", 0.28),
+            ("Amount", 0.16),
+        ],
+        rows=rows,
+        row_h=7 * mm,
+        bottom_margin=bottom,
+        new_page_fn=lambda: new_page("ADVANCE LEDGER (Cont.)"),
+    )
+
+    y -= 4 * mm
+    if y - 16 * mm < bottom:
+        c.showPage()
+        y = new_page("ADVANCE LEDGER (Summary)")
+
+    t = adv_payload.get("totals") or {}
+    c.setStrokeColor(colors.black)
+    c.setLineWidth(0.8)
+    c.line(x0, y, x0 + w0, y)
+    y -= 5 * mm
+
+    c.setFont("Helvetica-Bold", 9.6)
+    c.drawRightString(x0 + w0 - 42 * mm, y, "Net Advance Balance :")
+    c.drawRightString(x0 + w0, y, _money(t.get("net")))
+    y -= 6 * mm
+
+    c.setFont("Helvetica-Bold", 9.2)
+    c.drawString(x0, y, "In Words :")
+    c.setFont("Helvetica", 9.2)
+    words = _safe(t.get("net_words") or "")
+    for ln in simpleSplit(words, "Helvetica", 9.2, w0 - 22 * mm)[:3]:
+        c.drawString(x0 + 18 * mm, y, ln)
+        y -= 4.6 * mm
+
+    c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+def _render_insurance_pdf_reportlab(
+    payload: Dict[str, Any],
+    branding: Optional[UiBranding],
+    ins_payload: Dict[str, Any],
+) -> bytes:
+    # If no insurance at all, return empty bytes (we will skip it)
+    if not ins_payload or (not ins_payload.get("insurance_case")
+                           and not ins_payload.get("preauths")
+                           and not ins_payload.get("claims")):
+        return b""
+
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    W, H = A4
+    M = 10 * mm
+    x0 = M
+    w0 = W - 2 * M
+    bottom = 14 * mm
+
+    def new_page(title: str) -> float:
+        y0 = H - M
+        y0 = _draw_branding_header(c, branding, x0, y0, w0)
+        y0 -= 2 * mm
+        y0 = _draw_patient_header_block(c, payload, x0, y0, w0)
+        y0 -= 3 * mm
+        c.setFont("Helvetica-Bold", 10.0)
+        c.drawCentredString(x0 + w0 / 2, y0, title)
+        y0 -= 5 * mm
+        return y0
+
+    y = new_page("INSURANCE")
+
+    ic = ins_payload.get("insurance_case")
+    if ic:
+        # mini govt key/value block
+        c.setFont("Helvetica-Bold", 9.6)
+        c.drawString(x0, y, "Insurance Case")
+        y -= 4.5 * mm
+
+        def kv(label: str, val: str):
+            nonlocal y
+            c.setFont("Helvetica-Bold", 9.0)
+            c.drawString(x0, y, f"{label} :")
+            c.setFont("Helvetica", 9.0)
+            c.drawString(x0 + 32 * mm, y, _safe(val))
+            y -= 4.8 * mm
+
+        kv("Payer", ic.get("payer"))
+        kv("TPA", ic.get("tpa"))
+        kv("Policy No", ic.get("policy_no"))
+        kv("Member ID", ic.get("member_id"))
+        kv("Status", ic.get("status"))
+        kv("Approved Limit", ic.get("approved_limit"))
+
+        y -= 2 * mm
+        c.setStrokeColor(colors.black)
+        c.setLineWidth(0.8)
+        c.line(x0, y, x0 + w0, y)
+        y -= 5 * mm
+
+    preauths = ins_payload.get("preauths") or []
+    if preauths:
+        if y - 20 * mm < bottom:
+            c.showPage()
+            y = new_page("INSURANCE (Preauth)")
+        c.setFont("Helvetica-Bold", 9.8)
+        c.drawString(x0, y, "PREAUTH REQUESTS")
+        y -= 4 * mm
+
+        rows = []
+        for p in preauths:
+            rows.append([
+                _safe(p.get("preauth_no")),
+                _safe(p.get("status")),
+                _safe(p.get("date")),
+                _safe(p.get("requested")),
+                _safe(p.get("approved")),
+            ])
+
+        y = _draw_simple_table(
+            c,
+            x=x0,
+            y=y,
+            w=w0,
+            cols=[("Preauth No", 0.22), ("Status", 0.16), ("Date", 0.26),
+                  ("Requested", 0.18), ("Approved", 0.18)],
+            rows=rows,
+            row_h=7 * mm,
+            bottom_margin=bottom,
+            new_page_fn=lambda: new_page("INSURANCE (Preauth Cont.)"),
+        )
+        y -= 5 * mm
+
+    claims = ins_payload.get("claims") or []
+    if claims:
+        if y - 20 * mm < bottom:
+            c.showPage()
+            y = new_page("INSURANCE (Claims)")
+        c.setFont("Helvetica-Bold", 9.8)
+        c.drawString(x0, y, "CLAIMS")
+        y -= 4 * mm
+
+        rows = []
+        for cl in claims:
+            rows.append([
+                _safe(cl.get("claim_no")),
+                _safe(cl.get("status")),
+                _safe(cl.get("date")),
+                _safe(cl.get("claimed")),
+                _safe(cl.get("approved")),
+            ])
+
+        y = _draw_simple_table(
+            c,
+            x=x0,
+            y=y,
+            w=w0,
+            cols=[("Claim No", 0.22), ("Status", 0.16), ("Date", 0.26),
+                  ("Claimed", 0.18), ("Approved", 0.18)],
+            rows=rows,
+            row_h=7 * mm,
+            bottom_margin=bottom,
+            new_page_fn=lambda: new_page("INSURANCE (Claims Cont.)"),
+        )
 
     c.showPage()
     c.save()
@@ -1517,3 +2813,200 @@ def billing_overview_pdf(
     return StreamingResponse(BytesIO(pdf_bytes),
                              media_type="application/pdf",
                              headers=headers)
+
+
+# ✅ FIX 1: ADD ROUTE DECORATOR
+# ✅ FIX 2: make invoice_id a PATH param
+@router.get("/invoices/{invoice_id}/pdf")
+def billing_invoice_pdf(
+        invoice_id: int = FPath(..., gt=0),
+        disposition: str = Query("inline", pattern="^(inline|attachment)$"),
+        paper: str = Query("A4", pattern="^(A3|A4|A5)$"),
+        orientation: str = Query("portrait", pattern="^(portrait|landscape)$"),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    _need_any(user, ["billing.view", "billing.cases.view", "billing.print"])
+
+    inv = (db.query(BillingInvoice).options(
+        selectinload(BillingInvoice.lines),
+        joinedload(BillingInvoice.billing_case),
+    ).filter(BillingInvoice.id == int(invoice_id)).first())
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+
+    # UiBranding (safe tenant filter if column exists)
+    branding_q = db.query(UiBranding)
+    tenant_id = getattr(user, "tenant_id", None) or getattr(
+        user, "hospital_id", None)
+    if tenant_id is not None and hasattr(UiBranding, "tenant_id"):
+        branding_q = branding_q.filter(UiBranding.tenant_id == tenant_id)
+    if hasattr(UiBranding, "is_active"):
+        branding_q = branding_q.filter(UiBranding.is_active.is_(True))
+    branding = branding_q.order_by(UiBranding.id.desc()).first()
+
+    # Load full case + patient + addresses for the patient header block
+    case = None
+    try:
+        cid = getattr(inv, "billing_case_id", None) or getattr(
+            getattr(inv, "billing_case", None), "id", None)
+        if cid:
+            case = _load_case(db, int(cid))
+    except Exception:
+        case = None
+
+    patient = getattr(case, "patient", None) if case else None
+
+    payer_type = str(
+        getattr(getattr(inv, "payer_type", None), "value",
+                getattr(inv, "payer_type", "")) or "")
+    payer_label = payer_type.title() if payer_type else "Patient"
+
+    doc_no = _safe(getattr(inv, "invoice_number", None) or f"INV-{invoice_id}")
+    created_at = getattr(inv, "created_at", None)
+    doc_date = created_at.date() if isinstance(created_at, datetime) else None
+
+    header_payload = None
+    if case is not None:
+        header_payload = _build_header_payload(db,
+                                               case,
+                                               doc_no=doc_no,
+                                               doc_date=doc_date)
+
+    # ✅ paper + orientation are passed through to build_invoice_pdf (your pdf builder must accept them)
+    pdf_bytes = build_invoice_pdf(
+        invoice=inv,
+        lines=list(getattr(inv, "lines", []) or []),
+        branding=branding,
+        patient=patient,
+        payer_label=payer_label,
+        header_payload=header_payload,
+        paper=paper,
+        orientation=orientation,
+    )
+
+    filename = f"Invoice_{getattr(inv, 'invoice_number', invoice_id)}.pdf"
+    headers = {"Content-Disposition": f'{disposition}; filename="{filename}"'}
+    return StreamingResponse(BytesIO(pdf_bytes),
+                             media_type="application/pdf",
+                             headers=headers)
+
+
+@router.get("/full-history/data")
+def billing_full_history_data(
+        case_id: int = Query(..., gt=0),
+        doc_no: Optional[str] = Query(None),
+        doc_date: Optional[date] = Query(None),
+        include_draft_invoices: bool = Query(True),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    _need_any(user, ["billing.view", "billing.cases.view", "billing.print"])
+    case = _load_case(db, case_id)
+
+    overview = _build_overview_payload(
+        db,
+        case,
+        doc_no=doc_no,
+        doc_date=doc_date,
+        include_draft_invoices=include_draft_invoices,
+    )
+
+    invoices = _list_case_invoices(
+        db, case.id, include_draft_invoices=include_draft_invoices)
+    payments_ledger = _build_payments_ledger_payload(db, case)
+    advance_ledger = _build_advance_ledger_payload(db, case)
+    insurance = _try_load_insurance_payload(db, case)
+
+    inv_rows = []
+    for inv in invoices:
+        inv_rows.append({
+            "invoice_number":
+            _safe(getattr(inv, "invoice_number", None)),
+            "module":
+            _safe(getattr(inv, "module", None)),
+            "invoice_type":
+            _safe(_val(getattr(inv, "invoice_type", None))),
+            "status":
+            _safe(_val(getattr(inv, "status", None))),
+            "created_at":
+            _fmt_dt(getattr(inv, "created_at", None)),
+            "grand_total":
+            float(_dec(getattr(inv, "grand_total", 0))),
+        })
+
+    return {
+        "kind": "FULL_HISTORY",
+        "case_id": int(case.id),
+        "case_number": _safe(getattr(case, "case_number", None)),
+        "overview": overview,
+        "invoices": inv_rows,
+        "payments_ledger": payments_ledger,
+        "advance_ledger": advance_ledger,
+        "insurance": insurance,
+    }
+
+
+@router.get("/full-history")
+def billing_full_history_pdf(
+        case_id: int = Query(..., gt=0),
+        doc_no: Optional[str] = Query(None),
+        doc_date: Optional[date] = Query(None),
+        include_draft_invoices: bool = Query(True),
+        disposition: str = Query("inline", pattern="^(inline|attachment)$"),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    """
+    ✅ Govt form Full Bill History:
+    Summary + Detail Lines + Payments + Deposits + Insurance + Pharmacy Split-Up
+    """
+    _need_any(user, ["billing.view", "billing.cases.view", "billing.print"])
+    try:
+        case = _load_case(db, case_id)
+        branding = _load_branding(db)
+
+        inv_q = (db.query(BillingInvoice).options(
+            selectinload(BillingInvoice.lines)).filter(
+                BillingInvoice.billing_case_id == case.id,
+                BillingInvoice.status
+                != DocStatus.VOID).order_by(BillingInvoice.created_at.asc()))
+        if not include_draft_invoices:
+            inv_q = inv_q.filter(BillingInvoice.status != DocStatus.DRAFT)
+        invoices = inv_q.all()
+
+        overview_payload = _build_overview_payload(
+            db,
+            case,
+            doc_no=doc_no,
+            doc_date=doc_date,
+            include_draft_invoices=include_draft_invoices,
+        )
+
+        printed_by = _safe(
+            getattr(user, "name", None) or getattr(user, "full_name", None)
+            or getattr(user, "username", None))
+
+        pdf_bytes = _render_full_history_pdf_reportlab(
+            db=db,
+            case=case,
+            invoices=invoices,
+            branding=branding,
+            overview_payload=overview_payload,
+            printed_by=printed_by if printed_by != "—" else "",
+        )
+
+        filename = f"Billing_FullHistory_{_safe(getattr(case, 'case_number', None))}.pdf"
+        headers = {
+            "Content-Disposition": f'{disposition}; filename="{filename}"'
+        }
+        return StreamingResponse(BytesIO(pdf_bytes),
+                                 media_type="application/pdf",
+                                 headers=headers)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        # ✅ shows real reason instead of silent 500
+        raise HTTPException(status_code=500,
+                            detail=f"Full history PDF failed: {str(e)}")

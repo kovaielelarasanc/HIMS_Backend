@@ -187,17 +187,18 @@ def _pick_procedures_to_bill(sched: OtSchedule) -> List[OtProcedure]:
 
 def _instrument_bill_qty(line: OtCaseInstrumentCountLine) -> int:
     """
-    ✅ Default billing logic:
+    Default billing logic:
       billable_qty = initial_qty + added_qty
-    (Because these are the instruments “opened/used for the case”)
-
     If you want strict “consumed/missing” billing:
       return max(0, (initial + added) - final)
     """
     initial_ = int(getattr(line, "initial_qty", 0) or 0)
     added_ = int(getattr(line, "added_qty", 0) or 0)
-    qty = initial_ + added_
-    return max(0, (initial_ + added_) - final_)
+    final_ = int(getattr(line, "final_qty", 0) or 0)
+
+    # choose ONE rule:
+    return max(0, initial_ + added_)            # ✅ opened/used billing
+    # return max(0, (initial_ + added_) - final_)  # ✅ missing/consumed billing
 
 
 def create_ot_invoice_items_for_case(db: Session, *, case_id: int, user):
