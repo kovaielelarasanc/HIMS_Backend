@@ -47,6 +47,13 @@ from app.models.ui_branding import UiBranding
 
 # ✅ payer masters
 from app.models.payer import Payer, Tpa, CreditPlan  # type: ignore
+from sqlalchemy.inspection import inspect as sa_inspect
+
+# Optional: Department lookup fallback
+try:
+    from app.models.department import Department  # type: ignore
+except Exception:
+    Department = None  # type: ignore
 
 # (Optional) Weasy helpers (only if installed)
 brand_header_css = None
@@ -174,6 +181,14 @@ def _safe(v: Any) -> str:
         return "—"
     s = str(v).strip()
     return s if s else "—"
+
+
+def _has_rel(model: Any, rel_name: str) -> bool:
+    """True only if rel_name is a SQLAlchemy relationship on model."""
+    try:
+        return rel_name in sa_inspect(model).relationships
+    except Exception:
+        return False
 
 
 def _dec(v: Any) -> Decimal:
@@ -449,19 +464,31 @@ def _load_op_context(db: Session, encounter_id: int) -> Dict[str, str]:
     if Visit is None:
         return out
 
-    v = (db.query(Visit).options(
-        selectinload(Visit.appointment),
-        selectinload(Visit.doctor),
-        selectinload(Visit.department),
-    ).filter(Visit.id == encounter_id).first())
+    q = db.query(Visit)
+
+    # Apply loader options ONLY if these are relationships
+    opts = []
+    if _has_rel(Visit, "appointment"):
+        opts.append(selectinload(Visit.appointment))
+    if _has_rel(Visit, "doctor"):
+        opts.append(selectinload(Visit.doctor))
+    if _has_rel(Visit, "department"):
+        opts.append(selectinload(Visit.department))
+
+    if opts:
+        q = q.options(*opts)
+
+    v = q.filter(Visit.id == encounter_id).first()
     if not v:
         return out
 
-    visit_no = getattr(v, "episode_id", None) or getattr(v, "op_no",
-                                                         None) or None
+    visit_no = getattr(v, "episode_id", None) or getattr(
+        v, "op_no", None) or getattr(v, "visit_no", None)
     out["Visit Id"] = _safe(visit_no)
 
-    appt = getattr(v, "appointment", None)
+    # Appointment date/time
+    appt = getattr(v, "appointment", None) if _has_rel(Visit,
+                                                       "appointment") else None
     if appt is not None:
         appt_date = getattr(appt, "date", None)
         slot_start = getattr(appt, "slot_start", None)
@@ -470,16 +497,31 @@ def _load_op_context(db: Session, encounter_id: int) -> Dict[str, str]:
         elif appt_date:
             out["Appointment On"] = _fmt_date(appt_date)
 
-        doc = getattr(appt, "doctor", None) or getattr(v, "doctor", None)
-        dept = getattr(appt, "department", None) or getattr(
-            v, "department", None)
-        out["Doctor"] = _safe(getattr(doc, "name", None))
-        out["Department"] = _safe(getattr(dept, "name", None))
+    # Doctor (relationship OR id fallback)
+    doc_obj = getattr(v, "doctor", None) if _has_rel(Visit, "doctor") else None
+    if doc_obj is not None and hasattr(doc_obj, "name"):
+        out["Doctor"] = _safe(getattr(doc_obj, "name", None))
     else:
-        doc = getattr(v, "doctor", None)
-        dept = getattr(v, "department", None)
-        out["Doctor"] = _safe(getattr(doc, "name", None))
-        out["Department"] = _safe(getattr(dept, "name", None))
+        doc_id = getattr(v, "doctor_id", None) or getattr(
+            v, "practitioner_user_id", None)
+        if doc_id:
+            doc = db.query(User).filter(User.id == int(doc_id)).first()
+            if doc:
+                out["Doctor"] = _safe(getattr(doc, "name", None))
+
+    # Department (relationship OR id fallback)
+    dept_obj = getattr(v, "department", None) if _has_rel(
+        Visit, "department") else None
+    if dept_obj is not None and hasattr(dept_obj, "name"):
+        out["Department"] = _safe(getattr(dept_obj, "name", None))
+    else:
+        dept_id = getattr(v, "department_id", None) or getattr(
+            v, "dept_id", None)
+        if dept_id and Department is not None:
+            d = db.query(Department).filter(
+                Department.id == int(dept_id)).first()
+            if d:
+                out["Department"] = _safe(getattr(d, "name", None))
 
     return out
 
@@ -498,11 +540,31 @@ def _load_ip_context(db: Session, encounter_id: int) -> Dict[str, str]:
     if IpdAdmission is None:
         return out
 
-    q = db.query(IpdAdmission).options(
-        selectinload(IpdAdmission.current_bed).selectinload(
-            IpdBed.room).selectinload(IpdRoom.ward),
-        selectinload(IpdAdmission.department),
-    )
+    q = db.query(IpdAdmission)
+
+    opts = []
+
+    # ✅ Bed → Room → Ward (apply only if they are relationships)
+    if _has_rel(IpdAdmission, "current_bed"):
+        bed_opt = selectinload(IpdAdmission.current_bed)
+
+        if IpdBed is not None and _has_rel(IpdBed, "room"):
+            room_opt = bed_opt.selectinload(IpdBed.room)
+
+            if IpdRoom is not None and _has_rel(IpdRoom, "ward"):
+                room_opt = room_opt.selectinload(IpdRoom.ward)
+
+            bed_opt = room_opt
+
+        opts.append(bed_opt)
+
+    # ✅ Department relationship (only if relationship exists)
+    if _has_rel(IpdAdmission, "department"):
+        opts.append(selectinload(IpdAdmission.department))
+
+    if opts:
+        q = q.options(*opts)
+
     adm = q.filter(IpdAdmission.id == encounter_id).first()
     if not adm:
         return out
@@ -513,21 +575,45 @@ def _load_ip_context(db: Session, encounter_id: int) -> Dict[str, str]:
     out["Admitted On"] = _fmt_dt(getattr(adm, "admitted_at", None))
     out["Discharged On"] = _fmt_dt(getattr(adm, "discharge_at", None))
 
-    practitioner_id = getattr(adm, "practitioner_user_id", None)
+    # Doctor fallback
+    practitioner_id = getattr(adm, "practitioner_user_id", None) or getattr(
+        adm, "doctor_id", None)
     if practitioner_id:
-        doc = db.query(User).filter(User.id == practitioner_id).first()
-        out["Admission Doctor"] = _safe(getattr(doc, "name", None))
+        doc = db.query(User).filter(User.id == int(practitioner_id)).first()
+        if doc:
+            out["Admission Doctor"] = _safe(getattr(doc, "name", None))
 
-    dept = getattr(adm, "department", None)
-    out["Department"] = _safe(getattr(dept, "name", None))
+    # Department name (relationship OR department_id fallback)
+    dept_name = "—"
+    if _has_rel(IpdAdmission, "department"):
+        dept_obj = getattr(adm, "department", None)
+        if dept_obj is not None and hasattr(dept_obj, "name"):
+            dept_name = _safe(getattr(dept_obj, "name", None))
 
-    bed = getattr(adm, "current_bed", None)
+    if dept_name == "—":
+        dept_id = getattr(adm, "department_id", None) or getattr(
+            adm, "dept_id", None)
+        if dept_id and Department is not None:
+            d = db.query(Department).filter(
+                Department.id == int(dept_id)).first()
+            if d:
+                dept_name = _safe(getattr(d, "name", None))
+
+    out["Department"] = dept_name
+
+    # Bed / Room / Ward (relationship chain)
+    bed = getattr(adm, "current_bed", None) if _has_rel(
+        IpdAdmission, "current_bed") else None
     if bed is not None:
         out["Bed"] = _safe(getattr(bed, "code", None))
-        room = getattr(bed, "room", None)
+
+        room = getattr(bed, "room", None) if (
+            IpdBed is not None and _has_rel(IpdBed, "room")) else None
         if room is not None:
             out["Room"] = _safe(getattr(room, "number", None))
-            ward = getattr(room, "ward", None)
+
+            ward = getattr(room, "ward", None) if (
+                IpdRoom is not None and _has_rel(IpdRoom, "ward")) else None
             if ward is not None:
                 out["Ward"] = _safe(getattr(ward, "name", None))
 
