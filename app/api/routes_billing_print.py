@@ -17,7 +17,7 @@ from reportlab.lib.units import mm
 from reportlab.lib import colors
 from reportlab.lib.utils import simpleSplit, ImageReader
 from reportlab.pdfgen import canvas
-
+from typing import Iterable, Union
 from app.api.deps import get_db, current_user
 from app.core.config import settings
 
@@ -104,14 +104,33 @@ except Exception:
 
 router = APIRouter(prefix="/billing/print", tags=["Billing Print"])
 
-
 # ---------------------------
 # Permissions (safe fallback)
 # ---------------------------
-def _need_any(user: User, perms: list[str]) -> None:
+
+from typing import Iterable, Union
+
+
+def _perm_code(x: Any) -> Optional[str]:
+    if x is None:
+        return None
+    if isinstance(x, str):
+        return x.strip()
+    return (getattr(x, "code", None) or getattr(x, "name", None)
+            or "").strip() or None
+
+
+def _need_any(user: User, perms: Union[str, Iterable[str]]) -> None:
+    # accept "billing.view" or ["billing.view", ...]
+    if isinstance(perms, str):
+        perms = [perms]
+    else:
+        perms = list(perms)
+
     if getattr(user, "is_admin", False):
         return
 
+    # 1) preferred method if your User has it
     fn = getattr(user, "has_perm", None)
     if callable(fn):
         for p in perms:
@@ -121,10 +140,27 @@ def _need_any(user: User, perms: list[str]) -> None:
             except Exception:
                 pass
 
-    perms_list = getattr(user, "permissions", None) or []
-    perms_set = set(perms_list) if isinstance(perms_list,
-                                              (list, tuple, set)) else set()
-    if any(p in perms_set for p in perms):
+    # 2) Collect codes from user.permissions (if any)
+    codes: set[str] = set()
+    try:
+        for item in (getattr(user, "permissions", None) or []):
+            c = _perm_code(item)
+            if c:
+                codes.add(c)
+    except Exception:
+        pass
+
+    # 3) ✅ Collect codes from roles -> role.permissions (THIS is what your /me/permissions uses)
+    try:
+        for role in (getattr(user, "roles", None) or []):
+            for item in (getattr(role, "permissions", None) or []):
+                c = _perm_code(item)
+                if c:
+                    codes.add(c)
+    except Exception:
+        pass
+
+    if any(p in codes for p in perms):
         return
 
     raise HTTPException(status_code=403, detail="Not permitted")
@@ -2823,7 +2859,7 @@ def billing_common_header_data(
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
 ):
-    _need_any(user, ["billing.view", "billing.cases.view", "billing.print"])
+    _need_any(user, ["billing.view"])
     case = _load_case(db, case_id)
     return _build_header_payload(db, case, doc_no=doc_no, doc_date=doc_date)
 
@@ -2837,7 +2873,7 @@ def billing_common_header_pdf(
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
 ):
-    _need_any(user, ["billing.view", "billing.cases.view", "billing.print"])
+    _need_any(user, ["billing.view"])
     case = _load_case(db, case_id)
     branding = _load_branding(db)
 
@@ -2860,7 +2896,7 @@ def billing_overview_data(
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
 ):
-    _need_any(user, ["billing.view", "billing.cases.view", "billing.print"])
+    _need_any(user, ["billing.view"])
     case = _load_case(db, case_id)
     return _build_overview_payload(
         db,
@@ -2881,7 +2917,7 @@ def billing_overview_pdf(
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
 ):
-    _need_any(user, ["billing.view", "billing.cases.view", "billing.print"])
+    _need_any(user, ["billing.view"])
     case = _load_case(db, case_id)
     branding = _load_branding(db)
 
@@ -2912,7 +2948,7 @@ def billing_invoice_pdf(
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
 ):
-    _need_any(user, ["billing.view", "billing.cases.view", "billing.print"])
+    _need_any(user, ["billing.view"])
 
     inv = (db.query(BillingInvoice).options(
         selectinload(BillingInvoice.lines),
@@ -2987,7 +3023,7 @@ def billing_full_history_data(
         db: Session = Depends(get_db),
         user: User = Depends(current_user),
 ):
-    _need_any(user, ["billing.view", "billing.cases.view", "billing.print"])
+    _need_any(user, ["billing.view"])
     case = _load_case(db, case_id)
 
     overview = _build_overview_payload(
@@ -3047,7 +3083,7 @@ def billing_full_history_pdf(
     ✅ Govt form Full Bill History:
     Summary + Detail Lines + Payments + Deposits + Insurance + Pharmacy Split-Up
     """
-    _need_any(user, ["billing.view", "billing.cases.view", "billing.print"])
+    _need_any(user, ["billing.view"])
     try:
         case = _load_case(db, case_id)
         branding = _load_branding(db)
