@@ -88,10 +88,19 @@ class ServiceGroup(str, enum.Enum):
     RAD = "RAD"
     PHARM = "PHARM"
     OT = "OT"
-    PROC = "PROC"
     ROOM = "ROOM"
+    PROC = "PROC"
     NURSING = "NURSING"
+    SURGEON = "SURGEON"
+    ANESTHESIA= "ANESTHESIA"
+    OT_DOCTOR = "OT_DOCTOR"
     MISC = "MISC"
+    OPD = "OPD"
+    IPD = "IPD"
+    GENERAL = "GENERAL"
+    BLOOD = "BLOOD"
+    DIET = "DIET"
+
 
 
 class CoverageFlag(str, enum.Enum):

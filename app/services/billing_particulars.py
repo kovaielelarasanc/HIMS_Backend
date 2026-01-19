@@ -135,7 +135,7 @@ class ParticularMeta:
 
 
 PARTICULARS: List[ParticularMeta] = [
-    ParticularMeta("ADM", "ADMISSIONS CHARGES", "ADM", ServiceGroup.MISC,
+    ParticularMeta("ADM", "ADMISSIONS CHARGES", "ADM", ServiceGroup.IPD,
                    InvoiceType.PATIENT, "CHARGE_ITEM"),
     ParticularMeta("ROOM", "OBSERVATION/BED CHARGES", "ROOM",
                    ServiceGroup.ROOM, InvoiceType.PATIENT, "BED"),
@@ -143,7 +143,7 @@ PARTICULARS: List[ParticularMeta] = [
                    InvoiceType.PATIENT, "LAB_TEST"),
     ParticularMeta("PHC", "CONSUMBLES & DISPOSABLES CHARGES", "PHC",
                    ServiceGroup.PHARM, InvoiceType.PATIENT, "MANUAL"),
-    ParticularMeta("DIET", "DIETRY CHARGES", "DIET", ServiceGroup.MISC,
+    ParticularMeta("DIET", "DIETRY CHARGES", "DIET", ServiceGroup.DIET,
                    InvoiceType.PATIENT, "CHARGE_ITEM"),
     ParticularMeta("DOC", "DOCTOR CHARGES", "DOC", ServiceGroup.CONSULT,
                    InvoiceType.PATIENT, "DOCTOR"),
@@ -159,7 +159,7 @@ PARTICULARS: List[ParticularMeta] = [
                    InvoiceType.PATIENT, "RAD_TEST"),
     ParticularMeta("MISC", "MISCELLANEOUS CHARGES", "MISC", ServiceGroup.MISC,
                    InvoiceType.PATIENT, "CHARGE_ITEM"),
-    ParticularMeta("BLOOD", "BLOOD BANK", "BLOOD", ServiceGroup.MISC,
+    ParticularMeta("BLOOD", "BLOOD BANK", "BLOOD", ServiceGroup.BLOOD,
                    InvoiceType.PATIENT, "CHARGE_ITEM"),
     # --- NEW: OT Masters as separate Billing module headings ---
     ParticularMeta("OTT", "OT THEATER CHARGES", "OTT", ServiceGroup.OT,

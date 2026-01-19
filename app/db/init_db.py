@@ -244,6 +244,9 @@ def seed_permissions(db: Session) -> None:
         "billing.invoices.create",
         "masters.charge_items.view",
         "masters.charge_items.manage",
+        "billing.invoice.lines.edit",
+        "billing.invoice.lines.delete",
+        "billing.invoice.reopen",
     ]
 
     from app.models.permission import Permission
