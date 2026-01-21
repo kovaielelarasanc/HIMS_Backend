@@ -766,5 +766,6 @@ def my_permissions(
     modules = {}
     for code, label, module in perms:
         modules.setdefault(module, []).append({"code": code, "label": label})
+    
 
     return {"modules": modules}

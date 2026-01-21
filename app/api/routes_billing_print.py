@@ -1529,34 +1529,54 @@ def _draw_simple_table(
     w: float,
     cols: list[tuple[str, float]],
     rows: list[list[str]],
-    row_h: float = 7 * mm,
+    row_h: float = 7 * mm,  # treated as MIN row height now
     bottom_margin: float = 14 * mm,
     new_page_fn=None,
+
+    # ✅ new optional UI controls (won't break existing calls)
+    aligns: Optional[list[str]] = None,  # "left" | "right" | "center"
+    max_lines: int = 2,  # wrap lines up to this
+    zebra: bool = True,
 ) -> float:
     col_widths = [w * r for _, r in cols]
-    head_h = row_h
+
+    # typography + padding
+    head_font = ("Helvetica-Bold", 9.2)
+    body_font = ("Helvetica", 9.1)
+    lead = 11.2  # points
+    pad_x = 2.2 * mm
+    pad_y = 1.6 * mm
 
     def draw_header(cur_y: float) -> float:
-        c.setFont("Helvetica-Bold", 9.2)
-        c.setFillColor(colors.black)
-        c.setStrokeColor(colors.black)
+        h = row_h
+        c.setFillColor(HEAD_FILL)
+        c.setStrokeColor(GRID)
         c.setLineWidth(0.9)
-        c.rect(x, cur_y - head_h, w, head_h, stroke=1, fill=0)
+        c.rect(x, cur_y - h, w, h, stroke=1, fill=1)
+
+        c.setFillColor(INK)
+        c.setFont(*head_font)
 
         xx = x
         for (title, _), cw in zip(cols, col_widths):
-            c.drawString(xx + 2.0 * mm, cur_y - head_h + 2.2 * mm, title)
+            tw = cw - 2 * pad_x
+            t = _clip_text(str(title or ""), head_font[0], head_font[1], tw)
+            c.drawString(xx + pad_x, cur_y - h + (h - head_font[1]) / 2 - 0.5,
+                         t)
             xx += cw
 
+        # verticals
+        c.setStrokeColor(GRID)
+        c.setLineWidth(0.7)
         xx = x
         for cw in col_widths[:-1]:
             xx += cw
-            c.line(xx, cur_y - head_h, xx, cur_y)
+            c.line(xx, cur_y - h, xx, cur_y)
 
-        return cur_y - head_h
+        return cur_y - h
 
-    def ensure(cur_y: float, need: float) -> float:
-        if cur_y - need < bottom_margin:
+    def ensure(cur_y: float, need_h: float) -> float:
+        if cur_y - need_h < bottom_margin:
             if callable(new_page_fn):
                 c.showPage()
                 cur_y = new_page_fn()
@@ -1566,33 +1586,160 @@ def _draw_simple_table(
             cur_y = draw_header(cur_y)
         return cur_y
 
+    def cell_align(j: int, txt: Any) -> str:
+        if aligns and j < len(aligns) and aligns[j] in ("left", "right",
+                                                        "center"):
+            return aligns[j]
+        # auto: numbers right-aligned remind “perfect alignment”
+        return "right" if _is_number_like(txt) else "left"
+
+    # header
     cur_y = draw_header(y)
-    c.setFont("Helvetica", 9.2)
+    c.setFont(*body_font)
 
-    for r in rows:
-        cur_y = ensure(cur_y, row_h + 2 * mm)
+    for i, r in enumerate(rows or []):
+        # measure wrapped lines per cell -> decide row height
+        cell_lines: list[list[str]] = []
+        max_needed_lines = 1
 
-        c.setStrokeColor(colors.black)
-        c.setLineWidth(0.7)
-        c.rect(x, cur_y - row_h, w, row_h, stroke=1, fill=0)
+        for j, cw in enumerate(col_widths):
+            raw = "" if j >= len(r) else ("" if r[j] is None else str(r[j]))
+            raw = raw.strip() if raw.strip() else "—"
 
+            available_w = max(8.0, cw - 2 * pad_x)
+
+            # wrap if needed
+            lines = simpleSplit(raw, body_font[0], body_font[1],
+                                available_w) or [raw]
+            # if a single "word" is too long, split won't help → clip
+            if len(lines) == 1 and stringWidth(lines[0], body_font[0],
+                                               body_font[1]) > available_w:
+                lines = [
+                    _clip_text(lines[0], body_font[0], body_font[1],
+                               available_w)
+                ]
+
+            lines = _cap_lines_with_ellipsis(lines, max_lines, body_font[0],
+                                             body_font[1], available_w)
+
+            cell_lines.append(lines)
+            max_needed_lines = max(max_needed_lines, len(lines))
+
+        # compute dynamic row height
+        dyn_h = max(row_h, (pad_y * 2) + (max_needed_lines * lead))
+        cur_y = ensure(cur_y, dyn_h + 2 * mm)
+
+        # row background
+        if zebra and (i % 2 == 1):
+            c.setFillColor(ZEBRA_FILL)
+            c.setStrokeColor(GRID_SOFT)
+            c.setLineWidth(0.7)
+            c.rect(x, cur_y - dyn_h, w, dyn_h, stroke=1, fill=1)
+        else:
+            c.setFillColor(colors.white)
+            c.setStrokeColor(GRID_SOFT)
+            c.setLineWidth(0.7)
+            c.rect(x, cur_y - dyn_h, w, dyn_h, stroke=1, fill=0)
+
+        # verticals
+        c.setStrokeColor(GRID_SOFT)
+        c.setLineWidth(0.6)
         xx = x
         for cw in col_widths[:-1]:
             xx += cw
-            c.line(xx, cur_y - row_h, xx, cur_y)
+            c.line(xx, cur_y - dyn_h, xx, cur_y)
 
+        # text
+        baseline_top = cur_y - pad_y - body_font[1]  # top baseline inside cell
         xx = x
+        c.setFillColor(INK)
+        c.setFont(*body_font)
+
         for j, cw in enumerate(col_widths):
-            txt = "" if j >= len(r) else ("" if r[j] is None else str(r[j]))
-            c.drawString(xx + 2.0 * mm, cur_y - row_h + 2.0 * mm, txt[:200])
+            al = cell_align(j, (r[j] if j < len(r) else ""))
+            lines = cell_lines[j]
+            for li, line in enumerate(lines):
+                yy = baseline_top - (li * lead)
+                if al == "right":
+                    c.drawRightString(xx + cw - pad_x, yy, line)
+                elif al == "center":
+                    c.drawCentredString(xx + cw / 2, yy, line)
+                else:
+                    c.drawString(xx + pad_x, yy, line)
             xx += cw
 
-        cur_y -= row_h
+        cur_y -= dyn_h
 
     return cur_y
 
 
 from reportlab.pdfbase.pdfmetrics import stringWidth
+# ---- Premium PDF UI tokens (ReportLab) ----
+INK = colors.HexColor("#0f172a")  # slate-900
+MUTED = colors.HexColor("#475569")  # slate-600
+GRID = colors.HexColor("#94a3b8")  # slate-400
+GRID_SOFT = colors.HexColor("#cbd5e1")  # slate-300
+HEAD_FILL = colors.HexColor("#f1f5f9")  # slate-100
+ZEBRA_FILL = colors.HexColor("#f8fafc")  # slate-50
+
+
+def _is_number_like(v: Any) -> bool:
+    if v is None:
+        return False
+    s = str(v).strip()
+    if not s:
+        return False
+    s = s.replace(",", "")
+    try:
+        Decimal(s)
+        return True
+    except Exception:
+        return False
+
+
+def _clip_text(txt: str, font: str, size: float, max_w: float) -> str:
+    """Clip to width with ellipsis (… )"""
+    t = (txt or "").strip()
+    if not t:
+        return "—"
+    if stringWidth(t, font, size) <= max_w:
+        return t
+    ell = "…"
+    # keep at least 1 char
+    cut = t
+    while cut and stringWidth(cut + ell, font, size) > max_w:
+        cut = cut[:-1]
+    return (cut + ell) if cut else ell
+
+
+def _cap_lines_with_ellipsis(lines: list[str], max_lines: int, font: str,
+                             size: float, max_w: float) -> list[str]:
+    if not lines:
+        return ["—"]
+    if len(lines) <= max_lines:
+        return lines
+    keep = lines[:max_lines]
+    # add ellipsis to last line
+    keep[-1] = _clip_text(keep[-1], font, size, max_w)
+    if not keep[-1].endswith("…"):
+        keep[-1] = _clip_text(keep[-1] + "…", font, size, max_w)
+    return keep
+
+
+def _draw_section_bar(c: canvas.Canvas, *, x: float, y: float, w: float,
+                      title: str) -> float:
+    """Small premium section header bar"""
+    h = 7.5 * mm
+    c.setFillColor(HEAD_FILL)
+    c.setStrokeColor(GRID_SOFT)
+    c.setLineWidth(0.7)
+    c.roundRect(x, y - h, w, h, radius=2.5 * mm, stroke=1, fill=1)
+
+    c.setFillColor(INK)
+    c.setFont("Helvetica-Bold", 9.6)
+    c.drawString(x + 3.0 * mm, y - h + 2.3 * mm, (title or "").strip().upper())
+
+    return (y - h - 2.5 * mm)
 
 
 class _NumberedCanvas(canvas.Canvas):
@@ -1933,15 +2080,16 @@ def _render_full_history_pdf_reportlab(
 
     y = _draw_simple_table(
         c,
-        x=x0,
-        y=y,
-        w=w0,
+        x=x0, y=y, w=w0,
         cols=[("Particulars", 0.76), ("Total Amount", 0.24)],
         rows=sum_rows,
         row_h=7 * mm,
         bottom_margin=bottom,
         new_page_fn=lambda: new_page(title1),
+        aligns=["left", "right"],     # ✅
+        max_lines=2,
     )
+
     y -= 3.0 * mm
 
     # Totals block (match sample: Exempted/Taxable/GST/RoundOff/Total)
@@ -1984,9 +2132,7 @@ def _render_full_history_pdf_reportlab(
             y = new_page(title1)
 
         y -= 3.5 * mm
-        c.setFont("Helvetica-Bold", 9.8)
-        c.drawString(x0, y, "PAYMENT DETAILS")
-        y -= 4.0 * mm
+        y = _draw_section_bar(c, x=x0, y=y, w=w0, title="Payment Details")
 
         pr = []
         total_pay = Decimal("0")
@@ -2002,16 +2148,16 @@ def _render_full_history_pdf_reportlab(
 
         y = _draw_simple_table(
             c,
-            x=x0,
-            y=y,
-            w=w0,
-            cols=[("Receipt No", 0.30), ("Paymode", 0.18), ("Date", 0.22),
-                  ("Amount", 0.30)],
+            x=x0, y=y, w=w0,
+            cols=[("Receipt No", 0.30), ("Paymode", 0.18), ("Date", 0.22), ("Amount", 0.30)],
             rows=pr,
             row_h=7 * mm,
             bottom_margin=bottom,
             new_page_fn=lambda: new_page(title1),
+            aligns=["left", "left", "left", "right"],   # ✅
+            max_lines=2,
         )
+
         y -= 4.0 * mm
         c.setFont("Helvetica-Bold", 9.2)
         c.drawRightString(x0 + w0 - 42 * mm, y, "Payment Received :")
@@ -2036,16 +2182,18 @@ def _render_full_history_pdf_reportlab(
         ]]
         y = _draw_simple_table(
             c,
-            x=x0,
-            y=y,
-            w=w0,
-            cols=[("Company", 0.56), ("Approval Number", 0.26),
-                  ("Amount", 0.18)],
-            rows=ins_rows,
+            x=x0, y=y, w=w0,
+            cols=[("Bill No", 0.16), ("Bill Date", 0.12), ("Item Name", 0.36),
+                ("Batch No", 0.12), ("Expiry Date", 0.10), ("Qty", 0.06), ("Item Amount", 0.08)],
+            rows=ph_rows,
             row_h=7 * mm,
             bottom_margin=bottom,
-            new_page_fn=lambda: new_page(title1),
+            new_page_fn=lambda: new_page(title4),
+            aligns=["left", "left", "left", "left", "left", "right", "right"],  # ✅
+            max_lines=2,
         )
+
+
 
         y -= 4.0 * mm
         c.setFont("Helvetica-Bold", 9.2)

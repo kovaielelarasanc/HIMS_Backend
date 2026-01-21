@@ -14,7 +14,8 @@ from app.models.charge_item_master import ChargeItemMaster
 from enum import Enum
 from fastapi.responses import StreamingResponse
 from io import BytesIO
-
+from sqlalchemy.orm import aliased
+from app.services.billing_finance import BillingStateError
 from app.models.ui_branding import UiBranding
 from app.services.pdfs.billing_case_export import build_full_case_pdf
 
@@ -234,6 +235,76 @@ MODULE_COLUMNS = {
         },
     ],
 }
+
+
+def get_billing_case_view(db, case_id: int):
+    RefUser = aliased(User)
+
+    row = (db.query(BillingCase, Patient, RefUser).join(
+        Patient, Patient.id == BillingCase.patient_id).outerjoin(
+            RefUser, RefUser.id == BillingCase.referral_user_id).filter(
+                BillingCase.id == int(case_id)).first())
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Billing case not found")
+
+    bc, p, ref = row
+
+    patient_name = " ".join([
+        x for x in [
+            getattr(p, "prefix", None),
+            getattr(p, "first_name", None),
+            getattr(p, "last_name", None)
+        ] if x
+    ]) or None
+
+    return {
+        "id":
+        bc.id,
+        "case_number":
+        bc.case_number,
+        "status":
+        bc.status.value if hasattr(bc.status, "value") else bc.status,
+        "payer_mode":
+        bc.payer_mode.value
+        if hasattr(bc.payer_mode, "value") else bc.payer_mode,
+        "encounter_type":
+        bc.encounter_type.value
+        if hasattr(bc.encounter_type, "value") else bc.encounter_type,
+        "encounter_id":
+        bc.encounter_id,
+        "patient_id":
+        bc.patient_id,
+        "patient_name":
+        patient_name,
+        "uhid":
+        getattr(p, "uhid", None),
+        "phone":
+        getattr(p, "phone", None),
+
+        # ✅ referral display fields
+        "referral_user_id":
+        bc.referral_user_id,
+        "referral_user_name": (ref.name if ref else None),
+        "referral_notes":
+        bc.referral_notes,
+
+        # existing fields if you want
+        "default_payer_type":
+        bc.default_payer_type,
+        "default_payer_id":
+        bc.default_payer_id,
+        "default_tpa_id":
+        bc.default_tpa_id,
+        "default_credit_plan_id":
+        bc.default_credit_plan_id,
+        "notes":
+        bc.notes,
+        "created_at":
+        bc.created_at,
+        "updated_at":
+        bc.updated_at,
+    }
 
 
 def _now_utc():
@@ -1301,7 +1372,8 @@ def _normalize_module(module: Optional[str]) -> str:
 
 
 def _case_to_dict(c: BillingCase,
-                  p: Optional[Patient] = None) -> Dict[str, Any]:
+                  p: Optional[Patient] = None,
+                  ref_user: Optional[User] = None) -> Dict[str, Any]:
     uhid_col = _patient_uhid_col()
     phone_col = _patient_phone_col()
     first_col, last_col, full_col = _patient_name_cols()
@@ -1326,6 +1398,12 @@ def _case_to_dict(c: BillingCase,
         if phone_col is not None:
             phone = getattr(p, phone_col.key, None)
 
+    # ✅ referral name (no raw id in UI)
+    referral_user_name = None
+    if ref_user is not None:
+        referral_user_name = (getattr(ref_user, "full_name", None) or getattr(
+            ref_user, "name", None) or "").strip() or None
+
     return {
         "id": int(c.id),
         "case_number": c.case_number,
@@ -1346,6 +1424,7 @@ def _case_to_dict(c: BillingCase,
         "default_tpa_id": getattr(c, "default_tpa_id", None),
         "default_credit_plan_id": getattr(c, "default_credit_plan_id", None),
         "referral_user_id": getattr(c, "referral_user_id", None),
+        "referral_user_name": referral_user_name,  # ✅ NEW
         "referral_notes": getattr(c, "referral_notes", None),
         "created_at": c.created_at.isoformat() if c.created_at else None,
         "updated_at": c.updated_at.isoformat() if c.updated_at else None,
@@ -1979,10 +2058,10 @@ def list_cases(
     try:
         page = max(int(page or 1), 1)
         page_size = min(max(int(page_size or 20), 1), 100)
-
-        qry = db.query(BillingCase,
-                       Patient).join(Patient,
-                                     BillingCase.patient_id == Patient.id)
+        RefUser = aliased(User)
+        qry = (db.query(BillingCase, Patient, RefUser).join(
+            Patient, BillingCase.patient_id == Patient.id).outerjoin(
+                RefUser, RefUser.id == BillingCase.referral_user_id))
 
         if encounter_type:
             et = encounter_type.strip().upper()
@@ -2046,11 +2125,13 @@ def list_cases(
                 qry = qry.filter(or_(*conds))
 
         total = qry.with_entities(func.count(BillingCase.id)).scalar() or 0
+
         rows = qry.order_by(desc(BillingCase.created_at)).offset(
             (page - 1) * page_size).limit(page_size).all()
 
         return {
-            "items": [_case_to_dict(c, p) for (c, p) in rows],
+            "items":
+            [_case_to_dict(c, p, ref) for (c, p, ref) in rows],  # ✅ pass ref
             "total": int(total),
             "page": page,
             "page_size": page_size
@@ -2060,20 +2141,21 @@ def list_cases(
 
 
 @router.get("/cases/{case_id}")
-def get_case_detail(
-        case_id: int,
-        db: Session = Depends(get_db),
-        user: User = Depends(current_user),
-):
+def get_case_detail(case_id: int,
+                    db: Session = Depends(get_db),
+                    user: User = Depends(current_user)):
     try:
-        row = (db.query(BillingCase, Patient).join(
-            Patient, BillingCase.patient_id == Patient.id).filter(
-                BillingCase.id == int(case_id)).first())
+        RefUser = aliased(User)
+
+        row = (db.query(BillingCase, Patient, RefUser).join(
+            Patient, BillingCase.patient_id == Patient.id).outerjoin(
+                RefUser, RefUser.id == BillingCase.referral_user_id).filter(
+                    BillingCase.id == int(case_id)).first())
         if not row:
             raise HTTPException(status_code=404,
                                 detail="Billing case not found")
 
-        c, p = row
+        c, p, ref = row
 
         posted_total = (db.query(
             func.coalesce(func.sum(BillingInvoice.grand_total), 0)).filter(
@@ -2086,7 +2168,7 @@ def get_case_detail(
 
         balance = Decimal(str(posted_total)) - Decimal(str(paid_total))
 
-        out = _case_to_dict(c, p)
+        out = _case_to_dict(c, p, ref)  # ✅ pass ref
         out["totals"] = {
             "posted_invoice_total": str(posted_total or 0),
             "paid_total": str(paid_total or 0),
@@ -2822,23 +2904,27 @@ def approve(
 
 
 @router.post("/invoices/{invoice_id}/post")
-def post(
-        invoice_id: int,
-        db: Session = Depends(get_db),
-        user: User = Depends(current_user),
-):
+def post(invoice_id: int,
+         db: Session = Depends(get_db),
+         user: User = Depends(current_user)):
     try:
         _get_invoice_or_404(db, user, invoice_id)
-
-        # ✅ IMPORTANT: make billing_service.post_invoice return (inv, claim)
         inv, claim = post_invoice(db, invoice_id=invoice_id, user=user)
-
         db.commit()
         return {
             "id": int(inv.id),
             "status": _enum_value(inv.status),
-            "claim": claim_to_dict(claim) if claim else None,
+            "claim": claim_to_dict(claim) if claim else None
         }
+
+    except BillingStateError as e:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(e))
+
+    except HTTPException:
+        db.rollback()
+        raise
+
     except Exception as e:
         db.rollback()
         _err(e)

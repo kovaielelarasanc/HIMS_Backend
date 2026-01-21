@@ -185,17 +185,50 @@ def normalize_invoice_line_splits(db: Session, *, invoice_id: int) -> None:
     db.flush()
 
 
+def _is_insurance_context(db: Session, inv: BillingInvoice) -> bool:
+    case = db.query(BillingCase).filter(
+        BillingCase.id == int(inv.billing_case_id)).first()
+    if not case:
+        return False
+
+    pm = str(_enum_value(getattr(case, "payer_mode", "") or "")).upper()
+    pt = str(_enum_value(getattr(inv, "payer_type", "") or "")).upper()
+
+    # 보험 케이스가 필요한 경우만 True
+    if pm in {"INSURANCE"}:
+        return True
+    if pt in {"TPA", "INSURER", "INSURANCE"}:
+        return True
+
+    return False
+
+
+def _normalize_self_invoice_lines(db: Session, *, invoice_id: int) -> None:
+    """
+    SELF invoice safety:
+    - insurer_pay_amount must be 0
+    - requires_preauth must be False
+    (prevents accidental insurance gating on SELF)
+    """
+    lines = db.query(BillingInvoiceLine).filter(
+        BillingInvoiceLine.invoice_id == int(invoice_id)).all()
+    for ln in lines:
+        if hasattr(ln, "insurer_pay_amount"):
+            try:
+                ln.insurer_pay_amount = Decimal("0")
+            except Exception:
+                pass
+        if hasattr(ln, "requires_preauth"):
+            try:
+                ln.requires_preauth = False
+            except Exception:
+                pass
+    db.flush()
+
+
 def post_invoice_workflow(
         db: Session, *, invoice_id: int,
         user: User) -> Tuple[BillingInvoice, Optional[BillingClaim]]:
-    """
-    Posting workflow:
-      1) Invoice must be APPROVED (or already POSTED)
-      2) Normalize payer splits (optional)
-      3) Enforce preauth + approved_limit validation (cumulative)
-      4) POST invoice
-      5) Auto-create/update a DRAFT claim with submission package (invoice + lines)
-    """
     inv = db.query(BillingInvoice).filter(
         BillingInvoice.id == int(invoice_id)).first()
     if not inv:
@@ -203,20 +236,31 @@ def post_invoice_workflow(
 
     st = str(_enum_value(inv.status) or "").upper()
 
+    insurance_ctx = _is_insurance_context(db, inv)
+
+    # ✅ If already POSTED: keep idempotent, but only update claim for insurance
     if st == "POSTED":
-        # Idempotent: keep claim draft updated
-        claim = upsert_draft_claim_from_invoice(db,
-                                                invoice_id=int(inv.id),
-                                                user=user)
-        return inv, claim
+        if insurance_ctx and _invoice_insurer_due(db, invoice_id=int(
+                inv.id)) > 0:
+            claim = upsert_draft_claim_from_invoice(db,
+                                                    invoice_id=int(inv.id),
+                                                    user=user)
+            return inv, claim
+        return inv, None
 
     if st != "APPROVED":
         raise BillingStateError("Only APPROVED invoices can be POSTED")
 
+    # Optional split normalize
     normalize_invoice_line_splits(db, invoice_id=int(inv.id))
 
-    # preauth hard gate + approved limit validation
-    assert_preauth_ok_for_post(db, inv=inv)
+    # ✅ SELF: force lines to not trigger insurance/preeauth accidentally
+    if not insurance_ctx:
+        _normalize_self_invoice_lines(db, invoice_id=int(inv.id))
+
+    # ✅ Only insurance invoices should enforce preauth gate
+    if insurance_ctx:
+        assert_preauth_ok_for_post(db, inv=inv)
 
     # POST
     inv.status = DocStatus.POSTED
@@ -225,9 +269,11 @@ def post_invoice_workflow(
     db.add(inv)
     db.flush()
 
-    # Auto create claim draft + package (only if insurer_due > 0)
-    claim = upsert_draft_claim_from_invoice(db,
-                                            invoice_id=int(inv.id),
-                                            user=user)
+    # ✅ Create claim ONLY if insurer payable exists AND insurance context
+    if insurance_ctx and _invoice_insurer_due(db, invoice_id=int(inv.id)) > 0:
+        claim = upsert_draft_claim_from_invoice(db,
+                                                invoice_id=int(inv.id),
+                                                user=user)
+        return inv, claim
 
-    return inv, claim
+    return inv, None
