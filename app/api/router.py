@@ -73,6 +73,7 @@ from app.api import (
     # routes_settings_branding
     routes_opd_reports,
     routes_billing_revenue,
+    routes_billing_payments,
 )
 
 
@@ -164,6 +165,7 @@ api_router.include_router(charge_item_master.router)
 api_router.include_router(routes_billing_edits .router)
 api_router.include_router(routes_billing_print.router)
 api_router.include_router(routes_billing_revenue.router)
+api_router.include_router(routes_billing_payments.router)
 # api_router.include_router(routes_billing_advances.router)
 # api_router.include_router(routes_billing_wallet.router )
 # api_router.include_router(routes_billing_invoice_wallet.router)

@@ -85,7 +85,7 @@ def revenue_dashboard(
         date_from: Optional[str] = Query(None, description="YYYY-MM-DD"),
         date_to: Optional[str] = Query(None, description="YYYY-MM-DD"),
         statuses: List[str] = Query(
-            ["POSTED"],
+            ["APPROVED", "POSTED"],
             description="POSTED, APPROVED, DRAFT (VOID always excluded)"),
         module: Optional[str] = Query(
             None,
@@ -124,7 +124,7 @@ def revenue_dashboard(
             continue
         wanted_statuses.append(s)
     if not wanted_statuses:
-        wanted_statuses = ["POSTED"]
+        wanted_statuses = ["APPROVED", "POSTED"]
 
     inv_event_at = func.coalesce(BillingInvoice.posted_at,
                                  BillingInvoice.approved_at,

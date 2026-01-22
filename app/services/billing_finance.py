@@ -34,9 +34,20 @@ from app.models.billing import (
 
 # Optional legacy alias (some code referenced BillingAdvanceAllocation)
 try:
-    from app.models.billing import BillingAdvanceAllocation as _BillingAdvanceAllocation  # type: ignore
+    from app.models.billing import BillingAdvanceApplication as _BillingAdvanceAllocation  # type: ignore
 except Exception:
     _BillingAdvanceAllocation = None  # fallback to BillingAdvanceApplication
+    
+
+from decimal import Decimal
+from typing import Any, Dict, List
+
+from sqlalchemy.orm import Session
+from sqlalchemy import func, exists, and_
+
+
+
+
 
 AUTO_APPLY_ADVANCE_ENABLED = False
 
@@ -811,62 +822,161 @@ def patient_due_for_invoice(db: Session, *, invoice_id: int) -> Decimal:
     return due
 
 
+
+def _d(x) -> Decimal:
+    return Decimal(str(x or 0))
+
+
+def _enum_value(x):
+    return x.value if hasattr(x, "value") else x
+
+
+def _apply_active_payment_filters(q):
+    if ReceiptStatus is not None and hasattr(BillingPayment, "status"):
+        try:
+            q = q.filter(BillingPayment.status == ReceiptStatus.ACTIVE)
+        except Exception:
+            pass
+    if PaymentDirection is not None and hasattr(BillingPayment, "direction"):
+        try:
+            q = q.filter(BillingPayment.direction == PaymentDirection.IN)
+        except Exception:
+            pass
+    return q
+
+
+def _paid_map_for_invoices(db: Session,
+                           invoice_ids: List[int]) -> Dict[int, Decimal]:
+    """
+    Returns paid per invoice_id using:
+    allocations (active) + legacy direct payments without allocations.
+    """
+    invoice_ids = [int(x) for x in invoice_ids if x]
+    if not invoice_ids:
+        return {}
+
+    paid: Dict[int, Decimal] = {iid: Decimal("0") for iid in invoice_ids}
+
+    # If no allocations table -> legacy only
+    if BillingPaymentAllocation is None:
+        q = db.query(BillingPayment.invoice_id,
+                     func.coalesce(func.sum(BillingPayment.amount), 0)).filter(
+                         BillingPayment.invoice_id.in_(invoice_ids)).group_by(
+                             BillingPayment.invoice_id)
+        q = _apply_active_payment_filters(q)
+        for inv_id, amt in q.all():
+            if inv_id is not None:
+                paid[int(inv_id)] = _d(amt)
+        return paid
+
+    # 1) allocations sum
+    aq = db.query(
+        BillingPaymentAllocation.invoice_id,
+        func.coalesce(func.sum(BillingPaymentAllocation.amount), 0),
+    ).join(BillingPayment,
+           BillingPayment.id == BillingPaymentAllocation.payment_id).filter(
+               BillingPaymentAllocation.invoice_id.in_(invoice_ids))
+
+    if ReceiptStatus is not None and hasattr(BillingPaymentAllocation,
+                                             "status"):
+        try:
+            aq = aq.filter(
+                BillingPaymentAllocation.status == ReceiptStatus.ACTIVE)
+        except Exception:
+            pass
+
+    aq = _apply_active_payment_filters(aq)
+    aq = aq.group_by(BillingPaymentAllocation.invoice_id)
+
+    for inv_id, amt in aq.all():
+        if inv_id is not None:
+            paid[int(inv_id)] += _d(amt)
+
+    # 2) legacy direct payments without allocations (anti-join)
+    alloc_exists = exists().where(
+        and_(
+            BillingPaymentAllocation.payment_id == BillingPayment.id,
+            (BillingPaymentAllocation.status == ReceiptStatus.ACTIVE) if
+            (ReceiptStatus is not None
+             and hasattr(BillingPaymentAllocation, "status")) else True,
+        ))
+
+    dq = db.query(
+        BillingPayment.invoice_id,
+        func.coalesce(func.sum(BillingPayment.amount), 0),
+    ).filter(
+        BillingPayment.invoice_id.in_(invoice_ids),
+        ~alloc_exists,
+    )
+
+    dq = _apply_active_payment_filters(dq)
+    dq = dq.group_by(BillingPayment.invoice_id)
+
+    for inv_id, amt in dq.all():
+        if inv_id is not None:
+            paid[int(inv_id)] += _d(amt)
+
+    return paid
+
+
 def list_case_invoice_outstanding(
     db: Session,
     *,
     billing_case_id: int,
-    status_names: Sequence[str] = ("APPROVED", "POSTED"),
+    status_names: List[str],
 ) -> List[Dict[str, Any]]:
-    allowed = []
-    for s in status_names:
-        s = str(s).upper().strip()
-        if s == "APPROVED":
-            allowed.append(DocStatus.APPROVED)
-        elif s == "POSTED":
-            allowed.append(DocStatus.POSTED)
+    # normalize statuses
+    sts = []
+    for s in (status_names or []):
+        s2 = (s or "").strip().upper()
+        if s2 and s2 in DocStatus.__members__:
+            sts.append(DocStatus[s2])
+    if not sts:
+        sts = [DocStatus.APPROVED, DocStatus.POSTED]
 
-    q = db.query(BillingInvoice).filter(
-        BillingInvoice.billing_case_id == int(billing_case_id),
-        BillingInvoice.status != DocStatus.VOID,
-    )
-    if allowed:
-        q = q.filter(BillingInvoice.status.in_(allowed))
+    invs = (db.query(BillingInvoice).filter(
+        BillingInvoice.billing_case_id == int(billing_case_id)).filter(
+            BillingInvoice.status.in_(sts)).filter(
+                BillingInvoice.status != DocStatus.VOID).order_by(
+                    BillingInvoice.id.desc()).all())
 
-    invoices = q.order_by(
-        func.coalesce(BillingInvoice.posted_at,
-                      BillingInvoice.created_at).asc(),
-        BillingInvoice.id.asc(),
-    ).all()
+    ids = [int(i.id) for i in invs]
+    paid_map = _paid_map_for_invoices(db, ids)
 
     out: List[Dict[str, Any]] = []
-    for inv in invoices:
-        # ✅ total due (for debugging)
-        total_due = D(invoice_outstanding_total(db, invoice_id=int(inv.id)))
-        paid = D(invoice_paid_total(db, invoice_id=int(inv.id)))
-
-        # ✅ patient due (THIS is what Apply uses)
-        p_due = D(patient_due_for_invoice(db, invoice_id=int(inv.id)))
+    for inv in invs:
+        iid = int(inv.id)
+        gt = _d(getattr(inv, "grand_total", 0))
+        paid = paid_map.get(iid, Decimal("0"))
+        due = gt - paid
+        if due < 0:
+            due = Decimal("0")
 
         out.append({
             "invoice_id":
-            int(inv.id),
+            iid,
             "invoice_number":
             inv.invoice_number,
-            "module":
-            inv.module,
+            "module": (inv.module or "MISC"),
             "status":
-            _enum_name(inv.status),
-            "invoice_type":
-            _enum_name(getattr(inv, "invoice_type", None)) or None,
+            _enum_value(inv.status),
+            "payer_type":
+            _enum_value(inv.payer_type),
+            "payer_id":
+            getattr(inv, "payer_id", None),
             "grand_total":
-            str(_d(getattr(inv, "grand_total", 0))),
-            "paid_total":
-            str(_d(paid)),  # debug
-            "total_outstanding":
-            str(_d(total_due)),  # debug
+            str(gt),
+            "paid":
+            str(paid),
+            "outstanding":
+            str(due),
+
+            # keep your old key for UI compatibility
             "patient_outstanding":
-            str(_d(p_due)),  # ✅ UI checkbox must use THIS
+            str(due)
+            if str(_enum_value(inv.payer_type)).upper() == "PATIENT" else "0",
         })
+
     return out
 
 

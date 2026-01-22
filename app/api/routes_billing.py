@@ -14,8 +14,7 @@ from app.models.charge_item_master import ChargeItemMaster
 from enum import Enum
 from fastapi.responses import StreamingResponse
 from io import BytesIO
-from sqlalchemy.orm import aliased
-from app.services.billing_finance import BillingStateError
+
 from app.models.ui_branding import UiBranding
 from app.services.pdfs.billing_case_export import build_full_case_pdf
 
@@ -117,6 +116,14 @@ try:
     from app.services.billing_ot import create_ot_invoice_items_for_case  # type: ignore
 except Exception:
     create_ot_invoice_items_for_case = None  # type: ignore
+
+
+
+# optional (safe)
+try:
+    from app.models.billing import PaymentDirection
+except Exception:
+    PaymentDirection = None  # type: ignore
 
 router = APIRouter(prefix="/billing", tags=["Billing"])
 
@@ -237,76 +244,6 @@ MODULE_COLUMNS = {
 }
 
 
-def get_billing_case_view(db, case_id: int):
-    RefUser = aliased(User)
-
-    row = (db.query(BillingCase, Patient, RefUser).join(
-        Patient, Patient.id == BillingCase.patient_id).outerjoin(
-            RefUser, RefUser.id == BillingCase.referral_user_id).filter(
-                BillingCase.id == int(case_id)).first())
-
-    if not row:
-        raise HTTPException(status_code=404, detail="Billing case not found")
-
-    bc, p, ref = row
-
-    patient_name = " ".join([
-        x for x in [
-            getattr(p, "prefix", None),
-            getattr(p, "first_name", None),
-            getattr(p, "last_name", None)
-        ] if x
-    ]) or None
-
-    return {
-        "id":
-        bc.id,
-        "case_number":
-        bc.case_number,
-        "status":
-        bc.status.value if hasattr(bc.status, "value") else bc.status,
-        "payer_mode":
-        bc.payer_mode.value
-        if hasattr(bc.payer_mode, "value") else bc.payer_mode,
-        "encounter_type":
-        bc.encounter_type.value
-        if hasattr(bc.encounter_type, "value") else bc.encounter_type,
-        "encounter_id":
-        bc.encounter_id,
-        "patient_id":
-        bc.patient_id,
-        "patient_name":
-        patient_name,
-        "uhid":
-        getattr(p, "uhid", None),
-        "phone":
-        getattr(p, "phone", None),
-
-        # ✅ referral display fields
-        "referral_user_id":
-        bc.referral_user_id,
-        "referral_user_name": (ref.name if ref else None),
-        "referral_notes":
-        bc.referral_notes,
-
-        # existing fields if you want
-        "default_payer_type":
-        bc.default_payer_type,
-        "default_payer_id":
-        bc.default_payer_id,
-        "default_tpa_id":
-        bc.default_tpa_id,
-        "default_credit_plan_id":
-        bc.default_credit_plan_id,
-        "notes":
-        bc.notes,
-        "created_at":
-        bc.created_at,
-        "updated_at":
-        bc.updated_at,
-    }
-
-
 def _now_utc():
     return datetime.utcnow()
 
@@ -324,50 +261,98 @@ def _norm_payer_bucket(
     return pt, pid
 
 
-def _sum_allocated_for_invoice(db: Session, invoice_id: int) -> Decimal:
-    """
-    Source of truth:
-    - If BillingPaymentAllocation exists -> sum ACTIVE allocations for this invoice.
-    - Else -> sum direct payments.payment.invoice_id
-    Avoid double-counting when both exist.
-    """
-    if BillingPaymentAllocation is not None:
-        q = db.query(
-            func.coalesce(func.sum(
-                BillingPaymentAllocation.amount), 0)).filter(
-                    BillingPaymentAllocation.invoice_id == int(invoice_id))
 
-        # allocation status
-        if ReceiptStatus is not None and hasattr(BillingPaymentAllocation,
-                                                 "status"):
-            try:
-                q = q.filter(
-                    BillingPaymentAllocation.status == ReceiptStatus.ACTIVE)
-            except Exception:
-                pass
 
-        # also ensure payment is ACTIVE if payment has status column
-        if hasattr(BillingPayment, "status"):
-            try:
-                q = q.join(
-                    BillingPayment, BillingPayment.id ==
-                    BillingPaymentAllocation.payment_id).filter(
-                        BillingPayment.status == ReceiptStatus.ACTIVE)
-            except Exception:
-                pass
+def _d(x) -> Decimal:
+    return Decimal(str(x or 0))
 
-        return Decimal(str(q.scalar() or 0))
 
-    # fallback (legacy)
-    q2 = db.query(
-        func.coalesce(func.sum(BillingPayment.amount),
-                      0)).filter(BillingPayment.invoice_id == int(invoice_id))
-    if hasattr(BillingPayment, "status") and ReceiptStatus is not None:
+def _apply_active_payment_filters(q):
+    # payment.status == ACTIVE
+    if ReceiptStatus is not None and hasattr(BillingPayment, "status"):
         try:
-            q2 = q2.filter(BillingPayment.status == ReceiptStatus.ACTIVE)
+            q = q.filter(BillingPayment.status == ReceiptStatus.ACTIVE)
         except Exception:
             pass
-    return Decimal(str(q2.scalar() or 0))
+
+    # payment.direction == IN (ignore refunds/outgoing)
+    if PaymentDirection is not None and hasattr(BillingPayment, "direction"):
+        try:
+            q = q.filter(BillingPayment.direction == PaymentDirection.IN)
+        except Exception:
+            pass
+
+    return q
+
+
+def _apply_active_alloc_filters(q):
+    # allocation.status == ACTIVE
+    if ReceiptStatus is not None and hasattr(BillingPaymentAllocation, "status"):
+        try:
+            q = q.filter(BillingPaymentAllocation.status == ReceiptStatus.ACTIVE)
+        except Exception:
+            pass
+    return q
+
+
+def _sum_allocated_for_invoice(db: Session, invoice_id: int) -> Decimal:
+    """
+    ✅ Correct source-of-truth:
+    - Sum ACTIVE allocations for invoice (joined to ACTIVE payments).
+    - PLUS legacy direct payments (payment.invoice_id == invoice_id) ONLY IF that payment has NO allocations.
+    - Prevents double counting.
+    """
+    invoice_id = int(invoice_id)
+
+    # If allocation model not wired -> legacy only
+    if BillingPaymentAllocation is None:
+        q = db.query(func.coalesce(func.sum(BillingPayment.amount), 0)).filter(
+            BillingPayment.invoice_id == invoice_id
+        )
+        q = _apply_active_payment_filters(q)
+        return _d(q.scalar())
+
+    # 1) allocations sum
+    aq = (
+        db.query(func.coalesce(func.sum(BillingPaymentAllocation.amount), 0))
+        .join(BillingPayment, BillingPayment.id == BillingPaymentAllocation.payment_id)
+        .filter(BillingPaymentAllocation.invoice_id == invoice_id)
+    )
+    aq = _apply_active_alloc_filters(aq)
+    aq = _apply_active_payment_filters(aq)
+    alloc_sum = _d(aq.scalar())
+
+    # 2) legacy direct payments WITHOUT allocations (anti-join)
+    alloc_exists = exists().where(
+        and_(
+            BillingPaymentAllocation.payment_id == BillingPayment.id,
+            # only consider active allocations as "exists"
+            (BillingPaymentAllocation.status == ReceiptStatus.ACTIVE)
+            if (ReceiptStatus is not None and hasattr(BillingPaymentAllocation, "status"))
+            else True,
+        )
+    )
+
+    dq = (
+        db.query(func.coalesce(func.sum(BillingPayment.amount), 0))
+        .filter(BillingPayment.invoice_id == invoice_id)
+        .filter(~alloc_exists)
+    )
+    dq = _apply_active_payment_filters(dq)
+    direct_sum = _d(dq.scalar())
+
+    return alloc_sum + direct_sum
+
+
+def _invoice_outstanding(db: Session, inv: BillingInvoice) -> Decimal:
+    st = str(_enum_value(getattr(inv, "status", "")) or "").upper()
+    if st == "VOID":
+        return Decimal("0")
+
+    gt = _d(getattr(inv, "grand_total", 0))
+    paid = _sum_allocated_for_invoice(db, int(inv.id))
+    out = gt - paid
+    return out if out > 0 else Decimal("0")
 
 
 def _invoice_outstanding(db: Session, inv: BillingInvoice) -> Decimal:
@@ -1372,8 +1357,7 @@ def _normalize_module(module: Optional[str]) -> str:
 
 
 def _case_to_dict(c: BillingCase,
-                  p: Optional[Patient] = None,
-                  ref_user: Optional[User] = None) -> Dict[str, Any]:
+                  p: Optional[Patient] = None) -> Dict[str, Any]:
     uhid_col = _patient_uhid_col()
     phone_col = _patient_phone_col()
     first_col, last_col, full_col = _patient_name_cols()
@@ -1398,12 +1382,6 @@ def _case_to_dict(c: BillingCase,
         if phone_col is not None:
             phone = getattr(p, phone_col.key, None)
 
-    # ✅ referral name (no raw id in UI)
-    referral_user_name = None
-    if ref_user is not None:
-        referral_user_name = (getattr(ref_user, "full_name", None) or getattr(
-            ref_user, "name", None) or "").strip() or None
-
     return {
         "id": int(c.id),
         "case_number": c.case_number,
@@ -1424,7 +1402,6 @@ def _case_to_dict(c: BillingCase,
         "default_tpa_id": getattr(c, "default_tpa_id", None),
         "default_credit_plan_id": getattr(c, "default_credit_plan_id", None),
         "referral_user_id": getattr(c, "referral_user_id", None),
-        "referral_user_name": referral_user_name,  # ✅ NEW
         "referral_notes": getattr(c, "referral_notes", None),
         "created_at": c.created_at.isoformat() if c.created_at else None,
         "updated_at": c.updated_at.isoformat() if c.updated_at else None,
@@ -2058,10 +2035,10 @@ def list_cases(
     try:
         page = max(int(page or 1), 1)
         page_size = min(max(int(page_size or 20), 1), 100)
-        RefUser = aliased(User)
-        qry = (db.query(BillingCase, Patient, RefUser).join(
-            Patient, BillingCase.patient_id == Patient.id).outerjoin(
-                RefUser, RefUser.id == BillingCase.referral_user_id))
+
+        qry = db.query(BillingCase,
+                       Patient).join(Patient,
+                                     BillingCase.patient_id == Patient.id)
 
         if encounter_type:
             et = encounter_type.strip().upper()
@@ -2125,13 +2102,11 @@ def list_cases(
                 qry = qry.filter(or_(*conds))
 
         total = qry.with_entities(func.count(BillingCase.id)).scalar() or 0
-
         rows = qry.order_by(desc(BillingCase.created_at)).offset(
             (page - 1) * page_size).limit(page_size).all()
 
         return {
-            "items":
-            [_case_to_dict(c, p, ref) for (c, p, ref) in rows],  # ✅ pass ref
+            "items": [_case_to_dict(c, p) for (c, p) in rows],
             "total": int(total),
             "page": page,
             "page_size": page_size
@@ -2141,21 +2116,20 @@ def list_cases(
 
 
 @router.get("/cases/{case_id}")
-def get_case_detail(case_id: int,
-                    db: Session = Depends(get_db),
-                    user: User = Depends(current_user)):
+def get_case_detail(
+        case_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
     try:
-        RefUser = aliased(User)
-
-        row = (db.query(BillingCase, Patient, RefUser).join(
-            Patient, BillingCase.patient_id == Patient.id).outerjoin(
-                RefUser, RefUser.id == BillingCase.referral_user_id).filter(
-                    BillingCase.id == int(case_id)).first())
+        row = (db.query(BillingCase, Patient).join(
+            Patient, BillingCase.patient_id == Patient.id).filter(
+                BillingCase.id == int(case_id)).first())
         if not row:
             raise HTTPException(status_code=404,
                                 detail="Billing case not found")
 
-        c, p, ref = row
+        c, p = row
 
         posted_total = (db.query(
             func.coalesce(func.sum(BillingInvoice.grand_total), 0)).filter(
@@ -2168,7 +2142,7 @@ def get_case_detail(case_id: int,
 
         balance = Decimal(str(posted_total)) - Decimal(str(paid_total))
 
-        out = _case_to_dict(c, p, ref)  # ✅ pass ref
+        out = _case_to_dict(c, p)
         out["totals"] = {
             "posted_invoice_total": str(posted_total or 0),
             "paid_total": str(paid_total or 0),
@@ -2554,7 +2528,7 @@ def list_invoice_payments(
     aq = db.query(BillingPaymentAllocation).filter(
         BillingPaymentAllocation.invoice_id == int(invoice_id))
     if ReceiptStatus is not None and hasattr(BillingPaymentAllocation,
-                                             "status"):
+                                            "status"):
         try:
             aq = aq.filter(
                 BillingPaymentAllocation.status == ReceiptStatus.ACTIVE)
@@ -2594,14 +2568,21 @@ def list_invoice_payments(
     for p in pays:
         d = _payment_to_dict(p)
 
-        # attach allocations (for invoice editor)
         pid = int(p.id)
         d["allocations"] = allocs_by_payment.get(pid, [])
+        d["allocated_amount"] = float(alloc_sum_by_payment.get(pid, Decimal("0")))
 
-        # attach allocated amount (handy for UI)
-        d["allocated_amount"] = float(
-            alloc_sum_by_payment.get(pid, Decimal("0")))
+        # ✅ THIS is what Payment Tab should use for this invoice:
+        # - if allocations exist -> allocated_amount
+        # - else (legacy direct payment) -> full payment.amount
+        applied = Decimal("0")
+        if d["allocations"]:
+            applied = alloc_sum_by_payment.get(pid, Decimal("0"))
+        else:
+            if getattr(p, "invoice_id", None) and int(getattr(p, "invoice_id")) == int(invoice_id):
+                applied = _dec(getattr(p, "amount", 0))
 
+        d["applied_amount"] = float(applied)
         out.append(d)
 
     return {"items": out}
@@ -2904,27 +2885,23 @@ def approve(
 
 
 @router.post("/invoices/{invoice_id}/post")
-def post(invoice_id: int,
-         db: Session = Depends(get_db),
-         user: User = Depends(current_user)):
+def post(
+        invoice_id: int,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
     try:
         _get_invoice_or_404(db, user, invoice_id)
+
+        # ✅ IMPORTANT: make billing_service.post_invoice return (inv, claim)
         inv, claim = post_invoice(db, invoice_id=invoice_id, user=user)
+
         db.commit()
         return {
             "id": int(inv.id),
             "status": _enum_value(inv.status),
-            "claim": claim_to_dict(claim) if claim else None
+            "claim": claim_to_dict(claim) if claim else None,
         }
-
-    except BillingStateError as e:
-        db.rollback()
-        raise HTTPException(status_code=409, detail=str(e))
-
-    except HTTPException:
-        db.rollback()
-        raise
-
     except Exception as e:
         db.rollback()
         _err(e)
