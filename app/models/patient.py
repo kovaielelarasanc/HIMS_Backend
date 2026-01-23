@@ -25,7 +25,7 @@ class Patient(Base):
     id = Column(Integer, primary_key=True, index=True)
     uhid = Column(String(32), index=True, nullable=False)
     abha_number = Column(String(32), index=True, nullable=True)
-    
+
     # prefix (Mr, Ms, Mrs, etc.)
     prefix = Column(String(16), nullable=True)
 
@@ -102,6 +102,8 @@ class Patient(Base):
         "PatientAddress",
         cascade="all, delete-orphan",
         back_populates="patient",
+        order_by="PatientAddress.id.desc()",  # ✅ latest first
+        lazy="selectin",  # ✅ better loading
     )
     documents = relationship("PatientDocument", cascade="all, delete-orphan")
     consents = relationship(

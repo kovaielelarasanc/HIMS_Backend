@@ -1,6 +1,6 @@
 # FILE: app/api/routes_patients.py
 from __future__ import annotations
-
+from sqlalchemy.orm import Session, selectinload
 import os
 import io
 import base64
@@ -60,6 +60,7 @@ router = APIRouter()
 UPLOAD_DIR = Path(settings.STORAGE_DIR).joinpath("patient_docs")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+
 def _is_female_gender(gender: Optional[str]) -> bool:
     g = (gender or "").strip().lower()
     return g in {"female", "f", "woman", "women", "girl"}
@@ -95,7 +96,8 @@ def _enforce_pregnancy_rch_rules(
     if is_pregnant is False and rid:
         raise HTTPException(
             status_code=422,
-            detail="RCH ID is allowed only for pregnancy patients. Clear RCH ID or set is_pregnant=true.",
+            detail=
+            "RCH ID is allowed only for pregnancy patients. Clear RCH ID or set is_pregnant=true.",
         )
 
     # Pregnancy only for female
@@ -278,6 +280,10 @@ def serialize_patient(p: Patient, db: Session) -> PatientOut:
         plan = db.query(CreditPlan).get(p.credit_plan_id)
         if plan:
             data.credit_plan_name = plan.name
+    try:
+        data.addresses = sorted(list(data.addresses or []), key=lambda x: x.id, reverse=True)
+    except Exception:
+        pass
 
     return data
 
@@ -406,13 +412,17 @@ def create_patient(
 
     # uniqueness checks (phone/email)
     if payload.phone:
-        exists = db.query(Patient).filter(Patient.phone == payload.phone).first()
+        exists = db.query(Patient).filter(
+            Patient.phone == payload.phone).first()
         if exists:
-            raise HTTPException(status_code=400, detail="Phone already registered")
+            raise HTTPException(status_code=400,
+                                detail="Phone already registered")
     if payload.email:
-        exists = db.query(Patient).filter(Patient.email == payload.email).first()
+        exists = db.query(Patient).filter(
+            Patient.email == payload.email).first()
         if exists:
-            raise HTTPException(status_code=400, detail="Email already registered")
+            raise HTTPException(status_code=400,
+                                detail="Email already registered")
 
     p = Patient(
         uhid="TEMP",
@@ -423,46 +433,35 @@ def create_patient(
         dob=payload.dob,
         phone=payload.phone,
         email=payload.email,
-
         blood_group=payload.blood_group,
         marital_status=payload.marital_status,
         is_pregnant=preg_info["is_pregnant"],
         rch_id=preg_info["rch_id"],
-
         ref_source=payload.ref_source,
         ref_doctor_id=final_ref_doctor_id,
         ref_details=payload.ref_details,
-
         id_proof_type=payload.id_proof_type,
         id_proof_no=payload.id_proof_no,
-
         guardian_name=payload.guardian_name,
         guardian_phone=payload.guardian_phone,
         guardian_relation=payload.guardian_relation,
-
         patient_type=payload.patient_type,
         tag=payload.tag,
         religion=payload.religion,
         occupation=payload.occupation,
-
         file_number=payload.file_number,
         file_location=payload.file_location,
-
         credit_type=payload.credit_type,
         credit_payer_id=payload.credit_payer_id,
         credit_tpa_id=payload.credit_tpa_id,
         credit_plan_id=payload.credit_plan_id,
-
         principal_member_name=payload.principal_member_name,
         principal_member_address=payload.principal_member_address,
-
         policy_number=payload.policy_number,
         policy_name=payload.policy_name,
-
         family_id=payload.family_id,
 
         # ✅ new fields
-        
         is_active=True,
     )
     db.add(p)
@@ -489,9 +488,11 @@ def create_patient(
         db.rollback()
         msg = str(e.orig).lower()
         if "phone" in msg:
-            raise HTTPException(status_code=400, detail="Phone already registered")
+            raise HTTPException(status_code=400,
+                                detail="Phone already registered")
         if "email" in msg:
-            raise HTTPException(status_code=400, detail="Email already registered")
+            raise HTTPException(status_code=400,
+                                detail="Email already registered")
         raise
 
     db.refresh(p)
@@ -512,7 +513,6 @@ def create_patient(
     )
 
     return serialize_patient(p, db)
-
 
 
 @router.get("", response_model=List[PatientOut])
@@ -539,14 +539,13 @@ def list_patients(
     qry = db.query(Patient).filter(Patient.is_active.is_(True))
     if q:
         ql = f"%{q.lower()}%"
-        qry = qry = qry.filter(
-            (Patient.uhid.like(ql))
-            | (Patient.phone.like(ql))
-            | (Patient.email.like(ql))
-            | (Patient.first_name.like(ql))
-            | (Patient.last_name.like(ql))
-            | (Patient.rch_id.like(ql))  # ✅ add
-        )
+        qry = qry = qry.filter((Patient.uhid.like(ql))
+                               | (Patient.phone.like(ql))
+                               | (Patient.email.like(ql))
+                               | (Patient.first_name.like(ql))
+                               | (Patient.last_name.like(ql))
+                               | (Patient.rch_id.like(ql))  # ✅ add
+                               )
 
     if patient_type:
         qry = qry.filter(Patient.patient_type == patient_type)
@@ -561,11 +560,11 @@ def list_patients(
 
 @router.get("/export", summary="Export patients to Excel")
 def export_patients_report(
-    from_date: Optional[date] = Query(None, alias="from_date"),
-    to_date: Optional[date] = Query(None, alias="to_date"),
-    patient_type: Optional[str] = Query(None, alias="patient_type"),
-    db: Session = Depends(get_db),
-    user: User = Depends(auth_current_user),
+        from_date: Optional[date] = Query(None, alias="from_date"),
+        to_date: Optional[date] = Query(None, alias="to_date"),
+        patient_type: Optional[str] = Query(None, alias="patient_type"),
+        db: Session = Depends(get_db),
+        user: User = Depends(auth_current_user),
 ):
     """
     Generate Excel report based on:
@@ -585,21 +584,19 @@ def export_patients_report(
         from_date = to_date - timedelta(days=30)
 
     if to_date < from_date:
-        raise HTTPException(status_code=422, detail="To Date must be on or after From Date")
+        raise HTTPException(status_code=422,
+                            detail="To Date must be on or after From Date")
 
     start_dt = datetime.combine(from_date, datetime.min.time())
     end_dt = datetime.combine(to_date + timedelta(days=1), datetime.min.time())
 
     try:
         # ---- Query patients ----
-        qry = (
-            db.query(Patient)
-            .filter(
-                Patient.is_active.is_(True),
-                Patient.created_at >= start_dt,
-                Patient.created_at < end_dt,
-            )
-        )
+        qry = (db.query(Patient).filter(
+            Patient.is_active.is_(True),
+            Patient.created_at >= start_dt,
+            Patient.created_at < end_dt,
+        ))
 
         if patient_type:
             qry = qry.filter(Patient.patient_type == patient_type)
@@ -638,24 +635,24 @@ def export_patients_report(
             except Exception:
                 age_text = ""
 
-            ws.append(
-                [
-                    p.uhid or "",
-                    p.prefix or "",
-                    p.first_name or "",
-                    p.last_name or "",
-                    p.gender or "",
-                    p.dob.isoformat() if p.dob else "",
-                    age_text,
-                    p.marital_status or "",
-                    "Yes" if getattr(p, "is_pregnant", False) else "No",  # ✅ correct column
-                    getattr(p, "rch_id", None) or "",                      # ✅ correct column
-                    p.phone or "",                                         # ✅ correct column
-                    p.email or "",                                         # ✅ correct column
-                    p.patient_type or "",
-                    p.created_at.isoformat() if getattr(p, "created_at", None) else "",
-                ]
-            )
+            ws.append([
+                p.uhid or "",
+                p.prefix or "",
+                p.first_name or "",
+                p.last_name or "",
+                p.gender or "",
+                p.dob.isoformat() if p.dob else "",
+                age_text,
+                p.marital_status or "",
+                "Yes" if getattr(p, "is_pregnant", False) else
+                "No",  # ✅ correct column
+                getattr(p, "rch_id", None) or "",  # ✅ correct column
+                p.phone or "",  # ✅ correct column
+                p.email or "",  # ✅ correct column
+                p.patient_type or "",
+                p.created_at.isoformat()
+                if getattr(p, "created_at", None) else "",
+            ])
 
         # ---- Simple column width auto-fit ----
         for col_idx in range(1, len(headers) + 1):
@@ -675,12 +672,14 @@ def export_patients_report(
         import traceback
 
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Excel export failed: {e}")
+        raise HTTPException(status_code=500,
+                            detail=f"Excel export failed: {e}")
 
     filename = f"patients_{from_date.isoformat()}_to_{to_date.isoformat()}.xlsx"
     return StreamingResponse(
         buf,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        media_type=
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
@@ -693,10 +692,81 @@ def get_patient(
 ):
     if not has_perm(user, "patients.view"):
         raise HTTPException(status_code=403, detail="Not permitted")
-    p = db.query(Patient).get(patient_id)
+    p = _get_patient_with_related(db, patient_id)
     if not p or not p.is_active:
         raise HTTPException(status_code=404, detail="Not found")
     return serialize_patient(p, db)
+
+
+_MISSING = object()
+
+
+def _dump_model(obj):
+    if obj is None:
+        return None
+    if hasattr(obj, "model_dump"):  # pydantic v2
+        return obj.model_dump(exclude_unset=True)
+    if hasattr(obj, "dict"):  # pydantic v1
+        return obj.dict(exclude_unset=True)
+    return obj
+
+
+def _normalize_addr_payload(d: Dict[str, Any]) -> Dict[str, str]:
+
+    def s(key: str, default: str = "") -> str:
+        v = d.get(key, None)
+        if v is None:
+            return default
+        return str(v).strip()
+
+    addr_type = s("type", "current").lower() or "current"
+    country = s("country", "India") or "India"
+
+    return {
+        "type": addr_type,
+        "line1": s("line1", ""),
+        "line2": s("line2", ""),
+        "city": s("city", ""),
+        "state": s("state", ""),
+        "pincode": s("pincode", ""),
+        "country": country,
+    }
+
+
+def _upsert_primary_address(
+    *,
+    db: Session,
+    patient_id: int,
+    addr_in: Dict[str, Any],
+) -> PatientAddress:
+    addr_data = _normalize_addr_payload(addr_in)
+    addr_type = addr_data["type"]
+
+    # Prefer same type (current/permanent/office), else fallback to latest
+    a = (db.query(PatientAddress).filter(
+        PatientAddress.patient_id == patient_id,
+        PatientAddress.type == addr_type).order_by(
+            PatientAddress.id.desc()).first())
+    if not a:
+        a = (db.query(PatientAddress).filter(
+            PatientAddress.patient_id == patient_id).order_by(
+                PatientAddress.id.desc()).first())
+
+    if a:
+        for k, v in addr_data.items():
+            setattr(a, k, v)
+        return a
+
+    a = PatientAddress(patient_id=patient_id, **addr_data)
+    db.add(a)
+    db.flush()  # get a.id
+    return a
+
+
+def _get_patient_with_related(db: Session,
+                              patient_id: int) -> Optional[Patient]:
+    return (db.query(Patient).options(selectinload(
+        Patient.addresses)).filter(Patient.id == patient_id).first())
 
 
 @router.put("/{patient_id}", response_model=PatientOut)
@@ -714,29 +784,32 @@ def update_patient(
     if not p or not p.is_active:
         raise HTTPException(status_code=404, detail="Not found")
 
-    old_data = instance_to_audit_dict(p)
-    data = payload.dict(exclude_unset=True)
+    old_patient = instance_to_audit_dict(p)
+
+    data = _dump_model(payload) or {}
+    # ✅ extract address separately (do NOT setattr on Patient)
+    addr_payload = data.pop("address", _MISSING)
 
     # uniqueness when changing phone/email
     if "phone" in data:
         new_phone = data["phone"]
         if new_phone:
-            exists = (db.query(Patient).filter(
-                Patient.phone == new_phone,
-                Patient.id != patient_id,
-            ).first())
+            exists = (db.query(Patient).filter(Patient.phone == new_phone,
+                                               Patient.id
+                                               != patient_id).first())
             if exists:
-                raise HTTPException(status_code=400, detail="Phone already registered")
+                raise HTTPException(status_code=400,
+                                    detail="Phone already registered")
 
     if "email" in data:
         new_email = data["email"]
         if new_email:
-            exists = (db.query(Patient).filter(
-                Patient.email == new_email,
-                Patient.id != patient_id,
-            ).first())
+            exists = (db.query(Patient).filter(Patient.email == new_email,
+                                               Patient.id
+                                               != patient_id).first())
             if exists:
-                raise HTTPException(status_code=400, detail="Email already registered")
+                raise HTTPException(status_code=400,
+                                    detail="Email already registered")
 
     # validate patient_type if changed
     if "patient_type" in data and data["patient_type"] is not None:
@@ -746,10 +819,7 @@ def update_patient(
     ref_source_val = data.get("ref_source", p.ref_source)
     ref_doctor_val = data.get("ref_doctor_id", p.ref_doctor_id)
     final_ref_doctor_id = _validate_reference_source_and_doctor(
-        db,
-        ref_source_val,
-        ref_doctor_val,
-    )
+        db, ref_source_val, ref_doctor_val)
     if ref_source_val and ref_source_val.strip().lower() != "doctor":
         data["ref_doctor_id"] = None
     else:
@@ -761,11 +831,12 @@ def update_patient(
     if "first_name" in data and isinstance(data["first_name"], str):
         data["first_name"] = data["first_name"].strip()
     if "last_name" in data and isinstance(data["last_name"], str):
-        data["last_name"] = data["last_name"].strip()
+        data["last_name"] = data["last_name"].strip() or None
 
     # ✅ pregnancy + RCH rule (based on final values)
     final_gender = data.get("gender", p.gender)
-    final_is_pregnant = data.get("is_pregnant", getattr(p, "is_pregnant", False))
+    final_is_pregnant = data.get("is_pregnant",
+                                 getattr(p, "is_pregnant", False))
     final_rch_id = data.get("rch_id", getattr(p, "rch_id", None))
 
     preg_info = _enforce_pregnancy_rch_rules(
@@ -773,12 +844,42 @@ def update_patient(
         is_pregnant=final_is_pregnant,
         rch_id=final_rch_id,
     )
-
     data["is_pregnant"] = preg_info["is_pregnant"]
     data["rch_id"] = preg_info["rch_id"]
 
+    # Apply patient fields
     for k, v in data.items():
         setattr(p, k, v)
+
+    # ✅ Upsert address if provided and not null
+    addr_action = None
+    addr_old = None
+    addr_obj: Optional[PatientAddress] = None
+
+    if addr_payload is not _MISSING and addr_payload is not None:
+        addr_in = _dump_model(addr_payload) or {}
+        # find target (for audit)
+        # prefer same type else latest
+        addr_type = str(addr_in.get("type")
+                        or "current").strip().lower() or "current"
+        existing = (db.query(PatientAddress).filter(
+            PatientAddress.patient_id == patient_id,
+            PatientAddress.type == addr_type).order_by(
+                PatientAddress.id.desc()).first())
+        if not existing:
+            existing = (db.query(PatientAddress).filter(
+                PatientAddress.patient_id == patient_id).order_by(
+                    PatientAddress.id.desc()).first())
+
+        if existing:
+            addr_old = instance_to_audit_dict(existing)
+            addr_action = "UPDATE"
+        else:
+            addr_action = "CREATE"
+
+        addr_obj = _upsert_primary_address(db=db,
+                                           patient_id=patient_id,
+                                           addr_in=addr_in)
 
     try:
         db.commit()
@@ -786,30 +887,50 @@ def update_patient(
         db.rollback()
         msg = str(e.orig).lower()
         if "phone" in msg:
-            raise HTTPException(status_code=400, detail="Phone already registered")
+            raise HTTPException(status_code=400,
+                                detail="Phone already registered")
         if "email" in msg:
-            raise HTTPException(status_code=400, detail="Email already registered")
+            raise HTTPException(status_code=400,
+                                detail="Email already registered")
         raise
 
     db.refresh(p)
 
-    # --- Audit log (UPDATE) ---
+    # --- Audit log (UPDATE patient) ---
     meta = get_request_meta(request)
-    new_data = instance_to_audit_dict(p)
+    new_patient = instance_to_audit_dict(p)
     log_audit(
         db=db,
         user_id=user.id,
         action="UPDATE",
         table_name="patients",
         record_id=p.id,
-        old_values=old_data,
-        new_values=new_data,
+        old_values=old_patient,
+        new_values=new_patient,
         ip_address=meta["ip"],
         user_agent=meta["ua"],
     )
 
-    return serialize_patient(p, db)
+    # --- Audit log (UPSERT address) ---
+    if addr_obj and addr_action:
+        db.refresh(addr_obj)
+        log_audit(
+            db=db,
+            user_id=user.id,
+            action=addr_action,
+            table_name="patient_addresses",
+            record_id=addr_obj.id,
+            old_values=addr_old,
+            new_values=instance_to_audit_dict(addr_obj),
+            ip_address=meta["ip"],
+            user_agent=meta["ua"],
+        )
 
+    fresh = _get_patient_with_related(db, patient_id)
+    if not fresh:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    return serialize_patient(fresh, db)
 
 
 @router.patch("/{patient_id}/deactivate")

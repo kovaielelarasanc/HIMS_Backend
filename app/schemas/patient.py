@@ -299,6 +299,7 @@ class PatientUpdate(BaseModel):
     # --- Pregnancy (optional) ---
     is_pregnant: Optional[bool] = None
     rch_id: Optional[str] = None
+    address: Optional[AddressIn] = None
 
     @field_validator("phone")
     @classmethod
