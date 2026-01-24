@@ -74,6 +74,9 @@ from app.api import (
     routes_opd_reports,
     routes_billing_revenue,
     routes_billing_payments,
+    routes_emr_template_library,
+    routes_emr_all,
+    routes_emr_meta
 )
 
 
@@ -183,6 +186,9 @@ api_router.include_router(routes_ris_history.router)
 api_router.include_router(routes_emr.router, prefix="/emr", tags=["EMR"])
 
 
+api_router.include_router(routes_emr_all.router)
+api_router.include_router(routes_emr_meta.router)
+api_router.include_router(routes_emr_template_library.router)
 
 api_router.include_router(routes_templates.router,
                           prefix="/templates",

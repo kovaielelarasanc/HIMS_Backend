@@ -26,10 +26,23 @@ from app.models.role import Role
 # =========================================================
 # AUTH HELPERS
 # =========================================================
-def _extract_bearer(authorization: Optional[str]) -> Optional[str]:
+def _extract_bearer(authorization: Any) -> Optional[str]:
+    # CLI-safe: FastAPI Header(None) becomes a Header object outside request context
     if not authorization:
         return None
-    parts = authorization.split()
+
+    # If it's not a string (e.g. fastapi.params.Header), ignore it
+    if not isinstance(authorization, str):
+        # allow bytes -> str
+        if isinstance(authorization, (bytes, bytearray)):
+            try:
+                authorization = authorization.decode("utf-8", "ignore")
+            except Exception:
+                return None
+        else:
+            return None
+
+    parts = authorization.strip().split()
     if len(parts) == 2 and parts[0].lower() == "bearer":
         return parts[1]
     return None

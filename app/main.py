@@ -18,6 +18,11 @@ from app.services.error_logger import log_error, format_exception
 from app.utils.jwt import extract_tenant_from_request
 from app.lab_integration.mllp_server import MLLPServer, should_start_mllp
 # from app.api.routes_lis_device import public_router as lis_public_router
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from typing import Any, Dict, List
+import json
+from fastapi.encoders import jsonable_encoder
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -63,6 +68,58 @@ def setup_logging():
 
 setup_logging()
 
+
+def _safe_json_value(v: Any) -> Any:
+    """
+    Ensure the value can be JSON serialized.
+    Exceptions (ValueError, etc.) are converted to string.
+    Unknown objects are stringified.
+    """
+    if isinstance(v, BaseException):
+        return str(v)
+    try:
+        json.dumps(v)
+        return v
+    except Exception:
+        return str(v)
+
+
+def _sanitize_validation_errors(errors: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for e in errors or []:
+        d = dict(e)
+
+        # sanitize ctx
+        ctx = d.get("ctx")
+        if isinstance(ctx, dict):
+            d["ctx"] = {k: _safe_json_value(v) for k, v in ctx.items()}
+
+        # sanitize input
+        if "input" in d:
+            d["input"] = _safe_json_value(d.get("input"))
+
+        out.append(d)
+    return out
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_handler(request: Request, exc: RequestValidationError):
+    details = _sanitize_validation_errors(exc.errors())
+
+    payload = {
+        "status": False,
+        "msg": "Validation error",
+        "error": {
+            "type": "RequestValidationError",
+            "path": str(request.url.path),
+            "method": request.method,
+            "details": details,
+        },
+        "data": None,
+    }
+
+    # jsonable_encoder ensures safe conversion for datetime, enums, etc.
+    return JSONResponse(status_code=422, content=jsonable_encoder(payload))
 
 logger = logging.getLogger("app")
 logger.info("✅ App starting...")
@@ -167,6 +224,20 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         content={"detail": exc.detail},
         headers=getattr(exc, "headers", None),
 
+    )
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_handler(request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content={
+            "ok": False,
+            "data": None,
+            "error": {
+                "msg": "Validation error",
+                "details": exc.errors(),
+            },
+        },
     )
 
 @app.options("/{rest_of_path:path}")

@@ -9,7 +9,8 @@ from sqlalchemy import (Column, Integer, String, DateTime, Date, Text,
 from sqlalchemy.orm import relationship
 
 from app.db.base import Base
-
+from app.models.ipd_nursing import IpdDressingRecord
+from app.models.ipd_referral import IpdReferral
 # ---------------------------------------------------------------------
 # IPD Masters
 # ---------------------------------------------------------------------
