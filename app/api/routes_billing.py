@@ -2376,9 +2376,11 @@ class InvoiceLineUpdateIn(BaseModel):
     description: Optional[str] = None
     doctor_id: Optional[int] = None
     service_date: Optional[datetime] = None
+    item_code: Optional[str] = None  # ✅ add (optional)
     meta_json: Optional[Dict[str, Any]] = None
 
     reason: str = Field(..., min_length=3, max_length=255)
+
 
 
 @router.put("/lines/{line_id}")
@@ -2418,10 +2420,10 @@ def update_line(
             description=inp.description,
             doctor_id=inp.doctor_id,
             service_date=inp.service_date,
-            meta_json=(jsonable_encoder(inp.meta_json)
-                       if inp.meta_json else None),
+            meta_json=(jsonable_encoder(inp.meta_json) if inp.meta_json is not None else None),
             reason=inp.reason,
         )
+
 
         db.commit()
         db.refresh(updated)

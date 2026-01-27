@@ -7,6 +7,8 @@ from datetime import datetime, timezone, date as dt_date
 from decimal import Decimal
 from typing import Any, Dict, Optional, Tuple, List
 from zoneinfo import ZoneInfo
+from decimal import Decimal, ROUND_HALF_UP
+
 
 from fastapi import HTTPException
 from sqlalchemy import func, or_
@@ -409,20 +411,52 @@ def _set_if_has(obj: Any, field: str, value: Any) -> None:
     if hasattr(obj, field):
         setattr(obj, field, value)
 
+from typing import Any, Dict
+from sqlalchemy.orm.attributes import flag_modified
+
+def _deep_merge_with_remove(dst: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Deep merge with remove semantics:
+    - value None or "" => remove key
+    - dict => deep merge
+    - otherwise overwrite
+    """
+    for k, v in (patch or {}).items():
+        if v is None or (isinstance(v, str) and v.strip() == ""):
+            dst.pop(k, None)
+            continue
+
+        if isinstance(v, dict):
+            cur = dst.get(k)
+            if not isinstance(cur, dict):
+                cur = {}
+            dst[k] = _deep_merge_with_remove(cur, v)
+        else:
+            dst[k] = v
+    return dst
 
 def _merge_meta(obj: Any, patch: Dict[str, Any]) -> None:
     """
     Safe meta_json merge:
-    - If models don't have meta_json -> no-op
-    - If meta_json is NULL -> initializes dict
+    - Supports removing keys (None/"")
+    - Supports nested dict merges
+    - Ensures SQLAlchemy persists JSON updates
     """
     if not hasattr(obj, "meta_json"):
         return
+
     current = getattr(obj, "meta_json", None)
     if not isinstance(current, dict):
         current = {}
-    current.update(patch or {})
-    setattr(obj, "meta_json", current)
+
+    merged = _deep_merge_with_remove(dict(current), patch or {})
+    setattr(obj, "meta_json", merged if merged else None)
+
+    # ✅ force persist even if JSON isn't MutableDict
+    try:
+        flag_modified(obj, "meta_json")
+    except Exception:
+        pass
 
 
 def _now_local() -> datetime:
@@ -1308,6 +1342,20 @@ def add_manual_line(
 # ============================================================
 # ✅ Edit/Delete any line (manual + auto) + FIX totals
 # ============================================================
+
+
+def _q2(x: Decimal) -> Decimal:
+    return (x or Decimal("0")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+def normalize_gst_rate(gst_rate: Decimal) -> Decimal:
+    r = gst_rate or Decimal("0")
+    # ✅ common fix: 0.05 stored instead of 5.00
+    if r > 0 and r < 1:
+        r = r * Decimal("100")
+    if r < 0 or r > 100:
+        raise BillingError(f"Invalid gst_rate: {r}")
+    return r
+
 def update_invoice_line(
     db: Session,
     *,
@@ -1324,7 +1372,7 @@ def update_invoice_line(
     service_date: Optional[datetime] = None,
     item_code: Optional[str] = None,
 
-    # ✅ NEW: accept meta_json (patch/merge)
+    # ✅ accept meta_json patch (can be {} or contain nulls for remove)
     meta_json: Optional[Dict[str, Any]] = None,
     reason: Optional[str] = None,
 ) -> BillingInvoiceLine:
@@ -1338,9 +1386,9 @@ def update_invoice_line(
     if not inv:
         raise BillingError("Invoice not found for this line")
     if inv.status not in (DocStatus.DRAFT, DocStatus.APPROVED):
-        raise BillingStateError(
-            "Can edit lines only in DRAFT/APPROVED invoice")
+        raise BillingStateError("Can edit lines only in DRAFT/APPROVED invoice")
 
+    # ✅ apply fields (use is not None, so 0 values work)
     if description is not None:
         ln.description = str(description or "")[:255]
     if qty is not None:
@@ -1359,39 +1407,42 @@ def update_invoice_line(
     if hasattr(ln, "service_date") and service_date is not None:
         ln.service_date = _to_local_naive(service_date)
 
-    # ✅ Merge incoming meta_json patch (pharmacy batch / extra fields)
-    if meta_json:
+    # ✅ meta patch must be checked with "is not None" (so {} doesn't get ignored)
+    #    Use {"batch_no": None} / {"expiry_date": ""} to remove keys.
+    if meta_json is not None:
         _merge_meta(ln, meta_json)
 
-    dp = _d(discount_percent) if discount_percent is not None else _d(
-        getattr(ln, "discount_percent", 0))
-    da = _d(discount_amount) if discount_amount is not None else _d(
-        getattr(ln, "discount_amount", 0))
+    # ---- recompute totals ----
+    dp = _d(discount_percent) if discount_percent is not None else _d(getattr(ln, "discount_percent", 0))
+    da = _d(discount_amount) if discount_amount is not None else _d(getattr(ln, "discount_amount", 0))
 
-    line_total = _d(getattr(ln, "qty", 0)) * _d(getattr(ln, "unit_price", 0))
+    line_total = _q2(_d(getattr(ln, "qty", 0)) * _d(getattr(ln, "unit_price", 0)))
 
-    # if percent provided but amount not, compute
-    if (discount_amount is None) and (discount_percent
-                                      is not None) and da <= 0 and dp > 0:
-        da = (line_total * dp) / Decimal("100")
+    # compute discount if percent provided and amount not provided
+    if (discount_amount is None) and (discount_percent is not None) and da <= 0 and dp > 0:
+        da = _q2((line_total * dp) / Decimal("100"))
 
     if da < 0:
         da = Decimal("0")
     if da > line_total:
         da = line_total
 
-    taxable = max(line_total - da, Decimal("0"))
-    gr = _d(getattr(ln, "gst_rate", 0))
-    tax_amount = (taxable * gr) / Decimal("100") if gr > 0 else Decimal("0")
-    net_amount = taxable + tax_amount
+    taxable = _q2(max(line_total - da, Decimal("0")))
+
+    gr_raw = _d(getattr(ln, "gst_rate", 0))
+    gr = normalize_gst_rate(gr_raw)
+
+    tax_amount = _q2((taxable * gr) / Decimal("100")) if gr > 0 else Decimal("0.00")
+    net_amount = _q2(taxable + tax_amount)
 
     ln.discount_percent = dp
-    ln.discount_amount = da
+    ln.discount_amount = _q2(da)
     ln.line_total = line_total
     ln.tax_amount = tax_amount
     ln.net_amount = net_amount
     ln.patient_pay_amount = net_amount
 
+    # split GST (your existing helpers)
     split_rates = _gst_split(gr, intra_state=intra_state_gst)
     split_amt = _gst_amount_split(tax_amount, split_rates)
 
@@ -1423,6 +1474,7 @@ def update_invoice_line(
     _set_if_has(inv, "updated_by", getattr(user, "id", None))
     db.flush()
     return ln
+
 
 
 def delete_invoice_line(

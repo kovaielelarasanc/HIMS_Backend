@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import enum
 from enum import Enum as PyEnum
-
+from sqlalchemy.ext.mutable import MutableDict
+from sqlalchemy import JSON
 from sqlalchemy import (
     Column,
     Integer,
@@ -756,7 +757,7 @@ class BillingInvoiceLine(Base):
     service_date = Column(DateTime, nullable=True)
 
     # per-line meta (pharmacy batch_id/expiry/hsn_sac etc.)
-    meta_json = Column(JSON, nullable=True)
+    meta_json = Column(MutableDict.as_mutable(JSON), nullable=True)
 
 
 # ============================================================

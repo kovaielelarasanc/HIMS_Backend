@@ -111,6 +111,16 @@ except Exception:
     BillingInsuranceCase = None  # type: ignore
     BillingPreauthRequest = None  # type: ignore
     BillingClaim = None  # type: ignore
+from sqlalchemy import func
+
+try:
+    from app.models.ui_branding import UiBrandingContext  # type: ignore
+except Exception:
+    UiBrandingContext = None  # type: ignore
+
+from decimal import Decimal, InvalidOperation
+from datetime import date, datetime
+from typing import List, Tuple, Any
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/billing/print", tags=["Billing Print"])
@@ -173,6 +183,64 @@ def _need_any(user: User, perms: Union[str, Iterable[str]]) -> None:
 # =========================================================
 # Small utils
 # =========================================================
+
+from decimal import Decimal, ROUND_HALF_UP
+
+
+def q2(x) -> Decimal:
+    return Decimal(x or 0).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def q4(x) -> Decimal:
+    return Decimal(x or 0).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+
+
+def normalize_gst_rate(gst_rate) -> Decimal:
+    r = Decimal(gst_rate or 0)
+    # ✅ common fix: 0.05 stored instead of 5.00
+    if r > 0 and r < 1:
+        r = r * Decimal("100")
+    # optional guard
+    if r < 0 or r > 100:
+        raise ValueError(f"Invalid gst_rate: {r}")
+    return r
+
+
+def recompute_invoice_line(line):
+    qty = q4(line.qty)
+    unit = q2(line.unit_price)
+    gross = q2(qty * unit)
+
+    # discount
+    disc_amt = q2(line.discount_amount)
+    disc_pct = Decimal(line.discount_percent or 0)
+
+    if disc_amt <= 0 and disc_pct > 0:
+        disc_amt = q2(gross * disc_pct / Decimal("100"))
+
+    if disc_amt > gross:
+        disc_amt = gross  # clamp
+
+    taxable = q2(gross - disc_amt)
+
+    rate = normalize_gst_rate(line.gst_rate)
+    tax = q2(taxable * rate / Decimal("100"))
+
+    # ✅ persist
+    line.discount_amount = disc_amt
+    line.line_total = gross
+    line.tax_amount = tax
+    line.net_amount = q2(taxable + tax)
+
+    return {
+        "gross": gross,
+        "taxable": taxable,
+        "tax": tax,
+        "net": line.net_amount,
+        "rate": rate,
+    }
+
+
 def _val(x: Any) -> Any:
     return getattr(x, "value", x)
 
@@ -240,12 +308,6 @@ def _dec(v: Any) -> Decimal:
 def _money(v: Any) -> str:
     d = _dec(v).quantize(Decimal("0.01"))
     return f"{d}"
-
-
-def _fmt_date(d: Any) -> str:
-    if isinstance(d, (datetime, date)):
-        return d.strftime("%d-%b-%Y")
-    return _safe(d)
 
 
 def _fmt_dt(d: Any) -> str:
@@ -1781,6 +1843,314 @@ def _read_logo_reader(branding: Any) -> Optional[ImageReader]:
         return None
 
 
+# =========================================================
+# Branding context merge + Pharmacy legal lines (MISSING)
+# =========================================================
+
+
+def _has_col(model: Any, col_name: str) -> bool:
+    try:
+        return col_name in sa_inspect(model).columns
+    except Exception:
+        return False
+
+
+def _model_columns_to_dict(obj: Any) -> Dict[str, Any]:
+    """
+    Convert a SQLAlchemy model instance to a dict using mapped columns only.
+    Safe for instrumentation-heavy objects.
+    """
+    if obj is None:
+        return {}
+    try:
+        insp = sa_inspect(obj.__class__)
+        out: Dict[str, Any] = {}
+        for c in insp.columns:
+            name = c.key
+            try:
+                out[name] = getattr(obj, name, None)
+            except Exception:
+                pass
+        return out
+    except Exception:
+        # last fallback
+        try:
+            return dict(getattr(obj, "__dict__", {}) or {})
+        except Exception:
+            return {}
+
+
+def _bget(b: Any, *names: str) -> str:
+    """
+    Safer getter: supports SqlAlchemy models, SimpleNamespace, and dict.
+    """
+    for n in names:
+        try:
+            if isinstance(b, dict):
+                v = b.get(n)
+            else:
+                v = getattr(b, n, None)
+            if v not in (None, "", []):
+                return str(v).strip()
+        except Exception:
+            pass
+    return ""
+
+
+def _read_pdf_header_reader(branding: Any) -> Optional[ImageReader]:
+    """
+    Reads a pharmacy/pdf header image if configured.
+    Supports multiple key names + both relative and absolute paths.
+    """
+    rel = (
+        _bget(
+            branding,
+            # common names we see in installs
+            "pdf_header_path",
+            "header_pdf_path",
+            "header_image_path",
+            "header_path",
+            "pharmacy_header_path",
+            "pharmacy_header_image_path",
+            "rx_header_path",
+            "pharmacy_header",
+            "pdf_header",
+            "header_image",
+        ) or "").strip()
+
+    if not rel:
+        return None
+
+    try:
+        p = Path(rel)
+        if not p.is_absolute():
+            base = Path(getattr(settings, "STORAGE_DIR", "."))
+            p = base.joinpath(rel)
+        if not p.exists() or not p.is_file():
+            return None
+        return ImageReader(str(p))
+    except Exception:
+        return None
+
+
+def _pharmacy_legal_lines(branding: Any) -> List[str]:
+    """
+    Produces 1–2 compact legal lines for Pharmacy headers.
+    Now supports common DL 20B/21B naming patterns + pharmacist keys.
+    """
+    # --- direct known keys first ---
+    dl1 = _safe(
+        _bget(
+            branding,
+            "license_no",
+            "dl_no",
+            "drug_license_no",
+            "drug_license_number",
+            "dl_number",
+            "dl1",
+            "license1",
+            # common pharmacy patterns
+            "dl_20b",
+            "dl20b",
+            "dl_no_20b",
+            "dlno20b",
+            "drug_license_20b",
+            "dl_21b",
+            "dl21b",
+            "dl_no_21b",
+            "dlno21b",
+            "drug_license_21b",
+        ))
+    dl2 = _safe(
+        _bget(
+            branding,
+            "license_no2",
+            "dl_no2",
+            "drug_license_no2",
+            "dl_number2",
+            "dl2",
+            "license2",
+            # sometimes stored as second line / alternate key
+            "dl_20b_21b",
+            "dl_21b_20b",
+        ))
+
+    pharm = _safe(
+        _bget(
+            branding,
+            "pharmacist_name",
+            "pharmacist",
+            "pharmacist_full_name",
+            "registered_pharmacist_name",
+            "rph_name",
+            "chief_pharmacist_name",
+        ))
+    regno = _safe(
+        _bget(
+            branding,
+            "pharmacist_reg_no",
+            "pharmacist_reg_number",
+            "reg_no",
+            "pharmacist_registration_no",
+            "pharmacist_registration_number",
+            "rph_reg_no",
+            "rph_registration_no",
+        ))
+
+    # --- fuzzy fallback: scan merged branding keys if still empty ---
+    try:
+        d: Dict[str, Any] = branding if isinstance(
+            branding, dict) else (vars(branding) if branding else {})
+    except Exception:
+        d = {}
+
+    def _good_val(v: Any) -> bool:
+        return v not in (None, "", [], {}, "—")
+
+    if dl1 == "—":
+        cands = []
+        for k, v in (d or {}).items():
+            if not _good_val(v):
+                continue
+            key = str(k).lower().strip()
+            # pick likely DL/license keys, ignore paths/dates/etc.
+            if (("dl" in key) or ("license" in key)) and not any(
+                    x in key for x in ("expiry", "date", "valid", "path",
+                                       "file", "image", "logo")):
+                cands.append((key, str(v).strip()))
+        # prefer 20b/21b if present
+        cands.sort(
+            key=lambda kv: (0 if re.search(r"(20b|21b)", kv[0]) else 1, kv[0]))
+        if cands:
+            dl1 = _safe(cands[0][1])
+        if len(cands) > 1 and dl2 == "—":
+            dl2 = _safe(cands[1][1])
+
+    if pharm == "—":
+        for k, v in (d or {}).items():
+            if not _good_val(v):
+                continue
+            key = str(k).lower().strip()
+            if "pharmacist" in key and ("name" in key
+                                        or key.endswith("pharmacist")):
+                pharm = _safe(str(v).strip())
+                break
+
+    if regno == "—":
+        for k, v in (d or {}).items():
+            if not _good_val(v):
+                continue
+            key = str(k).lower().strip()
+            if "pharmacist" in key and ("reg" in key or "registration" in key):
+                regno = _safe(str(v).strip())
+                break
+
+    lines: List[str] = []
+
+    if dl1 != "—":
+        lines.append(f"License No: {dl1}" + (f", {dl2}" if dl2 != "—" else ""))
+
+    if pharm != "—" or regno != "—":
+        name_part = "" if pharm == "—" else pharm
+        reg_part = "" if regno == "—" else f" (Reg: {regno})"
+        joined = f"Pharmacist: {name_part}{reg_part}".strip()
+        if joined.endswith(":"):
+            joined = joined[:-1].strip()
+        if joined:
+            lines.append(joined)
+
+    return lines
+
+
+def _load_branding_merged(db: Session,
+                          context: Optional[str] = None) -> Optional[Any]:
+    """
+    Returns UiBranding merged with UiBrandingContext for the given context.
+    - If UiBrandingContext is missing/not installed → returns UiBranding.
+    - Supports BOTH:
+        a) key/value rows
+        b) JSON blob rows (data_json/meta_json/etc.)
+        c) wide columns stored directly on UiBrandingContext
+    """
+    base = _load_branding(db)
+    if not context or UiBrandingContext is None:
+        return base
+
+    ctx = str(context).strip().lower()
+    if not ctx:
+        return base
+
+    # Start with a mutable namespace clone
+    merged = SimpleNamespace(**(_model_columns_to_dict(base) if base else {}))
+
+    try:
+        q = db.query(UiBrandingContext)
+
+        # Find a usable "context" column name
+        if _has_col(UiBrandingContext, "context"):
+            q = q.filter(func.lower(UiBrandingContext.context) == ctx)
+        elif _has_col(UiBrandingContext, "module"):
+            q = q.filter(func.lower(UiBrandingContext.module) == ctx)
+        elif _has_col(UiBrandingContext, "code"):
+            q = q.filter(func.lower(UiBrandingContext.code) == ctx)
+        elif _has_col(UiBrandingContext, "name"):
+            q = q.filter(func.lower(UiBrandingContext.name) == ctx)
+        # else: no filter column available → cannot context-filter
+
+        # order older → newer so newest wins
+        if _has_col(UiBrandingContext, "id"):
+            q = q.order_by(UiBrandingContext.id.asc())
+
+        rows = q.all() or []
+    except Exception:
+        rows = []
+
+    def _row_to_map(r: Any) -> Dict[str, Any]:
+        # 1) key/value style
+        if _has_col(UiBrandingContext, "key") and _has_col(
+                UiBrandingContext, "value"):
+            k = getattr(r, "key", None)
+            v = getattr(r, "value", None)
+            if k:
+                return {str(k).strip(): v}
+
+        # 2) JSON blob style
+        for jcol in ("data_json", "meta_json", "payload_json", "json", "data",
+                     "payload", "fields_json", "fields"):
+            if _has_col(UiBrandingContext, jcol):
+                raw = getattr(r, jcol, None)
+                m = _meta(raw)
+                if m:
+                    return m
+
+        # 3) wide columns: take mapped columns except bookkeeping
+        m = _model_columns_to_dict(r)
+        drop = {
+            "id", "created_at", "updated_at", "deleted_at", "context",
+            "module", "code", "name", "tenant_id"
+        }
+        out: Dict[str, Any] = {}
+        for k, v in (m or {}).items():
+            if k in drop:
+                continue
+            if v not in (None, "", [], {}):
+                out[k] = v
+        return out
+
+    # Apply overlays
+    for r in rows:
+        try:
+            mp = _row_to_map(r)
+            for k, v in (mp or {}).items():
+                if v in (None, "", [], {}):
+                    continue
+                setattr(merged, str(k).strip(), v)
+        except Exception:
+            continue
+
+    return merged
+
+
 def _draw_branding_header(c: canvas.Canvas,
                           branding: Optional[UiBranding],
                           x: float,
@@ -1788,6 +2158,74 @@ def _draw_branding_header(c: canvas.Canvas,
                           w: float,
                           *,
                           scale: float = 1.0) -> float:
+    b = branding or SimpleNamespace()
+
+    # ✅ 1) If a PDF header image exists, use it (Pharmacy custom header)
+    hdr = _read_pdf_header_reader(b)
+    if hdr:
+        try:
+            iw, ih = hdr.getSize()
+            max_h = (30.0 * scale) * mm  # adjust if you want taller/shorter
+            draw_w = w
+            draw_h = (draw_w * float(ih) / float(iw)) if iw and ih else max_h
+
+            if draw_h > max_h and iw and ih:
+                draw_h = max_h
+                draw_w = (draw_h * float(iw) / float(ih))
+
+            x_img = x + (w - draw_w) / 2
+            y_img = top_y - draw_h
+
+            c.drawImage(hdr,
+                        x_img,
+                        y_img,
+                        width=draw_w,
+                        height=draw_h,
+                        preserveAspectRatio=True,
+                        mask="auto")
+
+            y_after = y_img - (2.0 * mm)
+
+            # Optional: tiny legal line(s) if provided (won’t show if empty)
+            lic1 = _safe(_bget(b, "license_no"))
+            lic2 = _safe(_bget(b, "license_no2"))
+            pharm = _safe(_bget(b, "pharmacist_name"))
+            regno = _safe(_bget(b, "pharmacist_reg_no"))
+
+            y_after = y_img - (2.0 * mm)
+
+            legal_bits = _pharmacy_legal_lines(b)
+            if lic1 != "—":
+                legal_bits.append(f"DL No: {lic1}" +
+                                  (f", {lic2}" if lic2 != "—" else ""))
+            if pharm != "—" or regno != "—":
+                legal_bits.append(
+                    f"Pharmacist: {pharm if pharm != '—' else ''}{f' (Reg: {regno})' if regno != '—' else ''}"
+                    .strip())
+
+            # ✅ legal lines (DL + pharmacist) — now uses robust key mapping
+
+            y_after = y_img - (2.0 * mm)
+
+            # ✅ Pharmacy legal lines (from UiBrandingContext merged fields)
+            legal_bits = _pharmacy_legal_lines(b)
+            if legal_bits:
+                c.setFont("Helvetica", 7.6 * scale)
+                c.setFillColor(MUTED)
+                for line in legal_bits[:2]:
+                    c.drawRightString(x + w, y_after, line)
+                    y_after -= (3.6 * mm)
+
+            c.setStrokeColor(GRID_SOFT)
+            c.setLineWidth(0.6)
+            c.line(x, y_after, x + w, y_after)
+            return y_after - (2.0 * mm)
+
+        except Exception:
+            # fallback to text header if image draw fails
+            pass
+
+    # ✅ 2) Fallback: your existing text/logo header (kept)
     b = branding or SimpleNamespace(
         org_name="",
         org_tagline="",
@@ -1841,15 +2279,29 @@ def _draw_branding_header(c: canvas.Canvas,
             _cap_lines(
                 simpleSplit(" | ".join(extra_bits), "Helvetica", 8.4 * scale,
                             right_w), 1))
-    meta_lines = _cap_lines(meta_lines, 3)
+        # ✅ Pharmacy legal lines must show even when NO header image is used
+    legal_bits = _pharmacy_legal_lines(b)
+
+    # If legal lines exist, keep meta compact so everything fits nicely
+    meta_lines = _cap_lines(meta_lines, 2 if legal_bits else 3)
 
     lines: List[Tuple[str, str, float, Any]] = []
     if org != "—":
         lines.append((org, "Helvetica-Bold", 12.0 * scale, INK))
     if tag != "—":
         lines.append((tag, "Helvetica", 8.6 * scale, MUTED))
+
     for ln in meta_lines:
         lines.append((ln, "Helvetica", 8.4 * scale, MUTED))
+
+    # ✅ Add DL / Pharmacist lines (smaller font) in fallback header too
+    if legal_bits:
+        for ln in legal_bits[:2]:
+            # keep each legal line to one wrapped line (avoid header becoming too tall)
+            wrapped = _cap_lines(
+                simpleSplit(ln, "Helvetica", 7.6 * scale, right_w), 1)
+            for wln in wrapped:
+                lines.append((wln, "Helvetica", 7.6 * scale, MUTED))
 
     def lh(sz: float) -> float:
         return sz * 1.18
@@ -1865,23 +2317,19 @@ def _draw_branding_header(c: canvas.Canvas,
                 scale_h = logo_h / float(ih)
                 draw_w = float(iw) * scale_h
                 draw_h = logo_h
-
                 max_w = logo_col
                 if draw_w > max_w:
                     scale_w = max_w / float(iw)
                     draw_w = max_w
                     draw_h = float(ih) * scale_w
-
                 center_y = top_y - header_h / 2
-                c.drawImage(
-                    logo_reader,
-                    x,
-                    center_y - (draw_h / 2),
-                    width=draw_w,
-                    height=draw_h,
-                    preserveAspectRatio=True,
-                    mask="auto",
-                )
+                c.drawImage(logo_reader,
+                            x,
+                            center_y - (draw_h / 2),
+                            width=draw_w,
+                            height=draw_h,
+                            preserveAspectRatio=True,
+                            mask="auto")
         except Exception:
             pass
 
@@ -1902,24 +2350,64 @@ def _draw_branding_header(c: canvas.Canvas,
     return top_y - header_h - (2 * mm)
 
 
-def _draw_branding_header_small(c: canvas.Canvas,
-                                branding: Optional[UiBranding],
-                                x: float,
-                                top_y: float,
-                                w: float,
-                                *,
-                                scale: float = 1.0) -> float:
-    b = branding or SimpleNamespace(
-        org_name="",
-        org_tagline="",
-        org_address="",
-        org_phone="",
-        org_email="",
-        org_website="",
-        org_gstin="",
-        logo_path="",
-    )
+def _draw_branding_header_small(
+    c: canvas.Canvas,
+    branding: Optional[UiBranding],
+    x: float,
+    top_y: float,
+    w: float,
+    *,
+    scale: float = 1.0,
+) -> float:
+    b = branding or SimpleNamespace()
 
+    # ✅ Prefer pharmacy/pdf header image if present
+    hdr = _read_pdf_header_reader(b)
+    if hdr:
+        try:
+            iw, ih = hdr.getSize()
+            max_h = (22.0 * scale) * mm
+
+            draw_w = w
+            draw_h = (draw_w * float(ih) / float(iw)) if iw and ih else max_h
+
+            if draw_h > max_h and iw and ih:
+                draw_h = max_h
+                draw_w = (draw_h * float(iw) / float(ih))
+
+            x_img = x + (w - draw_w) / 2
+            y_img = top_y - draw_h
+
+            c.drawImage(
+                hdr,
+                x_img,
+                y_img,
+                width=draw_w,
+                height=draw_h,
+                preserveAspectRatio=True,
+                mask="auto",
+            )
+
+            y_after = y_img - (1.5 * mm)
+
+            # ✅ Add legal lines even in small header
+            legal_bits = _pharmacy_legal_lines(b)
+            if legal_bits:
+                c.setFont("Helvetica", 7.0 * scale)
+                c.setFillColor(MUTED)
+                for line in legal_bits[:2]:
+                    c.drawRightString(x + w, y_after, line)
+                    y_after -= (3.2 * mm)
+
+            c.setStrokeColor(GRID_SOFT)
+            c.setLineWidth(0.6)
+            c.line(x, y_after, x + w, y_after)
+
+            return y_after - (2.0 * mm)
+        except Exception:
+            pass
+
+    # ✅ fallback small text/logo header
     logo_h = (14.0 * scale) * mm
     gutter = 4 * mm
 
@@ -1941,6 +2429,13 @@ def _draw_branding_header_small(c: canvas.Canvas,
             _cap_lines(
                 simpleSplit(f"Ph: {phone}", "Helvetica", 7.7 * scale, right_w),
                 1))
+
+    # ✅ If room, include pharmacy legal lines in fallback too
+    legal_bits = _pharmacy_legal_lines(b)
+    for ln in legal_bits:
+        if len(meta_lines) < 2:
+            meta_lines.append(ln)
+
     meta_lines = _cap_lines(meta_lines, 2)
 
     lines: List[Tuple[str, str, float, Any]] = []
@@ -1994,11 +2489,12 @@ def _draw_branding_header_small(c: canvas.Canvas,
         c.setFillColor(col)
         c.drawRightString(text_right_x, cur_y, txt)
 
+    y_line = top_y - header_h
     c.setStrokeColor(GRID_SOFT)
     c.setLineWidth(0.6)
-    c.line(x, top_y - header_h, x + w, top_y - header_h)
+    c.line(x, y_line, x + w, y_line)
 
-    return top_y - header_h - (2 * mm)
+    return y_line - (2.0 * mm)
 
 
 # =========================================================
@@ -2540,55 +3036,315 @@ def _collect_detail_rows(
     return out
 
 
+def _to_dec(v: Any) -> Decimal:
+    try:
+        if v is None or v == "":
+            return Decimal("0")
+        return Decimal(str(v))
+    except (InvalidOperation, ValueError, TypeError):
+        return Decimal("0")
+
+
+def _fmt_money(v: Decimal) -> str:
+    try:
+        return f"{v.quantize(Decimal('0.01')):f}"
+    except Exception:
+        return str(v)
+
+
+def _fmt_date(v: Any) -> str:
+    if not v:
+        return "—"
+    try:
+        if isinstance(v, (datetime, date)):
+            return v.strftime("%d-%m-%Y")
+        s = str(v).strip()
+        return s if s else "—"
+    except Exception:
+        return "—"
+
+
+def _first_nonblank(*vals: Any) -> Any:
+    for v in vals:
+        if v is None:
+            continue
+        if isinstance(v, str):
+            s = v.strip()
+            if not s or s == "—":
+                continue
+            return s
+        if v in ("—", [], {}, ()):
+            continue
+        return v
+    return None
+
+
+from decimal import Decimal, ROUND_HALF_UP
+
+
 def _collect_pharmacy_split_rows(
-        invoices: List[BillingInvoice]) -> List[List[str]]:
+    invoices: List[Any],
+    *,
+    include_bill_date: bool = False,
+) -> Tuple[List[List[str]], Decimal]:
     """
-    Bill Date | Item Name | Batch No | Expiry Date | Qty | Item Amount
-    ✅ Bill No removed (shown in header).
+    ONLY pharmacy medicines lines.
+
+    Columns (default): Item Name | Batch No | Expiry Date | Qty | Price | Total Amount (NET incl tax)
+    If include_bill_date=True: Bill Date is prepended.
+    Returns rows + pharmacy_grand_total (sum of pharmacy NET totals)
     """
     rows: List[List[str]] = []
+    total_sum = Decimal("0")
 
-    for inv in invoices:
-        mod = (getattr(inv, "module", "") or "").upper()
-        if mod not in ("PHM", "PHARM", "PHARMACY", "RX", "MED"):
-            continue
+    def q2(x) -> Decimal:
+        return (Decimal(str(x or 0))).quantize(Decimal("0.01"),
+                                               rounding=ROUND_HALF_UP)
 
-        bill_date = _invoice_bill_date(inv)
+    def q4(x) -> Decimal:
+        return (Decimal(str(x or 0))).quantize(Decimal("0.0001"),
+                                               rounding=ROUND_HALF_UP)
 
-        for ln in list(getattr(inv, "lines", []) or []):
-            meta = _meta(getattr(ln, "meta_json", None))
+    def normalize_gst_rate(gst_rate) -> Decimal:
+        """
+        Accepts:
+          - 5 / 5.00 (percent)
+          - 0.05 (fraction for 5%)  ✅ common DB/storage issue
+        Returns percent [0..100]
+        """
+        r = q2(gst_rate)
+        if r > 0 and r < 1:
+            r = q2(r * Decimal("100"))
+        if r < 0 or r > 100:
+            return Decimal("0.00")  # be safe in PDF; don't crash printing
+        return r
 
-            batch_no = _safe(
-                getattr(ln, "batch_no", None)
-                or getattr(ln, "batch_number", None)
-                or getattr(ln, "batch", None))
-            if batch_no == "—":
-                batch_no = _meta_pick(meta, [
-                    "batch_no", "batchNo", "batch_number", "batchNumber",
-                    "batch", "batch_id", "batchId"
-                ], "—")
+    # 1) Prefer invoice.module == pharmacy medicines (PHM/PHARMACY/RX)
+    ph_invoices = [
+        inv for inv in (invoices or []) if _is_pharmacy_invoice(inv)
+    ]
 
-            exp_raw = _safe(
-                getattr(ln, "expiry_date", None)
-                or getattr(ln, "exp_date", None)
-                or getattr(ln, "expiry", None))
-            if exp_raw == "—":
-                exp_raw = _meta_pick(meta, [
-                    "expiry_date", "expiryDate", "expiry", "exp_date",
-                    "expDate", "exp"
-                ], "—")
-            exp = _fmt_ddmmyyyy(exp_raw) if exp_raw != "—" else "—"
+    # 2) Fallback: detect by pharmacy lines
+    if not ph_invoices:
+        for inv in (invoices or []):
+            lines = getattr(inv, "lines", None) or getattr(
+                inv, "invoice_lines", None) or []
+            if any(_is_pharmacy_line(ln) for ln in (lines or [])):
+                ph_invoices.append(inv)
 
-            qty = _safe(getattr(ln, "qty", None))
-            amt = _money(getattr(ln, "net_amount", 0))
+    for inv in ph_invoices:
+        inv_bill_date = _invoice_bill_date(inv)
 
-            rows.append([
-                bill_date,
-                _safe(getattr(ln, "description", None)), batch_no, exp, qty,
-                amt
+        lines = (getattr(inv, "lines", None)
+                 or getattr(inv, "invoice_lines", None)
+                 or getattr(inv, "items", None) or [])
+
+        for ln in (lines or []):
+            if not _is_pharmacy_line(ln, invoice=inv):
+                continue
+
+            meta = _line_meta(ln) or {}
+
+            item_name_raw = _first_nonblank(
+                _bget(ln, "item_name", "name", "product_name", "service_name",
+                      "description"),
+                meta.get("item_name"),
+                meta.get("itemName"),
+                meta.get("product_name"),
+                meta.get("productName"),
+                meta.get("service_name"),
+                meta.get("serviceName"),
+                meta.get("description"),
+            )
+            item_name = _safe(item_name_raw)
+
+            batch_meta = meta.get("batch") if isinstance(
+                meta.get("batch"), dict) else {}
+
+            batch_rel = _first_nonblank(
+                getattr(ln, "batch", None),
+                getattr(ln, "stock_batch", None),
+                getattr(ln, "item_batch", None),
+            )
+
+            batch_rel_no = None
+            batch_rel_exp = None
+            if batch_rel and not isinstance(
+                    batch_rel, (str, int, float, Decimal, date, datetime)):
+                batch_rel_no = _first_nonblank(
+                    _bget(batch_rel, "batch_no", "batchNo", "number", "code",
+                          "name", "lot_no", "lotNo"), )
+                batch_rel_exp = _first_nonblank(
+                    _bget(batch_rel, "expiry_date", "expiryDate", "exp_date",
+                          "expDate", "expiry"), )
+
+            batch_no_raw = _first_nonblank(
+                _bget(ln, "batch_no", "batchNo", "batch_number", "batchNumber",
+                      "lot_no", "lotNo", "batch_code", "batchCode"),
+                meta.get("batch_no"),
+                meta.get("batchNo"),
+                meta.get("batch_number"),
+                meta.get("batchNumber"),
+                meta.get("lot_no"),
+                meta.get("lotNo"),
+                batch_meta.get("batch_no"),
+                batch_meta.get("batchNo"),
+                batch_meta.get("number"),
+                batch_meta.get("code"),
+                batch_meta.get("lot_no"),
+                batch_meta.get("lotNo"),
+                batch_rel_no,
+            )
+            batch_no = _safe(batch_no_raw)
+
+            exp_raw = _first_nonblank(
+                _bget(ln, "expiry_date", "expiryDate", "exp_date", "expDate",
+                      "expiry", "batch_expiry_date", "batchExpiryDate"),
+                meta.get("expiry_date"),
+                meta.get("expiryDate"),
+                meta.get("exp_date"),
+                meta.get("expDate"),
+                meta.get("expiry"),
+                meta.get("batch_expiry_date"),
+                meta.get("batchExpiryDate"),
+                batch_meta.get("expiry_date"),
+                batch_meta.get("expiryDate"),
+                batch_meta.get("exp_date"),
+                batch_meta.get("expDate"),
+                batch_meta.get("expiry"),
+                batch_rel_exp,
+            )
+            exp_dt = _fmt_date(exp_raw)
+
+            qty = _to_dec(
+                _first_nonblank(
+                    _bget(ln, "qty", "quantity", "q"),
+                    meta.get("qty"),
+                    meta.get("quantity"),
+                ))
+            qty = q4(qty)
+
+            unit_price = _to_dec(
+                _first_nonblank(
+                    _bget(ln, "unit_price", "price", "rate", "mrp",
+                          "sale_price"),
+                    meta.get("unit_price"),
+                    meta.get("unitPrice"),
+                    meta.get("price"),
+                    meta.get("rate"),
+                ))
+            unit_price = q2(unit_price)
+
+            # ✅ gross (line_total) MUST NOT read net_amount
+            gross = _to_dec(
+                _first_nonblank(
+                    _bget(ln, "line_total", "total_amount", "amount",
+                          "gross_amount", "gross"),
+                    meta.get("line_total"),
+                    meta.get("lineTotal"),
+                    meta.get("gross_amount"),
+                    meta.get("grossAmount"),
+                    meta.get("total_amount"),
+                    meta.get("totalAmount"),
+                    meta.get("amount"),
+                ))
+            gross = q2(gross)
+
+            # fallback gross
+            if gross == 0 and qty != 0 and unit_price != 0:
+                gross = q2(qty * unit_price)
+
+            # fallback unit_price if missing
+            if unit_price == 0 and qty != 0 and gross != 0:
+                unit_price = q2(gross / qty)
+
+            discount_amount = _to_dec(
+                _first_nonblank(
+                    _bget(ln, "discount_amount"),
+                    meta.get("discount_amount"),
+                    meta.get("discountAmount"),
+                ))
+            discount_amount = q2(discount_amount)
+
+            discount_percent = _to_dec(
+                _first_nonblank(
+                    _bget(ln, "discount_percent"),
+                    meta.get("discount_percent"),
+                    meta.get("discountPercent"),
+                ))
+            discount_percent = q2(discount_percent)
+
+            if discount_amount <= 0 and discount_percent > 0:
+                discount_amount = q2(gross * discount_percent / Decimal("100"))
+
+            if discount_amount > gross:
+                discount_amount = gross
+            if discount_amount < 0:
+                discount_amount = Decimal("0.00")
+
+            taxable = q2(gross - discount_amount)
+
+            gst_rate = _to_dec(
+                _first_nonblank(
+                    _bget(ln, "gst_rate", "tax_rate"),
+                    meta.get("gst_rate"),
+                    meta.get("gstRate"),
+                    meta.get("tax_rate"),
+                    meta.get("taxRate"),
+                ))
+            gst_rate = normalize_gst_rate(gst_rate)
+
+            tax_amount = _to_dec(
+                _first_nonblank(
+                    _bget(ln, "tax_amount"),
+                    meta.get("tax_amount"),
+                    meta.get("taxAmount"),
+                ))
+            tax_amount = q2(tax_amount)
+
+            # ✅ compute tax if missing/0
+            if tax_amount == 0 and taxable > 0 and gst_rate > 0:
+                tax_amount = q2(taxable * gst_rate / Decimal("100"))
+
+            # ✅ NET amount (incl tax) is what you must sum / print
+            net_amount = _to_dec(
+                _first_nonblank(
+                    _bget(ln, "net_amount"),
+                    meta.get("net_amount"),
+                    meta.get("netAmount"),
+                    # some sources store net in total/total_amount
+                    meta.get("total"),
+                    meta.get("total_amount"),
+                    meta.get("totalAmount"),
+                ))
+            net_amount = q2(net_amount)
+
+            # fallback compute net
+            if net_amount == 0 and (taxable > 0 or tax_amount > 0):
+                net_amount = q2(taxable + tax_amount)
+
+            # if tax missing but net exists, infer tax (optional safety)
+            if tax_amount == 0 and net_amount > 0 and taxable > 0 and net_amount >= taxable:
+                tax_amount = q2(net_amount - taxable)
+
+            total_sum += net_amount
+
+            row: List[str] = []
+            if include_bill_date:
+                row.append(inv_bill_date)
+
+            row.extend([
+                item_name,
+                batch_no,
+                exp_dt,
+                _fmt_money(qty) if qty != 0 else "0",
+                _fmt_money(unit_price) if unit_price != 0 else "0.00",
+                _fmt_money(net_amount)
+                if net_amount != 0 else "0.00",  # ✅ NET incl tax
             ])
+            rows.append(row)
 
-    return rows
+    return rows, q2(total_sum)
 
 
 # =========================================================
@@ -3356,11 +4112,40 @@ def _render_full_history_pdf_reportlab(
     # =======================
     # PHARMACY SPLIT UP
     # =======================
-    ph_rows = _collect_pharmacy_split_rows(invoices)
+    ph_rows, ph_total = _collect_pharmacy_split_rows(invoices,
+                                                     include_bill_date=True)
     if ph_rows:
         c.showPage()
         title4 = "PHARMACY SPLIT UP REPORT"
-        y = new_page(title4)
+
+        # ✅ use pharmacy context branding ONLY for this page
+        pharmacy_branding = _load_branding_merged(
+            db, context="pharmacy") or branding
+
+        def new_page_pharmacy(title: str) -> float:
+            _draw_page_border(c, W=W, H=H, pad=border_pad)
+            y0 = H - M
+            y0 = _draw_branding_header(c,
+                                       pharmacy_branding,
+                                       x0,
+                                       y0,
+                                       w0,
+                                       scale=scale)
+            y0 -= 1.5 * mm
+            c.setFont("Helvetica-Bold", 10.5 * scale)
+            c.setFillColor(colors.black)
+            c.drawCentredString(x0 + w0 / 2, y0, (title or "").strip().upper())
+            y0 -= 4.8 * mm
+            y0 = _draw_patient_header_block(c,
+                                            header_payload,
+                                            x0,
+                                            y0,
+                                            w0,
+                                            scale=scale)
+            y0 -= 3.0 * mm
+            return y0
+
+        y = new_page_pharmacy(title4)
 
         y = _draw_simple_table(
             c,
@@ -3378,7 +4163,7 @@ def _render_full_history_pdf_reportlab(
             rows=ph_rows,
             row_h=(7.0 * scale) * mm,
             bottom_margin=bottom,
-            new_page_fn=lambda: new_page(title4),
+            new_page_fn=lambda: new_page_pharmacy(title4),
             aligns=["left", "left", "left", "left", "right", "right"],
             max_lines=2,
             head_size=9.2 * scale,
@@ -3922,7 +4707,7 @@ def billing_common_header_pdf(
 ):
     _need_any(user, ["billing.view"])
     case = _load_case(db, case_id)
-    branding = _load_branding(db)
+    branding = _load_branding_merged(db, context="context") or _load_branding(db)
 
     payload = _build_header_payload(db, case, doc_no=doc_no, doc_date=doc_date)
     pdf_bytes = _render_common_header_pdf_reportlab(payload, branding, paper,
@@ -3968,7 +4753,7 @@ def billing_overview_pdf(
 ):
     _need_any(user, ["billing.view"])
     case = _load_case(db, case_id)
-    branding = _load_branding(db)
+    branding = _load_branding_merged(db, context="context") or _load_branding(db)
 
     payload = _build_overview_payload(
         db,
@@ -4144,7 +4929,7 @@ def billing_case_payments_ledger_pdf(
 ):
     _need_any(user, ["billing.view"])
     case = _load_case(db, int(case_id))
-    branding = _load_branding(db)
+    branding = _load_branding_merged(db, context="context") or _load_branding(db)
 
     header_payload = _build_header_payload(db,
                                            case,
@@ -4175,7 +4960,7 @@ def billing_case_advance_ledger_pdf(
 ):
     _need_any(user, ["billing.view"])
     case = _load_case(db, int(case_id))
-    branding = _load_branding(db)
+    branding = _load_branding_merged(db, context="context") or _load_branding(db)
 
     header_payload = _build_header_payload(db,
                                            case,
@@ -4206,7 +4991,7 @@ def billing_case_insurance_pdf(
 ):
     _need_any(user, ["billing.view"])
     case = _load_case(db, int(case_id))
-    branding = _load_branding(db)
+    branding = _load_branding_merged(db, context="context") or _load_branding(db)
 
     header_payload = _build_header_payload(db,
                                            case,
@@ -4252,7 +5037,7 @@ def bill_summary(
         "billing.case.view", "billing.invoices.view"
     ])
     case = _load_case(db, case_id)
-    branding = _load_branding(db)
+    branding = _load_branding_merged(db, context="context") or _load_branding(db)
 
     payload = _build_overview_payload(
         db,
@@ -4274,3 +5059,417 @@ def bill_summary(
 
     return _pdf_response(
         pdf, f"bill_summary_case_{case_id}_{paper}_{orientation}.pdf")
+
+
+# ===============================================================
+# =================phramacy======================================================================================================================================
+# =============================================================================================================
+
+
+def _is_filled(v: Any) -> bool:
+    return v not in (None, "", [], {})
+
+
+def _merge_branding(global_b: Any, ctx_b: Any) -> Any:
+    """
+    Merge UiBranding + UiBrandingContext into a SimpleNamespace where
+    ctx values override global only when filled.
+    """
+    g = global_b or SimpleNamespace()
+    c = ctx_b or SimpleNamespace()
+
+    fields = [
+        # org fields
+        "org_name",
+        "org_tagline",
+        "org_address",
+        "org_phone",
+        "org_email",
+        "org_website",
+        "org_gstin",
+        # assets
+        "logo_path",
+        "pdf_header_path",
+        "pdf_footer_path",
+        "letterhead_path",
+        "letterhead_type",
+        "letterhead_position",
+        # pharmacy legal extras
+        "license_no",
+        "license_no2",
+        "pharmacist_name",
+        "pharmacist_reg_no",
+    ]
+
+    out = SimpleNamespace()
+    for f in fields:
+        cv = getattr(c, f, None)
+        gv = getattr(g, f, None)
+        setattr(out, f, cv if _is_filled(cv) else gv)
+
+    # keep any additional globals if your header reads them
+    # (optional safety: copy common alternative names)
+    for extra in [
+            "name", "hospital_name", "tagline", "address", "phone", "email",
+            "website", "gstin"
+    ]:
+        if not hasattr(out, extra) and hasattr(g, extra):
+            setattr(out, extra, getattr(g, extra, None))
+
+    return out
+
+
+from types import SimpleNamespace
+
+from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, List, Tuple
+
+
+def _to_dec(v: Any) -> Decimal:
+    try:
+        if v is None or v == "":
+            return Decimal("0")
+        return Decimal(str(v))
+    except (InvalidOperation, ValueError, TypeError):
+        return Decimal("0")
+
+
+def _fmt_money(v: Decimal) -> str:
+    try:
+        return f"{v.quantize(Decimal('0.01')):f}"
+    except Exception:
+        return str(v)
+
+
+def _enum_str(v: Any) -> str:
+    if v is None:
+        return ""
+    try:
+        # Enum -> value/name
+        if hasattr(v, "value"):
+            return str(v.value).upper()
+        if hasattr(v, "name"):
+            return str(v.name).upper()
+    except Exception:
+        pass
+    return str(v).upper()
+
+
+def _line_meta(ln: Any) -> Dict[str, Any]:
+    """
+    Pull meta map from common json/meta columns.
+    Uses your existing _meta(raw) helper (already in your file).
+    """
+    for jcol in ("meta_json", "data_json", "payload_json", "json", "meta",
+                 "data", "payload", "fields_json", "fields", "attrs",
+                 "attributes", "extra_json", "extra"):
+        try:
+            raw = getattr(ln, jcol, None)
+        except Exception:
+            raw = None
+        m = _meta(raw)  # <-- your existing JSON/dict parser
+        if isinstance(m, dict) and m:
+            return m
+    return {}
+
+
+def _norm_token(v):
+    if v is None:
+        return ""
+    try:
+        s = str(v).strip()
+    except Exception:
+        return ""
+    return s.upper()
+
+
+# Map invoice.module/source_module variants you might have in DB
+_PHARM_TOKENS = {"PHARM", "PHARMACY", "PHM", "RX", "MED", "MEDS"}
+
+
+def _is_pharmacy_invoice(inv) -> bool:
+    """
+    Strict invoice classifier.
+    Prefer invoice_type, then module.
+    """
+    if inv is None:
+        return False
+
+    it = _norm_token(getattr(inv, "invoice_type", None))
+    if it == "PHARMACY":
+        return True
+
+    mod = _norm_token(getattr(inv, "module", None))
+    if mod in _PHARM_TOKENS:
+        return True
+
+    # Optional: if invoice.meta_json explicitly tags it (safe but not required)
+    meta = getattr(inv, "meta_json", None) or {}
+    if isinstance(meta, dict) and _norm_token(
+            meta.get("module")) in _PHARM_TOKENS:
+        return True
+
+    return False
+
+
+def _is_pharmacy_line(ln, invoice=None) -> bool:
+    """
+    Strict line classifier.
+
+    ✅ Primary (best): service_group == PHARM
+    ✅ Secondary: source_module in pharmacy tokens
+    ✅ Tertiary: invoice itself is pharmacy + line looks like a medicine line
+    ❌ Avoid: generic item_type guesses unless invoice is already pharmacy
+    """
+    if ln is None:
+        return False
+
+    # 1) Strongest: service_group
+    sg = getattr(ln, "service_group", None)
+    sg_tok = _norm_token(getattr(sg, "value", sg))  # handles Enum or str
+    if sg_tok == "PHARM":
+        return True
+
+    # 2) Strong: source_module
+    src = _norm_token(getattr(ln, "source_module", None))
+    if src in _PHARM_TOKENS:
+        return True
+
+    # 3) If the invoice is pharmacy, allow more permissive checks
+    if invoice is not None and _is_pharmacy_invoice(invoice):
+        itype = _norm_token(getattr(ln, "item_type", None))
+        # Keep this list SHORT to avoid pulling non-medicine items
+        if itype in {"DRUG", "MEDICINE", "MED", "PHARM_ITEM"}:
+            return True
+
+        # meta_json fallback ONLY when invoice is pharmacy
+        meta = getattr(ln, "meta_json", None) or {}
+        if isinstance(meta, dict):
+            # common keys that indicate a drug line
+            if meta.get("drug_id") or meta.get("medicine_id") or meta.get(
+                    "item_kind") == "DRUG":
+                return True
+            # if you store batch/expiry only for pharmacy, this is a good hint
+            if meta.get("batch_no") or meta.get("batchNo") or meta.get(
+                    "expiry_date") or meta.get("expiryDate"):
+                return True
+
+    return False
+
+
+def get_branding_for_context(db, context_code: str | None):
+    base = db.query(UiBranding).order_by(UiBranding.id.asc()).first()
+    ctx = None
+    if context_code:
+        ctx = db.query(UiBrandingContext).filter(
+            UiBrandingContext.code == context_code).first()
+
+    data = {}
+    if base:
+        for col in UiBranding.__table__.columns:
+            data[col.name] = getattr(base, col.name)
+
+    if ctx:
+        # overlay all context override fields (including pharmacy legal extras)
+        for col in UiBrandingContext.__table__.columns:
+            if col.name in ("id", "code", "updated_at", "updated_by_id"):
+                continue
+            v = getattr(ctx, col.name)
+            if v is not None and str(v).strip() != "":
+                data[col.name] = v
+
+    return SimpleNamespace(**data)
+
+
+def _load_branding_context(db: Session, code: Optional[str]) -> Any:
+    if not code or UiBrandingContext is None:
+        return None
+    code = str(code).strip()
+    if not code:
+        return None
+    try:
+        return (db.query(UiBrandingContext).filter(
+            func.lower(UiBrandingContext.code) == code.lower()).order_by(
+                UiBrandingContext.id.desc()).first())
+    except Exception:
+        return (db.query(UiBrandingContext).filter(
+            UiBrandingContext.code == code).order_by(
+                UiBrandingContext.id.desc()).first())
+
+
+def _load_branding_merged(db: Session, context: Optional[str] = None) -> Any:
+    base = _load_branding(db)
+    ctx = _load_branding_context(db, context)
+    return _merge_branding(base, ctx) if ctx else base
+
+
+def _read_asset_reader_by_attr(branding: Any,
+                               attr: str) -> Optional[ImageReader]:
+    rel = (_bget(branding, attr) or "").strip()
+    if not rel:
+        return None
+    abs_path = Path(getattr(settings, "STORAGE_DIR", ".")).joinpath(rel)
+    if not abs_path.exists() or not abs_path.is_file():
+        return None
+    try:
+        return ImageReader(str(abs_path))
+    except Exception:
+        return None
+
+
+def _read_pdf_header_reader(branding: Any) -> Optional[ImageReader]:
+    # supports both UiBranding and UiBrandingContext naming
+    return _read_asset_reader_by_attr(
+        branding, "pdf_header_path") or _read_asset_reader_by_attr(
+            branding, "pdf_header")
+
+
+def _render_pharmacy_splitup_pdf_reportlab(
+    *,
+    db: Session,
+    case: BillingCase,
+    invoices: List[BillingInvoice],
+    branding: Any,
+    paper: str,
+    orientation: str,
+    printed_by: str = "",
+) -> bytes:
+    lay = _layout_for(paper, orientation)
+    size = lay["size"]
+    W, H = lay["W"], lay["H"]
+    M, x0, w0 = lay["M"], lay["x0"], lay["w0"]
+    bottom = lay["bottom"]
+    scale = lay["scale"]
+    border_pad = lay["border_pad"]
+
+    buf = BytesIO()
+    printed_at = datetime.now().strftime("%d/%m/%Y %I:%M %p")
+    c = _NumberedCanvas(buf,
+                        pagesize=size,
+                        printed_at=printed_at,
+                        printed_by=printed_by)
+
+    paper_u = (paper or "A4").upper()
+    is_a5 = (paper_u == "A5"
+             and (orientation or "portrait").lower() != "landscape")
+
+    header_payload = _build_header_payload(
+        db,
+        case,
+        doc_no=_safe(getattr(case, "case_number", None)),
+        doc_date=None,
+    )
+
+    def new_page() -> float:
+        _draw_page_border(c, W=W, H=H, pad=border_pad)
+        y = H - M
+
+        y = (_draw_branding_header_small(c, branding, x0, y, w0, scale=scale)
+             if is_a5 else _draw_branding_header(
+                 c, branding, x0, y, w0, scale=1.0))
+        y -= 1.5 * mm
+
+        y = (_draw_patient_header_block_a5(
+            c, header_payload, x0, y, w0, scale=scale)
+             if is_a5 else _draw_patient_header_block(
+                 c, header_payload, x0, y, w0, scale=scale))
+        y -= 3.0 * mm
+        return y
+
+    y = new_page()
+
+    # --- collect rows (now returns rows + line_total_sum)
+    ph_rows, ph_grand_total = _collect_pharmacy_split_rows(invoices)
+
+    if not ph_rows:
+        c.setFont("Helvetica", 9.6 * scale)
+        c.setFillColor(INK)
+        c.drawString(x0, y - 6 * mm,
+                     "No pharmacy items found for this billing case.")
+        c.save()
+        return buf.getvalue()
+
+    y = _draw_simple_table(
+        c,
+        x=x0,
+        y=y,
+        w=w0,
+        cols=[
+            ("Item Name", 0.42),
+            ("Batch No", 0.14),
+            ("Expiry ", 0.12),
+            ("Qty", 0.06),
+            ("Price", 0.10),
+            ("Total Amount", 0.16),
+        ],
+        rows=ph_rows,
+        row_h=(7.0 * scale) * mm,
+        bottom_margin=bottom,
+        new_page_fn=new_page,
+        aligns=["left", "left", "left", "right", "right", "right"],
+        max_lines=2,
+        head_size=9.2 * scale,
+        body_size=9.1 * scale,
+        lead=11.2 * scale,
+    )
+
+    # ✅ Pharmacy-only Grand Total
+    # ✅ Pharmacy-only Grand Total (DRAW ONCE)
+    need_h = 18 * mm
+    if y < (bottom + need_h):
+        y = new_page()
+
+    c.setStrokeColor(GRID_SOFT)
+    c.setLineWidth(0.8)
+    c.line(x0, y - 2 * mm, x0 + w0, y - 2 * mm)
+    y -= 8 * mm
+
+    label_x = x0 + w0 - (42 * mm)
+    value_x = x0 + w0
+
+    c.setFont("Helvetica-Bold", 10.2 * scale)
+    c.setFillColor(INK)
+    c.drawRightString(label_x, y, "Grand Total :")
+    c.drawRightString(value_x, y, _fmt_money(ph_grand_total))
+
+    c.save()
+    return buf.getvalue()
+
+
+@router.get("/pharmacy-split-up")
+def billing_pharmacy_splitup_pdf(
+        case_id: int = Query(..., gt=0),
+        include_draft_invoices: bool = Query(True),
+        context: str = Query("pharmacy"),  # ✅ default pharmacy branding
+        paper: str = Query("A4", pattern="^(A3|A4|A5)$"),
+        orientation: str = Query("portrait", pattern="^(portrait|landscape)$"),
+        disposition: str = Query("inline", pattern="^(inline|attachment)$"),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user),
+):
+    _need_any(user, ["billing.view"])
+    case = _load_case(db, case_id)
+    invoices = _list_case_invoices(
+        db, case_id, include_draft_invoices=include_draft_invoices)
+
+    # ✅ merged branding: UiBranding + UiBrandingContext(code="pharmacy")
+    branding = _load_branding_merged(db, context=context)
+
+    printed_by = _safe(
+        getattr(user, "full_name", None) or getattr(user, "name", None)
+        or getattr(user, "email", None))
+    pdf_bytes = _render_pharmacy_splitup_pdf_reportlab(
+        db=db,
+        case=case,
+        invoices=invoices,
+        branding=branding,
+        paper=paper,
+        orientation=orientation,
+        printed_by=printed_by,
+    )
+
+    filename = f"Pharmacy_SplitUp_{_safe(getattr(case, 'case_number', None))}.pdf"
+    headers = {"Content-Disposition": f'{disposition}; filename="{filename}"'}
+    return StreamingResponse(BytesIO(pdf_bytes),
+                             media_type="application/pdf",
+                             headers=headers)
