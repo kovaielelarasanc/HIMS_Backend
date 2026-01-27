@@ -14,10 +14,25 @@ from app.models.emr_template_library import EmrTemplateBlock
 
 
 ALLOWED_FIELD_TYPES = {
-    "text", "textarea", "number", "date", "time", "datetime",
-    "boolean", "select", "multiselect", "radio", "chips",
-    "table", "group", "signature", "file", "image",
+    "text",
+    "textarea",
+    "number",
+    "date",
+    "time",
+    "datetime",
+    "boolean",
+    "select",
+    "multiselect",
+    "radio",
+    "chips",
+    "table",
+    "group",
+    "signature",
+    "file",
+    "image",
     "calculation",
+    "graph",
+    "chart",
 }
 
 MAX_SECTIONS = 60
@@ -121,7 +136,19 @@ def _get_block_schema(db: Session, *, block_code: str, dept_code: str, record_ty
         raise HTTPException(status_code=422, detail=f"Block schema invalid: {bc}")
     return obj
 
-PHASE_SET = {"INTAKE","HISTORY","EXAM","ASSESSMENT","PLAN","ORDERS","NURSING","DISCHARGE","ATTACHMENTS","SIGN_OFF"}
+PHASE_SET = {
+    "INTAKE",
+    "HISTORY",
+    "EXAM",
+    "ASSESSMENT",
+    "PLAN",
+    "ORDERS",
+    "NURSING",
+    "DISCHARGE",
+    "ATTACHMENTS",
+    "SIGN_OFF",
+    "OTHER",
+}
 
 def normalize_template_schema(
     db: Session,
@@ -130,6 +157,8 @@ def normalize_template_schema(
     record_type_code: str,
     schema_input: Any,
     sections_input: Any,
+    strict: bool = False,
+    **_ignored: Any,
 ) -> Dict[str, Any]:
     """
     Accepts:
@@ -203,63 +232,208 @@ def normalize_template_schema(
     field_count = 0
     warnings: List[str] = []
 
-    def add_field(sec_code: str, f: Dict[str, Any]):
-        nonlocal field_count
-        key = norm_key(str(f.get("key") or ""))
-        if not key:
-            raise HTTPException(status_code=422, detail=f"Field key missing in section {sec_code}")
-        ftype = str(f.get("type") or "").strip().lower()
+    def add_field(sec_code: str, f: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize a single field (including nested group items / table columns).
+        Keeps only supported keys and enforces a stable, backend-friendly shape.
+        """
+        if not isinstance(f, dict):
+            raise ValueError("Field must be an object")
+
+        ftype = str(f.get("type") or "text").strip().lower()
+        if ftype == "graph":
+            ftype = "chart"
+
         if ftype not in ALLOWED_FIELD_TYPES:
-            raise HTTPException(status_code=422, detail=f"Invalid field type '{ftype}' for '{key}' in {sec_code}")
+            raise ValueError(f"Unknown field type: {ftype}")
 
-        # select/radio needs options
-        if ftype in ("select", "multiselect", "radio", "chips"):
-            opts = f.get("options")
-            if not isinstance(opts, list) or not opts:
-                raise HTTPException(status_code=422, detail=f"Field '{key}' in {sec_code} requires options[]")
+        key = str(f.get("key") or "").strip()
+        label = str(f.get("label") or "").strip()
+        if not key:
+            raise ValueError("Field key is required")
 
-        # number constraints sanity
-        if ftype == "number":
-            mn = f.get("min")
-            mx = f.get("max")
-            if (mn is not None) and (mx is not None):
-                try:
-                    if float(mn) > float(mx):
-                        raise HTTPException(status_code=422, detail=f"Field '{key}' in {sec_code}: min > max")
-                except HTTPException:
-                    raise
-                except Exception:
-                    raise HTTPException(status_code=422, detail=f"Field '{key}' in {sec_code}: min/max must be numeric")
-
-        # unique across template (section.key)
-        composite = f"{sec_code}.{key}"
-        if composite in all_field_keys:
-            raise HTTPException(status_code=409, detail=f"Duplicate field key: {composite}")
-        all_field_keys.add(composite)
-
-        # stable id (good for UI diffing)
-        fid = hashlib.sha1(composite.encode("utf-8")).hexdigest()[:12]
-
-        out = {
+        # Common base
+        out: Dict[str, Any] = {
             "kind": "field",
-            "id": fid,
-            "key": key,
             "type": ftype,
-            "label": (str(f.get("label") or key).strip()),
-            "required": bool(f.get("required") or False),
-            "placeholder": f.get("placeholder"),
-            "help": f.get("help"),
-            "unit": f.get("unit"),
-            "min": f.get("min"),
-            "max": f.get("max"),
-            "options": f.get("options") if isinstance(f.get("options"), list) else None,
-            "clinical": f.get("clinical") if isinstance(f.get("clinical"), dict) else None,
-            "ui": f.get("ui") if isinstance(f.get("ui"), dict) else None,
+            "key": key,
+            "label": label or key.replace("_", " ").title(),
         }
 
-        field_count += 1
-        if field_count > MAX_FIELDS:
-            raise HTTPException(status_code=413, detail=f"Too many fields (max {MAX_FIELDS})")
+        # common optional props
+        if f.get("help_text") not in (None, ""):
+            out["help_text"] = str(f.get("help_text"))
+
+        if f.get("placeholder") not in (None, ""):
+            out["placeholder"] = str(f.get("placeholder"))
+
+        if "default_value" in f:
+            out["default_value"] = f.get("default_value")
+
+        if f.get("required") is not None:
+            out["required"] = bool(f.get("required"))
+
+        if f.get("readonly") is not None:
+            out["readonly"] = bool(f.get("readonly"))
+
+        # Rules/UI/Clinical
+        rules = f.get("rules")
+        if isinstance(rules, dict) and rules:
+            out["rules"] = rules
+
+        ui = f.get("ui")
+        if isinstance(ui, dict) and ui:
+            out["ui"] = ui
+
+        clinical = f.get("clinical")
+        if isinstance(clinical, dict) and clinical:
+            out["clinical"] = clinical
+
+        # Choice fields
+        if ftype in {"select", "multiselect", "radio", "chips"}:
+            options = f.get("options") or []
+            if not isinstance(options, list):
+                raise ValueError("options must be a list")
+            norm_opts = []
+            for o in options:
+                if isinstance(o, dict):
+                    ov = str(o.get("value") or "").strip()
+                    ol = str(o.get("label") or "").strip()
+                else:
+                    ov = str(o).strip()
+                    ol = str(o).strip()
+                if not ov:
+                    continue
+                norm_opts.append({"value": ov, "label": ol or ov})
+            out["options"] = norm_opts
+
+            choice = f.get("choice")
+            if isinstance(choice, dict) and choice:
+                out["choice"] = choice
+
+        # Table fields
+        if ftype == "table":
+            table = f.get("table") or {}
+            if not isinstance(table, dict):
+                raise ValueError("table must be an object")
+
+            cols = table.get("columns") or []
+            if not isinstance(cols, list):
+                raise ValueError("table.columns must be a list")
+
+            norm_cols = []
+            for c in cols:
+                if not isinstance(c, dict):
+                    raise ValueError("table column must be an object")
+                ctype = str(c.get("type") or "text").strip().lower()
+                if ctype == "graph":
+                    ctype = "chart"
+                # table columns are limited (keep it conservative)
+                if ctype not in {"text", "number", "date", "time", "datetime", "boolean", "select", "radio"}:
+                    raise ValueError(f"Invalid table column type: {ctype}")
+
+                ckey = str(c.get("key") or "").strip()
+                clabel = str(c.get("label") or "").strip()
+                if not ckey:
+                    raise ValueError("table column key is required")
+
+                col_out: Dict[str, Any] = {
+                    "key": ckey,
+                    "label": clabel or ckey.replace("_", " ").title(),
+                    "type": ctype,
+                    "required": bool(c.get("required") or False),
+                }
+
+                if ctype in {"select", "radio"}:
+                    copts = c.get("options") or []
+                    if not isinstance(copts, list):
+                        raise ValueError("table column options must be a list")
+                    norm_copts = []
+                    for o in copts:
+                        if isinstance(o, dict):
+                            ov = str(o.get("value") or "").strip()
+                            ol = str(o.get("label") or "").strip()
+                        else:
+                            ov = str(o).strip()
+                            ol = str(o).strip()
+                        if not ov:
+                            continue
+                        norm_copts.append({"value": ov, "label": ol or ov})
+                    col_out["options"] = norm_copts
+
+                norm_cols.append(col_out)
+
+            out["table"] = {
+                "min_rows": int(table.get("min_rows") or 0),
+                "max_rows": int(table.get("max_rows") or 0),
+                "allow_add_row": bool(table.get("allow_add_row", True)),
+                "allow_delete_row": bool(table.get("allow_delete_row", True)),
+                "columns": norm_cols,
+            }
+
+        # Group fields (nested items)
+        if ftype == "group":
+            group = f.get("group") or {}
+            if group is not None and not isinstance(group, dict):
+                raise ValueError("group must be an object")
+
+            items = f.get("items") or []
+            if not isinstance(items, list):
+                raise ValueError("group.items must be a list")
+
+            # Normalize children recursively
+            norm_items = []
+            seen_keys = set()
+            for child in items:
+                child_norm = add_field(sec_code, child)
+                ck = child_norm.get("key")
+                if ck in seen_keys:
+                    raise ValueError(f"Duplicate key inside group: {ck}")
+                seen_keys.add(ck)
+                norm_items.append(child_norm)
+
+            out["group"] = {
+                "layout": str((group or {}).get("layout") or "STACK"),
+                "collapsible": bool((group or {}).get("collapsible", False)),
+                "collapsed_by_default": bool((group or {}).get("collapsed_by_default", False)),
+            }
+            out["items"] = norm_items
+
+        # Signature/File/Image/Calculation/Chart (keep config blobs; runtime can validate deeper)
+        if ftype == "signature":
+            sig = f.get("signature") or {}
+            if sig is not None and not isinstance(sig, dict):
+                raise ValueError("signature must be an object")
+            if sig:
+                out["signature"] = sig
+
+        if ftype == "file":
+            cfg = f.get("file") or {}
+            if cfg is not None and not isinstance(cfg, dict):
+                raise ValueError("file must be an object")
+            if cfg:
+                out["file"] = cfg
+
+        if ftype == "image":
+            cfg = f.get("image") or {}
+            if cfg is not None and not isinstance(cfg, dict):
+                raise ValueError("image must be an object")
+            if cfg:
+                out["image"] = cfg
+
+        if ftype == "calculation":
+            cfg = f.get("calculation") or {}
+            if cfg is not None and not isinstance(cfg, dict):
+                raise ValueError("calculation must be an object")
+            if cfg:
+                out["calculation"] = cfg
+
+        if ftype == "chart":
+            cfg = f.get("chart") or {}
+            if cfg is not None and not isinstance(cfg, dict):
+                raise ValueError("chart must be an object")
+            if cfg:
+                out["chart"] = cfg
+
         return out
 
     for s in sections:

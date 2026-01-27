@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 from typing import List, Optional
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, Query, Request, Body
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
+import hashlib
+import json
 
 from app.api.deps import get_db, current_user
 from app.models.user import User
@@ -298,7 +300,7 @@ def api_template_list(
         return err(f"Template list failed: {ex}", 500)
 
 
-@router.get("/templates/{template_id}")
+@router.get("/templates/{template_id:int}")
 def api_template_get(template_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
     try:
         _need_any(user, ["emr.view", "emr.templates.view", "emr.manage"])
@@ -327,7 +329,7 @@ def api_template_create(
         return err(f"Template create failed: {ex}", 500)
 
 
-@router.put("/templates/{template_id}")
+@router.put("/templates/{template_id:int}")
 def api_template_update(template_id: int, payload: TemplateUpdateIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
     try:
         _need_any(user, ["emr.templates.manage", "emr.manage"])
@@ -340,7 +342,7 @@ def api_template_update(template_id: int, payload: TemplateUpdateIn, db: Session
         return err(f"Template update failed: {ex}", 500)
 
 
-@router.post("/templates/{template_id}/versions")
+@router.post("/templates/{template_id:int}/versions")
 def api_template_new_version(template_id: int, payload: TemplateVersionCreateIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
     try:
         _need_any(user, ["emr.templates.manage", "emr.manage"])
@@ -353,7 +355,7 @@ def api_template_new_version(template_id: int, payload: TemplateVersionCreateIn,
         return err(f"Template new version failed: {ex}", 500)
 
 
-@router.post("/templates/{template_id}/publish")
+@router.post("/templates/{template_id:int}/publish")
 def api_template_publish(template_id: int, payload: TemplatePublishIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
     try:
         _need_any(user, ["emr.templates.manage", "emr.manage"])
@@ -837,3 +839,128 @@ def api_patient_encounters(
     except Exception as ex:
         return err(f"Encounters fetch failed: {ex}", 500)
 
+
+# -----------------------
+# TEMPLATE NORMALIZE + HASH (for Visual Builder)
+# -----------------------
+
+def _stable_json_for_hash(obj) -> str:
+    """
+    Stable canonical JSON for hashing:
+    - sort keys
+    - no whitespace
+    - UTF-8 safe
+    """
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+@router.post("/templates/normalize")
+def api_template_normalize(
+    payload: TemplateSchemaValidateIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    """
+    Server-side normalization. Same input as /templates/validate.
+    Frontend uses this for consistent schema canonicalization.
+    """
+    try:
+        _need_any(user, ["emr.templates.manage", "emr.manage"])
+        norm = normalize_template_schema(
+            db,
+            dept_code=payload.dept_code,
+            record_type_code=payload.record_type_code,
+            schema_input=payload.schema_json,
+            sections_input=payload.sections,
+            strict=bool(getattr(payload, 'strict', False)),
+        )
+        return ok(norm, 200)
+    except HTTPException:
+        raise
+    except ValueError as ve:
+        raise HTTPException(status_code=422, detail=str(ve))
+    except Exception as ex:
+        return err(f"Template normalize failed: {ex}", 500)
+
+
+@router.post("/templates/hash")
+def api_template_hash(
+    payload: TemplateSchemaValidateIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    """
+    Server-side stable hash of the normalized schema.
+    Always normalizes first to avoid hash drift across clients.
+    """
+    try:
+        _need_any(user, ["emr.templates.manage", "emr.manage"])
+
+        norm = normalize_template_schema(
+            db,
+            dept_code=payload.dept_code,
+            record_type_code=payload.record_type_code,
+            schema_input=payload.schema_json,
+            sections_input=payload.sections,
+            strict=bool(getattr(payload, 'strict', False)),
+        )
+
+        raw = _stable_json_for_hash(norm).encode("utf-8")
+        sha = hashlib.sha256(raw).hexdigest()
+
+        return ok({"hash": sha, "algo": "sha256", "normalized": norm}, 200)
+    except HTTPException:
+        raise
+    except ValueError as ve:
+        raise HTTPException(status_code=422, detail=str(ve))
+    except Exception as ex:
+        return err(f"Template hash failed: {ex}", 500)
+
+
+@router.get("/templates/builder/meta")
+def api_template_builder_meta(
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    """
+    Builder metadata for frontend (field types, presets, etc.).
+    Keep response backward-compatible and safe to extend.
+    """
+    try:
+        _need_any(user, ["emr.templates.view", "emr.templates.manage", "emr.manage", "emr.view"])
+
+        # Minimal, stable contract (extend anytime without breaking UI)
+        field_types = [
+            {"type": "text", "label": "Text"},
+            {"type": "textarea", "label": "Textarea"},
+            {"type": "number", "label": "Number"},
+            {"type": "date", "label": "Date"},
+            {"type": "time", "label": "Time"},
+            {"type": "datetime", "label": "Date & Time"},
+            {"type": "boolean", "label": "Yes/No"},
+            {"type": "select", "label": "Select"},
+            {"type": "multiselect", "label": "Multi Select"},
+            {"type": "radio", "label": "Radio"},
+            {"type": "chips", "label": "Chips/Tags"},
+            {"type": "table", "label": "Table"},
+            {"type": "group", "label": "Group"},
+            {"type": "signature", "label": "Signature"},
+            {"type": "file", "label": "File"},
+            {"type": "image", "label": "Image"},
+            {"type": "calculation", "label": "Calculation"},
+        ]
+
+        return ok(
+            {
+                "field_types": field_types,
+                "clinical_concepts": [],     # safe default; can be backend-driven later
+                "validation_presets": [],    # safe default; can be backend-driven later
+                "ui_presets": [],            # safe default
+                "version": 1,
+            },
+            200,
+        )
+    except HTTPException:
+        raise
+    except Exception as ex:
+        return err(f"Builder meta failed: {ex}", 500)

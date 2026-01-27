@@ -191,14 +191,12 @@ class BlockOut(BaseModel):
 # Shared: schema validate input
 # -----------------------
 class TemplateSchemaValidateIn(BaseModel):
-    """Used by /emr/templates/validate and /emr/templates/suggest"""
-    model_config = ConfigDict(extra="ignore")
-
-    dept_code: str = Field(..., min_length=1, max_length=CODE_32)
-    record_type_code: str = Field(..., min_length=1, max_length=CODE_32)
-
+    dept_code: str
+    record_type_code: str
+    schema_json: Union[dict, list, str, None] = None
     sections: List[str] = Field(default_factory=list)
-    schema_json: Any = Field(default_factory=dict)
+
+    model_config = ConfigDict(extra="allow")
 
     @field_validator("dept_code", "record_type_code")
     @classmethod

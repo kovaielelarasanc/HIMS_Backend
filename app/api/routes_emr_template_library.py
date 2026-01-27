@@ -35,6 +35,10 @@ from app.utils.respo import err, ok
 
 router = APIRouter(prefix="/emr", tags=["EMR Templates"])
 
+def _safe_norm_code(v: str) -> str:
+    # never throws; compatible with frontend expectations
+    return (v or "").strip().upper().replace(" ", "_")
+
 
 # -----------------------
 # Request Models
@@ -177,13 +181,24 @@ def api_template_presets(
 ):
     try:
         need_any(user, ["emr.view", "emr.templates.view", "emr.templates.manage", "emr.manage"])
-        out = template_presets(db, dept_code=norm_code(dept_code), record_type_code=norm_code(record_type_code))
+
+        # ✅ robust normalization (never 422 due to norm_code)
+        try:
+            d = norm_code(dept_code)
+        except Exception:
+            d = _safe_norm_code(dept_code)
+
+        try:
+            r = norm_code(record_type_code)
+        except Exception:
+            r = _safe_norm_code(record_type_code)
+
+        out = template_presets(db, dept_code=d, record_type_code=r)
         return ok(out, 200)
     except HTTPException:
         raise
     except Exception as ex:
         return err(f"Template presets failed: {ex}", 500)
-
 
 @router.get("/templates/suggest")
 def api_template_suggest(
@@ -194,7 +209,19 @@ def api_template_suggest(
 ):
     try:
         need_any(user, ["emr.templates.manage", "emr.manage"])
-        out = suggest_template_schema(db, dept_code=norm_code(dept_code), record_type_code=norm_code(record_type_code))
+
+        # ✅ robust normalization (never 422 due to norm_code)
+        try:
+            d = norm_code(dept_code)
+        except Exception:
+            d = _safe_norm_code(dept_code)
+
+        try:
+            r = norm_code(record_type_code)
+        except Exception:
+            r = _safe_norm_code(record_type_code)
+
+        out = suggest_template_schema(db, dept_code=d, record_type_code=r)
         return ok(out, 200)
     except HTTPException:
         raise
