@@ -2157,18 +2157,25 @@ def _draw_branding_header(c: canvas.Canvas,
                           top_y: float,
                           w: float,
                           *,
-                          scale: float = 1.0) -> float:
+                          scale: float = 5.0) -> float:
     b = branding or SimpleNamespace()
+    page_w, page_h = getattr(c, "_pagesize", (0.0, 0.0))
+
+    # A5 portrait detection (rough)
+    is_a5 = (page_h <= (212 * mm)) and (page_w <= (150 * mm))
 
     # ✅ 1) If a PDF header image exists, use it (Pharmacy custom header)
     hdr = _read_pdf_header_reader(b)
     if hdr:
         try:
             iw, ih = hdr.getSize()
-            max_h = (30.0 * scale) * mm  # adjust if you want taller/shorter
+
+            # ✅ Clamp header image height on small pages so legal lines always fit
+            base_max_h = (80 * scale) * mm
+            max_h = min(base_max_h, page_h * (0.24 if is_a5 else 0.30))
+
             draw_w = w
             draw_h = (draw_w * float(ih) / float(iw)) if iw and ih else max_h
-
             if draw_h > max_h and iw and ih:
                 draw_h = max_h
                 draw_w = (draw_h * float(iw) / float(ih))
@@ -2176,45 +2183,38 @@ def _draw_branding_header(c: canvas.Canvas,
             x_img = x + (w - draw_w) / 2
             y_img = top_y - draw_h
 
-            c.drawImage(hdr,
-                        x_img,
-                        y_img,
-                        width=draw_w,
-                        height=draw_h,
-                        preserveAspectRatio=True,
-                        mask="auto")
+            c.drawImage(
+                hdr,
+                x_img,
+                y_img,
+                width=draw_w,
+                height=draw_h,
+                preserveAspectRatio=True,
+                mask="auto",
+            )
 
-            y_after = y_img - (2.0 * mm)
+            # ✅ spacing under image (A5 gets slightly less)
+            y_after = y_img - ((4.5 if is_a5 else 7.0) * mm)
 
-            # Optional: tiny legal line(s) if provided (won’t show if empty)
-            lic1 = _safe(_bget(b, "license_no"))
-            lic2 = _safe(_bget(b, "license_no2"))
-            pharm = _safe(_bget(b, "pharmacist_name"))
-            regno = _safe(_bget(b, "pharmacist_reg_no"))
+            # ✅ Always build PRIORITY legal lines first (DL + Pharmacist),
+            # then extras (so slicing never hides them)
+            legal_font = "Helvetica"
+            legal_sz = (6.2 if is_a5 else 7.6) * scale
+            legal_gap = (3.4 if is_a5 else 3.8) * mm
 
-            y_after = y_img - (2.0 * mm)
+            legal_bits = _pharmacy_priority_legal_lines(b,
+                                                        max_w=w,
+                                                        font=legal_font,
+                                                        sz=legal_sz)
 
-            legal_bits = _pharmacy_legal_lines(b)
-            if lic1 != "—":
-                legal_bits.append(f"DL No: {lic1}" +
-                                  (f", {lic2}" if lic2 != "—" else ""))
-            if pharm != "—" or regno != "—":
-                legal_bits.append(
-                    f"Pharmacist: {pharm if pharm != '—' else ''}{f' (Reg: {regno})' if regno != '—' else ''}"
-                    .strip())
-
-            # ✅ legal lines (DL + pharmacist) — now uses robust key mapping
-
-            y_after = y_img - (2.0 * mm)
-
-            # ✅ Pharmacy legal lines (from UiBrandingContext merged fields)
-            legal_bits = _pharmacy_legal_lines(b)
             if legal_bits:
-                c.setFont("Helvetica", 7.6 * scale)
+                c.setFont(legal_font, legal_sz)
                 c.setFillColor(MUTED)
+
+                # ✅ Ensure DL + Pharmacist are the ones drawn (first two)
                 for line in legal_bits[:2]:
                     c.drawRightString(x + w, y_after, line)
-                    y_after -= (3.6 * mm)
+                    y_after -= legal_gap
 
             c.setStrokeColor(GRID_SOFT)
             c.setLineWidth(0.6)
@@ -2222,10 +2222,9 @@ def _draw_branding_header(c: canvas.Canvas,
             return y_after - (2.0 * mm)
 
         except Exception:
-            # fallback to text header if image draw fails
             pass
 
-    # ✅ 2) Fallback: your existing text/logo header (kept)
+    # ✅ 2) Fallback: text/logo header
     b = branding or SimpleNamespace(
         org_name="",
         org_tagline="",
@@ -2239,7 +2238,6 @@ def _draw_branding_header(c: canvas.Canvas,
 
     logo_h = (18.0 * scale) * mm
     gutter = 5 * mm
-
     logo_col = min(max(62 * mm, w * 0.36), 78 * mm)
     right_w = max(58 * mm, w - logo_col - gutter)
 
@@ -2274,41 +2272,40 @@ def _draw_branding_header(c: canvas.Canvas,
         extra_bits.append(f"{website}")
     if gstin != "—":
         extra_bits.append(f"GSTIN: {gstin}")
-    if extra_bits and len(meta_lines) < 3:
+    if extra_bits and len(meta_lines) < 4:
         meta_lines.extend(
             _cap_lines(
                 simpleSplit(" | ".join(extra_bits), "Helvetica", 8.4 * scale,
                             right_w), 1))
-        # ✅ Pharmacy legal lines must show even when NO header image is used
-    legal_bits = _pharmacy_legal_lines(b)
 
-    # If legal lines exist, keep meta compact so everything fits nicely
-    meta_lines = _cap_lines(meta_lines, 2 if legal_bits else 3)
+    # ✅ Priority legal lines for fallback too
+    legal_bits = _pharmacy_priority_legal_lines(b,
+                                                max_w=right_w,
+                                                font="Helvetica",
+                                                sz=7.6 * scale)
+
+    # ✅ On A5, make room by reducing meta lines if legal exists
+    meta_lines = _cap_lines(meta_lines, 2 if legal_bits else 4)
 
     lines: List[Tuple[str, str, float, Any]] = []
     if org != "—":
         lines.append((org, "Helvetica-Bold", 12.0 * scale, INK))
     if tag != "—":
         lines.append((tag, "Helvetica", 8.6 * scale, MUTED))
-
     for ln in meta_lines:
         lines.append((ln, "Helvetica", 8.4 * scale, MUTED))
 
-    # ✅ Add DL / Pharmacist lines (smaller font) in fallback header too
     if legal_bits:
-        for ln in legal_bits[:2]:
-            # keep each legal line to one wrapped line (avoid header becoming too tall)
-            wrapped = _cap_lines(
-                simpleSplit(ln, "Helvetica", 7.6 * scale, right_w), 1)
-            for wln in wrapped:
-                lines.append((wln, "Helvetica", 7.6 * scale, MUTED))
+        for ln in legal_bits[:2]:  # ✅ guaranteed DL + Pharmacist
+            lines.append((ln, "Helvetica", 7.6 * scale, MUTED))
 
     def lh(sz: float) -> float:
         return sz * 1.18
 
     text_h = sum(lh(sz) for _, _, sz, _ in lines) if lines else (10 * mm)
-    header_h = max(logo_h, text_h) + (2 * mm)
+    header_h = max(logo_h, text_h) + (14 * mm)
 
+    # ... keep your existing logo draw + text draw + line ...
     logo_reader = _read_logo_reader(b)
     if logo_reader:
         try:
@@ -2349,7 +2346,6 @@ def _draw_branding_header(c: canvas.Canvas,
 
     return top_y - header_h - (2 * mm)
 
-
 def _draw_branding_header_small(
     c: canvas.Canvas,
     branding: Optional[UiBranding],
@@ -2360,17 +2356,20 @@ def _draw_branding_header_small(
     scale: float = 1.0,
 ) -> float:
     b = branding or SimpleNamespace()
+    page_w, page_h = getattr(c, "_pagesize", (0.0, 0.0))
+    is_a5 = (page_h <= (212 * mm)) and (page_w <= (150 * mm))
 
-    # ✅ Prefer pharmacy/pdf header image if present
     hdr = _read_pdf_header_reader(b)
     if hdr:
         try:
             iw, ih = hdr.getSize()
-            max_h = (22.0 * scale) * mm
+
+            # ✅ Clamp image height on A5 so legal lines fit
+            base_max_h = (120 * scale) * mm
+            max_h = min(base_max_h, page_h * (0.22 if is_a5 else 0.28))
 
             draw_w = w
             draw_h = (draw_w * float(ih) / float(iw)) if iw and ih else max_h
-
             if draw_h > max_h and iw and ih:
                 draw_h = max_h
                 draw_w = (draw_h * float(iw) / float(ih))
@@ -2378,34 +2377,37 @@ def _draw_branding_header_small(
             x_img = x + (w - draw_w) / 2
             y_img = top_y - draw_h
 
-            c.drawImage(
-                hdr,
-                x_img,
-                y_img,
-                width=draw_w,
-                height=draw_h,
-                preserveAspectRatio=True,
-                mask="auto",
+            c.drawImage(hdr, x_img, y_img, width=draw_w, height=draw_h,
+                        preserveAspectRatio=True, mask="auto")
+
+            y_after = y_img - ((3.0 if is_a5 else 5.0) * mm)
+
+            # ✅ Priority legal lines (DL + Pharmacist) for SMALL header too
+            legal_font = "Helvetica"
+            legal_sz = (6.0 if is_a5 else 7.0) * scale
+            legal_gap = (3.2 if is_a5 else 3.4) * mm
+
+            legal_bits = _pharmacy_priority_legal_lines(
+                b, max_w=w, font=legal_font, sz=legal_sz
             )
 
-            y_after = y_img - (1.5 * mm)
-
-            # ✅ Add legal lines even in small header
-            legal_bits = _pharmacy_legal_lines(b)
             if legal_bits:
-                c.setFont("Helvetica", 7.0 * scale)
+                c.setFont(legal_font, legal_sz)
                 c.setFillColor(MUTED)
                 for line in legal_bits[:2]:
                     c.drawRightString(x + w, y_after, line)
-                    y_after -= (3.2 * mm)
+                    y_after -= legal_gap
 
             c.setStrokeColor(GRID_SOFT)
             c.setLineWidth(0.6)
             c.line(x, y_after, x + w, y_after)
-
             return y_after - (2.0 * mm)
+
         except Exception:
             pass
+
+
+
 
     # ✅ fallback small text/logo header
     logo_h = (14.0 * scale) * mm
@@ -2423,20 +2425,20 @@ def _draw_branding_header_small(
     if addr != "—":
         meta_lines.extend(
             _cap_lines(simpleSplit(addr, "Helvetica", 7.7 * scale, right_w),
-                       1))
-    if phone != "—" and len(meta_lines) < 2:
+                       2))
+    if phone != "—":
         meta_lines.extend(
             _cap_lines(
                 simpleSplit(f"Ph: {phone}", "Helvetica", 7.7 * scale, right_w),
                 1))
 
-    # ✅ If room, include pharmacy legal lines in fallback too
-    legal_bits = _pharmacy_legal_lines(b)
-    for ln in legal_bits:
-        if len(meta_lines) < 2:
-            meta_lines.append(ln)
+    legal_bits = _pharmacy_legal_lines(b) or []
+    # ✅ allow room for 1 legal line in small header if present
+    if legal_bits and len(meta_lines) < 3:
+        meta_lines.append(legal_bits[0])
 
-    meta_lines = _cap_lines(meta_lines, 2)
+    # ✅ INCREASED: small header can show up to 3 lines (was 2)
+    meta_lines = _cap_lines(meta_lines, 3)
 
     lines: List[Tuple[str, str, float, Any]] = []
     if org != "—":
@@ -2450,7 +2452,9 @@ def _draw_branding_header_small(
         return sz * 1.16
 
     text_h = sum(lh(sz) for _, _, sz, _ in lines) if lines else (8 * mm)
-    header_h = max(logo_h, text_h) + (1.8 * mm)
+
+    # ✅ INCREASED: extra padding (was +1.8mm)
+    header_h = max(logo_h, text_h) + (10 * mm)
 
     logo_reader = _read_logo_reader(b)
     if logo_reader:
@@ -2495,6 +2499,63 @@ def _draw_branding_header_small(
     c.line(x, y_line, x + w, y_line)
 
     return y_line - (2.0 * mm)
+
+
+def _pharmacy_priority_legal_lines(b, *, max_w: float, font: str,
+                                   sz: float) -> list[str]:
+    """
+    Returns legal lines with guaranteed priority order:
+    1) DL No
+    2) Pharmacist (Reg)
+    Then appends any other _pharmacy_legal_lines(b) extras.
+    Also caps each line to ONE visible line width (no overflow).
+    """
+
+    def _one_line(t: str) -> str:
+        t = _safe(t)
+        if not t or t == "—":
+            return ""
+        parts = simpleSplit(t, font, sz, max_w)
+        return parts[0] if parts else ""
+
+    lic1 = _safe(_bget(b, "license_no", "dl_no", "drug_license_no"))
+    lic2 = _safe(_bget(b, "license_no2", "dl_no2", "drug_license_no2"))
+    pharm = _safe(_bget(b, "pharmacist_name", "pharmacist", "rph_name"))
+    regno = _safe(_bget(b, "pharmacist_reg_no", "pharmacist_reg",
+                        "rph_reg_no"))
+
+    out: list[str] = []
+
+    # ✅ Priority 1: DL No
+    if lic1 != "—":
+        dl = f"DL No: {lic1}" + (f", {lic2}" if lic2 != "—" else "")
+        dl = _one_line(dl)
+        if dl:
+            out.append(dl)
+
+    # ✅ Priority 2: Pharmacist line
+    if pharm != "—" or regno != "—":
+        ph = f"Pharmacist: {pharm if pharm != '—' else ''}{f' (Reg: {regno})' if regno != '—' else ''}".strip(
+        )
+        ph = _one_line(ph)
+        if ph:
+            out.append(ph)
+
+    # ✅ Extras (but don't let extras push priority lines out)
+    extras = _pharmacy_legal_lines(b) or []
+    for e in extras:
+        e = _safe(e)
+        if not e or e == "—":
+            continue
+        # avoid duplicates of the two priority topics
+        low = e.lower()
+        if "dl" in low or "drug lic" in low or "pharmacist" in low or "reg" in low:
+            continue
+        e1 = _one_line(e)
+        if e1:
+            out.append(e1)
+
+    return out
 
 
 # =========================================================
@@ -4158,7 +4219,7 @@ def _render_full_history_pdf_reportlab(
                 ("Batch No", 0.14),
                 ("Expiry Date", 0.12),
                 ("Qty", 0.06),
-                ("Item Amount", 0.10),
+                ("Amount", 0.10),
             ],
             rows=ph_rows,
             row_h=(7.0 * scale) * mm,
@@ -4707,7 +4768,8 @@ def billing_common_header_pdf(
 ):
     _need_any(user, ["billing.view"])
     case = _load_case(db, case_id)
-    branding = _load_branding_merged(db, context="context") or _load_branding(db)
+    branding = _load_branding_merged(db,
+                                     context="context") or _load_branding(db)
 
     payload = _build_header_payload(db, case, doc_no=doc_no, doc_date=doc_date)
     pdf_bytes = _render_common_header_pdf_reportlab(payload, branding, paper,
@@ -4753,7 +4815,8 @@ def billing_overview_pdf(
 ):
     _need_any(user, ["billing.view"])
     case = _load_case(db, case_id)
-    branding = _load_branding_merged(db, context="context") or _load_branding(db)
+    branding = _load_branding_merged(db,
+                                     context="context") or _load_branding(db)
 
     payload = _build_overview_payload(
         db,
@@ -4929,7 +4992,8 @@ def billing_case_payments_ledger_pdf(
 ):
     _need_any(user, ["billing.view"])
     case = _load_case(db, int(case_id))
-    branding = _load_branding_merged(db, context="context") or _load_branding(db)
+    branding = _load_branding_merged(db,
+                                     context="context") or _load_branding(db)
 
     header_payload = _build_header_payload(db,
                                            case,
@@ -4960,7 +5024,8 @@ def billing_case_advance_ledger_pdf(
 ):
     _need_any(user, ["billing.view"])
     case = _load_case(db, int(case_id))
-    branding = _load_branding_merged(db, context="context") or _load_branding(db)
+    branding = _load_branding_merged(db,
+                                     context="context") or _load_branding(db)
 
     header_payload = _build_header_payload(db,
                                            case,
@@ -4991,7 +5056,8 @@ def billing_case_insurance_pdf(
 ):
     _need_any(user, ["billing.view"])
     case = _load_case(db, int(case_id))
-    branding = _load_branding_merged(db, context="context") or _load_branding(db)
+    branding = _load_branding_merged(db,
+                                     context="context") or _load_branding(db)
 
     header_payload = _build_header_payload(db,
                                            case,
@@ -5037,7 +5103,8 @@ def bill_summary(
         "billing.case.view", "billing.invoices.view"
     ])
     case = _load_case(db, case_id)
-    branding = _load_branding_merged(db, context="context") or _load_branding(db)
+    branding = _load_branding_merged(db,
+                                     context="context") or _load_branding(db)
 
     payload = _build_overview_payload(
         db,
