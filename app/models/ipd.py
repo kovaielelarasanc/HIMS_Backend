@@ -1040,7 +1040,7 @@ class IpdDischargeSummary(Base):
     implants = Column(Text, default="")
     pending_reports = Column(Text, default="")
     patient_education = Column(Text, default="")
-    followup_appointment_ref = Column(String(255), default="")
+    # followup_appointment_ref = Column(String(255), default="")
 
     finalized = Column(Boolean, default=False)
     finalized_by = Column(Integer, ForeignKey("users.id"), nullable=True)

@@ -170,6 +170,24 @@ def _auto_fill_calculated_fields(
         if auto_fu:
             obj.follow_up = auto_fu
 
+    # Auto-fill preliminary diagnosis from admission if not already set
+    if not (getattr(obj, "final_diagnosis_primary", "") or "").strip():
+        admission_prelim_dx = getattr(adm, "preliminary_diagnosis", "") or ""
+        if admission_prelim_dx:
+            obj.final_diagnosis_primary = admission_prelim_dx
+    
+    # Auto-fill medical history from admission if not already set
+    if not (getattr(obj, "medical_history", "") or "").strip():
+        admission_history = getattr(adm, "history", "") or ""
+        if admission_history:
+            obj.medical_history = admission_history
+    
+    # Auto-fill treatment summary with care plan from admission if not already set
+    if not (getattr(obj, "treatment_summary", "") or "").strip():
+        admission_care_plan = getattr(adm, "care_plan", "") or ""
+        if admission_care_plan:
+            obj.treatment_summary = admission_care_plan
+
     if not (getattr(obj, "prepared_by_name", "") or "").strip():
         obj.prepared_by_name = _user_display_name(current_user)
 
@@ -754,3 +772,49 @@ def list_followups_for_admission(
         out.append({"value": str(r.id), "label": label})
 
     return out
+
+
+@router.get(
+    "/admissions/{admission_id}/discharge-summary/debug",
+    response_model=dict,
+)
+def debug_discharge_summary(
+    admission_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    """Debug endpoint to check all discharge summary fields in database vs PDF"""
+    _need_any(user, ["ipd.view", "ipd.doctor", "ipd.manage"])
+    
+    adm = _get_admission_or_404(db, admission_id)
+    
+    # Get discharge summary from database
+    ds = (
+        db.query(IpdDischargeSummary)
+        .filter(IpdDischargeSummary.admission_id == admission_id)
+        .first()
+    )
+    
+    if not ds:
+        return {"error": "No discharge summary found"}
+    
+    # Get all fields from the database model
+    db_fields = {}
+    for column in IpdDischargeSummary.__table__.columns:
+        field_name = column.name
+        field_value = getattr(ds, field_name, None)
+        db_fields[field_name] = field_value
+    
+    # Get PDF context to see what's being used
+    from app.services.pdf_discharge import build_discharge_context
+    pdf_context = build_discharge_context(db, admission_id)
+    
+    return {
+        "admission_id": admission_id,
+        "database_fields": db_fields,
+        "pdf_context_fields": pdf_context,
+        "missing_in_pdf": {
+            field: value for field, value in db_fields.items() 
+            if field not in pdf_context and value is not None and str(value).strip()
+        }
+    }

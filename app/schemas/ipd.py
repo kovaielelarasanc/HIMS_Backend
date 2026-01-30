@@ -915,7 +915,7 @@ class DischargeSummaryBase(BaseModel):
     implants: Optional[str] = ""
     pending_reports: Optional[str] = ""
     patient_education: Optional[str] = ""
-    followup_appointment_ref: Optional[str] = ""
+    # followup_appointment_ref: Optional[str] = ""
 
 
 class DischargeSummaryIn(DischargeSummaryBase):
@@ -1308,7 +1308,7 @@ class DischargeSummaryIn(BaseModel):
     implants: str = ""
     pending_reports: str = ""
     patient_education: str = ""
-    followup_appointment_ref: str = ""
+    # followup_appointment_ref: str = ""
 
     finalize: bool = False
 
@@ -1351,7 +1351,7 @@ class DischargeSummaryOut(BaseModel):
     implants: str | None = None
     pending_reports: str | None = None
     patient_education: str | None = None
-    followup_appointment_ref: str | None = None
+    # followup_appointment_ref: str | None = None
 
     finalized: bool = False
     finalized_at: Optional[datetime] = None

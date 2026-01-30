@@ -185,14 +185,40 @@ def _safe_dt(dt: Optional[datetime | date], with_time: bool = True) -> str:
 def _patient_name(patient: Optional[Patient]) -> str:
     if not patient:
         return ""
+    
+    # Get patient name
+    name = ""
     for attr in ("full_name", "name", "patient_name", "display_name"):
         val = getattr(patient, attr, None)
         if val:
+            name = str(val)
+            break
+    
+    if not name:
+        first = getattr(patient, "first_name", None) or ""
+        last = getattr(patient, "last_name", None) or ""
+        mid = getattr(patient, "middle_name", None) or ""
+        name = " ".join([x for x in [first, mid, last] if x]).strip()
+    
+    # Get UHID
+    uhid = getattr(patient, "uhid", None) or getattr(patient, "patient_id", None) or ""
+    
+    # Combine name with UHID in parentheses
+    if uhid:
+        return f"{name} ({uhid})"
+    return name
+
+
+def _user_display_name(user: Optional[User]) -> str:
+    if not user:
+        return ""
+    for attr in ("full_name", "name", "display_name"):
+        val = getattr(user, attr, None)
+        if val:
             return str(val)
-    first = getattr(patient, "first_name", None) or ""
-    last = getattr(patient, "last_name", None) or ""
-    mid = getattr(patient, "middle_name", None) or ""
-    return " ".join([x for x in [first, mid, last] if x]).strip()
+    first = getattr(user, "first_name", None) or ""
+    last = getattr(user, "last_name", None) or ""
+    return " ".join([x for x in [first, last] if x]).strip()
 
 
 def _load_branding(db: Session) -> Optional[UiBranding]:
@@ -419,7 +445,7 @@ def build_discharge_context(db: Session, admission_id: int) -> dict:
         .first()
     )
 
-    _ = (
+    checklist = (
         db.query(IpdDischargeChecklist)
         .filter(IpdDischargeChecklist.admission_id == admission_id)
         .first()
@@ -459,32 +485,80 @@ def build_discharge_context(db: Session, admission_id: int) -> dict:
         (_esc(getattr(dept, "name", None) or "") if dept else ""),
     ] if x]).strip()
 
-    provisional_dx = getattr(s, "provisional_diagnosis", None) if s else ""
+    # Additional missing fields that should be included in PDF context
+    provisional_diagnosis_field = getattr(s, "provisional_diagnosis", "") if s else ""
+    summary_presenting_illness = getattr(s, "summary_presenting_illness", "") if s else ""
+    key_findings_field = getattr(s, "key_findings", "") if s else ""
+    substance_abuse_history = getattr(s, "substance_abuse_history", "") if s else ""
+    # followup_appointment_ref = getattr(s, "followup_appointment_ref", "") if s else ""
+    
+    # Get provisional diagnosis from admission table
+    provisional_diagnosis = getattr(adm, "preliminary_diagnosis", "") or ""
+    
+    final_diagnosis_primary = getattr(s, "final_diagnosis_primary", "") if s else ""
+    final_diagnosis_secondary = getattr(s, "final_diagnosis_secondary", "") if s else ""
+    
     final_dx = " / ".join([x for x in [
-        getattr(s, "final_diagnosis_primary", "") if s else "",
-        getattr(s, "final_diagnosis_secondary", "") if s else "",
+        final_diagnosis_primary,
+        final_diagnosis_secondary,
     ] if x]).strip()
 
     icd10 = getattr(s, "icd10_codes", "") if s else ""
     presenting_complaints = getattr(s, "presenting_complaints", "") if s else ""
-    summary_illness = getattr(s, "summary_presenting_illness", "") if s else ""
-    if not summary_illness:
-        summary_illness = getattr(s, "hospital_course", "") if s else ""
+    
+    # # Summary of presenting illness - check multiple fields
+    # summary_illness = (
+    #     summary_presenting_illness or
+    #     getattr(s, "hospital_course", "") if s else ""
+    # ) or ""
 
-    key_findings = getattr(s, "key_findings", "") if s else ""
-    substance = getattr(s, "substance_abuse_history", "") if s else ""
-    past_history = getattr(s, "medical_history", "") if s else ""
+    key_findings = key_findings_field or (getattr(s, "key_findings", "") if s else "")
+    substance = substance_abuse_history or (getattr(s, "substance_abuse_history", "") if s else "")
+    
+    # Get medical history from discharge summary only
+    medical_history = getattr(s, "medical_history", "") if s else ""
+    past_history = medical_history
+    
     family_history = getattr(s, "family_history", "") if s else ""
     investigations = getattr(s, "investigations", "") if s else ""
     course = getattr(s, "hospital_course", "") if s else ""
-
+    
+    # Additional fields from discharge summary
+    procedures = getattr(s, "procedures", "") if s else ""
+    allergies = getattr(s, "allergies", "") if s else ""
+    discharge_condition = getattr(s, "discharge_condition", "") if s else ""
+    discharge_type = getattr(s, "discharge_type", "") if s else ""
+    
+    # Treatment and care information
+    treatment_summary = getattr(s, "treatment_summary", "") if s else ""
+    
+    # Instructions and follow-up
     meds = getattr(s, "medications", "") if s else ""
     follow = getattr(s, "follow_up", "") if s else ""
     diet = getattr(s, "diet_instructions", "") if s else ""
     activity = getattr(s, "activity_instructions", "") if s else ""
     warning = getattr(s, "warning_signs", "") if s else ""
+    referral_details = getattr(s, "referral_details", "") if s else ""
+    
+    # Safety and quality fields
+    implants = getattr(s, "implants", "") if s else ""
+    pending_reports = getattr(s, "pending_reports", "") if s else ""
+    patient_education = getattr(s, "patient_education", "") if s else ""
+    
+    # Insurance and operational details
+    # insurance_details = getattr(s, "insurance_details", "") if s else ""
+    # stay_summary = getattr(s, "stay_summary", "") if s else ""
 
+    # Get care plan from admission table
+    care_plan = getattr(adm, "care_plan", "") or ""
+    
+    # Get short history from admission record
+    short_history = getattr(adm, "history", "") or ""
+
+    # Build comprehensive advice section (excluding care plan)
     advice_parts = []
+    # if treatment_summary:
+    #     advice_parts.append("Care Plan:\n" + str(treatment_summary))
     if meds:
         advice_parts.append("Medications:\n" + str(meds))
     if diet:
@@ -495,6 +569,10 @@ def build_discharge_context(db: Session, admission_id: int) -> dict:
         advice_parts.append("Follow-up:\n" + str(follow))
     if warning:
         advice_parts.append("Warning signs:\n" + str(warning))
+    if referral_details:
+        advice_parts.append("Referral Details:\n" + str(referral_details))
+    if patient_education:
+        advice_parts.append("Patient Education:\n" + str(patient_education))
     advice = "\n\n".join(advice_parts)
 
     patient_ack_name = getattr(s, "patient_ack_name", "") if s else ""
@@ -504,7 +582,21 @@ def build_discharge_context(db: Session, admission_id: int) -> dict:
     reviewed_by = getattr(s, "reviewed_by_name", "") if s else ""
     prepared_by = getattr(s, "prepared_by_name", "") if s else ""
     reviewed_reg = getattr(s, "reviewed_by_regno", "") if s else ""
+    
+    # MLC information
     mlc = getattr(adm, "mlc_no", None) or (getattr(s, "mlc_no", None) if s else "") or ""
+    
+    # Demographics from discharge summary or auto-generated
+    demographics = getattr(s, "demographics", "") if s else ""
+    
+    # Finalization status
+    finalized = getattr(s, "finalized", False) if s else False
+    finalized_at = getattr(s, "finalized_at", None) if s else None
+    finalized_by_name = ""
+    if s and getattr(s, "finalized_by", None):
+        finalized_user = db.query(User).get(s.finalized_by)
+        if finalized_user:
+            finalized_by_name = _user_display_name(finalized_user)
 
     return {
         "org_name": org_name,
@@ -527,24 +619,45 @@ def build_discharge_context(db: Session, admission_id: int) -> dict:
         "time_dis": _safe_time(discharge_dt),
 
         "mlc": str(mlc or ""),
-        "provisional_dx": str(provisional_dx or ""),
+        "provisional_dx": str(provisional_diagnosis or ""),
         "final_dx": str(final_dx or ""),
+        "final_diagnosis_primary": str(final_diagnosis_primary or ""),
+        "final_diagnosis_secondary": str(final_diagnosis_secondary or ""),
         "icd10": str(icd10 or ""),
         "presenting_complaints": str(presenting_complaints or ""),
-        "summary_illness": str(summary_illness or ""),
+        #summary_illness": str(summary_illness or ""),
         "key_findings": str(key_findings or ""),
         "substance": str(substance or ""),
         "past_history": str(past_history or ""),
+        "medical_history": str(medical_history or ""),  # Add explicit medical_history field
         "family_history": str(family_history or ""),
         "investigations": str(investigations or ""),
         "course": str(course or ""),
+        "procedures": str(procedures or ""),
+        "allergies": str(allergies or ""),
+        "discharge_condition": str(discharge_condition or ""),
+        "discharge_type": str(discharge_type or ""),
+        "treatment_summary": str(treatment_summary or ""),
+        "care_plan": str(care_plan or ""),
+        "short_history": str(short_history or ""),
         "advice": str(advice or ""),
+        "implants": str(implants or ""),
+        "pending_reports": str(pending_reports or ""),
+        "patient_education": str(patient_education or ""),
+        # "insurance_details": str(insurance_details or ""),
+        # "stay_summary": str(stay_summary or ""),
+        "referral_details": str(referral_details or ""),
+        # "followup_appointment_ref": str(followup_appointment_ref or ""),
+        "demographics": str(demographics or ""),
 
         "doctor_name": (getattr(doctor, "full_name", None) or getattr(doctor, "name", None) or ""),
         "prepared_by": str(prepared_by or ""),
         "reviewed_by": str(reviewed_by or ""),
         "reviewed_regno": str(reviewed_reg or ""),
         "patient_ack_name": str(patient_ack_name or ""),
+        "finalized": finalized,
+        "finalized_at": finalized_at,
+        "finalized_by_name": str(finalized_by_name or ""),
     }
 
 
@@ -658,16 +771,29 @@ def render_discharge_summary_pdf(db: Session, admission_id: int) -> bytes:
 
     main_rows = [
         ["Provisional Diagnosis at the time of Admission", ctx["provisional_dx"]],
-        ["Final Diagnosis at the time of Discharge", ctx["final_dx"]],
+        ["Final Diagnosis at the time of Discharge (Primary)", ctx["final_diagnosis_primary"]],
+        ["Final Diagnosis at the time of Discharge (Secondary)", ctx["final_diagnosis_secondary"]],
         ["ICD-10 code(s) or any other codes, as recommended\nby the Authority, for Final diagnosis", ctx["icd10"]],
-        ["Presenting Complaints with Duration and Reason\nfor Admission", ctx["presenting_complaints"]],
-        ["Summary of Presenting Illness", ctx["summary_illness"]],
-        ["Key findings, on physical examination at the time of\nadmission", ctx["key_findings"]],
-        ["History of alcoholism, tobacco or substance abuse,\nif any", ctx["substance"]],
+        ["Short History", ctx["short_history"]],
+        #["Presenting Complaints with Duration and Reason\nfor Admission", ctx["presenting_complaints"]],
+        #["Summary of Presenting Illness", ctx["summary_illness"]],
+        #["Key findings, on physical examination at the time of\nadmission", ctx["key_findings"]],
+        #["History of alcoholism, tobacco or substance abuse,\nif any", ctx["substance"]],
         ["Significant Past Medical and Surgical History, if any", ctx["past_history"]],
-        ["Family History if significant/relevant to diagnosis or\ntreatment", ctx["family_history"]],
+        #["Family History if significant/relevant to diagnosis or\ntreatment", ctx["family_history"]],
+        ["Known Allergies", ctx["allergies"]],
+        ["Procedures Performed", ctx["procedures"]],
         ["Summary of key investigations during\nHospitalization", ctx["investigations"]],
         ["Course in the Hospital including complications, if\nany", ctx["course"]],
+        ["Care Plan", ctx["care_plan"]],
+       # ["Treatment Summary", ctx["treatment_summary"]],
+        ["Discharge Condition", ctx["discharge_condition"]],
+        ["Discharge Type", ctx["discharge_type"]],
+        ["Implants (if any)", ctx["implants"]],
+        ["Pending Reports", ctx["pending_reports"]],
+       # ["Patient Education Provided", ctx["patient_education"]],
+        # ["Insurance Details", ctx["insurance_details"]],
+        # ["Stay Summary", ctx["stay_summary"]],
         ["Advice on Discharge", ctx["advice"]],
     ]
 
