@@ -146,9 +146,7 @@ class PharmacyPrescriptionLine(Base):
     item_strength = Column(String(64), nullable=True)
     item_type = Column(String(32), nullable=True)  # drug / consumable
     # ✅ NEW: batch lock + snapshots for UI
-    batch_id = Column(Integer,
-                      ForeignKey("inv_item_batches.id"),
-                      nullable=True)
+    batch_id = Column(String(100), ForeignKey("inv_item_batches.id"), nullable=True)
     batch_no_snapshot = Column(String(100), nullable=True)
     expiry_date_snapshot = Column(Date, nullable=True)
 
