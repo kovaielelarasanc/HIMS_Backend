@@ -2,6 +2,7 @@
 from __future__ import annotations
 from datetime import datetime, date, timedelta, time, timezone
 from typing import List, Optional
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session, joinedload
@@ -95,7 +96,8 @@ from app.schemas.ipd import (
     IpdDischargeMedicationCreate,
     IpdAdmissionFeedbackOut,
     IpdAdmissionFeedbackCreate,
-    VitalSnapshot)
+    VitalSnapshot,
+    ClinicalNotesUpdateIn)
 
 # adjust if your model path differs
 # we will create this
@@ -106,6 +108,10 @@ from app.services.billing_ipd_room import sync_ipd_room_charges
 from zoneinfo import ZoneInfo
 
 IST = ZoneInfo("Asia/Kolkata")
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -473,6 +479,41 @@ def discharge_admission(
         "billing_locked": adm.billing_locked,
         "discharge_at": adm.discharge_at,
     }
+
+
+@router.patch("/admissions/{admission_id}/clinical-notes", response_model=AdmissionOut)
+def update_clinical_notes(
+        admission_id: int,
+        payload: ClinicalNotesUpdateIn,
+        db: Session = Depends(get_db),
+        user: User = Depends(auth_current_user),
+):
+    if not has_perm(user, "ipd.doctor"):
+        raise HTTPException(403, "Not permitted")
+    
+    adm = db.query(IpdAdmission).get(admission_id)
+    if not adm:
+        raise HTTPException(404, "Admission not found")
+    
+    # Clinical notes can be edited even after discharge
+    # if adm.billing_locked:
+    #     raise HTTPException(
+    #         400, "Billing is locked for this admission (discharged)."
+    #     )
+    
+    # Update only the clinical notes fields
+    if payload.preliminary_diagnosis is not None:
+        adm.preliminary_diagnosis = payload.preliminary_diagnosis
+    if payload.history is not None:
+        adm.history = payload.history
+    if payload.care_plan is not None:
+        adm.care_plan = payload.care_plan
+    
+    db.commit()
+    db.refresh(adm)
+    
+    dto = AdmissionOut.model_validate(adm, from_attributes=True)
+    return dto.model_copy(update={"display_code": _adm_display_code(db, adm)})
 
 
 @router.patch("/admissions/{admission_id}/cancel")

@@ -1543,3 +1543,12 @@ class IpdDrugChartDoctorAuthOut(IpdDrugChartDoctorAuthBase):
 
     class Config:
         orm_mode = True
+
+
+# ===========================================
+# Clinical Notes Update
+# ===========================================
+class ClinicalNotesUpdateIn(BaseModel):
+    preliminary_diagnosis: Optional[str] = None
+    history: Optional[str] = None
+    care_plan: Optional[str] = None
