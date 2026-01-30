@@ -2048,7 +2048,7 @@ def _pharmacy_legal_lines(branding: Any) -> List[str]:
     lines: List[str] = []
 
     if dl1 != "—":
-        lines.append(f"License No: {dl1}" + (f", {dl2}" if dl2 != "—" else ""))
+        lines.append(f"DL No: {dl1}" + (f", {dl2}" if dl2 != "—" else ""))
 
     if pharm != "—" or regno != "—":
         name_part = "" if pharm == "—" else pharm

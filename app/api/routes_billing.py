@@ -2027,6 +2027,8 @@ def list_cases(
             default=None, description="OPEN/READY_FOR_POST/CLOSED/CANCELLED"),
         payer_mode: Optional[str] = Query(
             default=None, description="SELF/INSURANCE/CORPORATE/MIXED"),
+        date_from: Optional[str] = Query(default=None, description="YYYY-MM-DD"),
+        date_to: Optional[str] = Query(default=None, description="YYYY-MM-DD"),
         page: int = 1,
         page_size: int = 20,
         db: Session = Depends(get_db),
@@ -2055,6 +2057,12 @@ def list_cases(
             pm = payer_mode.strip().upper()
             if pm in PayerMode.__members__:
                 qry = qry.filter(BillingCase.payer_mode == PayerMode[pm])
+
+        # Date filtering
+        if date_from:
+            qry = qry.filter(func.date(BillingCase.created_at) >= date_from)
+        if date_to:
+            qry = qry.filter(func.date(BillingCase.created_at) <= date_to)
 
         if q and q.strip():
             t = q.strip().lower()
