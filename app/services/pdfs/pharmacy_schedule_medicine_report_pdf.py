@@ -17,7 +17,7 @@ from reportlab.pdfbase import pdfmetrics
 
 from sqlalchemy.orm import Session, selectinload
 
-from app.models.ui_branding import UiBranding
+from app.models.ui_branding import UiBranding,UiBrandingContext
 from app.models.pharmacy_inventory import StockTransaction, InventoryItem, ItemBatch
 from app.models.pharmacy_prescription import PharmacyPrescriptionLine, PharmacyPrescription
 from app.models.user import User
@@ -379,9 +379,10 @@ def build_schedule_medicine_report_pdf(
     location_id: Optional[int] = None,
     only_outgoing: bool = True,
     report_title: str = "Schedule Medicine Report",
+    include_logo: bool = True,
 ) -> bytes:
-    branding: Optional[UiBranding] = (
-        db.query(UiBranding).order_by(UiBranding.id.asc()).first()
+    branding: Optional[UiBrandingContext] = (
+        db.query(UiBrandingContext).order_by(UiBrandingContext.id.asc()).first()
     )
 
     org_name = _get(branding, "org_name", default="QnQ Pharmacy")
@@ -391,6 +392,8 @@ def build_schedule_medicine_report_pdf(
     org_email = _get(branding, "org_email", default="")
     org_website = _get(branding, "org_website", default="")
     org_gstin = _get(branding, "org_gstin", default="")
+    org_license = _get(branding, "license_no", default="")
+    org_license2 = _get(branding, "license_no2", default="")
 
     logo_bytes = _read_bytes(_get(branding, "logo_path", default=""))
     header_img_bytes = _read_bytes(_get(branding, "pdf_header_path", default=""))
@@ -681,6 +684,9 @@ def build_schedule_medicine_report_pdf(
             c.setFillColor(header_muted)
         if org_gstin:
             c.drawString(text_x, y, f"GST No: {org_gstin}")
+            y -= 5 * mm
+        if org_license:
+            c.drawString(text_x, y, f"License No: {org_license}")
             y -= 5 * mm
 
         # right title + date

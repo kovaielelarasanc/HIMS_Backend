@@ -256,7 +256,7 @@ def build_pdf(rec: Any, hospital: Optional[Dict[str, Any]] = None) -> bytes:
     ry = cur
     _field(c, x0 + left_w, ry, right_w, row8, "GESTATIONAL AGE", _s(_safe_get(rec, "gestational_age_weeks", "")), label_w=44 * mm); ry -= row8
     _field(c, x0 + left_w, ry, right_w, row8, "CONSANGUINITY", _s(_safe_get(rec, "consanguinity", "")), label_w=44 * mm); ry -= row8
-    _field(c, x0 + left_w, ry, right_w, 20 * mm, "PREV SIBLING\nNEONATAL PERIOD", _s(_safe_get(rec, "previous_sibling_neonatal_period", "")), label_w=54 * mm); ry -= 20 * mm
+    _field(c, x0 + left_w, ry, right_w, 20 * mm, "PREV SIBLING\nNEONATAL PERIOD", _s(_safe_get(rec, "prev_sibling_neonatal_period", "")), label_w=54 * mm); ry -= 20 * mm
     _field(c, x0 + left_w, ry, right_w, row8, "MODE OF CONCEPTION", _s(_safe_get(rec, "mode_of_conception", "")), label_w=50 * mm); ry -= row8
     _field(c, x0 + left_w, ry, right_w, row8, "FROM", _s(_safe_get(rec, "referred_from", "")), label_w=20 * mm); ry -= row8
     _field(c, x0 + left_w, ry, right_w, row8, "AMNIOTIC FLUID", _s(_safe_get(rec, "amniotic_fluid", "")), label_w=36 * mm); ry -= row8
@@ -321,32 +321,65 @@ def build_pdf(rec: Any, hospital: Optional[Dict[str, Any]] = None) -> bytes:
 
     cur -= apgar_h
 
-    # Resuscitation details
-    res_h = 40 * mm
+    # Resuscitation details - Two row layout (expanded to use more space)
+    res_h = 80 * mm  # Further increased height
     _rect_top(c, x0, cur, w, res_h, stroke=1, fill=0)
     c.setFont("Helvetica-Bold", 9)
     c.drawString(x0 + 2 * mm, cur - 4.5 * mm, "RESUSCITATION DETAILS:")
 
+    # First row - Free text notes (expanded)
+    notes_h = 38 * mm  # Space for notes
+    c.line(x0, cur - 8 * mm, x0 + w, cur - 8 * mm)  # Horizontal line after title
+    c.line(x0, cur - 8 * mm - notes_h, x0 + w, cur - 8 * mm - notes_h)  # Horizontal divider
+    
+    notes = _s(_safe_get(rec, "resuscitation_notes", ""))
+    
+    c.setFont("Helvetica-Bold", 8)
+    c.drawString(x0 + 2 * mm, cur - 12 * mm, "RESUSCITATION NOTES:")
+    
+    if notes:
+        lines = _wrap(notes, "Helvetica", 8, w - 4 * mm)
+        c.setFont("Helvetica", 8)
+        yy = cur - 16 * mm
+        for line in lines[:9]:  # Allow up to 9 lines
+            c.drawString(x0 + 2 * mm, yy, line)
+            yy -= 3.2 * mm
+
+    # Second row - Structured data (expanded)
     res = _safe_get(rec, "resuscitation", {}) or {}
     summary_parts = []
+    toggle_parts = []
+    
     if isinstance(res, dict):
         for k, v in res.items():
-            if v is None or v == "" or v is False:
+            if v is None or v == "":
                 continue
-            summary_parts.append(f"{k}={v}")
-    summary = ", ".join(summary_parts)
-    notes = _s(_safe_get(rec, "resuscitation_notes", ""))
-
-    box_x = x0 + 2 * mm
-    box_w = w - 4 * mm
-    text = summary if summary else notes
-    lines = _wrap(text, "Helvetica", 9, box_w)
-
-    c.setFont("Helvetica", 9)
-    yy = cur - 9 * mm
-    for line in lines[:7]:
-        c.drawString(box_x, yy, line)
-        yy -= 4 * mm
+            elif v is True:
+                toggle_parts.append(f"{k}: YES")
+            elif v is False:
+                toggle_parts.append(f"{k}: NO")
+            else:
+                summary_parts.append(f"{k}={v}")
+    
+    # Combine regular data and toggle data
+    all_parts = []
+    if summary_parts:
+        all_parts.extend(summary_parts)
+    if toggle_parts:
+        all_parts.extend(toggle_parts)
+    
+    summary = ", ".join(all_parts)
+    
+    c.setFont("Helvetica-Bold", 8)
+    c.drawString(x0 + 2 * mm, cur - 50 * mm, "STRUCTURED DATA:")
+    
+    if summary:
+        lines = _wrap(summary, "Helvetica", 8, w - 4 * mm)
+        c.setFont("Helvetica", 8)
+        yy = cur - 54 * mm
+        for line in lines[:8]:  # Allow up to 8 lines for structured data
+            c.drawString(x0 + 2 * mm, yy, line)
+            yy -= 3.2 * mm
 
     c.showPage()
 
