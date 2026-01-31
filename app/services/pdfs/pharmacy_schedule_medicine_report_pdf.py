@@ -394,6 +394,8 @@ def build_schedule_medicine_report_pdf(
     org_gstin = _get(branding, "org_gstin", default="")
     org_license = _get(branding, "license_no", default="")
     org_license2 = _get(branding, "license_no2", default="")
+    pharmacist_name = _get(branding, "pharmacist_name", default="")
+    pharmacist_reg_no = _get(branding, "pharmacist_reg_no", default="")
 
     logo_bytes = _read_bytes(_get(branding, "logo_path", default=""))
     header_img_bytes = _read_bytes(_get(branding, "pdf_header_path", default=""))
@@ -610,18 +612,18 @@ def build_schedule_medicine_report_pdf(
     col_titles = [
         "Invoice Date",
         "Invoice No",
-        "Doctor Name",
-        "Client Name",
+        "Doctor",
+        "Patient",
         "Brand Name",
-        "Qty",
-        "Mfg Name",
+        "QTY",
+        "MFG",
         "Batch No",
-        "Exp Date",
-        "Schedule",
+        "EXP",
+        "SCH",
         "Pharmacist Signature",
     ]
     # ✅ sum=190mm (fits A4 with 10mm margins)
-    col_w_mm = [18, 20, 16, 18, 32, 8, 18, 14, 12, 8, 26]
+    col_w_mm = [18, 20, 16, 18, 28, 12, 18, 14, 12, 12, 22]
     col_w = [w * mm for w in col_w_mm]
     table_w = sum(col_w)
 
@@ -648,10 +650,11 @@ def build_schedule_medicine_report_pdf(
         logo_w = 22 * mm
         logo_h = 22 * mm
 
-        if logo_bytes:
-            _draw_image_bytes(c, logo_bytes, pad_lr, H - pad_top - logo_h, logo_w, logo_h, preserve_aspect=True)
+        # if logo_bytes:
+        #     _draw_image_bytes(c, logo_bytes, pad_lr, H - pad_top - logo_h, logo_w, logo_h, preserve_aspect=True)
 
-        text_x = pad_lr + (logo_w + 6 * mm if logo_bytes else 0)
+        # text_x = pad_lr + (logo_w + 6 * mm if logo_bytes else 0)
+        text_x = pad_lr
         y = H - pad_top - 2 * mm
 
         c.setFillColor(header_text)
@@ -671,11 +674,15 @@ def build_schedule_medicine_report_pdf(
                 c.drawString(text_x, y, line)
                 y -= 5 * mm
 
+        # Display phone and email on same line
+        contact_info = []
         if org_phone:
-            c.drawString(text_x, y, f"MobileNo: {org_phone}")
-            y -= 5 * mm
+            contact_info.append(f"MobileNo: {org_phone}")
         if org_email:
-            c.drawString(text_x, y, f"Email: {org_email}")
+            contact_info.append(f"Email: {org_email}")
+        
+        if contact_info:
+            c.drawString(text_x, y, " | ".join(contact_info))
             y -= 5 * mm
         if org_website:
             c.setFillColor(header_link)
@@ -685,8 +692,27 @@ def build_schedule_medicine_report_pdf(
         if org_gstin:
             c.drawString(text_x, y, f"GST No: {org_gstin}")
             y -= 5 * mm
-        if org_license:
-            c.drawString(text_x, y, f"License No: {org_license}")
+        # Display license numbers
+        license_text = ""
+        if org_license and org_license2:
+            license_text = f"DL No: {org_license} / {org_license2}"
+        elif org_license:
+            license_text = f"DL No: {org_license}"
+        elif org_license2:
+            license_text = f"DL No: {org_license2}"
+        
+        if license_text:
+            c.drawString(text_x, y, license_text)
+            y -= 5 * mm
+        
+        # Display pharmacist information
+        if pharmacist_name or pharmacist_reg_no:
+            pharmacist_text = f"Pharmacist: {pharmacist_name or '_______'}"
+            if pharmacist_reg_no:
+                pharmacist_text += f" (Reg: {pharmacist_reg_no})"
+            else:
+                pharmacist_text += " (Reg: _______)"
+            c.drawString(text_x, y, pharmacist_text)
             y -= 5 * mm
 
         # right title + date
