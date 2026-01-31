@@ -654,7 +654,7 @@ def list_items(
     supplier_id: Optional[int] = Query(None),
     include_qty: bool = Query(True, description="Include computed quantity on hand"),
     location_id: Optional[int] = Query(None, description="If set, qty_on_hand for that location only"),
-    limit: int = Query(200, ge=1, le=500),
+    limit: int = Query(5000, ge=1, le=10000),
     offset: int = Query(0, ge=0),
 ):
     if not has_perm(current_user, "pharmacy.inventory.items.view"):

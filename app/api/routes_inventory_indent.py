@@ -97,6 +97,7 @@ def list_items(
     search: Optional[str] = Query(None),
     is_active: Optional[bool] = Query(True),
     item_type: Optional[str] = Query(None),
+    limit: Optional[int] = Query(None),
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ):
@@ -111,7 +112,12 @@ def list_items(
             like = f"%{search.strip()}%"
             q = q.filter((InventoryItem.name.like(like)) | (InventoryItem.code.like(like)))
 
-        rows = q.order_by(InventoryItem.name.asc()).limit(500).all()
+        q = q.order_by(InventoryItem.name.asc())
+        
+        if limit:
+            q = q.limit(limit)
+            
+        rows = q.all()
         return ok([InventoryItemOut.model_validate(x).model_dump() for x in rows])
     except Exception as e:
         return _safe_err(e)
