@@ -624,11 +624,26 @@ def api_export_update_bundle(bundle_id: int, payload: ExportUpdateBundleIn, requ
 
 
 @router.post("/exports/bundles/{bundle_id}/generate")
-def api_export_generate(bundle_id: int, request: Request, db: Session = Depends(get_db), user: User = Depends(current_user)):
+def api_export_generate(
+    bundle_id: int,
+    request: Request,
+    paper: str = Query("A4", pattern="^(A3|A4|A5)$"),
+    orientation: str = Query("portrait", pattern="^(portrait|landscape)$"),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
     _need_any(user, ["emr.export.generate", "emr.manage"])
     uid = int(getattr(user, "id", 0) or 0)
     ip, ua = _client_meta(request)
-    data = export_generate_pdf(db, bundle_id=bundle_id, user_id=uid, ip=ip, ua=ua)
+    data = export_generate_pdf(
+        db,
+        bundle_id=bundle_id,
+        user_id=uid,
+        ip=ip,
+        ua=ua,
+        paper=paper,
+        orientation=orientation,
+    )
     return ok(data, 200)
 
 

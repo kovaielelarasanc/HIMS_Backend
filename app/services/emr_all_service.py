@@ -48,6 +48,10 @@ from app.services.emr_template_builder import normalize_template_schema
 from app.models.patient import Patient
 
 from app.services.emr_export_pdf import build_export_pdf_bytes
+from app.models.ui_branding import UiBranding
+from app.models.opd import Visit
+from app.models.ipd import IpdAdmission
+from app.models.ot import OtSchedule, OtCase
 
 ENCOUNTER_TYPES = {"OP", "IP", "ER", "OT"}
 
@@ -73,6 +77,28 @@ PHASE_SET = {p["code"] for p in PHASES}
 # -------------------------
 # Helpers
 # -------------------------
+# -------------------------
+# Helpers
+# -------------------------
+def _norm_encounter_type(v: Optional[str]) -> Optional[str]:
+    if not v:
+        return None
+    vv = str(v).strip().upper()
+    if vv in ("OP", "OPD"):
+        return "OP"
+    if vv in ("IP", "IPD"):
+        return "IP"
+    if vv in ("OT",):
+        return "OT"
+    return vv
+
+def _load_branding(db: Session) -> Optional[UiBranding]:
+    q = db.query(UiBranding)
+    if hasattr(UiBranding, "is_active"):
+        q = q.filter(UiBranding.is_active == True)  # noqa: E712
+    return q.order_by(UiBranding.id.desc()).first()
+
+
 def now() -> datetime:
     # Prefer UTC for DB timestamps; your project likely standardizes this already
     return datetime.utcnow()
@@ -1727,6 +1753,62 @@ def export_update_bundle(db: Session, *, bundle_id: int, payload: Dict[str, Any]
     safe_commit(db)
     return {"updated": True}
 
+def _load_encounter(
+        db: Session,
+        *,
+        encounter_type: Optional[str],
+        encounter_id: Any,
+        patient_id: int,
+    ) -> Tuple[Optional[str], Any]:
+        """
+        Returns (normalized_encounter_type, encounter_object_or_None).
+        Never raises if encounter not found (PDF can still generate).
+        """
+        et = _norm_encounter_type(encounter_type)
+        eid = _safe_int(encounter_id) if encounter_id is not None else None
+
+        if not et or not eid:
+            return et, None
+
+        try:
+            if et == "OP":
+                v = db.query(Visit).filter(Visit.id == eid).one_or_none()
+                if v and int(getattr(v, "patient_id", 0) or 0) == int(patient_id):
+                    return et, v
+                return et, None
+
+            if et == "IP":
+                adm = db.query(IpdAdmission).filter(IpdAdmission.id == eid).one_or_none()
+                if adm and int(getattr(adm, "patient_id", 0) or 0) == int(patient_id):
+                    return et, adm
+                return et, None
+
+            if et == "OT":
+                # Prefer schedule (most UI flows use schedule id)
+                sch = db.query(OtSchedule).filter(OtSchedule.id == eid).one_or_none()
+                if sch:
+                    # patient_id can be NULL for OT schedules; then admission may exist
+                    pid = getattr(sch, "patient_id", None)
+                    if pid and int(pid) != int(patient_id):
+                        return et, None
+                    return et, sch
+
+                # fallback: case id
+                cs = db.query(OtCase).filter(OtCase.id == eid).one_or_none()
+                if cs and cs.schedule:
+                    pid = getattr(cs.schedule, "patient_id", None)
+                    if pid and int(pid) != int(patient_id):
+                        return et, None
+                    return et, cs.schedule  # pass schedule for demographic block
+                return et, None
+
+            return et, None
+        except Exception:
+            return et, None
+# -------------------------
+# Service function (UPDATED)
+# -------------------------
+
 
 def export_generate_pdf(
     db: Session,
@@ -1736,23 +1818,23 @@ def export_generate_pdf(
     ip: Optional[str],
     ua: Optional[str],
     storage_dir: str = "storage/emr_exports",
+    # NEW optional overrides (API can pass these)
+    paper: str = "A4",
+    orientation: str = "portrait",
 ) -> Dict[str, Any]:
+    # NOTE: EmrExportBundle, EmrExportStatus, EmrExportAuditAction are assumed from your existing file
     b = db.query(EmrExportBundle).filter(EmrExportBundle.id == int(bundle_id)).one_or_none()
     if not b:
         raise HTTPException(status_code=404, detail="Bundle not found")
 
-    f = loads(b.filters_json, {})
+    f = loads(b.filters_json, {}) or {}
     record_ids = [int(x) for x in (f.get("record_ids") or []) if str(x).isdigit()]
-
-    qry = db.query(EmrRecord).filter(EmrRecord.patient_id == int(b.patient_id))
-    if record_ids:
-        qry = qry.filter(EmrRecord.id.in_(record_ids))
 
     def parse_ymd(s: Optional[str]) -> Optional[date]:
         if not s:
             return None
         try:
-            y, m, d = s.split("-")
+            y, m, d = str(s).split("-")
             return date(int(y), int(m), int(d))
         except Exception:
             raise HTTPException(status_code=422, detail=f"Invalid date format: {s} (expected YYYY-MM-DD)")
@@ -1760,38 +1842,103 @@ def export_generate_pdf(
     fd = parse_ymd(f.get("from_date"))
     td = parse_ymd(f.get("to_date"))
 
+    # Encounter context (bundle-level preferred)
+    bundle_enc_type = _norm_encounter_type(getattr(b, "encounter_type", None) or f.get("encounter_type"))
+    bundle_enc_id = getattr(b, "encounter_id", None) or f.get("encounter_id")
+
+    # Build record query
+    qry = db.query(EmrRecord).filter(EmrRecord.patient_id == int(b.patient_id))
+    if record_ids:
+        qry = qry.filter(EmrRecord.id.in_(record_ids))
+
+    # Optional encounter filter if your EmrRecord has these columns
+    # (won't crash if columns don't exist)
+    if bundle_enc_type and bundle_enc_id is not None:
+        try:
+            if hasattr(EmrRecord, "encounter_type"):
+                qry = qry.filter(EmrRecord.encounter_type == bundle_enc_type)
+            if hasattr(EmrRecord, "encounter_id"):
+                qry = qry.filter(EmrRecord.encounter_id == str(bundle_enc_id))
+        except Exception:
+            pass
+
     if fd:
         qry = qry.filter(EmrRecord.created_at >= datetime(fd.year, fd.month, fd.day))
     if td:
         qry = qry.filter(EmrRecord.created_at < datetime(td.year, td.month, td.day) + timedelta(days=1))
 
     records = qry.order_by(EmrRecord.created_at.asc(), EmrRecord.id.asc()).all()
+
     p = db.query(Patient).filter(Patient.id == int(b.patient_id)).one_or_none()
     if not p:
         raise HTTPException(status_code=404, detail="Patient not found")
 
+    branding = _load_branding(db)
+
+    # Encounter object for demographic block in PDF
+    enc_type, enc_obj = _load_encounter(
+        db,
+        encounter_type=bundle_enc_type,
+        encounter_id=bundle_enc_id,
+        patient_id=int(b.patient_id),
+    )
+
+    # Generate PDF
     try:
-        pdf_bytes = build_export_pdf_bytes(
-            patient=p,
-            bundle_title=b.title,
-            records=records,
-            watermark=b.watermark_text,
-            db=db,
-        )
+        # New signature (preferred)
+        try:
+            pdf_bytes = build_export_pdf_bytes(
+                patient=p,
+                bundle_title=b.title,
+                records=records,
+                watermark=b.watermark_text,
+                db=db,
+                branding=branding,
+                encounter_type=enc_type,
+                encounter=enc_obj,
+                paper=paper,
+                orientation=orientation,
+                system_footer="System-generated at print time",
+            )
+        except TypeError:
+            # Backward compatible with older build_export_pdf_bytes()
+            pdf_bytes = build_export_pdf_bytes(
+                patient=p,
+                bundle_title=b.title,
+                records=records,
+                watermark=b.watermark_text,
+                db=db,
+            )
     except HTTPException:
         raise
     except Exception as ex:
         raise HTTPException(status_code=500, detail=f"PDF generation failed: {ex}")
 
+    # Save to storage
     Path(storage_dir).mkdir(parents=True, exist_ok=True)
     file_path = Path(storage_dir) / f"bundle_{int(b.id)}.pdf"
     file_path.write_bytes(pdf_bytes)
 
+    # Update bundle
     b.pdf_file_key = str(file_path)
     b.status = EmrExportStatus.GENERATED
     b.generated_at = now()
 
-    export_audit(db, int(b.id), EmrExportAuditAction.GENERATE_PDF, user_id, ip, ua, meta={"pdf_file_key": b.pdf_file_key})
+    export_audit(
+        db,
+        int(b.id),
+        EmrExportAuditAction.GENERATE_PDF,
+        user_id,
+        ip,
+        ua,
+        meta={
+            "pdf_file_key": b.pdf_file_key,
+            "paper": paper,
+            "orientation": orientation,
+            "encounter_type": enc_type,
+            "encounter_id": bundle_enc_id,
+        },
+    )
     safe_commit(db)
     return {"pdf_file_key": b.pdf_file_key, "status": b.status.value}
 
@@ -2131,7 +2278,18 @@ def template_new_version(db: Session, *, template_id: int, payload: Dict[str, An
 # ===========================
 # Patient Encounters (Unified)
 # ===========================
-
+def _safe_int(v: Any) -> Optional[int]:
+        try:
+            if v is None:
+                return None
+            if isinstance(v, int):
+                return v
+            s = str(v).strip()
+            if not s:
+                return None
+            return int(s)
+        except Exception:
+            return None
 
 def patient_encounters(db: Session, *, patient_id: int, limit: int = 100) -> List[Dict[str, Any]]:
     """
@@ -2163,19 +2321,15 @@ def patient_encounters(db: Session, *, patient_id: int, limit: int = 100) -> Lis
         except Exception:
             return None
 
-    def _safe_int(v: Any) -> Optional[int]:
-        try:
-            if v is None:
-                return None
-            return int(v)
-        except Exception:
-            return None
+
 
     def _safe_str(v: Any) -> str:
         try:
             return str(v) if v is not None else ""
         except Exception:
             return ""
+        
+
 
     def _pick_dt(obj: Any, fields: List[str]) -> Any:
         for f in fields:

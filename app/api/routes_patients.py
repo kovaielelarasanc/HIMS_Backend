@@ -48,11 +48,12 @@ from app.schemas.patient import (
     DocumentOut,
     ConsentIn,
     ConsentOut,
+    PatientSummaryOut
 )
 from app.services.audit_logger import log_audit  # adjust path if your pkg is `services`
 import re
 from app.models.ui_branding import UiBranding
-
+from sqlalchemy import func
 router = APIRouter()
 
 # --------- utils ----------
@@ -60,6 +61,99 @@ router = APIRouter()
 UPLOAD_DIR = Path(settings.STORAGE_DIR).joinpath("patient_docs")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+
+def serialize_patient_summary(
+    p: Patient,
+    db: Session,
+    *,
+    include_barcode: bool = False,
+    include_counts: bool = False,
+) -> PatientSummaryOut:
+    years, months, days, full_text, short_text = calc_age(p.dob)
+
+    full_name = " ".join(x for x in [
+        (p.prefix or "").strip(),
+        (p.first_name or "").strip(),
+        (p.last_name or "").strip(),
+    ] if x).strip() or "—"
+
+    # pick latest address (your UI already sorts by id desc)
+    addr_obj = None
+    try:
+        if getattr(p, "addresses", None):
+            addr_obj = sorted(list(p.addresses or []), key=lambda a: a.id, reverse=True)[0]
+    except Exception:
+        addr_obj = (p.addresses[0] if getattr(p, "addresses", None) else None)
+
+    addr_out = None
+    if addr_obj:
+        try:
+            addr_out = AddressOut.model_validate(addr_obj, from_attributes=True)
+        except Exception:
+            addr_out = None
+
+    ref_doctor_name = None
+    if getattr(p, "ref_doctor_id", None):
+        doc = db.query(User).get(p.ref_doctor_id)
+        if doc:
+            ref_doctor_name = getattr(doc, "name", None)
+
+    barcode_uri = _generate_barcode_data_uri(p.uhid) if include_barcode else None
+
+    documents_count = None
+    consents_count = None
+    if include_counts:
+        documents_count = int(
+            db.query(func.count(PatientDocument.id))
+            .filter(PatientDocument.patient_id == p.id)
+            .scalar()
+            or 0
+        )
+        consents_count = int(
+            db.query(func.count(PatientConsent.id))
+            .filter(PatientConsent.patient_id == p.id)
+            .scalar()
+            or 0
+        )
+
+    return PatientSummaryOut(
+        id=p.id,
+        uhid=p.uhid,
+        name=full_name,
+
+        prefix=p.prefix,
+        first_name=p.first_name,
+        last_name=p.last_name,
+        gender=p.gender,
+        dob=p.dob,
+
+        age_years=years,
+        age_months=months,
+        age_days=days,
+        age_text=full_text,
+        age_short_text=short_text,
+
+        phone=p.phone,
+        email=p.email,
+        blood_group=p.blood_group,
+        marital_status=p.marital_status,
+        patient_type=p.patient_type,
+
+        is_pregnant=getattr(p, "is_pregnant", None),
+        rch_id=getattr(p, "rch_id", None),
+
+        ref_source=p.ref_source,
+        ref_doctor_id=p.ref_doctor_id,
+        ref_doctor_name=ref_doctor_name,
+
+        created_at=getattr(p, "created_at", None),
+
+        address=addr_out,
+
+        barcode_data_uri=barcode_uri,
+        documents_count=documents_count,
+        consents_count=consents_count,
+    )
 
 def _is_female_gender(gender: Optional[str]) -> bool:
     g = (gender or "").strip().lower()
@@ -1542,4 +1636,32 @@ def print_patient_info(
         io.BytesIO(pdf_bytes),
         media_type="application/pdf",
         headers={"Content-Disposition": f'inline; filename="{filename}"'},
+    )
+
+
+@router.get("/{patient_id}/summary", response_model=PatientSummaryOut)
+def get_patient_summary(
+    patient_id: int,
+    include_barcode: bool = Query(False),
+    include_counts: bool = Query(False),
+    db: Session = Depends(get_db),
+    user: User = Depends(auth_current_user),
+):
+    """
+    Lightweight patient summary for dashboards / EMR header / export screens.
+
+    GET /api/patients/{patient_id}/summary?include_barcode=false&include_counts=false
+    """
+    if not has_perm(user, "patients.view"):
+        raise HTTPException(status_code=403, detail="Not permitted")
+
+    p = _get_patient_with_related(db, patient_id)
+    if not p or not p.is_active:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    return serialize_patient_summary(
+        p,
+        db,
+        include_barcode=include_barcode,
+        include_counts=include_counts,
     )

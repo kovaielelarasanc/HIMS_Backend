@@ -424,3 +424,51 @@ class PatientOut(BaseModel):
     addresses: List[AddressOut] = []
 
     model_config = ConfigDict(from_attributes=True)
+
+class PatientSummaryOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    uhid: str
+
+    # display
+    name: str
+
+    # core fields
+    prefix: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    gender: Optional[str] = None
+    dob: Optional[date] = None
+
+    # computed age
+    age_years: Optional[int] = None
+    age_months: Optional[int] = None
+    age_days: Optional[int] = None
+    age_text: Optional[str] = None
+    age_short_text: Optional[str] = None
+
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    blood_group: Optional[str] = None
+    marital_status: Optional[str] = None
+    patient_type: Optional[str] = None
+
+    # pregnancy
+    is_pregnant: Optional[bool] = None
+    rch_id: Optional[str] = None
+
+    # references
+    ref_source: Optional[str] = None
+    ref_doctor_id: Optional[int] = None
+    ref_doctor_name: Optional[str] = None
+
+    created_at: Optional[datetime] = None
+
+    # resolved
+    address: Optional["AddressOut"] = None
+
+    # optional extras (only if asked)
+    barcode_data_uri: Optional[str] = None
+    documents_count: Optional[int] = None
+    consents_count: Optional[int] = None
