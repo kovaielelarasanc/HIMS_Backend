@@ -45,6 +45,8 @@ class EncounterType(str, enum.Enum):
     IP = "IP"
     OT = "OT"
     ER = "ER"
+    COUNTER = "COUNTER"
+
 
 
 class BillingCaseStatus(str, enum.Enum):

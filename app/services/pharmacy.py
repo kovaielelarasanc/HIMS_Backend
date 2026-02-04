@@ -948,7 +948,7 @@ def _map_encounter_for_sale(db: Session, sale: PharmacySale) -> tuple[EncounterT
         return EncounterType.OP, int(sale.visit_id)
 
     # pseudo encounter
-    return EncounterType.ER, -int(sale.id)
+    return EncounterType.COUNTER, int(sale.id)
 
 
 def _ensure_case_link(db: Session, *, case_id: int, entity_type: str, entity_id: int) -> None:
