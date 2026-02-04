@@ -101,6 +101,11 @@ class PharmacyPrescriptionLine(Base):
     """
 
     __tablename__ = "pharmacy_prescription_lines"
+    __table_args__ = {
+        "mysql_engine": "InnoDB",
+        "mysql_charset": "utf8mb4",
+        "mysql_collate": "utf8mb4_unicode_ci",
+    }
 
     id = Column(Integer, primary_key=True, index=True)
     prescription_id = Column(
@@ -178,6 +183,11 @@ class PharmacySale(Base):
     """
 
     __tablename__ = "pharmacy_sales"
+    __table_args__ = {
+        "mysql_engine": "InnoDB",
+        "mysql_charset": "utf8mb4",
+        "mysql_collate": "utf8mb4_unicode_ci",
+    }
 
     id = Column(Integer, primary_key=True, index=True)
     bill_number = Column(String(64), unique=True, index=True, nullable=False)
@@ -264,6 +274,11 @@ class PharmacySaleItem(Base):
     """
 
     __tablename__ = "pharmacy_sale_items"
+    __table_args__ = {
+        "mysql_engine": "InnoDB",
+        "mysql_charset": "utf8mb4",
+        "mysql_collate": "utf8mb4_unicode_ci",
+    }
 
     id = Column(Integer, primary_key=True, index=True)
     sale_id = Column(Integer,
