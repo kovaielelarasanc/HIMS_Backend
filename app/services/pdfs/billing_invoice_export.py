@@ -7,7 +7,7 @@ from decimal import Decimal
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
+import json
 from zoneinfo import ZoneInfo
 
 from reportlab.lib import colors
@@ -76,9 +76,127 @@ def _fmt_date_dt(dt: Optional[datetime]) -> str:
         return "—"
     return d.strftime("%d-%m-%Y")
 
+def _meta(v: Any) -> Dict[str, Any]:
+    if v is None:
+        return {}
+    if isinstance(v, dict):
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return {}
+        try:
+            obj = json.loads(s)
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            return {}
+    return {}
 
-def _meta(line_meta: Any) -> Dict[str, Any]:
-    return line_meta if isinstance(line_meta, dict) else {}
+def _truthy(v: Any) -> bool:
+    if v is None:
+        return False
+    if isinstance(v, bool):
+        return v
+
+    # ✅ IMPORTANT: meta flags may be dict like {"deleted": {"at": "...", "by": 1}}
+    if isinstance(v, (dict, list, tuple, set)):
+        return len(v) > 0
+
+    if isinstance(v, (int, float, Decimal)):
+        return v != 0
+
+    s = str(v).strip().lower()
+    return s in ("1", "true", "yes", "y", "t", "on")
+
+def _line_meta_any(ln: Any) -> Dict[str, Any]:
+    return _meta(
+        getattr(ln, "meta_json", None)
+        or getattr(ln, "meta", None)
+        or getattr(ln, "extra_json", None)
+        or getattr(ln, "payload_json", None)
+    )
+def _status_norm(st: Any) -> str:
+    if st is None:
+        return ""
+    v = getattr(st, "value", st)
+    return str(v or "").strip().upper()
+
+def _truthy(v: Any) -> bool:
+    if v is None:
+        return False
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v != 0
+    s = str(v).strip().lower()
+    return s in ("1", "true", "yes", "y", "t", "on")
+
+def _line_meta_any(ln: Any) -> Dict[str, Any]:
+    # support different field names across installs
+    return _meta(
+        getattr(ln, "meta_json", None)
+        or getattr(ln, "meta", None)
+        or getattr(ln, "extra_json", None)
+        or getattr(ln, "payload_json", None)
+    )
+def _line_is_removed(ln: Any) -> bool:
+    # 1) status-based remove (strict + contains)
+    st = _status_norm(getattr(ln, "status", None) or getattr(ln, "line_status", None))
+    if st in ("VOID", "DELETED", "CANCELLED", "CANCELED", "REMOVED", "INACTIVE"):
+        return True
+    if "REMOV" in st or "VOID" in st or "CANCEL" in st or "DELET" in st:
+        return True
+
+    # 2) common boolean columns (if exist)
+    for attr in ("is_deleted", "is_void", "is_cancelled", "is_canceled", "is_removed"):
+        try:
+            if _truthy(getattr(ln, attr, None)):
+                return True
+        except Exception:
+            pass
+
+    # 3) soft-delete timestamps (if exist)
+    for attr in ("deleted_at", "voided_at", "cancelled_at", "canceled_at", "removed_at"):
+        try:
+            if getattr(ln, attr, None):
+                return True
+        except Exception:
+            pass
+
+    # 4) active flag (if exist)
+    try:
+        if getattr(ln, "is_active", None) is False:
+            return True
+    except Exception:
+        pass
+
+    # 5) meta flags (handles JSON-string meta)
+    meta = _line_meta_any(ln)
+    for k in (
+        "is_deleted", "deleted", "deleted_flag", "deletedFlag",
+        "is_void", "void", "voided",
+        "is_removed", "removed", "removed_flag", "removedFlag",
+        "is_cancelled", "cancelled", "is_canceled", "canceled",
+        "is_inactive", "inactive",
+        "isRemoved", "removedAt", "removedOn",
+    ):
+        if _truthy(meta.get(k)) or (k.endswith("At") or k.endswith("On")) and meta.get(k):
+            return True
+
+    # 6) ✅ UI marker in description: "(REMOVED)" / "REMOVED"
+    desc = str(getattr(ln, "description", "") or "").strip()
+    udesc = desc.upper()
+
+    if "REMOVED" in udesc:
+        # many systems mark removed rows only by text + set qty/amount to 0
+        qty = _d(getattr(ln, "qty", 0))
+        amt = _d(getattr(ln, "net_amount", 0))
+        if "(REMOVED)" in udesc:
+            return True
+        if qty == 0 or amt == 0:
+            return True
+
+    return False
 
 
 def _meta_pick(m: Dict[str, Any], keys: List[str], default: str = "—") -> str:
@@ -710,17 +828,8 @@ def build_invoice_pdf(
     header_row = [Paragraph(f"<b>{c.label}</b>", SMALL) for c in cols]
     data: List[List[Any]] = [header_row]
 
-    cleaned: List[Any] = []
-    for ln in (lines or []):
-        st = _upper(
-            getattr(getattr(ln, "status", None), "value",
-                    getattr(ln, "status", "")))
-        if st in ("VOID", "DELETED", "CANCELLED"):
-            continue
-        m0 = _meta(getattr(ln, "meta_json", None))
-        if m0.get("is_void") is True or m0.get("is_deleted") is True:
-            continue
-        cleaned.append(ln)
+    cleaned = [ln for ln in (lines or []) if not _line_is_removed(ln)]
+
 
     for ln in cleaned:
         m = _meta(getattr(ln, "meta_json", None))

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 import json
 import logging
-
+import re
 from fastapi import APIRouter, Depends, HTTPException, Query, Path as FPath
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session, selectinload, joinedload
@@ -122,6 +122,10 @@ from decimal import Decimal, InvalidOperation
 from datetime import date, datetime
 from typing import List, Tuple, Any
 
+from sqlalchemy.orm import with_loader_criteria
+from sqlalchemy import and_, true
+from app.models.billing import BillingInvoiceLine  # import your line model
+
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/billing/print", tags=["Billing Print"])
 
@@ -179,6 +183,22 @@ def _need_any(user: User, perms: Union[str, Iterable[str]]) -> None:
 
     raise HTTPException(status_code=403, detail="Not permitted")
 
+def _visible_line_loader_criteria():
+    conds = []
+
+    if _has_col(BillingInvoiceLine, "deleted_at"):
+        conds.append(BillingInvoiceLine.deleted_at.is_(None))
+
+    if _has_col(BillingInvoiceLine, "is_active"):
+        conds.append(BillingInvoiceLine.is_active.is_(True))
+
+    if _has_col(BillingInvoiceLine, "status"):
+        try:
+            conds.append(BillingInvoiceLine.status != DocStatus.VOID)
+        except Exception:
+            conds.append(BillingInvoiceLine.status.notin_(["VOID", "DELETED", "CANCELLED", "CANCELED"]))
+
+    return and_(*conds) if conds else true()
 
 # =========================================================
 # Small utils
@@ -274,6 +294,86 @@ def _meta(v: Any) -> Dict[str, Any]:
         except Exception:
             return {}
     return {}
+def _truthy(v: Any) -> bool:
+    if v is None:
+        return False
+    if isinstance(v, bool):
+        return v
+
+    # ✅ IMPORTANT: meta flags may be dict like {"deleted": {"at": "...", "by": 1}}
+    if isinstance(v, (dict, list, tuple, set)):
+        return len(v) > 0
+
+    if isinstance(v, (int, float, Decimal)):
+        return v != 0
+
+    s = str(v).strip().lower()
+    return s in ("1", "true", "yes", "y", "t", "on")
+
+
+def _line_meta_any(ln: Any) -> Dict[str, Any]:
+    return _meta(
+        getattr(ln, "meta_json", None)
+        or getattr(ln, "meta", None)
+        or getattr(ln, "extra_json", None)
+        or getattr(ln, "payload_json", None)
+    )
+
+
+def _line_is_removed(ln: Any) -> bool:
+    """
+    Central rule: do NOT print removed/voided invoice lines.
+    Supports common schemas: meta_json flags, deleted_at, is_active, status.
+    """
+    meta = _line_meta_any(ln)
+
+    # 1) meta_json flags (different naming across installs)
+    for k in (
+        "is_deleted", "deleted", "deleted_flag",
+        "is_void", "void", "voided",
+        "is_removed", "removed",
+        "is_cancelled", "cancelled",
+        "is_inactive", "inactive",
+    ):
+        if _truthy(meta.get(k)):
+            return True
+
+    # 2) soft-delete timestamps
+    for k in ("deleted_at", "voided_at", "cancelled_at"):
+        try:
+            if getattr(ln, k, None):
+                return True
+        except Exception:
+            pass
+
+    # 3) active flag
+    for k in ("is_active", "active"):
+        try:
+            v = getattr(ln, k, None)
+            if v is False:
+                return True
+        except Exception:
+            pass
+
+    # 4) status enum/string
+    try:
+        st = getattr(ln, "status", None) or getattr(ln, "line_status", None)
+        if st is not None:
+            # enum compare
+            if _eq_enum(st, DocStatus.VOID):
+                return True
+            s = str(_val(st)).strip().upper()
+            if s in ("VOID", "CANCELLED", "CANCELED", "DELETED", "REMOVED", "INACTIVE"):
+                return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _iter_visible_lines(inv: Any) -> List[Any]:
+    lines = list(getattr(inv, "lines", None) or getattr(inv, "invoice_lines", None) or [])
+    return [ln for ln in lines if not _line_is_removed(ln)]
 
 
 def _meta_pick(meta: Dict[str, Any],
@@ -454,28 +554,37 @@ def _load_case(db: Session, case_id: int) -> BillingCase:
         raise HTTPException(status_code=404, detail="Billing case not found")
     return case
 
-
-def _list_case_invoices(
-    db: Session,
-    case_id: int,
-    *,
-    include_draft_invoices: bool = True,
-) -> List[BillingInvoice]:
-    q = (db.query(BillingInvoice).options(selectinload(
-        BillingInvoice.lines)).filter(
+def _list_case_invoices(db: Session, case_id: int, *, include_draft_invoices: bool = True) -> List[BillingInvoice]:
+    crit = _visible_line_loader_criteria()
+    q = (
+        db.query(BillingInvoice)
+        .options(
+            selectinload(BillingInvoice.lines),
+            with_loader_criteria(BillingInvoiceLine, crit, include_aliases=True),
+        )
+        .filter(
             BillingInvoice.billing_case_id == case_id,
             BillingInvoice.status != DocStatus.VOID,
-        ).order_by(BillingInvoice.created_at.asc()))
+        )
+        .order_by(BillingInvoice.created_at.asc())
+    )
     if not include_draft_invoices:
         q = q.filter(BillingInvoice.status != DocStatus.DRAFT)
     return q.all()
 
 
 def _load_invoice(db: Session, invoice_id: int) -> BillingInvoice:
-    inv = (db.query(BillingInvoice).options(
-        selectinload(BillingInvoice.lines),
-        joinedload(BillingInvoice.billing_case)).filter(
-            BillingInvoice.id == int(invoice_id)).first())
+    crit = _visible_line_loader_criteria()
+    inv = (
+        db.query(BillingInvoice)
+        .options(
+            joinedload(BillingInvoice.billing_case),
+            selectinload(BillingInvoice.lines),
+            with_loader_criteria(BillingInvoiceLine, crit, include_aliases=True),
+        )
+        .filter(BillingInvoice.id == int(invoice_id))
+        .first()
+    )
     if not inv:
         raise HTTPException(status_code=404, detail="Invoice not found")
     return inv
@@ -2500,15 +2609,12 @@ def _draw_branding_header_small(
 
     return y_line - (2.0 * mm)
 
-
-def _pharmacy_priority_legal_lines(b, *, max_w: float, font: str,
-                                   sz: float) -> list[str]:
+def _pharmacy_priority_legal_lines(b, *, max_w: float, font: str, sz: float) -> list[str]:
     """
-    Returns legal lines with guaranteed priority order:
-    1) DL No
-    2) Pharmacist (Reg)
-    Then appends any other _pharmacy_legal_lines(b) extras.
-    Also caps each line to ONE visible line width (no overflow).
+    Guaranteed order:
+      1) DL line
+      2) Pharmacist line
+    Then extras (never pushing the first two out).
     """
 
     def _one_line(t: str) -> str:
@@ -2518,44 +2624,31 @@ def _pharmacy_priority_legal_lines(b, *, max_w: float, font: str,
         parts = simpleSplit(t, font, sz, max_w)
         return parts[0] if parts else ""
 
-    lic1 = _safe(_bget(b, "license_no", "dl_no", "drug_license_no"))
-    lic2 = _safe(_bget(b, "license_no2", "dl_no2", "drug_license_no2"))
-    pharm = _safe(_bget(b, "pharmacist_name", "pharmacist", "rph_name"))
-    regno = _safe(_bget(b, "pharmacist_reg_no", "pharmacist_reg",
-                        "rph_reg_no"))
+    all_lines = _pharmacy_legal_lines(b) or []
+    dl = next((x for x in all_lines if x.strip().lower().startswith("dl")), "")
+    ph = next((x for x in all_lines if "pharmacist" in x.lower()), "")
 
     out: list[str] = []
+    if dl:
+        dl1 = _one_line(dl)
+        if dl1:
+            out.append(dl1)
+    if ph:
+        ph1 = _one_line(ph)
+        if ph1:
+            out.append(ph1)
 
-    # ✅ Priority 1: DL No
-    if lic1 != "—":
-        dl = f"DL No: {lic1}" + (f", {lic2}" if lic2 != "—" else "")
-        dl = _one_line(dl)
-        if dl:
-            out.append(dl)
-
-    # ✅ Priority 2: Pharmacist line
-    if pharm != "—" or regno != "—":
-        ph = f"Pharmacist: {pharm if pharm != '—' else ''}{f' (Reg: {regno})' if regno != '—' else ''}".strip(
-        )
-        ph = _one_line(ph)
-        if ph:
-            out.append(ph)
-
-    # ✅ Extras (but don't let extras push priority lines out)
-    extras = _pharmacy_legal_lines(b) or []
-    for e in extras:
-        e = _safe(e)
-        if not e or e == "—":
-            continue
-        # avoid duplicates of the two priority topics
-        low = e.lower()
-        if "dl" in low or "drug lic" in low or "pharmacist" in low or "reg" in low:
+    # extras (but skip anything DL/pharmacist-like)
+    for e in all_lines:
+        low = (e or "").lower()
+        if low.startswith("dl") or "pharmacist" in low or "reg" in low:
             continue
         e1 = _one_line(e)
         if e1:
             out.append(e1)
 
     return out
+
 
 
 # =========================================================
@@ -3076,8 +3169,8 @@ def _collect_detail_rows(
         mod = (getattr(inv, "module", None) or "MISC").strip().upper()
         grp = label_for_module(mod)
 
-        for ln in list(getattr(inv, "lines", []) or []):
-            meta = _meta(getattr(ln, "meta_json", None))
+        for ln in _iter_visible_lines(inv):
+            meta = _line_meta_any(ln)
             if meta.get("is_void") is True or meta.get("is_deleted") is True:
                 continue
 
@@ -3201,6 +3294,8 @@ def _collect_pharmacy_split_rows(
                  or getattr(inv, "items", None) or [])
 
         for ln in (lines or []):
+            if _line_is_removed(ln):
+                continue
             if not _is_pharmacy_line(ln, invoice=inv):
                 continue
 
@@ -3439,7 +3534,7 @@ def _load_insurance_block(db: Session, case: BillingCase,
 
     insurer_sum = Decimal("0")
     for inv in invoices:
-        for ln in list(getattr(inv, "lines", []) or []):
+        for ln in _iter_visible_lines(inv):
             v1 = _dec(getattr(ln, "insurer_pay_amount", 0))
             v2 = _dec(getattr(ln, "approved_amount", 0))
             insurer_sum += (v1 if v1 > 0 else v2)
@@ -3630,7 +3725,7 @@ def _render_invoices_by_case_pdf_reportlab(
 
         # build item rows
         item_rows: List[List[str]] = []
-        lines = list(getattr(inv, "lines", []) or [])
+        lines = _iter_visible_lines(inv)
         for i, ln in enumerate(lines, 1):
             desc = _safe(getattr(ln, "description", None))
             qty = _safe(getattr(ln, "qty", None))
@@ -4928,6 +5023,12 @@ def billing_case_invoices_pdf(
                              media_type="application/pdf",
                              headers=headers)
 
+# The above code is defining a route in a Python FastAPI application for generating a PDF document
+# that contains the full history of a billing case. The route is accessed using a GET request to
+# "/cases/{case_id}/history/pdf" where {case_id} is a parameter representing the ID of the billing
+# case. The function `billing_case_full_history_pdf` takes the case_id as a parameter and likely
+# generates a PDF document that includes a summary, detailed information, deposit details, and a
+# pharmacy split-up related to the specified billing case.
 
 # ✅ Full History (Govt form): Summary + Detail + Deposit + Pharmacy split-up
 @router.get("/cases/{case_id}/history/pdf")
