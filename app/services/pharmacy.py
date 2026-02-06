@@ -355,7 +355,7 @@ def _allocate_from_selected_batch(
     *,
     location_id: int,
     item: InventoryItem,
-    batch_id: str,
+    batch_id: int,
     qty: Decimal,
     patient_id: int | None,
     visit_id: int | None,
@@ -370,7 +370,7 @@ def _allocate_from_selected_batch(
 
     batch: ItemBatch | None = (
         db.query(ItemBatch).filter(
-            ItemBatch.batch_no == str(batch_id),
+            ItemBatch.batch_no == int(batch_id),
             ItemBatch.location_id == int(location_id),
             ItemBatch.item_id == int(item.id)
         ).with_for_update().first()
@@ -1408,7 +1408,7 @@ def dispense_from_rx(
                 db=db,
                 location_id=int(location_id),
                 item=item,
-                batch_id=str(chosen_batch_id),
+                batch_id=int(chosen_batch_id),
                 qty=disp_qty,
                 patient_id=rx.patient_id,
                 visit_id=rx.visit_id,

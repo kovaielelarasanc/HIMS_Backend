@@ -150,7 +150,7 @@ class PrescriptionOut(PrescriptionSummaryOut):
 class DispenseLineIn(BaseModel):
     line_id: int
     dispense_qty: Decimal = Field(..., gt=0)
-    batch_id: str | None = None
+    batch_id: int | None = None
 
 class DispenseFromRxIn(BaseModel):
     location_id: Optional[int] = None  # optional override; will fall back to Rx.location
