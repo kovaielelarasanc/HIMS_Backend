@@ -369,11 +369,7 @@ def _allocate_from_selected_batch(
         return []
 
     batch: ItemBatch | None = (
-        db.query(ItemBatch).filter(
-            ItemBatch.batch_no == int(batch_id),
-            ItemBatch.location_id == int(location_id),
-            ItemBatch.item_id == int(item.id)
-        ).with_for_update().first()
+        db.query(ItemBatch).filter(ItemBatch.id == int(batch_id)).with_for_update().first()
     )
     if not batch:
         raise HTTPException(status_code=400, detail="Selected batch not found.")
@@ -589,7 +585,7 @@ def assign_batches_on_send(db: Session, rx: PharmacyPrescription) -> None:
             continue
 
         if hasattr(ln, "batch_id"):
-            ln.batch_id = b.batch_no
+            ln.batch_id = b.id
 
         if hasattr(ln, "batch_no_snapshot"):
             ln.batch_no_snapshot = b.batch_no
@@ -644,7 +640,6 @@ def create_prescription(db: Session, data: PrescriptionCreate, current_user: Use
     if data.type == "IPD" and not data.ipd_admission_id:
         raise HTTPException(status_code=400, detail="ipd_admission_id is required for IPD prescriptions.")
 
-    # ✅ doctor_user_id logic
     doctor_user_id = _resolve_doctor_user_id(db, data.doctor_user_id, current_user)
 
     rx = PharmacyPrescription(
@@ -654,18 +649,17 @@ def create_prescription(db: Session, data: PrescriptionCreate, current_user: Use
         visit_id=data.visit_id,
         ipd_admission_id=data.ipd_admission_id,
         location_id=data.location_id,
-
-        # ✅ auto-set doctor id if logged-in user is doctor
         doctor_user_id=doctor_user_id,
-
         notes=data.notes,
         status="DRAFT",
         created_by_id=current_user.id,
     )
-    db.add(rx)
-    db.flush()
 
-    for line_data in (data.lines or []):
+    db.add(rx)
+    db.commit()
+    db.refresh(rx)
+
+    for line_data in data.lines:
         _add_rx_line_internal(db, rx, line_data)
 
     db.commit()
@@ -680,19 +674,6 @@ def _add_rx_line_internal(db: Session, rx: PharmacyPrescription, line_data: RxLi
 
     snap = _snapshot_available_stock(db, rx.location_id, item.id)
     is_ooo = snap is not None and snap <= 0
-
-    # Assign batch based on item_id
-    batch = (
-        db.query(ItemBatch)
-        .filter(
-            ItemBatch.item_id == item.id,
-            ItemBatch.is_active.is_(True),
-            ItemBatch.is_saleable.is_(True),
-            ItemBatch.current_qty > 0
-        )
-        .order_by(ItemBatch.expiry_date.asc(), ItemBatch.id.asc())
-        .first()
-    )
 
     line = PharmacyPrescriptionLine(
         prescription_id=rx.id,
@@ -718,9 +699,6 @@ def _add_rx_line_internal(db: Session, rx: PharmacyPrescription, line_data: RxLi
         item_form=_item_form(item),
         item_strength=_item_strength(item),
         item_type=_item_type_str(item).lower(),
-        batch_id=batch.batch_no if batch else None,
-        batch_no_snapshot=batch.batch_no if batch else None,
-        expiry_date_snapshot=batch.expiry_date if batch else None,
     )
     db.add(line)
     return line
@@ -1339,7 +1317,7 @@ def dispense_from_rx(
     location_id = getattr(payload, "location_id", None) or getattr(rx, "location_id", None)
 
     line_map = {int(l.id): l for l in (rx.lines or [])}
-    lines_to_process: List[tuple[PharmacyPrescriptionLine, Decimal, Optional[str]]] = []
+    lines_to_process: List[tuple[PharmacyPrescriptionLine, Decimal, Optional[int]]] = []
 
     for entry in (payload.lines or []):
         line_id = getattr(entry, "line_id", None) if not isinstance(entry, dict) else entry.get("line_id")
@@ -1364,7 +1342,7 @@ def dispense_from_rx(
         if disp_qty_dec <= 0:
             continue
 
-        chosen_batch_id = batch_id if batch_id else getattr(line, "batch_id", None)
+        chosen_batch_id = int(batch_id) if batch_id else (int(getattr(line, "batch_id", 0) or 0) or None)
         lines_to_process.append((line, disp_qty_dec, chosen_batch_id))
 
     if not lines_to_process:
@@ -1436,13 +1414,6 @@ def dispense_from_rx(
             line.status = "DISPENSED"
         else:
             line.status = "PARTIAL"
-        
-        # Update batch information in prescription line from the first allocation
-        if allocations and allocations[0].batch:
-            first_batch = allocations[0].batch
-            line.batch_id = first_batch.batch_no
-            line.batch_no_snapshot = first_batch.batch_no
-            line.expiry_date_snapshot = first_batch.expiry_date
 
         if sale:
             for alloc in allocations:

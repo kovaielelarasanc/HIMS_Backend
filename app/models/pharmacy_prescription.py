@@ -33,6 +33,11 @@ class PharmacyPrescription(Base):
     """
 
     __tablename__ = "pharmacy_prescriptions"
+    __table_args__ = {
+        "mysql_engine": "InnoDB",
+        "mysql_charset": "utf8mb4",
+        "mysql_collate": "utf8mb4_unicode_ci",
+    }
 
     id = Column(Integer, primary_key=True, index=True)
     prescription_number = Column(String(64),
@@ -151,7 +156,9 @@ class PharmacyPrescriptionLine(Base):
     item_strength = Column(String(64), nullable=True)
     item_type = Column(String(32), nullable=True)  # drug / consumable
     # ✅ NEW: batch lock + snapshots for UI
-    batch_id = Column(Integer, ForeignKey("inv_item_batches.id"), nullable=True, index=True)
+    batch_id = Column(Integer,
+                      ForeignKey("inv_item_batches.id"),
+                      nullable=True, index=True)
     batch_no_snapshot = Column(String(100), nullable=True)
     expiry_date_snapshot = Column(Date, nullable=True)
 
@@ -327,6 +334,12 @@ class PharmacyPayment(Base):
     """
 
     __tablename__ = "pharmacy_payments"
+
+    __table_args__ = {
+        "mysql_engine": "InnoDB",
+        "mysql_charset": "utf8mb4",
+        "mysql_collate": "utf8mb4_unicode_ci",
+    }
 
     id = Column(Integer, primary_key=True, index=True)
     sale_id = Column(Integer,
