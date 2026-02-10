@@ -18,6 +18,7 @@ from app.db.session import MasterSessionLocal, create_tenant_session
 from app.models.tenant import Tenant
 from app.models.user import User, UserSession
 from app.models.role import Role
+from app.core.rbac import has_perm as rbac_has_perm
 
 
 
@@ -302,10 +303,9 @@ def user_perm_codes(u: Any) -> Set[str]:
 
 
 def require_perm(u: Any, perm: str) -> None:
-    if bool(getattr(u, "is_admin", False)) is True:
+    if rbac_has_perm(u, perm):
         return
-    if perm not in user_perm_codes(u):
-        raise HTTPException(status_code=403, detail=f"Forbidden: missing {perm}")
+    raise HTTPException(status_code=403, detail=f"Forbidden: missing {perm}")
 
 
 def require_provider_tenant(tenant: Tenant) -> None:

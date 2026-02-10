@@ -6,7 +6,6 @@ from typing import Optional
 from sqlalchemy.exc import SQLAlchemyError
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session, selectinload
-from sqlalchemy import case
 from sqlalchemy.exc import IntegrityError
 from fastapi import HTTPException
 from app.api.deps import get_db, current_user
@@ -16,15 +15,7 @@ from app.core.rbac import require_any
 from app.models.user import User
 
 from app.models.inv_indent_issue import InvIndent, InvIssue, InvIndentItem, InvIssueItem
-from app.models.pharmacy_inventory import (
-    InventoryLocation,
-    InventoryItem,
-    ItemLocationStock,
-    ItemBatch,
-)
-
 from app.schemas.inventory_indent import (
-    LocationOut, InventoryItemOut, StockOut, BatchOut,
     IndentCreateIn, IndentUpdateIn, ApproveIndentIn, CancelIn, IndentOut,
     IssueCreateFromIndentIn, IssueOut, IssueItemUpdateIn
 )
@@ -45,12 +36,6 @@ from app.services.inventory_indent_service import (
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/inventory", tags=["inventory"])
 
-# Permissions (same as yours)
-P_LOC_VIEW = ["inventory.locations.view", "inventory.catalog.view", "inv.locations.view", "inv.catalog.view"]
-P_ITEM_VIEW = ["inventory.items.view", "inventory.catalog.view", "inv.items.view", "inv.catalog.view"]
-P_STOCK_VIEW = ["inventory.stock.view", "inventory.catalog.view", "inv.stock.view", "inv.catalog.view"]
-P_BATCH_VIEW = ["inventory.batches.view", "inventory.stock.view", "inv.batches.view", "inv.stock.view"]
-
 P_INDENT_VIEW = ["inventory.indents.view", "inventory.indent.view", "inv.indents.view", "inv.indent.view"]
 P_INDENT_CREATE = ["inventory.indents.create", "inventory.indents.manage", "inv.indents.create", "inv.indents.manage"]
 P_INDENT_UPDATE = ["inventory.indents.update", "inventory.indents.manage", "inv.indents.update", "inv.indents.manage"]
@@ -70,104 +55,6 @@ def _safe_err(e: Exception):
     if isinstance(e, IntegrityError):
         return err("Database constraint error (duplicate/invalid reference).", 400)
     return err(str(getattr(e, "detail", e)), getattr(e, "status_code", 500))
-
-
-# =========================
-# CATALOG
-# =========================
-@router.get("/locations")
-def list_locations(
-    active: Optional[bool] = Query(True),
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
-):
-    try:
-        require_any(user, P_LOC_VIEW)
-        q = db.query(InventoryLocation)
-        if active is not None:
-            q = q.filter(InventoryLocation.is_active == active)
-        rows = q.order_by(InventoryLocation.name.asc()).all()
-        return ok([LocationOut.model_validate(x).model_dump() for x in rows])
-    except Exception as e:
-        return _safe_err(e)
-
-
-@router.get("/items")
-def list_items(
-    search: Optional[str] = Query(None),
-    is_active: Optional[bool] = Query(True),
-    item_type: Optional[str] = Query(None),
-    limit: Optional[int] = Query(None),
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
-):
-    try:
-        require_any(user, P_ITEM_VIEW)
-        q = db.query(InventoryItem)
-        if is_active is not None:
-            q = q.filter(InventoryItem.is_active == is_active)
-        if item_type:
-            q = q.filter(InventoryItem.item_type == item_type)
-        if search:
-            like = f"%{search.strip()}%"
-            q = q.filter((InventoryItem.name.like(like)) | (InventoryItem.code.like(like)))
-
-        q = q.order_by(InventoryItem.name.asc())
-        
-        if limit:
-            q = q.limit(limit)
-            
-        rows = q.all()
-        return ok([InventoryItemOut.model_validate(x).model_dump() for x in rows])
-    except Exception as e:
-        return _safe_err(e)
-
-
-@router.get("/stock")
-def list_location_stock(
-    location_id: int = Query(...),
-    only_positive: bool = Query(False),
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
-):
-    try:
-        require_any(user, P_STOCK_VIEW)
-        q = db.query(ItemLocationStock).filter(ItemLocationStock.location_id == location_id)
-        if only_positive:
-            q = q.filter(ItemLocationStock.on_hand_qty > 0)
-        rows = q.order_by(ItemLocationStock.updated_at.desc()).all()
-        return ok([StockOut.model_validate(x).model_dump() for x in rows])
-    except Exception as e:
-        return _safe_err(e)
-
-
-@router.get("/batches")
-def list_batches(
-    location_id: int = Query(...),
-    item_id: Optional[int] = Query(None),
-    only_available: bool = Query(True),
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
-):
-    try:
-        require_any(user, P_BATCH_VIEW)
-
-        q = db.query(ItemBatch).filter(ItemBatch.location_id == location_id)
-        if item_id:
-            q = q.filter(ItemBatch.item_id == item_id)
-        if only_available:
-            q = q.filter(ItemBatch.current_qty > 0, ItemBatch.is_active.is_(True), ItemBatch.is_saleable.is_(True))
-
-        q = q.order_by(
-            case((ItemBatch.expiry_date.is_(None), 1), else_=0),
-            ItemBatch.expiry_date.asc(),
-            ItemBatch.id.asc(),
-        )
-
-        rows = q.limit(1000).all()
-        return ok([BatchOut.model_validate(x).model_dump() for x in rows])
-    except Exception as e:
-        return _safe_err(e)
 
 
 # =========================

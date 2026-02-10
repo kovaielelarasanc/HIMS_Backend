@@ -5,15 +5,10 @@ from typing import Iterable
 from fastapi import HTTPException
 
 from app.models.user import User
+from app.core.rbac import has_perm as rbac_has_perm
 
 def has_perm(user: User, code: str) -> bool:
-    if getattr(user, "is_admin", False):
-        return True
-    for r in getattr(user, "roles", []):
-        for p in getattr(r, "permissions", []):
-            if p.code == code:
-                return True
-    return False
+    return rbac_has_perm(user, code)
 
 
 def need_any(user: User, perms: Iterable[str]) -> None:

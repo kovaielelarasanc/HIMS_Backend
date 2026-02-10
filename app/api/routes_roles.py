@@ -1,16 +1,18 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from app.api.deps import get_db
+from app.api.deps import get_db, current_user, require_perm
 from app.models.role import Role, RolePermission
 from app.models.permission import Permission
 from app.schemas.role import RoleCreate, RoleOut
+from app.models.user import User
 
 
 router = APIRouter()
 
 
 @router.get("/", response_model=list[RoleOut])
-def list_roles(db: Session = Depends(get_db)):
+def list_roles(db: Session = Depends(get_db), me: User = Depends(current_user)):
+    require_perm(me, "roles.view")
     roles = db.query(Role).all()
     out = []
     for r in roles:
@@ -18,7 +20,8 @@ def list_roles(db: Session = Depends(get_db)):
     return out
 
 @router.post("/", response_model=RoleOut)
-def create_role(payload: RoleCreate, db: Session = Depends(get_db)):
+def create_role(payload: RoleCreate, db: Session = Depends(get_db), me: User = Depends(current_user)):
+    require_perm(me, "roles.create")
     if db.query(Role).filter(Role.name == payload.name).first():
         raise HTTPException(status_code=400, detail="Role exists")
     r = Role(name=payload.name, description=payload.description)
@@ -32,7 +35,8 @@ def create_role(payload: RoleCreate, db: Session = Depends(get_db)):
 
 
 @router.put("/{role_id}", response_model=RoleOut)
-def update_role(role_id: int, payload: RoleCreate, db: Session = Depends(get_db)):
+def update_role(role_id: int, payload: RoleCreate, db: Session = Depends(get_db), me: User = Depends(current_user)):
+    require_perm(me, "roles.update")
     r = db.query(Role).get(role_id)
     if not r: raise HTTPException(status_code=404, detail="Not found")
     r.name = payload.name; r.description = payload.description
@@ -43,7 +47,8 @@ def update_role(role_id: int, payload: RoleCreate, db: Session = Depends(get_db)
 
 
 @router.delete("/{role_id}")
-def delete_role(role_id: int, db: Session = Depends(get_db)):
+def delete_role(role_id: int, db: Session = Depends(get_db), me: User = Depends(current_user)):
+    require_perm(me, "roles.delete")
     r = db.query(Role).get(role_id)
     if not r: raise HTTPException(status_code=404, detail="Not found")
     db.delete(r); db.commit()

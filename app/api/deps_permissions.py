@@ -2,16 +2,11 @@
 from fastapi import Depends, HTTPException, status
 from app.api.deps import current_user
 from app.models.user import User as UserModel
+from app.core.rbac import has_perm as rbac_has_perm
 
 
 def has_perm(user: UserModel, code: str) -> bool:
-    if getattr(user, "is_admin", False):
-        return True
-    for r in user.roles:
-        for p in r.permissions:
-            if p.code == code:
-                return True
-    return False
+    return rbac_has_perm(user, code)
 
 
 def require_permission(code: str):

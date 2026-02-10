@@ -465,6 +465,11 @@ def _apply_schedule_sync(
 def _perm_or_403(user: User, perm: str) -> None:
     if not has_perm(user, perm):
         raise HTTPException(status_code=403, detail="Not enough permissions")
+
+def _need_any(user: User, perms: list[str]) -> None:
+    if any(has_perm(user, p) for p in (perms or [])):
+        return
+    raise HTTPException(status_code=403, detail="Not enough permissions")
     
 @router.get("/locations", response_model=List[LocationOut])
 def list_locations(
@@ -474,7 +479,12 @@ def list_locations(
     active_only: bool = Query(True, description="Return only active locations"),
     q: Optional[str] = Query(None, description="Search by code/name"),
 ):
-    _perm_or_403(current_user, "pharmacy.inventory.locations.view")
+    _need_any(current_user, [
+        "pharmacy.inventory.locations.view",
+        "inventory.locations.view",
+        "inventory.catalog.view",
+        "inventory.view",
+    ])
 
     qry = db.query(InventoryLocation)
 
@@ -657,7 +667,15 @@ def list_items(
     limit: int = Query(5000, ge=1, le=10000),
     offset: int = Query(0, ge=0),
 ):
-    if not has_perm(current_user, "pharmacy.inventory.items.view"):
+    if not any(
+        has_perm(current_user, p)
+        for p in [
+            "pharmacy.inventory.items.view",
+            "inventory.items.view",
+            "inventory.catalog.view",
+            "inventory.view",
+        ]
+    ):
         return err("Not enough permissions", status_code=403)
 
     item = InventoryItem
@@ -818,6 +836,40 @@ def search_item_batches_for_billing(
         raise HTTPException(status_code=500, detail="Database error while searching item batches.") from e
     except Exception as e:
         raise HTTPException(status_code=500, detail="Unexpected error while searching item batches.") from e
+
+
+@router.get("/batches", response_model=List[ItemBatchOut])
+def list_batches(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(auth_current_user),
+    location_id: int = Query(...),
+    item_id: Optional[int] = Query(None),
+    only_available: bool = Query(True),
+):
+    _need_any(current_user, [
+        "pharmacy.inventory.stock.view",
+        "inventory.batches.view",
+        "inventory.stock.view",
+        "inventory.view",
+    ])
+
+    q = db.query(ItemBatch).filter(ItemBatch.location_id == location_id)
+    if item_id:
+        q = q.filter(ItemBatch.item_id == item_id)
+    if only_available:
+        q = q.filter(
+            ItemBatch.current_qty > 0,
+            ItemBatch.is_active.is_(True),
+            ItemBatch.is_saleable.is_(True),
+        )
+
+    q = q.order_by(
+        case((ItemBatch.expiry_date.is_(None), 1), else_=0),
+        ItemBatch.expiry_date.asc(),
+        ItemBatch.id.asc(),
+    )
+
+    return q.limit(1000).all()
 
 
 # ✅ CREATE ITEM
@@ -1254,7 +1306,14 @@ def stock_summary(
     location_id: Optional[int] = Query(None),
     q: Optional[str] = Query(None),
 ):
-    if not has_perm(current_user, "pharmacy.inventory.stock.view"):
+    if not any(
+        has_perm(current_user, p)
+        for p in [
+            "pharmacy.inventory.stock.view",
+            "inventory.stock.view",
+            "inventory.view",
+        ]
+    ):
         raise HTTPException(status_code=403, detail="Not enough permissions")
 
     item = InventoryItem

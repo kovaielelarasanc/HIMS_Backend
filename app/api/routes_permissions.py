@@ -6,31 +6,12 @@ from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 from sqlalchemy import or_, func
-from app.api.deps import get_db, current_user
+from app.api.deps import get_db, current_user, require_perm
 from app.models.user import User
 from app.models.permission import Permission
 from app.schemas.permission import PermissionCreate, PermissionOut, ModuleCountOut
 
 router = APIRouter()
-
-# -------------------------
-# Permission guard helpers
-# -------------------------
-def has_perm(user: User, code: str) -> bool:
-    if user.is_admin:
-        return True
-    for r in user.roles:
-        for p in r.permissions:
-            if p.code == code:
-                return True
-    return False
-
-
-
-def _need(user: User, code: str):
-    if not has_perm(user, code):
-        raise HTTPException(status_code=403, detail="Not permitted")
-
 
 # -------------------------
 # Routes
@@ -41,7 +22,7 @@ def permission_modules(
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ):
-    _need(user, "permissions.view")
+    require_perm(user, "permissions.view")
 
     rows = (
         db.query(Permission.module, func.count(Permission.id))
@@ -60,7 +41,7 @@ def list_permissions(
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ):
-    _need(user, "permissions.view")
+    require_perm(user, "permissions.view")
 
     qry = db.query(Permission)
 
@@ -86,7 +67,7 @@ def create_permission(
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ):
-    _need(user, "permissions.create")
+    require_perm(user, "permissions.create")
 
     code = (payload.code or "").strip()
     label = (payload.label or "").strip()
@@ -113,7 +94,7 @@ def update_permission(
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ):
-    _need(user, "permissions.update")
+    require_perm(user, "permissions.update")
 
     p = db.get(Permission, perm_id)
     if not p:
@@ -146,7 +127,7 @@ def delete_permission(
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ):
-    _need(user, "permissions.delete")
+    require_perm(user, "permissions.delete")
 
     p = db.get(Permission, perm_id)
     if not p:

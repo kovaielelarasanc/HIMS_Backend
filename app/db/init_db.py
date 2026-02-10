@@ -67,6 +67,7 @@ def seed_permissions(db: Session) -> None:
         ("ipd.admissions",
          ["view", "create", "update", "cancel", "transfer", "discharge"]),
         ("ipd.tracking", ["view"]),
+        ("ipd.dashboard", ["view"]),
         ("ipd.my", ["view"]),
         ("ipd.discharged", ["view"]),
         ("ipd.bedboard", ["view"]),
@@ -173,6 +174,10 @@ def seed_permissions(db: Session) -> None:
 
         # -------- EMR / Settings / MIS ----------
         ("emr", ["view", "download"]),
+        ("emr.chart", ["view"]),
+        ("emr.templates", ["view"]),
+        ("emr.inbox", ["view"]),
+        ("emr.exports", ["view"]),
         ("templates", ["view", "manage"]),
         ("consents", ["view", "manage"]),
         ("mis", ["view"]),
