@@ -658,10 +658,14 @@ def build_schedule_medicine_report_pdf(
         y = H - pad_top - 2 * mm
 
         c.setFillColor(header_text)
-        c.setFont("Helvetica-Bold", 16)
-        c.drawString(text_x, y, _fit_text(org_name, "Helvetica-Bold", 16, 110 * mm))
+        c.setFont("Helvetica-Bold", 13)
+        # Wrap org_name if too long instead of truncating
+        org_name_lines = _wrap_text_hard(org_name, "Helvetica-Bold", 13, 110 * mm)
+        for line in org_name_lines[:2]:  # max 2 lines
+            c.drawString(text_x, y, line)
+            y -= 5.5 * mm
 
-        y -= 7 * mm
+        y -= 6 * mm
         c.setFont("Helvetica", 9)
         c.setFillColor(header_muted)
 
