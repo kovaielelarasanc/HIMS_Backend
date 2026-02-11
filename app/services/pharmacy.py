@@ -1334,11 +1334,6 @@ def dispense_from_rx(
         remaining = _d(line.requested_qty) - _d(line.dispensed_qty)
         disp_qty_dec = _d(disp_qty)
 
-        if disp_qty_dec > remaining:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Dispense quantity {disp_qty_dec} exceeds remaining {remaining} for line {line.id}.",
-            )
         if disp_qty_dec <= 0:
             continue
 
